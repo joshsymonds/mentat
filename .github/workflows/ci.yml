@@ -109,7 +109,7 @@ jobs:
         GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -o mentant-${{ matrix.os }}-${{ matrix.arch }} ./cmd/mentant
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: mentant-${{ matrix.os }}-${{ matrix.arch }}
         path: mentant-${{ matrix.os }}-${{ matrix.arch }}
