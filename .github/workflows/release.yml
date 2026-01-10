@@ -39,7 +39,7 @@ jobs:
       run: go test -short ./...
 
     - name: Install GoReleaser
-      uses: goreleaser/goreleaser-action@v5
+      uses: goreleaser/goreleaser-action@v6
       with:
         install-only: true
 
@@ -93,7 +93,7 @@ jobs:
         fi
 
     - name: Run GoReleaser
-      uses: goreleaser/goreleaser-action@v5
+      uses: goreleaser/goreleaser-action@v6
       with:
         distribution: goreleaser
         version: latest
