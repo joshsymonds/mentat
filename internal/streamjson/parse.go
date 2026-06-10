@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 )
 
 // maxLineBytes bounds a single NDJSON line. Assistant messages carrying large
@@ -40,26 +41,45 @@ func Parse(raw []byte) (Line, error) {
 	return line, nil
 }
 
+// Lines parses NDJSON lines from r incrementally until EOF. It is the live
+// supervisor's primitive: each line is yielded as soon as it arrives, so a
+// long-lived child process streams through it.
+func Lines(r io.Reader) iter.Seq2[Line, error] {
+	return func(yield func(Line, error) bool) {
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 0, bufio.MaxScanTokenSize), maxLineBytes)
+
+		lineNo := 0
+		for scanner.Scan() {
+			raw := scanner.Bytes()
+			if len(raw) == 0 {
+				continue
+			}
+			lineNo++
+			line, err := Parse(raw)
+			if err != nil {
+				yield(Line{}, fmt.Errorf("line %d: %w", lineNo, err))
+				return
+			}
+			if !yield(line, nil) {
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			yield(Line{}, fmt.Errorf("reading stream-json: %w", err))
+		}
+	}
+}
+
 // ReadAll parses every line from r until EOF. It is the cassette-replay
 // primitive: a recorded transcript in, the typed event sequence out.
 func ReadAll(r io.Reader) ([]Line, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, bufio.MaxScanTokenSize), maxLineBytes)
-
 	var lines []Line
-	for scanner.Scan() {
-		raw := scanner.Bytes()
-		if len(raw) == 0 {
-			continue
-		}
-		line, err := Parse(raw)
+	for line, err := range Lines(r) {
 		if err != nil {
-			return nil, fmt.Errorf("line %d: %w", len(lines)+1, err)
+			return nil, err
 		}
 		lines = append(lines, line)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("reading stream-json: %w", err)
 	}
 	return lines, nil
 }
