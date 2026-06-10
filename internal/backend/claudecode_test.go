@@ -2,14 +2,17 @@ package backend_test
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -27,7 +30,25 @@ func TestMain(m *testing.M) {
 		fakeClaudeMain()
 		return
 	}
+	if os.Getenv("MENTAT_FAKE_RAW") != "" {
+		fakeRawMain()
+		return
+	}
 	os.Exit(m.Run())
+}
+
+// fakeRawMain dumps a file's bytes to stdout verbatim on the first stdin
+// turn, then stays alive draining stdin until the parent closes it. It is
+// used to reproduce a child that keeps streaming after the parser chokes:
+// the process exits only when stdin closes (the supervisor's cancel path).
+func fakeRawMain() {
+	bufio.NewScanner(os.Stdin).Scan()
+	data, err := os.ReadFile(os.Getenv("MENTAT_FAKE_RAW"))
+	if err != nil {
+		os.Exit(2)
+	}
+	os.Stdout.Write(data)
+	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
 func fakeClaudeMain() {
@@ -305,6 +326,133 @@ func TestClaudeCodeCloseSessionResumesOnNextTurn(t *testing.T) {
 	sessionUUID := flagValue(t, spawns[0], "--session-id")
 	require.Contains(t, spawns[1], "--resume "+sessionUUID,
 		"an expired session resumes its CLI conversation rather than starting cold")
+}
+
+// readSpawns returns each recorded child invocation's argv line.
+func readSpawns(t *testing.T, argsFile string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(argsFile)
+	require.NoError(t, err)
+	return strings.Split(strings.TrimSpace(string(raw)), "\n")
+}
+
+// pickLine returns the first line of simple_turn.ndjson whose JSON "type"
+// (and, when nonempty, the inner stream event delta type) matches. It sources
+// synthetic fixtures from genuinely recorded wire bytes rather than invented
+// shapes.
+func pickLine(t *testing.T, eventType, deltaType string) string {
+	t.Helper()
+	data, err := os.ReadFile(cassettePath(t, "simple_turn.ndjson"))
+	require.NoError(t, err)
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var probe struct {
+			Type  string `json:"type"`
+			Event struct {
+				Delta struct {
+					Type string `json:"type"`
+				} `json:"delta"`
+			} `json:"event"`
+		}
+		if json.Unmarshal([]byte(line), &probe) != nil || probe.Type != eventType {
+			continue
+		}
+		if deltaType == "" || probe.Event.Delta.Type == deltaType {
+			return line
+		}
+	}
+	t.Fatalf("no %s/%s line in simple_turn.ndjson", eventType, deltaType)
+	return ""
+}
+
+// writeBigCassette builds a one-turn transcript with eventLines content
+// deltas — enough to overflow the supervisor's event buffer — bracketed by
+// the real init and result lines from simple_turn.
+func writeBigCassette(t *testing.T, eventLines int) string {
+	t.Helper()
+	initLine := pickLine(t, "system", "")
+	deltaLine := pickLine(t, "stream_event", "text_delta")
+	resultLine := pickLine(t, "result", "")
+
+	lines := make([]string, 0, eventLines+2)
+	lines = append(lines, initLine)
+	for range eventLines {
+		lines = append(lines, deltaLine)
+	}
+	lines = append(lines, resultLine)
+
+	path := filepath.Join(t.TempDir(), "big.ndjson")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600))
+	return path
+}
+
+func TestClaudeCodeAbandonedTurnRespawnsSession(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("MENTAT_FAKE_ARGS_FILE", argsFile)
+	cc := newFakeClaude(t, "multi_turn.ndjson", backend.ClaudeCodeConfig{})
+
+	stream, err := cc.Converse(t.Context(), backend.Turn{SessionID: "study", Text: "first"})
+	require.NoError(t, err)
+	for _, streamErr := range stream {
+		require.NoError(t, streamErr)
+		break // abandon the turn after its first event
+	}
+
+	events, err := collectTurn(t, cc, backend.Turn{SessionID: "study", Text: "second"})
+	require.NoError(t, err)
+	require.NotEmpty(t, doneTexts(events))
+
+	spawns := readSpawns(t, argsFile)
+	require.Len(t, spawns, 2, "abandoning a turn must poison the session so the next turn respawns")
+	sessionUUID := flagValue(t, spawns[0], "--session-id")
+	require.Contains(t, spawns[1], "--resume "+sessionUUID,
+		"the respawn after abandonment must resume the same CLI conversation")
+}
+
+func TestClaudeCodeAbandonedLargeTurnDoesNotDeadlock(t *testing.T) {
+	t.Setenv("MENTAT_FAKE_CLAUDE", writeBigCassette(t, 300))
+	cc, err := backend.NewClaudeCode(backend.ClaudeCodeConfig{Bin: os.Args[0]})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cc.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := cc.Converse(ctx, backend.Turn{SessionID: "big", Text: "go"})
+	require.NoError(t, err)
+	for _, streamErr := range stream {
+		require.NoError(t, streamErr)
+		cancel() // abandon with hundreds of events still queued behind us
+		break
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cc.CloseSession("big") }()
+	select {
+	case closeErr := <-done:
+		require.NoError(t, closeErr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("CloseSession deadlocked: reader wedged on a full event buffer behind an abandoned turn")
+	}
+}
+
+func TestClaudeCodeParseErrorDoesNotWedgeShutdown(t *testing.T) {
+	initLine := pickLine(t, "system", "")
+	rawFile := filepath.Join(t.TempDir(), "garbage.ndjson")
+	require.NoError(t, os.WriteFile(rawFile, []byte(initLine+"\nthis is not json\n"), 0o600))
+	t.Setenv("MENTAT_FAKE_RAW", rawFile)
+
+	cc, err := backend.NewClaudeCode(backend.ClaudeCodeConfig{Bin: os.Args[0]})
+	require.NoError(t, err)
+
+	_, err = collectTurn(t, cc, backend.Turn{SessionID: "noise", Text: "go"})
+	require.Error(t, err, "a malformed wire line must surface as a stream error")
+
+	done := make(chan error, 1)
+	go func() { done <- cc.Close() }()
+	select {
+	case closeErr := <-done:
+		require.NoError(t, closeErr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close deadlocked: parse-error path left the child unreaped on a blocking Wait")
+	}
 }
 
 func flagValue(t *testing.T, args, flag string) string {

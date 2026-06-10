@@ -99,7 +99,13 @@ func (b *ClaudeCode) Converse(ctx context.Context, turn Turn) (iter.Seq2[Event, 
 	}
 	return func(yield func(Event, error) bool) {
 		defer sess.turnMu.Unlock()
-		streamTurn(ctx, sess, yield)
+		if abandoned := streamTurn(ctx, sess, yield); abandoned {
+			// The consumer left before the turn's Done, so this session's
+			// event stream is now stranded mid-turn. Poison it: the next
+			// turn respawns with --resume rather than reading these
+			// leftovers and answering the wrong turn.
+			sess.poison()
+		}
 	}, nil
 }
 
@@ -140,7 +146,7 @@ func (b *ClaudeCode) sessionFor(id string) (*session, error) {
 	defer b.mu.Unlock()
 
 	existing := b.sessions[id]
-	if existing != nil && !existing.dead.Load() {
+	if existing != nil && !existing.dead.Load() && !existing.poisoned.Load() {
 		return existing, nil
 	}
 	resumeUUID := ""
@@ -214,6 +220,7 @@ func (b *ClaudeCode) startSession(resumeUUID string) (*session, error) {
 		uuid:       sessionUUID,
 		cmd:        cmd,
 		stdin:      stdin,
+		lifecycle:  lifecycle,
 		cancel:     cancel,
 		events:     make(chan turnEvent, eventBuffer),
 		readerDone: make(chan struct{}),
@@ -297,12 +304,14 @@ type session struct {
 	uuid       string
 	cmd        *exec.Cmd
 	stdin      io.WriteCloser
+	lifecycle  context.Context //nolint:containedctx // The session owns a process lifetime, not a request; the context IS the session's cancellation handle.
 	cancel     context.CancelFunc
 	turnMu     sync.Mutex
 	events     chan turnEvent
 	readerDone chan struct{}
 	translator *Translator
 	dead       atomic.Bool
+	poisoned   atomic.Bool
 	waitErr    error
 }
 
@@ -346,11 +355,21 @@ func (s *session) send(text string) error {
 func (s *session) readLoop(transcript io.Reader, recorder *os.File) {
 	for line, err := range streamjson.Lines(transcript) {
 		if err != nil {
-			s.events <- turnEvent{err: err}
+			s.emit(turnEvent{err: err})
+			// The child may still be streaming into a pipe nobody reads;
+			// cancel so cmd.Cancel/WaitDelay reaps it and Wait can return.
+			s.cancel()
 			break
 		}
+		stop := false
 		for _, event := range s.translator.Translate(line) {
-			s.events <- turnEvent{event: event}
+			if !s.emit(turnEvent{event: event}) {
+				stop = true
+				break
+			}
+		}
+		if stop {
+			break
 		}
 	}
 	if recorder != nil {
@@ -362,29 +381,52 @@ func (s *session) readLoop(transcript io.Reader, recorder *os.File) {
 	close(s.readerDone)
 }
 
+// emit hands one event to the current turn's consumer, or reports false if
+// the session's lifecycle is canceled first — which happens when a turn is
+// abandoned and the consumer has stopped reading. Selecting on the lifecycle
+// is what stops the reader from parking forever on a full channel, which
+// would otherwise wedge shutdown.
+func (s *session) emit(ev turnEvent) bool {
+	select {
+	case s.events <- ev:
+		return true
+	case <-s.lifecycle.Done():
+		return false
+	}
+}
+
+// poison marks a session unusable and cancels its child. The next turn for
+// the same SessionID respawns with --resume.
+func (s *session) poison() {
+	s.poisoned.Store(true)
+	s.cancel()
+}
+
 // streamTurn delivers one turn's events to yield, ending at the turn's Done,
-// a stream error, context cancellation, or session death.
-func streamTurn(ctx context.Context, sess *session, yield func(Event, error) bool) {
+// a stream error, context cancellation, or session death. It returns true if
+// the turn was abandoned before its Done (consumer canceled or stopped
+// reading) — the signal to poison the session.
+func streamTurn(ctx context.Context, sess *session, yield func(Event, error) bool) bool {
 	for {
 		select {
 		case <-ctx.Done():
 			yield(Event{}, fmt.Errorf("claudecode: turn interrupted: %w", ctx.Err()))
-			return
+			return true
 		case received, ok := <-sess.events:
 			if !ok {
 				yield(Event{}, fmt.Errorf("claudecode: session ended mid-turn: %w",
 					errors.Join(sess.waitErr, errSessionDied)))
-				return
+				return false
 			}
 			if received.err != nil {
 				yield(Event{}, received.err)
-				return
+				return false
 			}
 			if !yield(received.event, nil) {
-				return
+				return true
 			}
 			if received.event.Kind == KindDone {
-				return
+				return false
 			}
 		}
 	}
@@ -393,19 +435,15 @@ func streamTurn(ctx context.Context, sess *session, yield func(Event, error) boo
 // errSessionDied marks a child process exiting before its turn completed.
 var errSessionDied = errors.New("child process exited before the turn completed")
 
-// shutdown cancels the session's lifecycle: cmd.Cancel closes stdin (the
-// CLI's exit signal) and WaitDelay kills the child if it overstays the
-// grace period. A session that died before shutdown returns nil: its death
-// was already surfaced to the turn's consumer as a stream error.
+// shutdown cancels the session's lifecycle and waits for the reader to reap
+// the child: cmd.Cancel closes stdin (the CLI's exit signal) and WaitDelay
+// SIGKILLs a child that overstays the grace period (e.g. one wedged writing
+// to a stdout nobody is draining). It always returns nil — the child is
+// gone either way, and any exit error it produced was either our own
+// cancellation or was already surfaced to the turn's consumer as a stream
+// error. Idempotent: safe to call on an already-dead or already-shut session.
 func (s *session) shutdown() error {
-	alreadyDead := s.dead.Load()
 	s.cancel()
 	<-s.readerDone
-
-	// Wait reports the lifecycle context's cancellation even when the child
-	// exits cleanly in response to it; our own cancel is not a failure.
-	if !alreadyDead && s.waitErr != nil && !errors.Is(s.waitErr, context.Canceled) {
-		return fmt.Errorf("claudecode: session %s shutdown: %w", s.uuid, s.waitErr)
-	}
 	return nil
 }

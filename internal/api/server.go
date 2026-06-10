@@ -47,29 +47,50 @@ func (s *Server) Handler() http.Handler {
 }
 
 // ExpireIdle closes sessions whose last activity is older than maxIdle and
-// returns their IDs. Sessions with a turn in flight are never expired.
-// Expired sessions are forgotten; the backend may still restore their
-// context if a new turn arrives later.
+// returns their IDs. A session with a turn in flight is never expired: it is
+// skipped both in the scan and in a re-check immediately before close, so a
+// turn that arrives after the scan still spares its session. (A turn landing
+// in the final sliver between that re-check and CloseSession would attach to
+// the session being closed and fail; the backend's poison-and-resume makes a
+// client retry transparently restore the conversation.)
 func (s *Server) ExpireIdle(maxIdle time.Duration) []string {
 	cutoff := time.Now().Add(-maxIdle)
 
 	s.mu.Lock()
-	var expired []string
+	candidates := make([]string, 0, len(s.sessions))
 	for id, activity := range s.sessions {
 		if activity.activeTurns == 0 && !activity.lastActive.After(cutoff) {
-			expired = append(expired, id)
-			delete(s.sessions, id)
+			candidates = append(candidates, id)
 		}
 	}
 	s.mu.Unlock()
 
-	for _, id := range expired {
+	expired := make([]string, 0, len(candidates))
+	for _, id := range candidates {
+		if !s.claimForExpiry(id, cutoff) {
+			continue
+		}
+		expired = append(expired, id)
 		if err := s.backend.CloseSession(id); err != nil {
 			s.logger.Error("closing idle session failed",
 				slog.String("session_id", id), slog.Any("error", err))
 		}
 	}
 	return expired
+}
+
+// claimForExpiry atomically re-checks that a session is still idle and
+// removes it from tracking, returning false if a turn re-acquired it since
+// the scan.
+func (s *Server) claimForExpiry(id string, cutoff time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	activity := s.sessions[id]
+	if activity == nil || activity.activeTurns != 0 || activity.lastActive.After(cutoff) {
+		return false
+	}
+	delete(s.sessions, id)
+	return true
 }
 
 type turnRequest struct {
