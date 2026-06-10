@@ -55,11 +55,6 @@ func TestParseCassettesNoUnknownEvents(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, cassettes)
 
-	known := map[string]bool{
-		"system": true, "assistant": true, "user": true,
-		"stream_event": true, "result": true, "rate_limit_event": true,
-		"control_request": true, "control_response": true,
-	}
 	for _, path := range cassettes {
 		f, err := os.Open(path)
 		require.NoError(t, err)
@@ -67,7 +62,9 @@ func TestParseCassettesNoUnknownEvents(t *testing.T) {
 		f.Close()
 		require.NoError(t, err, path)
 		for _, ln := range lines {
-			require.True(t, known[ln.Type], "unknown event type %q in %s", ln.Type, path)
+			// Exercise the production predicate directly, so the test and
+			// Line.Unknown() can never disagree about what's recognized.
+			require.False(t, ln.Unknown(), "unknown event type %q in %s", ln.Type, path)
 			require.NotEmpty(t, ln.Raw)
 		}
 	}

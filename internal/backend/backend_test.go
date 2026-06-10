@@ -131,6 +131,40 @@ func TestTranslateEffortLowHasNoThinking(t *testing.T) {
 	require.Equal(t, []string{"3^17"}, doneTexts(events))
 }
 
+func TestToolResultContentShapes(t *testing.T) {
+	t.Parallel()
+	// tool_result content arrives on the wire as either a JSON string or a
+	// block array; both must translate to the same text. All recorded
+	// cassettes happen to use the string form, so cover the others directly.
+	cases := map[string]struct {
+		content string
+		want    string
+	}{
+		"string form":   {`"plain output"`, "plain output"},
+		"block array":   {`[{"type":"text","text":"from "},{"type":"text","text":"blocks"}]`, "from blocks"},
+		"raw fallback":  {`{"unexpected":"shape"}`, `{"unexpected":"shape"}`},
+		"empty content": {``, ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			raw := `{"type":"user","message":{"role":"user","content":[` +
+				`{"type":"tool_result","tool_use_id":"x"`
+			if tc.content != "" {
+				raw += `,"content":` + tc.content
+			}
+			raw += `}]}}`
+
+			line, err := streamjson.Parse([]byte(raw))
+			require.NoError(t, err)
+			events := backend.NewTranslator().Translate(line)
+			require.Len(t, events, 1)
+			require.Equal(t, backend.KindToolResult, events[0].Kind)
+			require.Equal(t, tc.want, events[0].Tool.Content)
+		})
+	}
+}
+
 func TestTranslateUnknownLineBecomesProtocolDrift(t *testing.T) {
 	t.Parallel()
 	line, err := streamjson.Parse([]byte(`{"type":"frobnicate","mystery":true}`))

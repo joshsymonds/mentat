@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"iter"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -229,6 +231,81 @@ func (b *errBackend) Converse(context.Context, backend.Turn) (iter.Seq2[backend.
 }
 
 func (b *errBackend) CloseSession(string) error { return nil }
+
+// scriptedEvent is one element of a scriptBackend's stream.
+type scriptedEvent struct {
+	event backend.Event
+	err   error
+}
+
+// scriptBackend yields a fixed sequence of events (and errors) for the turn,
+// letting tests drive the streaming/encoding paths precisely.
+type scriptBackend struct{ events []scriptedEvent }
+
+func (b *scriptBackend) Converse(context.Context, backend.Turn) (iter.Seq2[backend.Event, error], error) {
+	return func(yield func(backend.Event, error) bool) {
+		for _, e := range b.events {
+			if !yield(e.event, e.err) {
+				return
+			}
+		}
+	}, nil
+}
+
+func (b *scriptBackend) CloseSession(string) error { return nil }
+
+func collectWireKinds(t *testing.T, server *httptest.Server) []wireLine {
+	t.Helper()
+	_, lines := postTurn(t, server, "s", "go")
+	return lines
+}
+
+func TestConversationMidStreamErrorBecomesErrorLine(t *testing.T) {
+	t.Parallel()
+	stub := &scriptBackend{events: []scriptedEvent{
+		{event: backend.Event{Kind: backend.KindTextDelta, TextDelta: "par"}},
+		{err: errors.New("backend blew up mid-turn")},
+	}}
+	lines := collectWireKinds(t, newTestServer(t, stub))
+
+	last := lines[len(lines)-1]
+	require.Equal(t, "error", last.Kind)
+	require.Contains(t, last.Message, "backend blew up mid-turn")
+}
+
+func TestConversationMarshalFailureBecomesErrorLine(t *testing.T) {
+	t.Parallel()
+	// An Inf cost cannot be JSON-encoded; the stream must not silently
+	// truncate — it must deliver a terminal error line.
+	stub := &scriptBackend{events: []scriptedEvent{
+		{event: backend.Event{Kind: backend.KindDone, Done: &backend.Result{
+			Text: "hi", CostUSD: math.Inf(1),
+		}}},
+	}}
+	lines := collectWireKinds(t, newTestServer(t, stub))
+
+	require.NotEmpty(t, lines)
+	last := lines[len(lines)-1]
+	require.Equal(t, "error", last.Kind, "an unencodable event must surface as an error line, not a silent EOF")
+}
+
+func TestConversationToolEventsReachTheWire(t *testing.T) {
+	t.Parallel()
+	stub := &scriptBackend{events: []scriptedEvent{
+		{event: backend.Event{Kind: backend.KindToolUseStarted, Tool: &backend.ToolEvent{Name: "Bash"}}},
+		{event: backend.Event{Kind: backend.KindToolResult, Tool: &backend.ToolEvent{Name: "Bash", Content: "ok"}}},
+		{event: backend.Event{Kind: backend.KindProtocolDrift, Raw: []byte(`{"type":"mystery"}`)}},
+		{event: backend.Event{Kind: backend.KindDone, Done: &backend.Result{Text: "done"}}},
+	}}
+	lines := collectWireKinds(t, newTestServer(t, stub))
+
+	kinds := make([]string, len(lines))
+	for i, line := range lines {
+		kinds[i] = line.Kind
+	}
+	require.Equal(t, []string{"tool_start", "tool_result", "protocol_drift", "done"}, kinds)
+	require.Equal(t, "Bash", lines[0].Tool)
+}
 
 func TestExpireIdleClosesIdleSessions(t *testing.T) {
 	t.Parallel()

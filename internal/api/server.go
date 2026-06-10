@@ -144,7 +144,7 @@ func (s *Server) handleConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	streamEvents(w, stream)
+	streamEvents(w, s.logger, stream)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
