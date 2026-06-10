@@ -12,7 +12,7 @@ export interface TurnContext {
   meta: Record<string, string>;
 }
 
-export type PolicyDecision =
+type PolicyDecision =
   | { behavior: 'allow'; updatedInput: Record<string, unknown> }
   | { behavior: 'deny'; message: string };
 

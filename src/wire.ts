@@ -10,7 +10,7 @@ import type { Event } from './backend.ts';
  * As a constant of only literal text it always parses, so the client gets a
  * terminal error rather than a malformed line.
  */
-export const FALLBACK_ERROR_LINE = '{"kind":"error","message":"internal encoding failure"}';
+const FALLBACK_ERROR_LINE = '{"kind":"error","message":"internal encoding failure"}';
 
 /** Encodes a terminal error line. */
 export function errorLine(message: string): string {

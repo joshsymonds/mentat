@@ -6,7 +6,7 @@ import { isIP } from 'node:net';
 
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 
-export interface ListenAddress {
+interface ListenAddress {
   host: string;
   port: number;
 }
@@ -40,7 +40,11 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   }
 
   const listen = parseListen(env.MENTAT_LISTEN ?? DEFAULT_LISTEN);
-  validateListen(listen.host, env.MENTAT_ALLOW_NON_LOOPBACK !== undefined);
+  // Empty string means unset (Go's os.Getenv semantics): a blank
+  // MENTAT_ALLOW_NON_LOOPBACK= line in an env file must not disable the guard.
+  const allowNonLoopback =
+    env.MENTAT_ALLOW_NON_LOOPBACK !== undefined && env.MENTAT_ALLOW_NON_LOOPBACK !== '';
+  validateListen(listen.host, allowNonLoopback);
 
   return {
     listen,
@@ -51,7 +55,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
         ? parseDuration(env.MENTAT_SESSION_TTL)
         : DEFAULT_SESSION_TTL_MS,
     ...(env.MENTAT_MODEL !== undefined && { model: env.MENTAT_MODEL }),
-    ...(env.MENTAT_EFFORT !== undefined && { effort: env.MENTAT_EFFORT as Options['effort'] }),
+    ...(env.MENTAT_EFFORT !== undefined && { effort: parseEffort(env.MENTAT_EFFORT) }),
     ...(env.MENTAT_SYSTEM_PROMPT !== undefined && { systemPrompt: env.MENTAT_SYSTEM_PROMPT }),
     ...(env.MENTAT_MEMORY_DIR !== undefined && { memoryDir: env.MENTAT_MEMORY_DIR }),
     ...(env.MENTAT_MCP_CONFIG !== undefined && {
@@ -105,6 +109,16 @@ export function validateListen(host: string, allowNonLoopback: boolean): void {
   }
 }
 
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+/** A typo here must fail at startup, not flow silently into the session. */
+function parseEffort(value: string): Options['effort'] {
+  if (!EFFORT_LEVELS.has(value)) {
+    throw new Error(`invalid MENTAT_EFFORT ${value}: want low|medium|high|xhigh|max`);
+  }
+  return value as Options['effort'];
+}
+
 /** Go-style duration strings: "15m", "30s", "500ms", "1h30m". */
 export function parseDuration(value: string): number {
   const pattern = /(\d+)(ms|s|m|h)/g;
@@ -138,7 +152,8 @@ function resolveMcpServers(value: string): Options['mcpServers'] {
     parsed === null ||
     typeof parsed !== 'object' ||
     !('mcpServers' in parsed) ||
-    typeof (parsed).mcpServers !== 'object'
+    parsed.mcpServers === null ||
+    typeof parsed.mcpServers !== 'object'
   ) {
     throw new Error('invalid MCP config: want {"mcpServers": {...}}');
   }

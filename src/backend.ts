@@ -17,10 +17,25 @@ export interface Turn {
    * authority is per-turn.
    */
   meta?: Record<string, string>;
+  /**
+   * Aborting cancels the turn promptly (the caller went away), even while the
+   * backend is waiting silently on the model. Without it, cancellation is
+   * only noticed when the consumer stops iterating, which the backend can't
+   * see until the next event arrives.
+   */
+  signal?: AbortSignal;
+}
+
+/** A turn could not start because the backend is at its session capacity. */
+export class AtCapacityError extends Error {
+  constructor() {
+    super('backend: at session capacity');
+    this.name = 'AtCapacityError';
+  }
 }
 
 /** Token accounting for a completed turn. */
-export interface Usage {
+interface Usage {
   inputTokens: number;
   outputTokens: number;
   cacheReadInputTokens: number;
@@ -59,10 +74,14 @@ export type Event =
 
 /**
  * Streams conversation events for user turns. converse rejects for failures
- * to start the turn; failures mid-stream are thrown by the iterator.
- * closeSession releases a session's resources (idle expiry); it is harmless
- * for unknown or already-closed sessions, and a later turn with the same
- * sessionId may transparently restore context.
+ * to start the turn (AtCapacityError when the session cap is hit); failures
+ * mid-stream are thrown by the iterator. The returned iterable MUST be
+ * consumed (or explicitly closed by breaking out of iteration): the turn has
+ * already been sent to the session, and implementations may hold the
+ * session's turn slot until the iterable finishes. closeSession releases a
+ * session's resources (idle expiry); it is harmless for unknown or
+ * already-closed sessions, and a later turn with the same sessionId may
+ * transparently restore context.
  */
 export interface Backend {
   converse(turn: Turn): Promise<AsyncIterable<Event>>;

@@ -4,29 +4,22 @@
 // sessionId→CLI-UUID map. The SDK call is injectable so every behavior here
 // tests offline.
 
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import process from 'node:process';
 
 import { query, type Options, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
-import type { Backend, Event, Turn } from './backend.ts';
+import { AtCapacityError, type Backend, type Event, type Turn } from './backend.ts';
 import type { Logger } from './log.ts';
 import type { PolicyFn, TurnContext } from './policy.ts';
 import { Translator } from './translate.ts';
 
-/** A turn for a new session beyond maxSessions is refused with this. */
-export class AtCapacityError extends Error {
-  constructor() {
-    super('claudecode: at session capacity');
-    this.name = 'AtCapacityError';
-  }
-}
-
 /**
- * With no operator tool policy at all, disallow the dangerous built-ins: the
- * isolated child still carries the full toolset, and a voice surface must not
- * drive Bash/Write/etc. by default. Opt into danger explicitly.
+ * With no operator tool policy at all (neither allow nor disallow lists),
+ * disallow the dangerous built-ins: the isolated child still carries the full
+ * toolset, and a voice surface must not drive Bash/Write/etc. by default.
+ * Opt into danger explicitly.
  */
 export const DEFAULT_DISALLOWED_TOOLS = [
   'Bash',
@@ -45,8 +38,16 @@ export const DEFAULT_DISALLOWED_TOOLS = [
  */
 const ABANDON_DRAIN_LIMIT = 1000;
 
+/**
+ * Time bound on the abandon path's interrupt and per-message drain reads. A
+ * wedged child that never honors the interrupt would otherwise hold the
+ * session's turn slot forever — and the janitor can't expire a session whose
+ * turn is still counted active.
+ */
+const ABANDON_TIMEOUT_MS = 10_000;
+
 /** The slice of the SDK's query() the backend consumes — injectable in tests. */
-export interface QueryHandle extends AsyncIterable<unknown> {
+interface QueryHandle extends AsyncIterable<unknown> {
   interrupt(): Promise<void>;
 }
 
@@ -133,6 +134,21 @@ export function buildChildEnv(
 }
 
 /**
+ * The effective disallow list, ported from go-v2 toolPolicy: the dangerous
+ * built-ins default applies only when the operator set no tool policy at all.
+ * An allow-only policy (e.g. MENTAT_ALLOWED_TOOLS=Bash) must not be silently
+ * overridden by default deny rules, which take precedence in the CLI.
+ */
+function effectiveDisallowedTools(config: ClaudeCodeConfig): string[] {
+  const allow = config.allowedTools ?? [];
+  const disallow = config.disallowedTools ?? [];
+  if (allow.length === 0 && disallow.length === 0) {
+    return DEFAULT_DISALLOWED_TOOLS;
+  }
+  return disallow;
+}
+
+/**
  * Assembles the per-session SDK options. The isolation flags are
  * unconditional: a bare child inherits the operator's interactive Claude Code
  * configuration (settings, skills, MCP servers), which must never drive a
@@ -150,7 +166,7 @@ export function buildOptions(
     includePartialMessages: true,
     pathToClaudeCodeExecutable: config.bin,
     env: buildChildEnv(process.env, config.extraEnv ?? []),
-    disallowedTools: config.disallowedTools ?? DEFAULT_DISALLOWED_TOOLS,
+    disallowedTools: effectiveDisallowedTools(config),
     ...(config.model !== undefined && { model: config.model }),
     ...(config.effort !== undefined && { effort: config.effort }),
     ...(config.systemPrompt !== undefined && { systemPrompt: config.systemPrompt }),
@@ -222,46 +238,72 @@ class Mutex {
   }
 }
 
+interface Recorder {
+  write(message: unknown): void;
+  close(): void;
+}
+
+const NULL_RECORDER: Recorder = { write: () => undefined, close: () => undefined };
+
+/**
+ * Per-session message recorder. The client-chosen sessionId is URI-encoded so
+ * it cannot traverse out of recordDir. The file descriptor opens lazily and
+ * stays open for the session's lifetime — recording runs per message,
+ * including per-token partials, so a sync open/close per write would stall
+ * the event loop. Failures are logged once and recording stops — a full disk
+ * must not fail turns.
+ */
+function makeRecorder(
+  recordDir: string | undefined,
+  sessionId: string,
+  logger: Logger,
+): Recorder {
+  if (recordDir === undefined || recordDir === '') {
+    return NULL_RECORDER;
+  }
+  const path = join(recordDir, encodeURIComponent(sessionId) + '.jsonl');
+  let fd: number | undefined;
+  let broken = false;
+  return {
+    write: (message) => {
+      if (broken) {
+        return;
+      }
+      try {
+        fd ??= openSync(path, 'a');
+        writeSync(fd, JSON.stringify(message) + '\n');
+      } catch (error) {
+        broken = true;
+        logger.error('claudecode: session recording failed', {
+          path,
+          error: String(error),
+        });
+      }
+    },
+    close: () => {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          // already closed or invalid; nothing to release
+        }
+        fd = undefined;
+      }
+    },
+  };
+}
+
 interface Session {
   queue: AsyncQueue<SDKUserMessage>;
   iterator: AsyncIterator<unknown>;
   handle: QueryHandle;
   translator: Translator;
   mutex: Mutex;
-  activeContext: TurnContext | null;
+  /** The ACTIVE turn's identity context — set at turn start, cleared at turn
+   * end, never carried across turns (authority is per-turn). */
+  context: { current: TurnContext | null };
+  recorder: Recorder;
   dead: boolean;
-  record: (message: unknown) => void;
-}
-
-/**
- * Per-session message recorder. The client-chosen sessionId is URI-encoded so
- * it cannot traverse out of recordDir; append failures are logged once and
- * recording stops — a full disk must not fail turns.
- */
-function makeRecorder(
-  recordDir: string | undefined,
-  sessionId: string,
-  logger: Logger,
-): (message: unknown) => void {
-  if (recordDir === undefined || recordDir === '') {
-    return () => undefined;
-  }
-  const path = join(recordDir, encodeURIComponent(sessionId) + '.jsonl');
-  let broken = false;
-  return (message) => {
-    if (broken) {
-      return;
-    }
-    try {
-      appendFileSync(path, JSON.stringify(message) + '\n');
-    } catch (error) {
-      broken = true;
-      logger.error('claudecode: session recording failed', {
-        path,
-        error: String(error),
-      });
-    }
-  };
 }
 
 function userMessage(text: string): SDKUserMessage {
@@ -271,6 +313,40 @@ function userMessage(text: string): SDKUserMessage {
     parent_tool_use_id: null,
     session_id: '',
   };
+}
+
+/** Sentinel resolved by a turn's abort signal, raced against iterator reads. */
+const ABORTED = Symbol('aborted');
+
+function abortPromise(signal: AbortSignal | undefined): Promise<typeof ABORTED> {
+  if (signal === undefined) {
+    return new Promise(() => undefined); // never resolves; generator teardown handles it
+  }
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve(ABORTED);
+      return;
+    }
+    signal.addEventListener(
+      'abort',
+      () => {
+        resolve(ABORTED);
+      },
+      { once: true },
+    );
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`claudecode: ${what} timed out after ${String(ms)}ms`));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
 }
 
 export class ClaudeCode implements Backend {
@@ -313,7 +389,7 @@ export class ClaudeCode implements Backend {
       release();
       return this.startTurn(turn);
     }
-    session.activeContext = { sessionId: turn.sessionId, meta: turn.meta ?? {} };
+    session.context.current = { sessionId: turn.sessionId, meta: turn.meta ?? {} };
     session.queue.push(userMessage(turn.text));
     return { session, release };
   }
@@ -325,14 +401,23 @@ export class ClaudeCode implements Backend {
     retried: boolean,
   ): AsyncGenerator<Event> {
     const sessionId = turn.sessionId;
+    const aborted = abortPromise(turn.signal);
     let sawDone = false;
     let messagesRead = 0;
+    // The in-flight iterator read. It survives this generator's teardown
+    // (promises are multi-consumer), so the abandon path can hand it to the
+    // drain instead of losing whatever message it resolves to.
+    let pending: Promise<IteratorResult<unknown>> | null = null;
     try {
       while (!sawDone) {
-        const next = await session.iterator.next();
+        pending = session.iterator.next();
+        const next = await Promise.race([pending, aborted]);
+        if (next === ABORTED) {
+          return; // finally interrupts the turn, draining from `pending`
+        }
+        pending = null;
         if (next.done === true) {
-          session.dead = true;
-          this.sessions.delete(sessionId);
+          this.dropSession(sessionId, session);
           if (messagesRead === 0 && !retried) {
             // The child died between turns: nothing of this turn was
             // processed, so respawn with resume and replay it — the Go
@@ -349,14 +434,8 @@ export class ClaudeCode implements Backend {
           throw new Error('claudecode: session ended mid-turn');
         }
         messagesRead += 1;
-        session.record(next.value);
-        for (const event of session.translator.translate(next.value)) {
-          if (event.kind === 'unknown') {
-            this.logger.error('claudecode: unknown SDK message', {
-              session_id: sessionId,
-              raw: JSON.stringify(event.raw).slice(0, 2000),
-            });
-          }
+        session.recorder.write(next.value);
+        for (const event of this.translateAndLog(sessionId, session, next.value)) {
           if (event.kind === 'done') {
             sawDone = true;
             this.recordResume(sessionId, event.result.sessionId);
@@ -365,52 +444,86 @@ export class ClaudeCode implements Backend {
         }
       }
     } finally {
-      session.activeContext = null;
       if (!sawDone && !session.dead) {
-        await this.abandonTurn(sessionId, session);
+        await this.abandonTurn(sessionId, session, pending);
       }
+      // Cleared only after the abandon settles: permission decisions made
+      // while the interrupt is in flight still belong to this turn's identity.
+      session.context.current = null;
       release();
     }
+  }
+
+  private translateAndLog(sessionId: string, session: Session, message: unknown): Event[] {
+    const events = session.translator.translate(message);
+    for (const event of events) {
+      if (event.kind === 'unknown') {
+        this.logger.error('claudecode: unknown SDK message', {
+          session_id: sessionId,
+          raw: JSON.stringify(event.raw).slice(0, 2000),
+        });
+      }
+    }
+    return events;
   }
 
   /**
    * The consumer left before the turn's done, so the session's stream is
    * stranded mid-turn. Interrupt the child and drain to the interrupted
-   * turn's terminal result; if that fails, drop the session so the next turn
-   * respawns with resume.
+   * turn's terminal result; if that fails or times out, drop the session so
+   * the next turn respawns with resume. `pending` is the turn's in-flight
+   * read, drained first so its message isn't lost.
    */
-  private async abandonTurn(sessionId: string, session: Session): Promise<void> {
+  private async abandonTurn(
+    sessionId: string,
+    session: Session,
+    pending: Promise<IteratorResult<unknown>> | null,
+  ): Promise<void> {
     try {
-      await session.handle.interrupt();
+      await withTimeout(session.handle.interrupt(), ABANDON_TIMEOUT_MS, 'interrupt');
+      let read = pending ?? session.iterator.next();
       for (let drained = 0; drained < ABANDON_DRAIN_LIMIT; drained += 1) {
-        const next = await session.iterator.next();
+        const next = await withTimeout(read, ABANDON_TIMEOUT_MS, 'abandon drain');
         if (next.done === true) {
           break;
         }
-        session.record(next.value);
-        if (session.translator.translate(next.value).some((event) => event.kind === 'done')) {
+        session.recorder.write(next.value);
+        const events = this.translateAndLog(sessionId, session, next.value);
+        if (events.some((event) => event.kind === 'done')) {
           this.logger.warn('claudecode: turn abandoned, session interrupted', {
             session_id: sessionId,
           });
           return;
         }
+        read = session.iterator.next();
       }
-    } catch {
-      // fall through to respawn
+      this.logger.warn('claudecode: turn abandoned, session dropped for respawn', {
+        session_id: sessionId,
+        error: 'drain exhausted without a terminal result',
+      });
+    } catch (error) {
+      this.logger.warn('claudecode: turn abandoned, session dropped for respawn', {
+        session_id: sessionId,
+        error: String(error),
+      });
     }
+    this.dropSession(sessionId, session);
+  }
+
+  /** Marks a session dead and releases its resources. The resume uuid is
+   * retained, so the conversation survives into the next spawn. */
+  private dropSession(sessionId: string, session: Session): void {
     session.dead = true;
     this.sessions.delete(sessionId);
-    this.logger.warn('claudecode: turn abandoned, session dropped for respawn', {
-      session_id: sessionId,
-    });
+    session.queue.end(); // input end is the child's exit signal
+    session.recorder.close();
   }
 
   closeSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
-    this.sessions.delete(sessionId);
-    // Ending the input queue is the CLI's exit signal; the resume uuid is
-    // retained so the next turn restores the conversation.
-    session?.queue.end();
+    if (session !== undefined) {
+      this.dropSession(sessionId, session);
+    }
     return Promise.resolve();
   }
 
@@ -418,11 +531,6 @@ export class ClaudeCode implements Backend {
     for (const sessionId of [...this.sessions.keys()]) {
       await this.closeSession(sessionId);
     }
-  }
-
-  /** Number of sessions with a live child. */
-  liveSessions(): number {
-    return [...this.sessions.values()].filter((session) => !session.dead).length;
   }
 
   private sessionFor(sessionId: string): Session {
@@ -435,23 +543,23 @@ export class ClaudeCode implements Backend {
       throw new AtCapacityError();
     }
     const queue = new AsyncQueue<SDKUserMessage>();
-    const session: Session = {
-      queue,
-      iterator: undefined as unknown as AsyncIterator<unknown>,
-      handle: undefined as unknown as QueryHandle,
-      translator: new Translator(),
-      mutex: new Mutex(),
-      activeContext: null,
-      dead: false,
-      record: makeRecorder(this.config.recordDir, sessionId, this.logger),
-    };
+    const context: Session['context'] = { current: null };
     const options = buildOptions(
       this.config,
-      () => session.activeContext ?? { sessionId, meta: {} },
+      () => context.current ?? { sessionId, meta: {} },
       this.resumable.get(sessionId),
     );
-    session.handle = this.queryFn({ prompt: queue, options });
-    session.iterator = session.handle[Symbol.asyncIterator]();
+    const handle = this.queryFn({ prompt: queue, options });
+    const session: Session = {
+      queue,
+      iterator: handle[Symbol.asyncIterator](),
+      handle,
+      translator: new Translator(),
+      mutex: new Mutex(),
+      context,
+      recorder: makeRecorder(this.config.recordDir, sessionId, this.logger),
+      dead: false,
+    };
     this.sessions.set(sessionId, session);
     return session;
   }

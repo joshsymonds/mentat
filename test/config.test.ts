@@ -52,6 +52,14 @@ describe('loadConfig', () => {
 
   it('rejects malformed MCP config', () => {
     expect(() => loadConfig({ ...baseEnv, MENTAT_MCP_CONFIG: '{"oops"' })).toThrow(/MCP/i);
+    expect(() => loadConfig({ ...baseEnv, MENTAT_MCP_CONFIG: '{"mcpServers":null}' })).toThrow(
+      /MCP/i,
+    );
+  });
+
+  it('validates MENTAT_EFFORT instead of passing it through', () => {
+    expect(loadConfig({ ...baseEnv, MENTAT_EFFORT: 'low' }).effort).toBe('low');
+    expect(() => loadConfig({ ...baseEnv, MENTAT_EFFORT: 'hgih' })).toThrow(/MENTAT_EFFORT/);
   });
 
   it('refuses a non-loopback listen address without the override', () => {
@@ -64,6 +72,12 @@ describe('loadConfig', () => {
       MENTAT_ALLOW_NON_LOOPBACK: '1',
     });
     expect(allowed.listen).toEqual({ host: '0.0.0.0', port: 8484 });
+  });
+
+  it('treats an empty override as unset (a blank env-file line must not disable the guard)', () => {
+    expect(() =>
+      loadConfig({ ...baseEnv, MENTAT_LISTEN: '0.0.0.0:8484', MENTAT_ALLOW_NON_LOOPBACK: '' }),
+    ).toThrow(/non-loopback/);
   });
 });
 

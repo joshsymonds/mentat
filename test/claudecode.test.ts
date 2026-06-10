@@ -5,9 +5,8 @@ import { join } from 'node:path';
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import { describe, expect, it } from 'vitest';
 
-import type { Event } from '../src/backend.ts';
+import { AtCapacityError, type Event } from '../src/backend.ts';
 import {
-  AtCapacityError,
   ClaudeCode,
   DEFAULT_DISALLOWED_TOOLS,
   buildChildEnv,
@@ -57,31 +56,42 @@ interface FakeQuery {
 /**
  * A QueryFn that, for each user message read from the prompt, emits the next
  * scripted message batch. `endAfter` ends the stream (child death) after that
- * many batches instead of waiting for more input.
+ * many batches instead of waiting for more input; `interruptError` makes
+ * interrupt() reject (a child that won't honor the interrupt).
  */
-function fakeQuery(script: (turnIndex: number) => unknown[], endAfter?: number): FakeQuery {
-  const fake: FakeQuery = { fn: undefined as unknown as QueryFn, optionsSeen: [], interrupts: 0, calls: 0 };
-  fake.fn = ({ prompt, options }) => {
-    fake.optionsSeen.push(options);
-    fake.calls += 1;
-    async function* messages(): AsyncGenerator {
-      let turn = 0;
-      for await (const _user of prompt) {
-        yield* script(turn);
-        turn += 1;
-        if (endAfter !== undefined && turn >= endAfter) {
-          return;
+function fakeQuery(
+  script: (turnIndex: number) => unknown[],
+  endAfter?: number,
+  interruptError?: Error,
+): FakeQuery {
+  const fake: FakeQuery = {
+    optionsSeen: [],
+    interrupts: 0,
+    calls: 0,
+    fn: ({ prompt, options }) => {
+      fake.optionsSeen.push(options);
+      fake.calls += 1;
+      async function* messages(): AsyncGenerator {
+        let turn = 0;
+        for await (const _user of prompt) {
+          yield* script(turn);
+          turn += 1;
+          if (endAfter !== undefined && turn >= endAfter) {
+            return;
+          }
         }
       }
-    }
-    const iterable = messages();
-    return {
-      [Symbol.asyncIterator]: () => iterable[Symbol.asyncIterator](),
-      interrupt: () => {
-        fake.interrupts += 1;
-        return Promise.resolve();
-      },
-    };
+      const iterable = messages();
+      return {
+        [Symbol.asyncIterator]: () => iterable[Symbol.asyncIterator](),
+        interrupt: () => {
+          fake.interrupts += 1;
+          return interruptError === undefined
+            ? Promise.resolve()
+            : Promise.reject(interruptError);
+        },
+      };
+    },
   };
   return fake;
 }
@@ -140,10 +150,24 @@ describe('buildOptions isolation invariants', () => {
     expect(options.maxBudgetUsd).toBe(1.5);
   });
 
-  it('defaults to disallowing dangerous built-ins when no policy is set', () => {
-    expect(options.disallowedTools).toEqual(DEFAULT_DISALLOWED_TOOLS);
-    const custom = buildOptions(makeConfig({ disallowedTools: ['Bash'] }), () => context);
-    expect(custom.disallowedTools).toEqual(['Bash']);
+  it('defaults to disallowing dangerous built-ins only when no tool policy is set', () => {
+    expect(buildOptions(makeConfig(), () => context).disallowedTools).toEqual(
+      DEFAULT_DISALLOWED_TOOLS,
+    );
+    // Empty lists are still "no policy" (MENTAT_DISALLOWED_TOOLS="" must not
+    // silently disable the denylist).
+    expect(
+      buildOptions(makeConfig({ allowedTools: [], disallowedTools: [] }), () => context)
+        .disallowedTools,
+    ).toEqual(DEFAULT_DISALLOWED_TOOLS);
+    expect(
+      buildOptions(makeConfig({ disallowedTools: ['Bash'] }), () => context).disallowedTools,
+    ).toEqual(['Bash']);
+    // An allow-only policy is a policy: deny rules win in the CLI, so the
+    // defaults must not override an explicit allowlist (Go toolPolicy parity).
+    expect(
+      buildOptions(makeConfig({ allowedTools: ['Bash'] }), () => context).disallowedTools,
+    ).toEqual([]);
   });
 
   it('sets resume only when respawning', () => {
@@ -261,6 +285,68 @@ describe('ClaudeCode turns', () => {
     const second = await collect(await backend.converse({ sessionId: 's1', text: 'two' }));
     expect(second.at(-1)?.kind).toBe('done');
     expect(fake.calls).toBe(1); // same child, not respawned
+  });
+
+  it('drops the session for respawn when the interrupt fails', async () => {
+    const fake = fakeQuery(
+      (turn) =>
+        turn === 0
+          ? [resultMsg('cli-uuid-7', 'first')]
+          : [textDeltaMsg('x'), textDeltaMsg('y'), resultMsg('cli-uuid-7', 'second')],
+      undefined,
+      new Error('interrupt broken'),
+    );
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn }));
+    await collect(await backend.converse({ sessionId: 's1', text: 'one' }));
+
+    const stream = await backend.converse({ sessionId: 's1', text: 'two' });
+    for await (const event of stream) {
+      if (event.kind === 'textDelta') break; // abandon; interrupt will reject
+    }
+    expect(fake.interrupts).toBe(1);
+
+    const third = await collect(await backend.converse({ sessionId: 's1', text: 'three' }));
+    expect(third.at(-1)?.kind).toBe('done');
+    expect(fake.calls).toBe(2); // respawned
+    expect(fake.optionsSeen[1]?.resume).toBe('cli-uuid-7');
+  });
+
+  it('aborting the turn signal interrupts a silent child promptly', async () => {
+    let releaseResult: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseResult = resolve;
+    });
+    let interrupts = 0;
+    const fn: QueryFn = ({ prompt }) => {
+      async function* messages(): AsyncGenerator {
+        for await (const _user of prompt) {
+          yield textDeltaMsg('start');
+          await gate; // silent stretch: nothing more arrives until interrupted
+          yield resultMsg('u1', 'interrupted');
+        }
+      }
+      const iterable = messages();
+      return {
+        [Symbol.asyncIterator]: () => iterable[Symbol.asyncIterator](),
+        interrupt: () => {
+          interrupts += 1;
+          releaseResult?.();
+          return Promise.resolve();
+        },
+      };
+    };
+    const backend = new ClaudeCode(makeConfig({ queryFn: fn }));
+    const abort = new AbortController();
+    const stream = await backend.converse({
+      sessionId: 's1',
+      text: 'one',
+      signal: abort.signal,
+    });
+    const iterator = stream[Symbol.asyncIterator]();
+    expect((await iterator.next()).value).toEqual({ kind: 'textDelta', text: 'start' });
+    abort.abort(); // the child is silent; only the signal can end the turn now
+    expect((await iterator.next()).done).toBe(true);
+    expect(interrupts).toBe(1);
   });
 
   it('refuses new sessions at capacity but serves existing ones', async () => {

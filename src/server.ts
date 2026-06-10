@@ -2,10 +2,10 @@
 // events as NDJSON lines. Authentication is deliberately absent: the daemon
 // binds localhost and trusts the deploy's tailnet ingress.
 
+import { once } from 'node:events';
 import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
 
-import type { Backend } from './backend.ts';
-import { AtCapacityError } from './claudecode.ts';
+import { AtCapacityError, type Backend, type Event } from './backend.ts';
 import type { Logger } from './log.ts';
 import { errorLine, toWireLine } from './wire.ts';
 
@@ -67,7 +67,15 @@ export function createHandler(
 ): RequestListener {
   return (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/conversation') {
-      void handleConversation(backend, tracker, logger, req, res);
+      // The last-resort catch: a rejection escaping the handler must never
+      // become an unhandledRejection — on Node that exits the process,
+      // killing every live session over one bad request.
+      handleConversation(backend, tracker, logger, req, res).catch((error: unknown) => {
+        logger.error('conversation handler failed', { error: String(error) });
+        if (!res.destroyed) {
+          res.destroy();
+        }
+      });
       return;
     }
     if (req.method === 'GET' && req.url === '/healthz') {
@@ -89,7 +97,7 @@ async function handleConversation(
 ): Promise<void> {
   const parsed = await readTurnRequest(req, res);
   if (parsed === undefined) {
-    return; // response already written
+    return; // response already written (or the client is gone)
   }
 
   const tailscaleUser = req.headers['tailscale-user-login'];
@@ -97,13 +105,22 @@ async function handleConversation(
     logger.info('turn received', { session_id: parsed.sessionId, tailscale_user: tailscaleUser });
   }
 
+  // Aborts the turn the moment the client disconnects — even while the
+  // backend is silently waiting on the model — so the child is interrupted
+  // promptly instead of at the next event.
+  const abort = new AbortController();
+  res.on('close', () => {
+    abort.abort();
+  });
+
   tracker.beginTurn(parsed.sessionId);
   try {
-    let stream: AsyncIterable<import('./backend.ts').Event>;
+    let stream: AsyncIterable<Event>;
     try {
       stream = await backend.converse({
         sessionId: parsed.sessionId,
         text: parsed.text,
+        signal: abort.signal,
         ...(parsed.meta !== undefined && { meta: parsed.meta }),
       });
     } catch (error) {
@@ -132,14 +149,20 @@ async function readTurnRequest(
 ): Promise<TurnRequest | undefined> {
   const chunks: Buffer[] = [];
   let size = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    size += buffer.length;
-    if (size > MAX_REQUEST_BYTES) {
-      fail(res, 413, 'request body too large');
-      return undefined;
+  try {
+    for await (const chunk of req) {
+      const buffer = chunk as Buffer;
+      size += buffer.length;
+      if (size > MAX_REQUEST_BYTES) {
+        fail(res, 413, 'request body too large');
+        return undefined;
+      }
+      chunks.push(buffer);
     }
-    chunks.push(buffer);
+  } catch {
+    // The client aborted mid-body; there is nobody to answer.
+    res.destroy();
+    return undefined;
   }
 
   let body: unknown;
@@ -181,26 +204,26 @@ function parseMeta(value: unknown): Record<string, string> | undefined {
  * Writes a turn's events as NDJSON lines. A mid-stream failure becomes a
  * terminal {"kind":"error"} line: by then the 200 header has shipped, so
  * in-band delivery is the only honest option. A closed response stops
- * consumption, which is the backend's signal to interrupt the turn.
+ * consumption (the turn's abort signal has already interrupted the backend);
+ * a full write buffer pauses consumption until the socket drains.
  */
-async function streamEvents(
-  res: ServerResponse,
-  stream: AsyncIterable<import('./backend.ts').Event>,
-): Promise<void> {
+async function streamEvents(res: ServerResponse, stream: AsyncIterable<Event>): Promise<void> {
   res.writeHead(200, { 'content-type': 'application/x-ndjson' });
   res.flushHeaders();
   try {
     for await (const event of stream) {
       if (res.destroyed) {
-        return; // client left; stop consuming so the backend interrupts
+        return;
       }
       const line = toWireLine(event);
-      if (line !== null) {
-        res.write(line + '\n');
+      if (line !== null && !res.write(line + '\n')) {
+        await Promise.race([once(res, 'drain'), once(res, 'close')]);
       }
     }
   } catch (error) {
-    res.write(errorLine(error instanceof Error ? error.message : String(error)) + '\n');
+    if (!res.destroyed) {
+      res.write(errorLine(error instanceof Error ? error.message : String(error)) + '\n');
+    }
   } finally {
     res.end();
   }

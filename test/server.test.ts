@@ -1,10 +1,10 @@
 import { createServer, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { connect, type AddressInfo } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import type { Backend, Event, Turn } from '../src/backend.ts';
-import { AtCapacityError } from '../src/claudecode.ts';
+import { AtCapacityError, type Backend, type Event, type Turn } from '../src/backend.ts';
 import { nullLogger } from '../src/log.ts';
 import { SessionTracker, createHandler } from '../src/server.ts';
 
@@ -158,6 +158,26 @@ describe('POST /v1/conversation', () => {
       .split('\n');
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('"kind":"done"');
+  });
+
+  it('survives a client aborting mid-request-body', async () => {
+    const backend = new FakeBackend(() => [doneEvent('ok')]);
+    const base = await serve(backend);
+    const port = Number(new URL(base).port);
+    await new Promise<void>((resolve) => {
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(
+          'POST /v1/conversation HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n{"partial',
+          () => {
+            socket.destroy(); // abort mid-body: must not crash the daemon
+            resolve();
+          },
+        );
+      });
+    });
+    await delay(100);
+    const res = await fetch(`${base}/healthz`);
+    expect(res.status).toBe(200);
   });
 
   it('404s unknown routes and methods', async () => {
