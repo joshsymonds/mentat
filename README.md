@@ -22,9 +22,11 @@ just test   # go test -race ./...
 ```
 
 Cassette-based testing: integration tests replay recorded stream-json transcripts
-from `testdata/cassettes/` — no network, no claude binary required. Re-recording
-cassettes (`just record-cassettes`) requires a real claude binary and spends real
-tokens.
+from `testdata/cassettes/` — no network, no claude binary required. To record a new
+cassette, `just record-cassette <name> "<prompt>"` drives a real turn through the
+live backend's recording wrapper (`cmd/record`) and writes
+`testdata/cassettes/<name>.ndjson`. It needs a claude binary (`MENTAT_CLAUDE_BIN`,
+or `claude` on `PATH`) and spends real tokens.
 
 ## CI
 

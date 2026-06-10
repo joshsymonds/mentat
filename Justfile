@@ -12,6 +12,9 @@ lint:
 test:
     go test -race ./...
 
-# Re-record spike cassettes against the pinned claude binary (costs real tokens)
-record-cassettes:
-    go run ./cmd/spike record
+# Record a cassette from a real claude turn into testdata/cassettes/<name>.ndjson.
+# Requires a claude binary (MENTAT_CLAUDE_BIN, or claude on PATH) and spends
+# real tokens. Example: just record-cassette greeting "say hello in one word"
+record-cassette name prompt:
+    MENTAT_CLAUDE_BIN="${MENTAT_CLAUDE_BIN:-$(command -v claude)}" \
+        go run ./cmd/record -out testdata/cassettes/{{name}}.ndjson {{quote(prompt)}}
