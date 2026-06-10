@@ -336,6 +336,25 @@ describe('policy seam', () => {
   });
 });
 
+describe('record mode', () => {
+  it('captures the exact message stream, neutralizing path traversal', async () => {
+    const lines = readFileSync('test/fixtures/turn-with-tool.jsonl', 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line) as unknown);
+    const recordDir = mkdtempSync(join(tmpdir(), 'mentat-rec-'));
+    const fake = fakeQuery(() => lines);
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn, recordDir }));
+    await collect(await backend.converse({ sessionId: 's/../x', text: 'hi' }));
+
+    const recorded = readFileSync(join(recordDir, 's%2F..%2Fx.jsonl'), 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line) as unknown);
+    expect(recorded).toEqual(lines);
+  });
+});
+
 describe('resume state persistence', () => {
   it('persists the session map and loads it back', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'mentat-test-'));

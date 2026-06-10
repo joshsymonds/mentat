@@ -4,7 +4,8 @@
 // sessionId→CLI-UUID map. The SDK call is injectable so every behavior here
 // tests offline.
 
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import process from 'node:process';
 
 import { query, type Options, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
@@ -75,6 +76,12 @@ export interface ClaudeCodeConfig {
   extraEnv?: string[];
   /** Persists the sessionId→CLI-UUID map across daemon restarts. */
   statePath?: string;
+  /**
+   * When set, appends each session's raw SDK message stream to
+   * <recordDir>/<sessionId>.jsonl — recordings are future test fixtures.
+   * Grows without bound; the operator owns retention.
+   */
+  recordDir?: string;
   policy: PolicyFn;
   logger: Logger;
   /** Test seam; production uses the real SDK. */
@@ -223,6 +230,38 @@ interface Session {
   mutex: Mutex;
   activeContext: TurnContext | null;
   dead: boolean;
+  record: (message: unknown) => void;
+}
+
+/**
+ * Per-session message recorder. The client-chosen sessionId is URI-encoded so
+ * it cannot traverse out of recordDir; append failures are logged once and
+ * recording stops — a full disk must not fail turns.
+ */
+function makeRecorder(
+  recordDir: string | undefined,
+  sessionId: string,
+  logger: Logger,
+): (message: unknown) => void {
+  if (recordDir === undefined || recordDir === '') {
+    return () => undefined;
+  }
+  const path = join(recordDir, encodeURIComponent(sessionId) + '.jsonl');
+  let broken = false;
+  return (message) => {
+    if (broken) {
+      return;
+    }
+    try {
+      appendFileSync(path, JSON.stringify(message) + '\n');
+    } catch (error) {
+      broken = true;
+      logger.error('claudecode: session recording failed', {
+        path,
+        error: String(error),
+      });
+    }
+  };
 }
 
 function userMessage(text: string): SDKUserMessage {
@@ -310,6 +349,7 @@ export class ClaudeCode implements Backend {
           throw new Error('claudecode: session ended mid-turn');
         }
         messagesRead += 1;
+        session.record(next.value);
         for (const event of session.translator.translate(next.value)) {
           if (event.kind === 'unknown') {
             this.logger.error('claudecode: unknown SDK message', {
@@ -347,6 +387,7 @@ export class ClaudeCode implements Backend {
         if (next.done === true) {
           break;
         }
+        session.record(next.value);
         if (session.translator.translate(next.value).some((event) => event.kind === 'done')) {
           this.logger.warn('claudecode: turn abandoned, session interrupted', {
             session_id: sessionId,
@@ -402,6 +443,7 @@ export class ClaudeCode implements Backend {
       mutex: new Mutex(),
       activeContext: null,
       dead: false,
+      record: makeRecorder(this.config.recordDir, sessionId, this.logger),
     };
     const options = buildOptions(
       this.config,

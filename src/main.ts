@@ -31,6 +31,7 @@ try {
     ...(config.disallowedTools !== undefined && { disallowedTools: config.disallowedTools }),
     ...(config.extraEnv !== undefined && { extraEnv: config.extraEnv }),
     ...(config.statePath !== undefined && { statePath: config.statePath }),
+    ...(config.recordDir !== undefined && { recordDir: config.recordDir }),
     ...(config.maxBudgetUsd !== undefined && { maxBudgetUsd: config.maxBudgetUsd }),
   });
 
