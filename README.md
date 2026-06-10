@@ -25,3 +25,11 @@ Cassette-based testing: integration tests replay recorded stream-json transcript
 from `testdata/cassettes/` — no network, no claude binary required. Re-recording
 cassettes (`just record-cassettes`) requires a real claude binary and spends real
 tokens.
+
+## CI
+
+Every push runs lint, `go test -race` (cassettes only, no secrets), and a build.
+The **Live smoke** workflow is `workflow_dispatch`-only: run it when bumping the
+pinned claude binary — it executes one real haiku turn through the supervisor and
+fails on unrecognized protocol events. It needs a `CLAUDE_CODE_OAUTH_TOKEN`
+repository secret (`claude setup-token`) and spends about a cent per run.
