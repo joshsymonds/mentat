@@ -1,0 +1,519 @@
+# Global golangci-lint configuration
+# Ported from savecraft.gg — same linter set and severity posture.
+
+version: "2"
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 50
+  new: false
+
+formatters:
+  enable:
+    - goimports
+    - golines
+
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/Veraticus/mentat
+
+    golines:
+      max-len: 120
+      chain-split-dots: true
+
+linters:
+  default: none
+  enable:
+    # Essential - Must Have
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+
+    # Code Quality & Best Practices
+    - asasalint
+    - asciicheck
+    - bidichk
+    - gocritic
+    - revive
+    - godot
+    - misspell
+    - unconvert
+    - prealloc
+    - goconst
+    - dupl
+    - wastedassign
+    - unparam
+    - errname
+    - usestdlibvars
+    - predeclared
+
+    # Resource Management
+    - bodyclose
+    - noctx
+    - sqlclosecheck
+    - rowserrcheck
+    - copyloopvar
+    - nilerr
+    - makezero
+
+    # Interface & Type Safety
+    - forcetypeassert
+    - ireturn
+    - nilnil
+
+    # Context Handling
+    - containedctx
+    - contextcheck
+    - fatcontext
+
+    # Security
+    - gosec
+
+    # Testing
+    - thelper
+    - tparallel
+    - testifylint
+    - testableexamples
+    - usetesting
+
+    # Code Clarity & Complexity
+    - nakedret
+    - cyclop
+    - gocognit
+    - gocyclo
+    - nestif
+    - funlen
+
+    # Error Handling
+    - wrapcheck
+    - errorlint
+    - durationcheck
+
+    # Code Organization
+    - depguard
+    - gocheckcompilerdirectives
+    - gochecknoglobals
+    - gochecknoinits
+    - gomoddirectives
+    - funcorder
+
+    # Formatting & Style
+    - whitespace
+    - canonicalheader
+    - goprintffuncname
+
+    # Performance
+    - intrange
+    - mirror
+
+    # Struct & Type Validation
+    - musttag
+    - tagliatelle
+    - gochecksumtype
+    - exhaustive
+
+    # Logging
+    - sloglint
+
+    # Other Quality Checks
+    - reassign
+    - recvcheck
+    - nosprintfhostport
+    - nolintlint
+    - mnd
+    - varnamelen
+
+    # Code quality enforcement
+    - forbidigo
+    - godox
+
+  settings:
+    cyclop:
+      max-complexity: 30
+      package-average: 10.0
+
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+          yaml: snake
+
+    depguard:
+      rules:
+        deprecated:
+          files: ["$all"]
+          deny:
+            - pkg: github.com/golang/protobuf
+              desc: Use google.golang.org/protobuf instead
+            - pkg: github.com/satori/go.uuid
+              desc: Use github.com/google/uuid instead
+            - pkg: github.com/gofrs/uuid$
+              desc: Use github.com/gofrs/uuid/v5 or later
+        non-test:
+          files: ["!$test"]
+          deny:
+            - pkg: math/rand$
+              desc: Use math/rand/v2 instead (Go 1.22+)
+        non-main:
+          files: ["!**/main.go"]
+          deny:
+            - pkg: log$
+              desc: Use log/slog for structured logging
+
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*io.ReadCloser).Close
+        - (*net/http.Response).Body.Close
+        - (net/http.ResponseWriter).Write
+        - (*encoding/json.Encoder).Encode
+        - (*os.File).Sync
+        - (*bufio.Writer).Flush
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (*text/tabwriter.Writer).Flush
+        - os.Setenv
+        - os.Unsetenv
+
+    exhaustive:
+      check:
+        - switch
+        - map
+      default-signifies-exhaustive: true
+
+    gochecksumtype:
+      default-signifies-exhaustive: false
+
+    funcorder:
+      struct-method: false
+
+    funlen:
+      lines: 100
+      statements: 50
+
+    gocognit:
+      min-complexity: 20
+
+    gocyclo:
+      min-complexity: 15
+
+    gocritic:
+      enabled-checks:
+        - emptyStringTest
+        - sloppyReassign
+        - weakCond
+        - appendCombine
+        - commentedOutCode
+        - deferInLoop
+        - evalOrder
+        - nilValReturn
+        - truncateCmp
+        - unnecessaryDefer
+      settings:
+        captLocal:
+          paramsOnly: false
+        underef:
+          skipRecvDeref: false
+
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+      settings:
+        shadow:
+          strict: true
+
+    mnd:
+      ignored-functions:
+        - args.Error
+        - flag.*
+        - os.Chmod
+        - os.Mkdir.*
+        - os.OpenFile
+        - os.WriteFile
+        - make
+        - time.Duration
+        - context.WithTimeout
+      ignored-numbers:
+        - '10'
+        - '32'
+        - '100'
+        - '1000'
+        - '4096'
+
+    varnamelen:
+      min-name-length: 2
+      max-distance: 5
+      check-receiver: false
+      check-return: true
+      check-type-param: true
+      ignore-names:
+        - err
+        - ok
+        - id
+        - db
+        - tx
+        - ctx
+        - wg
+        - mu
+        - fs
+      ignore-decls:
+        - i int
+        - j int
+        - k int
+        - n int
+        - t testing.T
+        - b testing.B
+        - w http.ResponseWriter
+        - w *httptest.ResponseRecorder
+        - r *http.Request
+
+    nakedret:
+      max-func-lines: 30
+
+    nestif:
+      min-complexity: 5
+
+    nolintlint:
+      allow-no-explanation: [funlen, gocognit, golines]
+      require-explanation: true
+      require-specific: true
+
+    reassign:
+      patterns: [".*"]
+
+    staticcheck:
+      checks:
+        - all
+        - -ST1000
+        - -ST1016
+        - -QF1008
+
+    usetesting:
+      os-temp-dir: true
+      context-background: false
+      context-todo: false
+
+    revive:
+      severity: error
+      enable-all-rules: false
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unused-parameter
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: waitgroup-by-value
+        - name: use-any
+        - name: useless-break
+        - name: unnecessary-stmt
+
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^(fmt\.Print(|f|ln)|print|println)$'
+          msg: "Use structured logging instead of print statements"
+        - pattern: '^panic$'
+          msg: "NO panic() - return errors instead"
+        - pattern: '^time\.Sleep$'
+          msg: "NO time.Sleep() - use channels for synchronization"
+        - pattern: '.*V2$'
+          msg: "NO versioned function names (V2) - replace old implementations"
+        - pattern: '.*v2$'
+          msg: "NO versioned function names (v2) - replace old implementations"
+        - pattern: '.*Old$'
+          msg: "NO 'Old' prefix/suffix - delete old code"
+        - pattern: '^Old.*'
+          msg: "NO 'Old' prefix - delete old code"
+        - pattern: '.*Deprecated$'
+          msg: "NO 'Deprecated' - remove deprecated code"
+        - pattern: '.*Legacy$'
+          msg: "NO 'Legacy' - refactor legacy code"
+        - pattern: '.*Compat$'
+          msg: "NO 'Compat' - avoid compatibility layers"
+
+    godox:
+      keywords:
+        - TODO
+        - FIXME
+        - XXX
+        - HACK
+        - BUG
+        - OPTIMIZE
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+
+    dupl:
+      threshold: 150
+
+    ireturn:
+      allow:
+        - error
+        - stdlib
+        - generic
+        - io.Reader
+        - io.Writer
+        - io.Closer
+        - io.ReadWriter
+        - io.ReadCloser
+        - io.WriteCloser
+        - io.ReadWriteCloser
+        - http.ResponseWriter
+        - http.Handler
+        - anon
+        - any
+
+    wrapcheck:
+      ignore-sigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Unwrap(
+        - errors.Join(
+        - .Wrap(
+        - .Wrapf(
+        - .WithMessage(
+        - .WithMessagef(
+        - .WithStack(
+      ignore-package-globs:
+        - testing
+
+    unparam:
+      check-exported: true
+
+    errorlint:
+      errorf: true
+      errorf-multi: true
+      asserts: true
+      comparison: true
+
+    sloglint:
+      no-global: "all"
+      context: "scope"
+      static-msg: true
+      no-raw-keys: false
+      key-naming-case: snake
+
+    testifylint:
+      enable:
+        - bool-compare
+        - compares
+        - empty
+        - error-is-as
+        - error-nil
+        - expected-actual
+        - require-error
+
+    musttag:
+      functions:
+        - name: encoding/json.Marshal
+          tag: json
+          arg-pos: 0
+        - name: encoding/json.Unmarshal
+          tag: json
+          arg-pos: 1
+        - name: gopkg.in/yaml.v3.Marshal
+          tag: yaml
+          arg-pos: 0
+        - name: gopkg.in/yaml.v3.Unmarshal
+          tag: yaml
+          arg-pos: 1
+
+    misspell:
+      locale: US
+
+  exclusions:
+    warn-unused: false
+
+    rules:
+      - text: "will be used as .* by other packages, and that stutters"
+        linters:
+          - revive
+
+      # Relax linters for test files
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - cyclop
+          - dupl
+          - errcheck
+          - funlen
+          - gocyclo
+          - gocognit
+          - goconst
+          - gosec
+          - govet
+          - noctx
+          - tagliatelle
+          - wrapcheck
+          - containedctx
+          - forbidigo
+          - testpackage
+          - ireturn
+          - varnamelen
+          - musttag
+
+      # CLI entrypoints: fmt.Print, file I/O from args, arg count checks are idiomatic
+      - path: 'cmd/.*\.go'
+        linters:
+          - contextcheck
+          - errcheck
+          - forbidigo
+          - gosec
+          - govet
+          - mnd
+
+      # Allow local replacements in go.mod
+      - path: go\.mod
+        linters:
+          - gomoddirectives
+
+      # Protocol structs mirror the Claude Code wire format, which mixes
+      # camelCase and snake_case field names we don't control.
+      - path: 'internal/streamjson/.*\.go'
+        linters:
+          - tagliatelle
+
+      # Allow slog.New
+      - source: 'slog\.New'
+        linters:
+          - forbidigo
+
+      # Allow errors.New
+      - source: 'errors\.New'
+        linters:
+          - forbidigo
+
+run:
+  timeout: 5m
+  concurrency: 0
+  tests: true
+  modules-download-mode: readonly
+  build-tags: []
