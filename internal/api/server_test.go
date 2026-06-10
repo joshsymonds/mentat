@@ -142,6 +142,35 @@ func TestConversationRejectsBadRequests(t *testing.T) {
 	}
 }
 
+func TestConversationRejectsOversizeBody(t *testing.T) {
+	t.Parallel()
+	server := newCassetteServer(t, "simple_turn.ndjson")
+
+	huge := `{"session_id":"s","text":"` + strings.Repeat("a", 2<<20) + `"}`
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		server.URL+"/v1/conversation", strings.NewReader(huge))
+	require.NoError(t, err)
+	resp, err := server.Client().Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
+}
+
+func TestConversationCapacityIsServiceUnavailable(t *testing.T) {
+	t.Parallel()
+	stub := &errBackend{err: backend.ErrAtCapacity}
+	server := newTestServer(t, stub)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		server.URL+"/v1/conversation", strings.NewReader(`{"session_id":"s","text":"hi"}`))
+	require.NoError(t, err)
+	resp, err := server.Client().Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"a backend at capacity is a retryable 503, not a 502")
+}
+
 func TestHealthz(t *testing.T) {
 	t.Parallel()
 	server := newCassetteServer(t, "simple_turn.ndjson")
@@ -191,6 +220,15 @@ func (s *stubBackend) closedSessions() []string {
 	defer s.mu.Unlock()
 	return append([]string(nil), s.closed...)
 }
+
+// errBackend fails every turn with a fixed error.
+type errBackend struct{ err error }
+
+func (b *errBackend) Converse(context.Context, backend.Turn) (iter.Seq2[backend.Event, error], error) {
+	return nil, b.err
+}
+
+func (b *errBackend) CloseSession(string) error { return nil }
 
 func TestExpireIdleClosesIdleSessions(t *testing.T) {
 	t.Parallel()

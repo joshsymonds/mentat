@@ -60,6 +60,10 @@ func fakeClaudeMain() {
 		}
 	}
 
+	if envFile := os.Getenv("MENTAT_FAKE_ENV_FILE"); envFile != "" {
+		_ = os.WriteFile(envFile, []byte(strings.Join(os.Environ(), "\n")), 0o600)
+	}
+
 	data, err := os.ReadFile(os.Getenv("MENTAT_FAKE_CLAUDE"))
 	if err != nil {
 		os.Exit(2)
@@ -132,11 +136,26 @@ func cassettePath(t *testing.T, name string) string {
 	return abs
 }
 
+// harnessEnvVars are the control variables the fake-claude child reads. The
+// backend's childEnv allowlist strips everything non-standard, so tests must
+// pass these through ExtraEnv or the fake child can't function.
+var harnessEnvVars = []string{
+	"MENTAT_FAKE_CLAUDE", "MENTAT_FAKE_RAW", "MENTAT_FAKE_ARGS_FILE",
+	"MENTAT_FAKE_DIE_ONCE", "MENTAT_FAKE_ENV_FILE",
+}
+
+// fakeConfig fills in the Bin and ExtraEnv needed to drive the fake-claude
+// child, preserving any fields the caller already set.
+func fakeConfig(config backend.ClaudeCodeConfig) backend.ClaudeCodeConfig {
+	config.Bin = os.Args[0]
+	config.ExtraEnv = append(config.ExtraEnv, harnessEnvVars...)
+	return config
+}
+
 func newFakeClaude(t *testing.T, cassette string, config backend.ClaudeCodeConfig) *backend.ClaudeCode {
 	t.Helper()
 	t.Setenv("MENTAT_FAKE_CLAUDE", cassettePath(t, cassette))
-	config.Bin = os.Args[0]
-	cc, err := backend.NewClaudeCode(config)
+	cc, err := backend.NewClaudeCode(fakeConfig(config))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, cc.Close()) })
 	return cc
@@ -249,10 +268,9 @@ func TestClaudeCodeResumesAcrossRestart(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "sessions.json")
 
 	// First daemon instance: one turn, then shut down (simulating restart).
-	first, err := backend.NewClaudeCode(backend.ClaudeCodeConfig{
-		Bin:       os.Args[0],
+	first, err := backend.NewClaudeCode(fakeConfig(backend.ClaudeCodeConfig{
 		StatePath: statePath,
-	})
+	}))
 	require.NoError(t, err)
 	_, err = collectTurn(t, first, backend.Turn{SessionID: "kitchen", Text: "ping"})
 	require.NoError(t, err)
@@ -260,10 +278,9 @@ func TestClaudeCodeResumesAcrossRestart(t *testing.T) {
 
 	// Second instance over the same state: a turn on the same SessionID
 	// must resume the original CLI conversation, not start cold.
-	second, err := backend.NewClaudeCode(backend.ClaudeCodeConfig{
-		Bin:       os.Args[0],
+	second, err := backend.NewClaudeCode(fakeConfig(backend.ClaudeCodeConfig{
 		StatePath: statePath,
-	})
+	}))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, second.Close()) })
 	_, err = collectTurn(t, second, backend.Turn{SessionID: "kitchen", Text: "ping again"})
@@ -289,6 +306,77 @@ func TestClaudeCodeWithoutStatePathStartsCold(t *testing.T) {
 	require.Len(t, spawns, 1)
 	require.Contains(t, spawns[0], "--session-id",
 		"with no StatePath a fresh session uses --session-id, not --resume")
+}
+
+func TestClaudeCodeEnforcesMaxSessions(t *testing.T) {
+	// multi_turn has two turns, so "first" can take a second turn at capacity.
+	cc := newFakeClaude(t, "multi_turn.ndjson", backend.ClaudeCodeConfig{MaxSessions: 1})
+
+	_, err := collectTurn(t, cc, backend.Turn{SessionID: "first", Text: "ping"})
+	require.NoError(t, err)
+
+	_, err = cc.Converse(t.Context(), backend.Turn{SessionID: "second", Text: "ping"})
+	require.ErrorIs(t, err, backend.ErrAtCapacity,
+		"a new session beyond the cap must be refused, not silently spawned")
+
+	// The already-live session is still usable at capacity.
+	_, err = collectTurn(t, cc, backend.Turn{SessionID: "first", Text: "again"})
+	require.NoError(t, err)
+}
+
+func TestClaudeCodeChildEnvIsAllowlisted(t *testing.T) {
+	t.Setenv("MENTAT_SECRET_LEAK", "do-not-pass-this-to-children")
+	envFile := filepath.Join(t.TempDir(), "child.env")
+	t.Setenv("MENTAT_FAKE_ENV_FILE", envFile)
+	cc := newFakeClaude(t, "simple_turn.ndjson", backend.ClaudeCodeConfig{})
+
+	_, err := collectTurn(t, cc, backend.Turn{SessionID: "kitchen", Text: "ping"})
+	require.NoError(t, err)
+
+	raw, err := os.ReadFile(envFile)
+	require.NoError(t, err)
+	childEnv := string(raw)
+	require.NotContains(t, childEnv, "MENTAT_SECRET_LEAK",
+		"a non-allowlisted daemon env var must not reach the child")
+	require.Contains(t, childEnv, "PATH=", "allowlisted vars must reach the child")
+	require.Contains(t, childEnv, "MENTAT_FAKE_CLAUDE=", "ExtraEnv vars must reach the child")
+}
+
+func TestClaudeCodeInlineMCPConfigGoesToFileNotArgv(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("MENTAT_FAKE_ARGS_FILE", argsFile)
+	const inline = `{"mcpServers":{"shimmer":{"url":"https://example.invalid"}}}`
+	cc := newFakeClaude(t, "simple_turn.ndjson", backend.ClaudeCodeConfig{MCPConfig: inline})
+
+	_, err := collectTurn(t, cc, backend.Turn{SessionID: "kitchen", Text: "ping"})
+	require.NoError(t, err)
+
+	args := readSpawns(t, argsFile)[0]
+	require.NotContains(t, args, "example.invalid",
+		"inline MCP JSON must not appear on the child's argv (/proc/<pid>/cmdline is world-readable)")
+	mcpPath := flagArg(t, args, "--mcp-config")
+	require.NotEqual(t, inline, mcpPath, "--mcp-config must carry a path, not the inline JSON")
+}
+
+func TestClaudeCodeCloseSessionTombstonesEntry(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("MENTAT_FAKE_ARGS_FILE", argsFile)
+	cc := newFakeClaude(t, "simple_turn.ndjson", backend.ClaudeCodeConfig{})
+
+	_, err := collectTurn(t, cc, backend.Turn{SessionID: "kitchen", Text: "ping"})
+	require.NoError(t, err)
+	require.Equal(t, 1, cc.LiveSessions())
+
+	require.NoError(t, cc.CloseSession("kitchen"))
+	require.Equal(t, 0, cc.LiveSessions(),
+		"a closed session must not linger as a live entry (only its resume uuid is kept)")
+
+	// Resume identity survives the tombstone.
+	_, err = collectTurn(t, cc, backend.Turn{SessionID: "kitchen", Text: "again"})
+	require.NoError(t, err)
+	spawns := readSpawns(t, argsFile)
+	require.Len(t, spawns, 2)
+	require.Contains(t, spawns[1], "--resume "+sessionIDArg(t, spawns[0]))
 }
 
 func TestClaudeCodeRecordsParseableTranscript(t *testing.T) {
@@ -459,7 +547,7 @@ func TestClaudeCodeAbandonedTurnRespawnsSession(t *testing.T) {
 
 func TestClaudeCodeAbandonedLargeTurnDoesNotDeadlock(t *testing.T) {
 	t.Setenv("MENTAT_FAKE_CLAUDE", writeBigCassette(t, 300))
-	cc, err := backend.NewClaudeCode(backend.ClaudeCodeConfig{Bin: os.Args[0]})
+	cc, err := backend.NewClaudeCode(fakeConfig(backend.ClaudeCodeConfig{}))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cc.Close() })
 
@@ -488,7 +576,7 @@ func TestClaudeCodeParseErrorDoesNotWedgeShutdown(t *testing.T) {
 	require.NoError(t, os.WriteFile(rawFile, []byte(initLine+"\nthis is not json\n"), 0o600))
 	t.Setenv("MENTAT_FAKE_RAW", rawFile)
 
-	cc, err := backend.NewClaudeCode(backend.ClaudeCodeConfig{Bin: os.Args[0]})
+	cc, err := backend.NewClaudeCode(fakeConfig(backend.ClaudeCodeConfig{}))
 	require.NoError(t, err)
 
 	_, err = collectTurn(t, cc, backend.Turn{SessionID: "noise", Text: "go"})
@@ -508,12 +596,18 @@ func TestClaudeCodeParseErrorDoesNotWedgeShutdown(t *testing.T) {
 // child invocation.
 func sessionIDArg(t *testing.T, args string) string {
 	t.Helper()
+	return flagArg(t, args, "--session-id")
+}
+
+// flagArg returns the value following flag in a recorded child invocation.
+func flagArg(t *testing.T, args, flag string) string {
+	t.Helper()
 	fields := strings.Fields(args)
 	for i, field := range fields {
-		if field == "--session-id" && i+1 < len(fields) {
+		if field == flag && i+1 < len(fields) {
 			return fields[i+1]
 		}
 	}
-	t.Fatalf("--session-id not found in %q", args)
+	t.Fatalf("%s not found in %q", flag, args)
 	return ""
 }

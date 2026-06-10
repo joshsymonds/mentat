@@ -181,6 +181,7 @@ linters:
         - (*text/tabwriter.Writer).Flush
         - os.Setenv
         - os.Unsetenv
+        - os.Remove
 
     exhaustive:
       check:
@@ -370,6 +371,7 @@ linters:
     goconst:
       min-len: 3
       min-occurrences: 3
+      ignore-tests: true
 
     dupl:
       threshold: 150
@@ -466,6 +468,7 @@ linters:
           - bodyclose
           - cyclop
           - dupl
+          - gochecknoglobals
           - errcheck
           - funlen
           - gocyclo

@@ -26,13 +26,15 @@ type wireEvent struct {
 
 // wireDone is the terminal event's payload.
 type wireDone struct {
-	Text         string  `json:"text"`
-	IsError      bool    `json:"is_error"`
-	StopReason   string  `json:"stop_reason,omitempty"`
-	SessionID    string  `json:"session_id"`
-	CostUSD      float64 `json:"cost_usd"`
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
+	Text                     string  `json:"text"`
+	IsError                  bool    `json:"is_error"`
+	StopReason               string  `json:"stop_reason,omitempty"`
+	SessionID                string  `json:"session_id"`
+	CostUSD                  float64 `json:"cost_usd"`
+	InputTokens              int     `json:"input_tokens"`
+	OutputTokens             int     `json:"output_tokens"`
+	CacheReadInputTokens     int     `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int     `json:"cache_creation_input_tokens"`
 }
 
 // streamEvents writes a turn's events as flushed NDJSON lines. A mid-stream
@@ -94,13 +96,15 @@ func toWire(event backend.Event) wireEvent {
 		}
 	case backend.KindDone:
 		return wireEvent{Kind: "done", Done: &wireDone{
-			Text:         event.Done.Text,
-			IsError:      event.Done.IsError,
-			StopReason:   event.Done.StopReason,
-			SessionID:    event.Done.SessionID,
-			CostUSD:      event.Done.CostUSD,
-			InputTokens:  event.Done.Usage.InputTokens,
-			OutputTokens: event.Done.Usage.OutputTokens,
+			Text:                     event.Done.Text,
+			IsError:                  event.Done.IsError,
+			StopReason:               event.Done.StopReason,
+			SessionID:                event.Done.SessionID,
+			CostUSD:                  event.Done.CostUSD,
+			InputTokens:              event.Done.Usage.InputTokens,
+			OutputTokens:             event.Done.Usage.OutputTokens,
+			CacheReadInputTokens:     event.Done.Usage.CacheReadInputTokens,
+			CacheCreationInputTokens: event.Done.Usage.CacheCreationInputTokens,
 		}}
 	case backend.KindProtocolDrift:
 		return wireEvent{Kind: "protocol_drift", Raw: string(event.Raw)}

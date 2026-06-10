@@ -28,6 +28,18 @@ live backend's recording wrapper (`cmd/record`) and writes
 `testdata/cassettes/<name>.ndjson`. It needs a claude binary (`MENTAT_CLAUDE_BIN`,
 or `claude` on `PATH`) and spends real tokens.
 
+## Operational notes
+
+- The conversation API has no authentication; `mentatd` refuses a non-loopback
+  `-listen` unless `--allow-non-loopback` is set. Expose it over a tailnet
+  (`tailscale serve`), never the open internet.
+- Session recordings (`-record-dir`) grow without bound — the daemon never
+  prunes them. The operator owns retention (the Nix deploy uses a `tmpfiles.d`
+  age rule).
+- Child tool policy defaults to disallowing dangerous built-ins (Bash, Write,
+  Edit, …). Override with `-allowed-tools` / `-disallowed-tools`, and gate tool
+  calls through an MCP permission tool via `-permission-prompt-tool`.
+
 ## CI
 
 Every push runs lint, `go test -race` (cassettes only, no secrets), and a build.

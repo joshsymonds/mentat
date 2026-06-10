@@ -34,6 +34,15 @@ type decision struct {
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
+	// permd approves nearly everything; it is a spike artifact, not a real
+	// policy. Refuse to run unless explicitly acknowledged, so it can never
+	// be wired in front of live tool calls by accident.
+	if os.Getenv("MENTAT_PERMD_SPIKE") != "1" {
+		logger.Error("permd is a spike-grade approve-everything permission tool; " +
+			"set MENTAT_PERMD_SPIKE=1 to run it")
+		os.Exit(1)
+	}
+
 	server := mcp.NewServer(&mcp.Implementation{Name: "permd", Version: "0.0.1"}, nil)
 	mcp.AddTool(server,
 		&mcp.Tool{Name: "approve", Description: "Decide whether a tool call may proceed"},

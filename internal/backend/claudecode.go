@@ -31,6 +31,10 @@ const shutdownGrace = 5 * time.Second
 // goroutine and the turn consumer.
 const eventBuffer = 256
 
+// ErrAtCapacity is returned when a turn would start a new session beyond the
+// configured MaxSessions limit.
+var ErrAtCapacity = errors.New("claudecode: at session capacity")
+
 // ClaudeCodeConfig configures the live Claude Code backend.
 type ClaudeCodeConfig struct {
 	// Bin is the absolute path to the claude binary. Required; there is
@@ -57,8 +61,17 @@ type ClaudeCodeConfig struct {
 	DisallowedTools []string
 	// MaxBudgetUSD caps a session's spend when positive.
 	MaxBudgetUSD float64
+	// MaxSessions caps concurrent live child processes when positive. A turn
+	// for a new session beyond the cap is refused with ErrAtCapacity, so a
+	// misbehaving client cannot fork unbounded children.
+	MaxSessions int
+	// ExtraEnv names additional environment variables to pass through to
+	// child processes, beyond the standard allowlist (see childEnv).
+	ExtraEnv []string
 	// RecordDir, when set, appends each session's raw NDJSON transcript to
 	// <RecordDir>/<session-uuid>.ndjson. Recordings are future cassettes.
+	// It grows without bound; the operator owns retention (the deploy uses a
+	// tmpfiles.d age rule).
 	RecordDir string
 	// StatePath, when set, persists the SessionID→CLI-UUID mapping to this
 	// file so conversations resume across daemon restarts. Empty keeps the
@@ -183,16 +196,32 @@ func (b *ClaudeCode) Converse(ctx context.Context, turn Turn) (iter.Seq2[Event, 
 
 // CloseSession shuts down a session's child process while keeping its
 // conversation identity: the next turn with the same SessionID respawns
-// with --resume, restoring context. Unknown or already-dead sessions are
-// harmless no-ops.
+// with --resume, restoring context. The live *session is dropped from the
+// map (only its resume uuid is retained, in resumable), so closed sessions
+// don't accumulate as multi-KB tombstones over a long-running daemon.
+// Unknown or already-dead sessions are harmless no-ops.
 func (b *ClaudeCode) CloseSession(sessionID string) error {
 	b.mu.Lock()
 	sess := b.sessions[sessionID]
+	delete(b.sessions, sessionID)
 	b.mu.Unlock()
 	if sess == nil {
 		return nil
 	}
 	return sess.shutdown()
+}
+
+// LiveSessions reports the number of sessions with a live child process.
+func (b *ClaudeCode) LiveSessions() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	live := 0
+	for _, sess := range b.sessions {
+		if !sess.dead.Load() {
+			live++
+		}
+	}
+	return live
 }
 
 // Close shuts down every session: stdin closes, children get shutdownGrace
@@ -221,6 +250,9 @@ func (b *ClaudeCode) sessionFor(id string) (*session, error) {
 	if existing != nil && !existing.dead.Load() && !existing.poisoned.Load() {
 		return existing, nil
 	}
+	if b.config.MaxSessions > 0 && b.liveCountExcluding(id) >= b.config.MaxSessions {
+		return nil, ErrAtCapacity
+	}
 	// Prefer the persisted mapping (survives a daemon restart); fall back to
 	// a live-but-dead session's uuid. Both hold the same value when present.
 	resumeUUID := b.resumable[id]
@@ -239,6 +271,18 @@ func (b *ClaudeCode) sessionFor(id string) (*session, error) {
 	return sess, nil
 }
 
+// liveCountExcluding counts sessions with a live child, ignoring id (the
+// session being replaced/respawned). Callers hold b.mu.
+func (b *ClaudeCode) liveCountExcluding(id string) int {
+	live := 0
+	for sid, sess := range b.sessions {
+		if sid != id && !sess.dead.Load() {
+			live++
+		}
+	}
+	return live
+}
+
 // startSession spawns a child whose lifecycle context the session owns: the
 // process must outlive any single turn's request context, so cancellation
 // comes from shutdown(), not from the first Converse's ctx.
@@ -248,15 +292,26 @@ func (b *ClaudeCode) startSession(resumeUUID string) (*session, error) {
 		sessionUUID = uuid.NewString()
 	}
 
+	mcpArg, mcpFile, err := b.resolveMCPConfig(sessionUUID)
+	if err != nil {
+		return nil, err
+	}
+	removeMCP := func() {
+		if mcpFile != "" {
+			_ = os.Remove(mcpFile)
+		}
+	}
+
 	lifecycle, cancel := context.WithCancel(context.Background())
 	//nolint:gosec // Bin and args come from operator config, not user input.
-	cmd := exec.CommandContext(lifecycle, b.config.Bin, b.buildArgs(sessionUUID, resumeUUID != "")...)
-	cmd.Env = childEnv()
+	cmd := exec.CommandContext(lifecycle, b.config.Bin, b.buildArgs(sessionUUID, resumeUUID != "", mcpArg)...)
+	cmd.Env = b.childEnv()
 	cmd.WaitDelay = shutdownGrace
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
+		removeMCP()
 		return nil, fmt.Errorf("claudecode: opening stdin: %w", err)
 	}
 	// Graceful shutdown: cancellation closes stdin (the CLI's exit signal);
@@ -270,6 +325,7 @@ func (b *ClaudeCode) startSession(resumeUUID string) (*session, error) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
+		removeMCP()
 		return nil, fmt.Errorf("claudecode: opening stdout: %w", err)
 	}
 
@@ -281,6 +337,7 @@ func (b *ClaudeCode) startSession(resumeUUID string) (*session, error) {
 		recorder, err = os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			cancel()
+			removeMCP()
 			return nil, fmt.Errorf("claudecode: opening recording: %w", err)
 		}
 		transcript = io.TeeReader(stdout, recorder)
@@ -288,6 +345,7 @@ func (b *ClaudeCode) startSession(resumeUUID string) (*session, error) {
 
 	if startErr := cmd.Start(); startErr != nil {
 		cancel()
+		removeMCP()
 		if recorder != nil {
 			_ = recorder.Close()
 		}
@@ -295,23 +353,56 @@ func (b *ClaudeCode) startSession(resumeUUID string) (*session, error) {
 	}
 
 	sess := &session{
-		uuid:       sessionUUID,
-		cmd:        cmd,
-		stdin:      stdin,
-		lifecycle:  lifecycle,
-		cancel:     cancel,
-		events:     make(chan turnEvent, eventBuffer),
-		readerDone: make(chan struct{}),
-		translator: NewTranslator(),
+		uuid:          sessionUUID,
+		cmd:           cmd,
+		stdin:         stdin,
+		lifecycle:     lifecycle,
+		cancel:        cancel,
+		mcpConfigFile: mcpFile,
+		events:        make(chan turnEvent, eventBuffer),
+		readerDone:    make(chan struct{}),
+		translator:    NewTranslator(),
 	}
 	go sess.readLoop(transcript, recorder)
 	return sess, nil
 }
 
+// resolveMCPConfig returns the value for --mcp-config and, if it wrote a temp
+// file, that file's path (for cleanup). Inline JSON is written to a 0600 temp
+// file rather than passed on argv, where it would be world-readable via
+// /proc/<pid>/cmdline; a path-valued config is passed through unchanged.
+func (b *ClaudeCode) resolveMCPConfig(sessionUUID string) (arg, file string, err error) {
+	cfg := b.config.MCPConfig
+	if cfg == "" || !isInlineJSON(cfg) {
+		return cfg, "", nil
+	}
+	tmpFile, err := os.CreateTemp("", "mentat-mcp-"+sessionUUID+"-*.json")
+	if err != nil {
+		return "", "", fmt.Errorf("claudecode: writing mcp config: %w", err)
+	}
+	name := tmpFile.Name()
+	if _, writeErr := tmpFile.WriteString(cfg); writeErr != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(name)
+		return "", "", fmt.Errorf("claudecode: writing mcp config: %w", writeErr)
+	}
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		_ = os.Remove(name)
+		return "", "", fmt.Errorf("claudecode: writing mcp config: %w", closeErr)
+	}
+	return name, name, nil
+}
+
+// isInlineJSON reports whether s is a JSON object literal rather than a path.
+func isInlineJSON(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	return strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed))
+}
+
 // buildArgs assembles the invocation contract from docs/protocol.md. The
 // isolation flags are unconditional: a bare child inherits the operator's
 // interactive Claude Code configuration, which must never drive a daemon.
-func (b *ClaudeCode) buildArgs(sessionUUID string, resume bool) []string {
+func (b *ClaudeCode) buildArgs(sessionUUID string, resume bool, mcpArg string) []string {
 	args := []string{
 		"-p",
 		"--input-format", "stream-json",
@@ -338,8 +429,8 @@ func (b *ClaudeCode) buildArgs(sessionUUID string, resume bool) []string {
 	for _, dir := range b.config.AddDirs {
 		args = append(args, "--add-dir", dir)
 	}
-	if b.config.MCPConfig != "" {
-		args = append(args, "--mcp-config", b.config.MCPConfig)
+	if mcpArg != "" {
+		args = append(args, "--mcp-config", mcpArg)
 	}
 	if b.config.PermissionPromptTool != "" {
 		args = append(args, "--permission-prompt-tool", b.config.PermissionPromptTool)
@@ -356,17 +447,43 @@ func (b *ClaudeCode) buildArgs(sessionUUID string, resume bool) []string {
 	return args
 }
 
-// childEnv passes the daemon's environment through (auth tokens live there)
-// minus Claude Code's own nesting markers, which would make the child
-// believe it runs inside an interactive session.
-func childEnv() []string {
-	env := os.Environ()
-	out := make([]string, 0, len(env))
-	for _, entry := range env {
-		if strings.HasPrefix(entry, "CLAUDECODE=") || strings.HasPrefix(entry, "CLAUDE_CODE_ENTRYPOINT=") {
+// childEnv constructs the child's environment from an allowlist plus the
+// operator's ExtraEnv, rather than inheriting the daemon's full environment.
+// The child is a tool-bearing agent processing untrusted text, so it gets
+// least privilege: shell/locale/proxy basics and the Anthropic/Claude auth
+// surface, nothing else. The deny entries override the prefixes — those
+// nesting markers would make the child believe it runs inside an interactive
+// Claude Code session.
+func (b *ClaudeCode) childEnv() []string {
+	allowExact := map[string]bool{
+		"HOME": true, "PATH": true, "USER": true, "LOGNAME": true,
+		"SHELL": true, "TERM": true, "LANG": true, "TMPDIR": true, "TZ": true,
+		"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true,
+		"http_proxy": true, "https_proxy": true, "no_proxy": true,
+	}
+	allowPrefix := []string{"LC_", "XDG_", "ANTHROPIC_", "CLAUDE_CODE_", "AWS_"}
+	denyExact := map[string]bool{"CLAUDECODE": true, "CLAUDE_CODE_ENTRYPOINT": true}
+	for _, name := range b.config.ExtraEnv {
+		allowExact[name] = true
+	}
+
+	source := os.Environ()
+	out := make([]string, 0, len(source))
+	for _, entry := range source {
+		key, _, _ := strings.Cut(entry, "=")
+		if denyExact[key] {
 			continue
 		}
-		out = append(out, entry)
+		allowed := allowExact[key]
+		for _, prefix := range allowPrefix {
+			if allowed {
+				break
+			}
+			allowed = strings.HasPrefix(key, prefix)
+		}
+		if allowed {
+			out = append(out, entry)
+		}
 	}
 	return out
 }
@@ -379,18 +496,19 @@ type turnEvent struct {
 
 // session is one supervised child process and its conversation identity.
 type session struct {
-	uuid       string
-	cmd        *exec.Cmd
-	stdin      io.WriteCloser
-	lifecycle  context.Context //nolint:containedctx // The session owns a process lifetime, not a request; the context IS the session's cancellation handle.
-	cancel     context.CancelFunc
-	turnMu     sync.Mutex
-	events     chan turnEvent
-	readerDone chan struct{}
-	translator *Translator
-	dead       atomic.Bool
-	poisoned   atomic.Bool
-	waitErr    error
+	uuid          string
+	cmd           *exec.Cmd
+	stdin         io.WriteCloser
+	lifecycle     context.Context //nolint:containedctx // The session owns a process lifetime, not a request; the context IS the session's cancellation handle.
+	cancel        context.CancelFunc
+	mcpConfigFile string // temp file to remove when the child exits, if any
+	turnMu        sync.Mutex
+	events        chan turnEvent
+	readerDone    chan struct{}
+	translator    *Translator
+	dead          atomic.Bool
+	poisoned      atomic.Bool
+	waitErr       error
 }
 
 // wireUserMessage is the stdin frame for one user turn.
@@ -454,6 +572,9 @@ func (s *session) readLoop(transcript io.Reader, recorder *os.File) {
 		_ = recorder.Close()
 	}
 	s.waitErr = s.cmd.Wait()
+	if s.mcpConfigFile != "" {
+		_ = os.Remove(s.mcpConfigFile)
+	}
 	s.dead.Store(true)
 	close(s.events)
 	close(s.readerDone)

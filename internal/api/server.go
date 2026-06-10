@@ -6,6 +6,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -99,9 +100,19 @@ type turnRequest struct {
 	Meta      map[string]string `json:"meta,omitempty"`
 }
 
+// maxRequestBytes bounds the conversation request body. An utterance is tiny;
+// this only stops a client from streaming unbounded data into the decoder.
+const maxRequestBytes = 1 << 20
+
 func (s *Server) handleConversation(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	var req turnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
 		return
 	}
@@ -125,6 +136,10 @@ func (s *Server) handleConversation(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "backend refused turn",
 			slog.String("session_id", req.SessionID), slog.Any("error", err))
+		if errors.Is(err, backend.ErrAtCapacity) {
+			http.Error(w, `{"error":"at capacity, retry shortly"}`, http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, `{"error":"backend refused the turn"}`, http.StatusBadGateway)
 		return
 	}
