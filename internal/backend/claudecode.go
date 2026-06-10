@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"iter"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,23 +60,93 @@ type ClaudeCodeConfig struct {
 	// RecordDir, when set, appends each session's raw NDJSON transcript to
 	// <RecordDir>/<session-uuid>.ndjson. Recordings are future cassettes.
 	RecordDir string
+	// StatePath, when set, persists the SessionID→CLI-UUID mapping to this
+	// file so conversations resume across daemon restarts. Empty keeps the
+	// mapping in memory only (resume survives child death, not restart).
+	StatePath string
+	// Logger receives backend diagnostics. Defaults to a discard logger.
+	Logger *slog.Logger
 }
 
 // ClaudeCode is a Backend supervising one persistent claude CLI child
 // process per session, speaking the stream-json protocol over stdio.
 type ClaudeCode struct {
 	config   ClaudeCodeConfig
+	logger   *slog.Logger
 	mu       sync.Mutex
 	sessions map[string]*session
+	// resumable maps SessionID→CLI-UUID for every session this backend has
+	// started. It outlives the live *session entries (and a daemon restart,
+	// when StatePath is set), so a turn can resume a conversation whose
+	// child is gone.
+	resumable map[string]string
 }
 
-// NewClaudeCode validates config and returns a live backend. No process is
-// spawned until the first turn of a session arrives.
+// NewClaudeCode validates config, loads any persisted resume state, and
+// returns a live backend. No process is spawned until the first turn of a
+// session arrives.
 func NewClaudeCode(config ClaudeCodeConfig) (*ClaudeCode, error) {
 	if config.Bin == "" {
 		return nil, errors.New("claudecode: Bin is required (no PATH fallback)")
 	}
-	return &ClaudeCode{config: config, sessions: make(map[string]*session)}, nil
+	resumable, err := loadResumable(config.StatePath)
+	if err != nil {
+		return nil, err
+	}
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	return &ClaudeCode{
+		config:    config,
+		logger:    logger,
+		sessions:  make(map[string]*session),
+		resumable: resumable,
+	}, nil
+}
+
+// loadResumable reads the persisted SessionID→UUID map. A missing file or an
+// empty StatePath yields an empty map; a corrupt file is an error so the
+// operator notices rather than silently losing every conversation.
+func loadResumable(statePath string) (map[string]string, error) {
+	resumable := make(map[string]string)
+	if statePath == "" {
+		return resumable, nil
+	}
+	data, err := os.ReadFile(statePath) //nolint:gosec // StatePath is operator config, not user input.
+	if errors.Is(err, fs.ErrNotExist) {
+		return resumable, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claudecode: reading state %s: %w", statePath, err)
+	}
+	if unmarshalErr := json.Unmarshal(data, &resumable); unmarshalErr != nil {
+		return nil, fmt.Errorf("claudecode: parsing state %s: %w", statePath, unmarshalErr)
+	}
+	return resumable, nil
+}
+
+// persistResumable atomically writes the resume map (temp file + rename).
+// Callers hold b.mu. A no-op when StatePath is unset. Failures are logged,
+// not fatal: a write error degrades resume-across-restart for new sessions
+// but must not fail the turn that triggered it.
+func (b *ClaudeCode) persistResumable() {
+	if b.config.StatePath == "" {
+		return
+	}
+	data, err := json.Marshal(b.resumable)
+	if err != nil {
+		b.logger.Error("claudecode: encoding resume state", slog.Any("error", err))
+		return
+	}
+	tmp := b.config.StatePath + ".tmp"
+	if writeErr := os.WriteFile(tmp, data, 0o600); writeErr != nil {
+		b.logger.Error("claudecode: writing resume state", slog.Any("error", writeErr))
+		return
+	}
+	if renameErr := os.Rename(tmp, b.config.StatePath); renameErr != nil {
+		b.logger.Error("claudecode: committing resume state", slog.Any("error", renameErr))
+	}
 }
 
 // Converse sends one user turn into the session's child process and streams
@@ -149,8 +221,10 @@ func (b *ClaudeCode) sessionFor(id string) (*session, error) {
 	if existing != nil && !existing.dead.Load() && !existing.poisoned.Load() {
 		return existing, nil
 	}
-	resumeUUID := ""
-	if existing != nil {
+	// Prefer the persisted mapping (survives a daemon restart); fall back to
+	// a live-but-dead session's uuid. Both hold the same value when present.
+	resumeUUID := b.resumable[id]
+	if resumeUUID == "" && existing != nil {
 		resumeUUID = existing.uuid
 	}
 	sess, err := b.startSession(resumeUUID)
@@ -158,6 +232,10 @@ func (b *ClaudeCode) sessionFor(id string) (*session, error) {
 		return nil, err
 	}
 	b.sessions[id] = sess
+	if b.resumable[id] != sess.uuid {
+		b.resumable[id] = sess.uuid
+		b.persistResumable()
+	}
 	return sess, nil
 }
 

@@ -236,10 +236,59 @@ func TestClaudeCodeRespawnsWithResume(t *testing.T) {
 	spawns := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	require.Len(t, spawns, 2)
 
-	sessionUUID := flagValue(t, spawns[0], "--session-id")
+	sessionUUID := sessionIDArg(t, spawns[0])
 	require.Contains(t, spawns[1], "--resume "+sessionUUID,
 		"the respawn must resume the same CLI session")
 	require.NotContains(t, spawns[1], "--session-id")
+}
+
+func TestClaudeCodeResumesAcrossRestart(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("MENTAT_FAKE_ARGS_FILE", argsFile)
+	t.Setenv("MENTAT_FAKE_CLAUDE", cassettePath(t, "simple_turn.ndjson"))
+	statePath := filepath.Join(t.TempDir(), "sessions.json")
+
+	// First daemon instance: one turn, then shut down (simulating restart).
+	first, err := backend.NewClaudeCode(backend.ClaudeCodeConfig{
+		Bin:       os.Args[0],
+		StatePath: statePath,
+	})
+	require.NoError(t, err)
+	_, err = collectTurn(t, first, backend.Turn{SessionID: "kitchen", Text: "ping"})
+	require.NoError(t, err)
+	require.NoError(t, first.Close())
+
+	// Second instance over the same state: a turn on the same SessionID
+	// must resume the original CLI conversation, not start cold.
+	second, err := backend.NewClaudeCode(backend.ClaudeCodeConfig{
+		Bin:       os.Args[0],
+		StatePath: statePath,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, second.Close()) })
+	_, err = collectTurn(t, second, backend.Turn{SessionID: "kitchen", Text: "ping again"})
+	require.NoError(t, err)
+
+	spawns := readSpawns(t, argsFile)
+	require.Len(t, spawns, 2)
+	firstUUID := sessionIDArg(t, spawns[0])
+	require.Contains(t, spawns[1], "--resume "+firstUUID,
+		"a turn after restart must resume the persisted CLI session")
+	require.NotContains(t, spawns[1], "--session-id")
+}
+
+func TestClaudeCodeWithoutStatePathStartsCold(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("MENTAT_FAKE_ARGS_FILE", argsFile)
+	cc := newFakeClaude(t, "simple_turn.ndjson", backend.ClaudeCodeConfig{})
+
+	_, err := collectTurn(t, cc, backend.Turn{SessionID: "kitchen", Text: "ping"})
+	require.NoError(t, err)
+
+	spawns := readSpawns(t, argsFile)
+	require.Len(t, spawns, 1)
+	require.Contains(t, spawns[0], "--session-id",
+		"with no StatePath a fresh session uses --session-id, not --resume")
 }
 
 func TestClaudeCodeRecordsParseableTranscript(t *testing.T) {
@@ -323,7 +372,7 @@ func TestClaudeCodeCloseSessionResumesOnNextTurn(t *testing.T) {
 	require.NoError(t, err)
 	spawns := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	require.Len(t, spawns, 2, "the turn after CloseSession must respawn")
-	sessionUUID := flagValue(t, spawns[0], "--session-id")
+	sessionUUID := sessionIDArg(t, spawns[0])
 	require.Contains(t, spawns[1], "--resume "+sessionUUID,
 		"an expired session resumes its CLI conversation rather than starting cold")
 }
@@ -403,7 +452,7 @@ func TestClaudeCodeAbandonedTurnRespawnsSession(t *testing.T) {
 
 	spawns := readSpawns(t, argsFile)
 	require.Len(t, spawns, 2, "abandoning a turn must poison the session so the next turn respawns")
-	sessionUUID := flagValue(t, spawns[0], "--session-id")
+	sessionUUID := sessionIDArg(t, spawns[0])
 	require.Contains(t, spawns[1], "--resume "+sessionUUID,
 		"the respawn after abandonment must resume the same CLI conversation")
 }
@@ -455,14 +504,16 @@ func TestClaudeCodeParseErrorDoesNotWedgeShutdown(t *testing.T) {
 	}
 }
 
-func flagValue(t *testing.T, args, flag string) string {
+// sessionIDArg returns the value of the --session-id flag in a recorded
+// child invocation.
+func sessionIDArg(t *testing.T, args string) string {
 	t.Helper()
 	fields := strings.Fields(args)
 	for i, field := range fields {
-		if field == flag && i+1 < len(fields) {
+		if field == "--session-id" && i+1 < len(fields) {
 			return fields[i+1]
 		}
 	}
-	t.Fatalf("flag %s not found in %q", flag, args)
+	t.Fatalf("--session-id not found in %q", args)
 	return ""
 }

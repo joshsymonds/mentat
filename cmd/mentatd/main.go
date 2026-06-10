@@ -37,6 +37,7 @@ type config struct {
 	recordDir    string
 	mcpConfig    string
 	cassette     string
+	statePath    string
 	sessionTTL   time.Duration
 	maxBudgetUSD float64
 }
@@ -73,6 +74,8 @@ func parseFlags() config {
 		"MCP server configuration (inline JSON or path)")
 	flag.StringVar(&cfg.cassette, "cassette", os.Getenv("MENTAT_CASSETTE"),
 		"recorded transcript to replay (cassette backend)")
+	flag.StringVar(&cfg.statePath, "state-path", os.Getenv("MENTAT_STATE_PATH"),
+		"file persisting the session resume map across restarts (claudecode backend)")
 	flag.DurationVar(&cfg.sessionTTL, "session-ttl", 15*time.Minute,
 		"idle duration after which a session's child process is released")
 	flag.Float64Var(&cfg.maxBudgetUSD, "max-budget-usd", 0,
@@ -82,7 +85,7 @@ func parseFlags() config {
 }
 
 func run(cfg config, logger *slog.Logger) error {
-	bk, err := buildBackend(cfg)
+	bk, err := buildBackend(cfg, logger)
 	if err != nil {
 		return err
 	}
@@ -120,7 +123,7 @@ func run(cfg config, logger *slog.Logger) error {
 	return nil
 }
 
-func buildBackend(cfg config) (backend.Backend, error) {
+func buildBackend(cfg config, logger *slog.Logger) (backend.Backend, error) {
 	switch strings.ToLower(cfg.backendKind) {
 	case "claudecode":
 		bk, err := backend.NewClaudeCode(backend.ClaudeCodeConfig{
@@ -131,7 +134,9 @@ func buildBackend(cfg config) (backend.Backend, error) {
 			AddDirs:      addDirs(cfg.memoryDir),
 			MCPConfig:    cfg.mcpConfig,
 			RecordDir:    cfg.recordDir,
+			StatePath:    cfg.statePath,
 			MaxBudgetUSD: cfg.maxBudgetUSD,
+			Logger:       logger,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("building claudecode backend: %w", err)
