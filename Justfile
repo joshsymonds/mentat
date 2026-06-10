@@ -3,9 +3,10 @@
 # Lint and test everything
 default: lint test
 
-# Lint Go code
+# Lint Go code. Pinned through nix: golangci-lint must be built with a Go
+# toolchain >= the module's (2.5.0/go1.25 panics on Go 1.26 packages).
 lint:
-    golangci-lint run ./...
+    nix shell nixpkgs#golangci-lint -c golangci-lint run ./...
 
 # Run all tests with the race detector
 test:
