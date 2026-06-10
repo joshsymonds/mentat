@@ -24,9 +24,12 @@ type Turn struct {
 
 // Backend streams conversation events for user turns. Converse returns an
 // error for failures to start the turn; failures mid-stream arrive as the
-// iterator's error values.
+// iterator's error values. CloseSession releases a session's resources
+// (idle expiry); it is harmless for unknown or already-closed sessions, and
+// a later turn with the same SessionID may transparently restore context.
 type Backend interface {
 	Converse(ctx context.Context, turn Turn) (iter.Seq2[Event, error], error)
+	CloseSession(sessionID string) error
 }
 
 // EventKind discriminates Event payloads.

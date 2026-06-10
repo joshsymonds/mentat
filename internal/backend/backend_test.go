@@ -210,3 +210,22 @@ func TestCassetteMissingFileIsAnError(t *testing.T) {
 	_, err := backend.NewCassette(filepath.Join(t.TempDir(), "absent.ndjson"))
 	require.Error(t, err)
 }
+
+func TestCassetteCloseSessionIsHarmless(t *testing.T) {
+	t.Parallel()
+	cassette, err := backend.NewCassette(
+		filepath.Join("..", "..", "testdata", "cassettes", "multi_turn.ndjson"))
+	require.NoError(t, err)
+
+	require.NoError(t, cassette.CloseSession("anything"))
+
+	stream, err := cassette.Converse(t.Context(), backend.Turn{Text: "still works"})
+	require.NoError(t, err)
+	var events []backend.Event
+	for ev, streamErr := range stream {
+		require.NoError(t, streamErr)
+		events = append(events, ev)
+	}
+	require.Equal(t, []string{"OK"}, doneTexts(events),
+		"a cassette has no per-session state; CloseSession must not disturb replay")
+}

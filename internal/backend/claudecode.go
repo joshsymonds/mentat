@@ -103,6 +103,20 @@ func (b *ClaudeCode) Converse(ctx context.Context, turn Turn) (iter.Seq2[Event, 
 	}, nil
 }
 
+// CloseSession shuts down a session's child process while keeping its
+// conversation identity: the next turn with the same SessionID respawns
+// with --resume, restoring context. Unknown or already-dead sessions are
+// harmless no-ops.
+func (b *ClaudeCode) CloseSession(sessionID string) error {
+	b.mu.Lock()
+	sess := b.sessions[sessionID]
+	b.mu.Unlock()
+	if sess == nil {
+		return nil
+	}
+	return sess.shutdown()
+}
+
 // Close shuts down every session: stdin closes, children get shutdownGrace
 // to exit, stragglers are killed.
 func (b *ClaudeCode) Close() error {

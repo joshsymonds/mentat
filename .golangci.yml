@@ -379,6 +379,9 @@ linters:
         - error
         - stdlib
         - generic
+        # Backend factories legitimately return the abstraction: which
+        # implementation you get is the factory's whole job.
+        - github.com/Veraticus/mentat/internal/backend.Backend
         - io.Reader
         - io.Writer
         - io.Closer

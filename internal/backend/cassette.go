@@ -67,6 +67,11 @@ func (c *Cassette) Converse(ctx context.Context, _ Turn) (iter.Seq2[Event, error
 	}, nil
 }
 
+// CloseSession is a no-op: a cassette holds no per-session resources.
+func (c *Cassette) CloseSession(string) error {
+	return nil
+}
+
 // splitTurns groups a transcript's events into per-turn segments, each
 // ending at its Done. Trailing events with no Done (a truncated recording)
 // form a final partial turn rather than being dropped.

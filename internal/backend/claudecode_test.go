@@ -281,6 +281,32 @@ func TestClaudeCodeIsolationArgsAlwaysPresent(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeCloseSessionResumesOnNextTurn(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("MENTAT_FAKE_ARGS_FILE", argsFile)
+	cc := newFakeClaude(t, "simple_turn.ndjson", backend.ClaudeCodeConfig{})
+
+	events, err := collectTurn(t, cc, backend.Turn{SessionID: "kitchen", Text: "ping"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"PONG"}, doneTexts(events))
+
+	require.NoError(t, cc.CloseSession("kitchen"))
+	require.NoError(t, cc.CloseSession("kitchen"), "closing twice must be harmless")
+	require.NoError(t, cc.CloseSession("never-existed"), "closing an unknown session must be harmless")
+
+	events, err = collectTurn(t, cc, backend.Turn{SessionID: "kitchen", Text: "ping again"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"PONG"}, doneTexts(events))
+
+	raw, err := os.ReadFile(argsFile)
+	require.NoError(t, err)
+	spawns := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	require.Len(t, spawns, 2, "the turn after CloseSession must respawn")
+	sessionUUID := flagValue(t, spawns[0], "--session-id")
+	require.Contains(t, spawns[1], "--resume "+sessionUUID,
+		"an expired session resumes its CLI conversation rather than starting cold")
+}
+
 func flagValue(t *testing.T, args, flag string) string {
 	t.Helper()
 	fields := strings.Fields(args)
