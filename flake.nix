@@ -26,9 +26,11 @@
         runHook preInstall
         npm prune --omit=dev
         mkdir -p $out/lib/mentat
-        cp -r src node_modules package.json $out/lib/mentat/
+        cp -r src scripts node_modules package.json $out/lib/mentat/
         makeWrapper ${pkgs.nodejs_24}/bin/node $out/bin/mentatd \
           --add-flags $out/lib/mentat/src/main.ts
+        makeWrapper ${pkgs.nodejs_24}/bin/node $out/bin/mentat-reminder \
+          --add-flags $out/lib/mentat/scripts/daily-reminder.ts
         runHook postInstall
       '';
 
