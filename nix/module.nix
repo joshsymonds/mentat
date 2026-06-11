@@ -67,6 +67,16 @@ in {
       default = { };
       description = "Additional non-secret MENTAT_* environment.";
     };
+
+    reminder = {
+      enable = lib.mkEnableOption "the daily morning reminder timer";
+
+      time = lib.mkOption {
+        type = lib.types.str;
+        default = "09:00";
+        description = "Host-local HH:MM the reminder fires.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -123,6 +133,39 @@ in {
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;
+      };
+    };
+
+    systemd.services.mentat-reminder = lib.mkIf cfg.reminder.enable {
+      description = "mentat morning reminder (Morgen → mentat turn → ntfy)";
+      after = [ "network-online.target" "mentatd.service" ];
+      wants = [ "network-online.target" ];
+
+      environment = {
+        MENTAT_URL = "http://127.0.0.1:${toString cfg.listenPort}";
+      };
+
+      serviceConfig = {
+        Type = "oneshot";
+        User = "mentat";
+        Group = "mentat";
+        EnvironmentFile = cfg.environmentFile;
+        ExecStart = lib.getExe' cfg.package "mentat-reminder";
+
+        PrivateTmp = true;
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+      };
+    };
+
+    systemd.timers.mentat-reminder = lib.mkIf cfg.reminder.enable {
+      description = "Daily mentat morning reminder";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = "*-*-* ${cfg.reminder.time}:00";
+        # Fire on next boot if the host slept through the slot.
+        Persistent = true;
       };
     };
   };

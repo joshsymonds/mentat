@@ -69,14 +69,19 @@
                   type = "http";
                   url = "http://127.0.0.1:8001/mcp";
                 };
+                reminder.enable = true;
               };
             }
           ];
         };
-        env = eval.config.systemd.services.mentatd.environment;
+        observed = {
+          daemonEnv = eval.config.systemd.services.mentatd.environment;
+          reminderEnv = eval.config.systemd.services.mentat-reminder.environment;
+          reminderTimer = eval.config.systemd.timers.mentat-reminder.timerConfig;
+        };
       in pkgs.runCommand "mentat-module-eval" {} ''
         cat > $out <<'EOF'
-        ${builtins.toJSON env}
+        ${builtins.toJSON observed}
         EOF
       '';
     };
