@@ -4,3 +4,4 @@
 .envrc
 .direnv/
 node_modules/
+result
