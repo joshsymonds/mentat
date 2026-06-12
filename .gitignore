@@ -2,6 +2,7 @@
 /dist/
 *.log
 .envrc
+.env.local
 .direnv/
 node_modules/
 result
