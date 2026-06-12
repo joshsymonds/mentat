@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import { connect, type AddressInfo } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AtCapacityError, type Backend, type Event, type Turn } from '../src/backend.ts';
 import { nullLogger } from '../src/log.ts';
@@ -112,6 +112,65 @@ describe('POST /v1/conversation', () => {
         '"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}',
     ]);
     expect(backend.turns[0]?.meta).toEqual({ surface: 'voice' });
+  });
+
+  it('passes a valid effort through to the backend turn', async () => {
+    const backend = new FakeBackend(() => [doneEvent('ok')]);
+    const base = await serve(backend);
+    const res = await post(base, { session_id: 's1', text: 'hi', effort: 'low' });
+    expect(res.status).toBe(200);
+    expect(backend.turns[0]?.effort).toBe('low');
+  });
+
+  it('omits effort from the turn when the request has none', async () => {
+    const backend = new FakeBackend(() => [doneEvent('ok')]);
+    const base = await serve(backend);
+    await post(base, { session_id: 's1', text: 'hi' });
+    expect(backend.turns[0]?.effort).toBeUndefined();
+  });
+
+  it('rejects an invalid effort with 400', async () => {
+    const backend = new FakeBackend(() => [doneEvent('ok')]);
+    const base = await serve(backend);
+    expect((await post(base, { session_id: 's1', text: 'hi', effort: 'turbo' })).status).toBe(400);
+    expect((await post(base, { session_id: 's1', text: 'hi', effort: 7 })).status).toBe(400);
+    expect(backend.turns).toHaveLength(0);
+  });
+
+  it('aborts the turn signal when the client disconnects mid-stream', async () => {
+    // Pins the voice-surface interruption contract: the moment the consumer
+    // goes away, the backend's turn signal fires (which the live backend
+    // turns into an interrupt-and-drain of the child).
+    let seenTurn: Turn | undefined;
+    const backend: Backend = {
+      converse(turn: Turn): Promise<AsyncIterable<Event>> {
+        seenTurn = turn;
+        async function* events(): AsyncGenerator<Event> {
+          yield { kind: 'textDelta', text: 'started' };
+          // Block until the turn is aborted — a turn mid-generation.
+          await new Promise<void>((resolve) => {
+            turn.signal?.addEventListener('abort', () => {
+              resolve();
+            });
+          });
+        }
+        return Promise.resolve(events());
+      },
+      closeSession: () => Promise.resolve(),
+    };
+    const base = await serve(backend);
+    const controller = new AbortController();
+    const res = await fetch(`${base}/v1/conversation`, {
+      method: 'POST',
+      body: JSON.stringify({ session_id: 's1', text: 'hi' }),
+      signal: controller.signal,
+    });
+    const reader = res.body?.getReader();
+    await reader?.read(); // first delta arrived; the stream is live
+    controller.abort(); // client hangs up mid-stream
+    await vi.waitFor(() => {
+      expect(seenTurn?.signal?.aborted).toBe(true);
+    });
   });
 
   it('rejects bad JSON and missing fields', async () => {

@@ -270,6 +270,32 @@ describe('ClaudeCode turns', () => {
     ).rejects.toThrow(/ended mid-turn/);
   });
 
+  it("applies the turn's effort when the turn creates the session", async () => {
+    const fake = fakeQuery(() => [resultMsg('u1', 'ok')]);
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn }));
+    await collect(await backend.converse({ sessionId: 's1', text: 'hi', effort: 'low' }));
+    expect(fake.optionsSeen[0]?.effort).toBe('low');
+  });
+
+  it("prefers the turn's effort over the daemon default at session creation", async () => {
+    const fake = fakeQuery(() => [resultMsg('u1', 'ok')]);
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn, effort: 'high' }));
+    await collect(await backend.converse({ sessionId: 's1', text: 'hi', effort: 'low' }));
+    expect(fake.optionsSeen[0]?.effort).toBe('low');
+  });
+
+  it('keeps the creation effort for the life of the session', async () => {
+    // effort is an SDK option fixed at child spawn: a later turn naming a
+    // different effort neither respawns nor reconfigures the session.
+    const fake = fakeQuery((turn) => [resultMsg('u1', turn === 0 ? 'one' : 'two')]);
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn }));
+    await collect(await backend.converse({ sessionId: 's1', text: 'a', effort: 'low' }));
+    await collect(await backend.converse({ sessionId: 's1', text: 'b', effort: 'max' }));
+    expect(fake.calls).toBe(1);
+    expect(fake.optionsSeen).toHaveLength(1);
+    expect(fake.optionsSeen[0]?.effort).toBe('low');
+  });
+
   it('interrupts abandoned turns and keeps the session usable', async () => {
     const fake = fakeQuery((turn) =>
       turn === 0

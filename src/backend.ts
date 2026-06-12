@@ -2,6 +2,17 @@
 // user turns and streams typed events back; the agentic loop, tool execution,
 // and MCP connections live inside the implementation, invisible to callers.
 
+/** Reasoning-effort levels a turn may request (mirrors the SDK's enum). */
+export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export const EFFORT_LEVELS: ReadonlySet<string> = new Set<Effort>([
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]);
+
 /** One user utterance entering a conversation session. */
 export interface Turn {
   /**
@@ -24,6 +35,13 @@ export interface Turn {
    * see until the next event arrives.
    */
   signal?: AbortSignal;
+  /**
+   * Reasoning effort for the session this turn belongs to. Effort is fixed
+   * when the backend spawns the session, so it only takes effect on the turn
+   * that creates (or respawns) one; later turns on a live session keep the
+   * creation effort. Surfaces with latency budgets (voice) send "low".
+   */
+  effort?: Effort;
 }
 
 /** A turn could not start because the backend is at its session capacity. */

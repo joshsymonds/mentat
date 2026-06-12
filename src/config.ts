@@ -6,6 +6,8 @@ import { isIP } from 'node:net';
 
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 
+import { EFFORT_LEVELS } from './backend.ts';
+
 interface ListenAddress {
   host: string;
   port: number;
@@ -108,8 +110,6 @@ export function validateListen(host: string, allowNonLoopback: boolean): void {
     );
   }
 }
-
-const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
 /** A typo here must fail at startup, not flow silently into the session. */
 function parseEffort(value: string): Options['effort'] {

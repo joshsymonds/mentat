@@ -5,7 +5,7 @@
 import { once } from 'node:events';
 import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
 
-import { AtCapacityError, type Backend, type Event } from './backend.ts';
+import { AtCapacityError, EFFORT_LEVELS, type Backend, type Effort, type Event } from './backend.ts';
 import type { Logger } from './log.ts';
 import { errorLine, toWireLine } from './wire.ts';
 
@@ -58,6 +58,7 @@ interface TurnRequest {
   sessionId: string;
   text: string;
   meta?: Record<string, string>;
+  effort?: Effort;
 }
 
 export function createHandler(
@@ -122,6 +123,7 @@ async function handleConversation(
         text: parsed.text,
         signal: abort.signal,
         ...(parsed.meta !== undefined && { meta: parsed.meta }),
+        ...(parsed.effort !== undefined && { effort: parsed.effort }),
       });
     } catch (error) {
       logger.error('backend refused turn', {
@@ -183,8 +185,18 @@ async function readTurnRequest(
     fail(res, 400, 'session_id and text are required');
     return undefined;
   }
+  const effort = record.effort;
+  if (effort !== undefined && (typeof effort !== 'string' || !EFFORT_LEVELS.has(effort))) {
+    fail(res, 400, 'effort must be one of low|medium|high|xhigh|max');
+    return undefined;
+  }
   const meta = parseMeta(record.meta);
-  return { sessionId, text, ...(meta !== undefined && { meta }) };
+  return {
+    sessionId,
+    text,
+    ...(meta !== undefined && { meta }),
+    ...(effort !== undefined && { effort: effort as Effort }),
+  };
 }
 
 function parseMeta(value: unknown): Record<string, string> | undefined {

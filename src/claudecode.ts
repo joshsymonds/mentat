@@ -381,7 +381,7 @@ export class ClaudeCode implements Backend {
 
   /** Acquires the session's turn slot and sends the turn into the child. */
   private async startTurn(turn: Turn): Promise<{ session: Session; release: () => void }> {
-    const session = this.sessionFor(turn.sessionId);
+    const session = this.sessionFor(turn.sessionId, turn.effort);
     const release = await session.mutex.acquire();
     // The session may have died while this turn waited on the previous one;
     // respawn rather than reading a dead iterator.
@@ -533,7 +533,7 @@ export class ClaudeCode implements Backend {
     }
   }
 
-  private sessionFor(sessionId: string): Session {
+  private sessionFor(sessionId: string, effort?: Turn['effort']): Session {
     const existing = this.sessions.get(sessionId);
     if (existing !== undefined && !existing.dead) {
       return existing;
@@ -544,8 +544,11 @@ export class ClaudeCode implements Backend {
     }
     const queue = new AsyncQueue<SDKUserMessage>();
     const context: Session['context'] = { current: null };
+    // The creating turn's effort wins over the daemon default; effort is an
+    // SDK option fixed at spawn, so it lives for the session.
+    const config = effort !== undefined ? { ...this.config, effort } : this.config;
     const options = buildOptions(
-      this.config,
+      config,
       () => context.current ?? { sessionId, meta: {} },
       this.resumable.get(sessionId),
     );
