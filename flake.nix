@@ -16,6 +16,9 @@
 
       npmDepsHash = "sha256-paKWa25wqIqRiMTvYe+nPEEXE1FPspBN1eXJs1oK76w=";
 
+      # Install-time npm must agree with the runtime wrappers below.
+      nodejs = pkgs.nodejs_24;
+
       # No build step: Node 24 runs the TypeScript sources directly via
       # type stripping (the repo has no compile output by design).
       dontNpmBuild = true;
@@ -25,8 +28,9 @@
       installPhase = ''
         runHook preInstall
         npm prune --omit=dev
-        mkdir -p $out/lib/mentat
-        cp -r src scripts node_modules package.json $out/lib/mentat/
+        mkdir -p $out/lib/mentat/scripts
+        cp -r src node_modules package.json $out/lib/mentat/
+        cp scripts/daily-reminder.ts $out/lib/mentat/scripts/
         makeWrapper ${pkgs.nodejs_24}/bin/node $out/bin/mentatd \
           --add-flags $out/lib/mentat/src/main.ts
         makeWrapper ${pkgs.nodejs_24}/bin/node $out/bin/mentat-reminder \

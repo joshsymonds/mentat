@@ -72,7 +72,8 @@ in {
       enable = lib.mkEnableOption "the daily morning reminder timer";
 
       time = lib.mkOption {
-        type = lib.types.str;
+        # Fail at eval, not at unit activation: OnCalendar interpolates this.
+        type = lib.types.strMatching "[0-9]{2}:[0-9]{2}";
         default = "09:00";
         description = "Host-local HH:MM the reminder fires.";
       };
@@ -91,7 +92,9 @@ in {
       after = [ "network.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      restartTriggers = [ cfg.environmentFile ];
+      # No restartTriggers on cfg.environmentFile here: that's the constant
+      # /run/agenix path, which never changes between generations. The host
+      # config triggers on the .age ciphertext store path instead.
 
       environment = {
         MENTAT_CLAUDE_BIN = lib.getExe' cfg.claudePackage "claude";
@@ -150,7 +153,14 @@ in {
         User = "mentat";
         Group = "mentat";
         EnvironmentFile = cfg.environmentFile;
+        # The script only needs MORGEN_API_KEY/NTFY_URL/NTFY_TOKEN; keep the
+        # daemon credential out of this process's environment.
+        UnsetEnvironment = [ "CLAUDE_CODE_OAUTH_TOKEN" ];
         ExecStart = lib.getExe' cfg.package "mentat-reminder";
+        # Type=oneshot disables the default start timeout; without a bound, a
+        # turn that trickles deltas forever hangs the unit silently and blocks
+        # the next day's Persistent= activation. Fail loudly instead.
+        TimeoutStartSec = "15min";
 
         PrivateTmp = true;
         NoNewPrivileges = true;
