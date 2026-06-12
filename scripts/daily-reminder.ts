@@ -127,9 +127,8 @@ export function buildTurnText(events: MorgenEvent[], now: Date): string {
 
 interface WireLine {
   kind?: string;
-  text?: string;
-  is_error?: boolean;
   message?: string;
+  done?: { text?: string; is_error?: boolean };
 }
 
 /** One turn against the conversation API; resolves to the done text. */
@@ -161,10 +160,16 @@ export async function converse(
       throw new Error(`mentat error: ${parsed.message ?? 'unknown'}`);
     }
     if (parsed.kind === 'done') {
-      if (parsed.is_error === true) {
-        throw new Error(`mentat turn failed: ${parsed.text ?? ''}`);
+      const done = parsed.done ?? {};
+      if (done.is_error === true) {
+        throw new Error(`mentat turn failed: ${done.text ?? ''}`);
       }
-      return parsed.text ?? '';
+      const reminder = done.text ?? '';
+      if (reminder.trim() === '') {
+        // ntfy renders an empty body as the literal message "triggered".
+        throw new Error('mentat returned an empty done text');
+      }
+      return reminder;
     }
   }
   throw new Error('mentat stream ended without a done line');

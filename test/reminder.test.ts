@@ -133,18 +133,45 @@ describe('converse', () => {
       expect(urlOf(input)).toBe('http://127.0.0.1:8484/v1/conversation');
       expect(init?.method).toBe('POST');
       body = JSON.parse(init?.body as string);
+      // Recorded verbatim from the deployed daemon (2026-06-12): the done
+      // payload is NESTED under "done" — reading top-level text yields ''.
       const ndjson =
-        '{"kind":"text_delta","text":"It"}\n' +
-        '{"kind":"done","text":"It is Dad\'s birthday today. Call him.","is_error":false,"session_id":"reminder-2026-06-11"}\n';
+        '{"kind":"text_delta","text":"de"}\n' +
+        '{"kind":"text_delta","text":"ployed and alive"}\n' +
+        '{"kind":"done","done":{"text":"deployed and alive","is_error":false,"stop_reason":"end_turn","session_id":"d07d65a2-96a9-4206-9a53-96cc1bd3da53","cost_usd":0.29947799999999997,"input_tokens":354,"output_tokens":8,"cache_read_input_tokens":0,"cache_creation_input_tokens":14752}}\n';
       return Promise.resolve(new Response(ndjson, { status: 200 }));
     };
     const text = await converse(fakeFetch, 'http://127.0.0.1:8484', 'turn text', new Date(2026, 5, 11));
-    expect(text).toBe("It is Dad's birthday today. Call him.");
+    expect(text).toBe('deployed and alive');
     expect(body).toMatchObject({
       session_id: 'reminder-2026-06-11',
       text: 'turn text',
       meta: { surface: 'reminder', user: 'josh' },
     });
+  });
+
+  it('throws when the turn itself failed', async () => {
+    const fakeFetch: FetchFn = () =>
+      Promise.resolve(
+        new Response(
+          '{"kind":"done","done":{"text":"budget exceeded","is_error":true,"session_id":"s","cost_usd":0,"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n',
+          { status: 200 },
+        ),
+      );
+    await expect(converse(fakeFetch, 'http://x', 't', new Date())).rejects.toThrow(/budget exceeded/);
+  });
+
+  it('throws on an empty done text rather than pushing nothing', async () => {
+    // ntfy renders an empty POST body as the literal message "triggered";
+    // an empty reminder is a failure, not a push.
+    const fakeFetch: FetchFn = () =>
+      Promise.resolve(
+        new Response(
+          '{"kind":"done","done":{"text":"","is_error":false,"session_id":"s","cost_usd":0.1,"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n',
+          { status: 200 },
+        ),
+      );
+    await expect(converse(fakeFetch, 'http://x', 't', new Date())).rejects.toThrow(/empty/);
   });
 
   it('throws on a terminal error line', async () => {
