@@ -15,3 +15,4 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm test
+      - run: python3 -m unittest discover -s ha/tests
