@@ -6,3 +6,4 @@
 .direnv/
 node_modules/
 result
+__pycache__/
