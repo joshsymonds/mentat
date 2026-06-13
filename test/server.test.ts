@@ -137,6 +137,41 @@ describe('POST /v1/conversation', () => {
     expect(backend.turns).toHaveLength(0);
   });
 
+  it('passes a valid model through to the backend turn', async () => {
+    const backend = new FakeBackend(() => [doneEvent('ok')]);
+    const base = await serve(backend);
+    const res = await post(base, { session_id: 's1', text: 'hi', model: 'sonnet' });
+    expect(res.status).toBe(200);
+    expect(backend.turns[0]?.model).toBe('sonnet');
+  });
+
+  it('accepts a full dashed model id', async () => {
+    const backend = new FakeBackend(() => [doneEvent('ok')]);
+    const base = await serve(backend);
+    await post(base, { session_id: 's1', text: 'hi', model: 'claude-sonnet-4-6' });
+    expect(backend.turns[0]?.model).toBe('claude-sonnet-4-6');
+  });
+
+  it('omits model from the turn when the request has none', async () => {
+    const backend = new FakeBackend(() => [doneEvent('ok')]);
+    const base = await serve(backend);
+    await post(base, { session_id: 's1', text: 'hi' });
+    expect(backend.turns[0]?.model).toBeUndefined();
+  });
+
+  it('rejects an invalid model with 400', async () => {
+    const backend = new FakeBackend(() => [doneEvent('ok')]);
+    const base = await serve(backend);
+    expect((await post(base, { session_id: 's1', text: 'hi', model: '../evil' })).status).toBe(400);
+    expect((await post(base, { session_id: 's1', text: 'hi', model: '' })).status).toBe(400);
+    expect((await post(base, { session_id: 's1', text: 'hi', model: 'a'.repeat(65) })).status).toBe(
+      400,
+    );
+    expect((await post(base, { session_id: 's1', text: 'hi', model: 7 })).status).toBe(400);
+    expect((await post(base, { session_id: 's1', text: 'hi', model: 'so net' })).status).toBe(400);
+    expect(backend.turns).toHaveLength(0);
+  });
+
   it('aborts the turn signal when the client disconnects mid-stream', async () => {
     // Pins the voice-surface interruption contract: the moment the consumer
     // goes away, the backend's turn signal fires (which the live backend

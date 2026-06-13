@@ -13,6 +13,13 @@ export const EFFORT_LEVELS: ReadonlySet<string> = new Set<Effort>([
   'max',
 ]);
 
+/**
+ * Shape of an acceptable per-turn model name: a CLI alias ("sonnet") or a
+ * full model id ("claude-sonnet-4-6"). Deliberately tighter than what the
+ * CLI would accept — the value lands on a child's argv.
+ */
+export const MODEL_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9.-]{0,63}$/;
+
 /** One user utterance entering a conversation session. */
 export interface Turn {
   /**
@@ -42,6 +49,12 @@ export interface Turn {
    * creation effort. Surfaces with latency budgets (voice) send "low".
    */
   effort?: Effort;
+  /**
+   * Model for the session this turn belongs to (alias or full id). Like
+   * effort, fixed at session spawn: only the creating turn's value applies.
+   * Surfaces with latency budgets (voice) send a fast model.
+   */
+  model?: string;
 }
 
 /** A turn could not start because the backend is at its session capacity. */

@@ -5,7 +5,14 @@
 import { once } from 'node:events';
 import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
 
-import { AtCapacityError, EFFORT_LEVELS, type Backend, type Effort, type Event } from './backend.ts';
+import {
+  AtCapacityError,
+  EFFORT_LEVELS,
+  MODEL_PATTERN,
+  type Backend,
+  type Effort,
+  type Event,
+} from './backend.ts';
 import type { Logger } from './log.ts';
 import { errorLine, toWireLine } from './wire.ts';
 
@@ -59,6 +66,7 @@ interface TurnRequest {
   text: string;
   meta?: Record<string, string>;
   effort?: Effort;
+  model?: string;
 }
 
 export function createHandler(
@@ -124,6 +132,7 @@ async function handleConversation(
         signal: abort.signal,
         ...(parsed.meta !== undefined && { meta: parsed.meta }),
         ...(parsed.effort !== undefined && { effort: parsed.effort }),
+        ...(parsed.model !== undefined && { model: parsed.model }),
       });
     } catch (error) {
       logger.error('backend refused turn', {
@@ -190,12 +199,18 @@ async function readTurnRequest(
     fail(res, 400, 'effort must be one of low|medium|high|xhigh|max');
     return undefined;
   }
+  const model = record.model;
+  if (model !== undefined && (typeof model !== 'string' || !MODEL_PATTERN.test(model))) {
+    fail(res, 400, 'model must be a short model alias or id');
+    return undefined;
+  }
   const meta = parseMeta(record.meta);
   return {
     sessionId,
     text,
     ...(meta !== undefined && { meta }),
     ...(effort !== undefined && { effort: effort as Effort }),
+    ...(model !== undefined && { model }),
   };
 }
 

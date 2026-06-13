@@ -149,16 +149,55 @@ function effectiveDisallowedTools(config: ClaudeCodeConfig): string[] {
 }
 
 /**
+ * Simple-name shapes for the spawn-time surface context line. The system
+ * prompt is a privileged channel; meta values that don't look like plain
+ * surface/user names stay out of it entirely.
+ */
+const SURFACE_SHAPE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const USER_SHAPE = /^[a-zA-Z0-9][a-zA-Z0-9_@.-]{0,63}$/;
+
+/**
+ * The session's surface context as a system-prompt line, or undefined when
+ * the spawning turn carried no (well-formed) surface. The daemon stays
+ * semantics-free: what a surface means lives in the operator's prompt.
+ */
+function surfaceContextLine(meta: Record<string, string> | undefined): string | undefined {
+  if (meta === undefined) {
+    return undefined;
+  }
+  const surface = meta.surface;
+  if (surface === undefined || !SURFACE_SHAPE.test(surface)) {
+    return undefined;
+  }
+  const user = meta.user;
+  return user !== undefined && USER_SHAPE.test(user)
+    ? `Session surface: ${surface} (user: ${user})`
+    : `Session surface: ${surface}`;
+}
+
+/**
  * Assembles the per-session SDK options. The isolation flags are
  * unconditional: a bare child inherits the operator's interactive Claude Code
  * configuration (settings, skills, MCP servers), which must never drive a
  * daemon. Exported pure so tests pin every invariant.
+ *
+ * spawnMeta is the session-creating turn's meta; its surface/user become a
+ * trailing system-prompt line so the model knows which surface it serves.
+ * Only an operator-configured prompt is extended — supplying systemPrompt to
+ * the SDK replaces its default, so a daemon without one must not gain a
+ * prompt consisting solely of the surface line.
  */
 export function buildOptions(
   config: ClaudeCodeConfig,
   getContext: () => TurnContext,
   resumeUuid?: string,
+  spawnMeta?: Record<string, string>,
 ): Options {
+  const surfaceLine = surfaceContextLine(spawnMeta);
+  const systemPrompt =
+    config.systemPrompt !== undefined && surfaceLine !== undefined
+      ? `${config.systemPrompt}\n\n${surfaceLine}`
+      : config.systemPrompt;
   return {
     settingSources: [],
     skills: [],
@@ -169,7 +208,7 @@ export function buildOptions(
     disallowedTools: effectiveDisallowedTools(config),
     ...(config.model !== undefined && { model: config.model }),
     ...(config.effort !== undefined && { effort: config.effort }),
-    ...(config.systemPrompt !== undefined && { systemPrompt: config.systemPrompt }),
+    ...(systemPrompt !== undefined && { systemPrompt }),
     ...(config.addDirs !== undefined && { additionalDirectories: config.addDirs }),
     ...(config.mcpServers !== undefined && { mcpServers: config.mcpServers }),
     ...(config.allowedTools !== undefined && { allowedTools: config.allowedTools }),
@@ -381,7 +420,7 @@ export class ClaudeCode implements Backend {
 
   /** Acquires the session's turn slot and sends the turn into the child. */
   private async startTurn(turn: Turn): Promise<{ session: Session; release: () => void }> {
-    const session = this.sessionFor(turn.sessionId, turn.effort);
+    const session = this.sessionFor(turn);
     const release = await session.mutex.acquire();
     // The session may have died while this turn waited on the previous one;
     // respawn rather than reading a dead iterator.
@@ -533,7 +572,8 @@ export class ClaudeCode implements Backend {
     }
   }
 
-  private sessionFor(sessionId: string, effort?: Turn['effort']): Session {
+  private sessionFor(turn: Turn): Session {
+    const sessionId = turn.sessionId;
     const existing = this.sessions.get(sessionId);
     if (existing !== undefined && !existing.dead) {
       return existing;
@@ -544,13 +584,19 @@ export class ClaudeCode implements Backend {
     }
     const queue = new AsyncQueue<SDKUserMessage>();
     const context: Session['context'] = { current: null };
-    // The creating turn's effort wins over the daemon default; effort is an
-    // SDK option fixed at spawn, so it lives for the session.
-    const config = effort !== undefined ? { ...this.config, effort } : this.config;
+    // The creating turn's effort/model win over the daemon defaults; both are
+    // SDK options fixed at spawn, so they live for the session. Its meta
+    // becomes the spawn-time surface context line.
+    const config = {
+      ...this.config,
+      ...(turn.effort !== undefined && { effort: turn.effort }),
+      ...(turn.model !== undefined && { model: turn.model }),
+    };
     const options = buildOptions(
       config,
       () => context.current ?? { sessionId, meta: {} },
       this.resumable.get(sessionId),
+      turn.meta,
     );
     const handle = this.queryFn({ prompt: queue, options });
     const session: Session = {
