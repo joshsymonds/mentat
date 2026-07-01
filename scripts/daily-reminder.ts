@@ -125,7 +125,8 @@ export function buildTurnText(events: MorgenEvent[], now: Date): string {
     'Write my morning reminder as a short push notification (a few sentences at most).',
     'Lead with life events I must act on personally — birthdays and anniversaries mean',
     'telling me to call or message that person today. Then anything time-sensitive from',
-    'the schedule. Skip filler and pleasantries.',
+    'the schedule. Flag any events that overlap in time as conflicts I need to resolve.',
+    'Skip filler and pleasantries.',
   ].join('\n');
 }
 
@@ -135,20 +136,27 @@ interface WireLine {
   done?: { text?: string; is_error?: boolean };
 }
 
-/** One turn against the conversation API; resolves to the done text. */
+/**
+ * One turn against the conversation API; resolves to the done text.
+ * Passing `model` also suffixes the session id so a fallback attempt never
+ * collides with the primary attempt's session.
+ */
 export async function converse(
   fetchFn: FetchFn,
   baseUrl: string,
   text: string,
   now: Date,
+  model?: string,
 ): Promise<string> {
+  const sessionId = `reminder-${localDateStamp(now)}${model === undefined ? '' : '-fallback'}`;
   const res = await fetchFn(`${baseUrl}/v1/conversation`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      session_id: `reminder-${localDateStamp(now)}`,
+      session_id: sessionId,
       text,
       meta: { surface: 'reminder', user: 'josh' },
+      ...(model !== undefined && { model }),
     }),
   });
   if (!res.ok) {
@@ -179,6 +187,25 @@ export async function converse(
   throw new Error('mentat stream ended without a done line');
 }
 
+/**
+ * A turn, retried once against the sonnet model if the primary attempt
+ * fails. Both attempts failing propagates the second attempt's error —
+ * tomorrow's run is still the retry, but the OnFailure alert fires today.
+ */
+export async function converseWithFallback(
+  fetchFn: FetchFn,
+  baseUrl: string,
+  text: string,
+  now: Date,
+): Promise<string> {
+  try {
+    return await converse(fetchFn, baseUrl, text, now);
+  } catch (error) {
+    console.error(`daily-reminder: primary turn failed, retrying with sonnet: ${String(error)}`);
+    return await converse(fetchFn, baseUrl, text, now, 'sonnet');
+  }
+}
+
 export async function pushNtfy(
   fetchFn: FetchFn,
   url: string,
@@ -207,7 +234,7 @@ async function main(): Promise<void> {
 
   const now = new Date();
   const events = await fetchTodayEvents(fetch, key, now);
-  const reminder = await converse(fetch, mentatUrl, buildTurnText(events, now), now);
+  const reminder = await converseWithFallback(fetch, mentatUrl, buildTurnText(events, now), now);
   await pushNtfy(fetch, ntfyUrl, ntfyToken, reminder);
   console.log(reminder);
 }

@@ -143,6 +143,11 @@ in {
       description = "mentat morning reminder (Morgen → mentat turn → ntfy)";
       after = [ "network-online.target" "mentatd.service" ];
       wants = [ "network-online.target" ];
+      # The reminder failed silently for 18 days (Jun 13–Jul 1 2026) before
+      # anyone noticed — an unattended daily job that only ever logs to a
+      # journal nobody reads is invisible by construction. Fire a push on
+      # every failure instead.
+      onFailure = [ "mentat-reminder-alert.service" ];
 
       environment = {
         MENTAT_URL = "http://127.0.0.1:${toString cfg.listenPort}";
@@ -161,6 +166,40 @@ in {
         # turn that trickles deltas forever hangs the unit silently and blocks
         # the next day's Persistent= activation. Fail loudly instead.
         TimeoutStartSec = "15min";
+
+        PrivateTmp = true;
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+      };
+    };
+
+    systemd.services.mentat-reminder-alert = lib.mkIf cfg.reminder.enable {
+      description = "ntfy alert for a failed mentat-reminder run";
+
+      # Same secrets file as the reminder itself, purely for NTFY_URL/
+      # NTFY_TOKEN — the daemon credential has no business here either.
+      script = ''
+        if [ -n "$NTFY_TOKEN" ]; then
+          exec ${lib.getExe pkgs.curl} --fail --silent --show-error \
+            -H "Authorization: Bearer $NTFY_TOKEN" \
+            -H "Title: mentat" -H "Priority: 5" -H "Tags: warning" \
+            -d "mentat-reminder failed — journalctl -u mentat-reminder" \
+            "$NTFY_URL"
+        else
+          exec ${lib.getExe pkgs.curl} --fail --silent --show-error \
+            -H "Title: mentat" -H "Priority: 5" -H "Tags: warning" \
+            -d "mentat-reminder failed — journalctl -u mentat-reminder" \
+            "$NTFY_URL"
+        fi
+      '';
+
+      serviceConfig = {
+        Type = "oneshot";
+        User = "mentat";
+        Group = "mentat";
+        EnvironmentFile = cfg.environmentFile;
+        UnsetEnvironment = [ "CLAUDE_CODE_OAUTH_TOKEN" ];
 
         PrivateTmp = true;
         NoNewPrivileges = true;

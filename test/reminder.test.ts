@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildTurnText,
   converse,
+  converseWithFallback,
   fetchTodayEvents,
   isMirror,
   pushNtfy,
@@ -128,6 +129,11 @@ describe('buildTurnText', () => {
     expect(text.toLowerCase()).toContain('no events');
   });
 
+  it('instructs flagging time-overlapping events as conflicts', () => {
+    const text = buildTurnText([], new Date(2026, 5, 11, 9, 0, 0));
+    expect(text).toContain('overlap in time as conflicts');
+  });
+
   it('fences the event listing as untrusted data', () => {
     // Event titles come from external calendar senders; an injected title
     // like this one must land inside the data fence, after the warning.
@@ -208,6 +214,71 @@ describe('converse', () => {
   it('throws on a non-200 status', async () => {
     const fakeFetch: FetchFn = () => Promise.resolve(new Response('busy', { status: 503 }));
     await expect(converse(fakeFetch, 'http://x', 't', new Date())).rejects.toThrow(/503/);
+  });
+
+  it('sends model and a -fallback session id when a model is given', async () => {
+    let body: unknown;
+    const fakeFetch: FetchFn = (_input, init) => {
+      body = JSON.parse(init?.body as string);
+      return Promise.resolve(
+        new Response(
+          '{"kind":"done","done":{"text":"ok","is_error":false,"session_id":"s","cost_usd":0,"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n',
+          { status: 200 },
+        ),
+      );
+    };
+    await converse(fakeFetch, 'http://127.0.0.1:8484', 'turn text', new Date(2026, 5, 11), 'sonnet');
+    expect(body).toMatchObject({ session_id: 'reminder-2026-06-11-fallback', model: 'sonnet' });
+  });
+});
+
+describe('converseWithFallback', () => {
+  it('returns the primary result without a retry when the first attempt succeeds', async () => {
+    let calls = 0;
+    const fakeFetch: FetchFn = () => {
+      calls += 1;
+      return Promise.resolve(
+        new Response(
+          '{"kind":"done","done":{"text":"all good","is_error":false,"session_id":"s","cost_usd":0,"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n',
+          { status: 200 },
+        ),
+      );
+    };
+    const text = await converseWithFallback(fakeFetch, 'http://x', 't', new Date(2026, 5, 11));
+    expect(text).toBe('all good');
+    expect(calls).toBe(1);
+  });
+
+  it('retries once with model sonnet and a distinct session id when the primary attempt fails', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    let call = 0;
+    const fakeFetch: FetchFn = (_input, init) => {
+      call += 1;
+      bodies.push(JSON.parse(init?.body as string) as Record<string, unknown>);
+      if (call === 1) {
+        return Promise.resolve(new Response('{"kind":"error","message":"budget exceeded"}\n', { status: 200 }));
+      }
+      return Promise.resolve(
+        new Response(
+          '{"kind":"done","done":{"text":"fallback ok","is_error":false,"session_id":"s","cost_usd":0,"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n',
+          { status: 200 },
+        ),
+      );
+    };
+    const text = await converseWithFallback(fakeFetch, 'http://x', 't', new Date(2026, 5, 11));
+    expect(text).toBe('fallback ok');
+    expect(call).toBe(2);
+    expect(bodies[0]).toMatchObject({ session_id: 'reminder-2026-06-11' });
+    expect(bodies[0]).not.toHaveProperty('model');
+    expect(bodies[1]).toMatchObject({ session_id: 'reminder-2026-06-11-fallback', model: 'sonnet' });
+  });
+
+  it('throws when both the primary and fallback attempts fail', async () => {
+    const fakeFetch: FetchFn = () =>
+      Promise.resolve(new Response('{"kind":"error","message":"still broken"}\n', { status: 200 }));
+    await expect(converseWithFallback(fakeFetch, 'http://x', 't', new Date(2026, 5, 11))).rejects.toThrow(
+      /still broken/,
+    );
   });
 });
 
