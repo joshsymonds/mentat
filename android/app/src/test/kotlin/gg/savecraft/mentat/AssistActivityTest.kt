@@ -3,12 +3,18 @@ package gg.savecraft.mentat
 import android.Manifest
 import android.app.Application
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
 import gg.savecraft.mentat.core.SessionState
+import gg.savecraft.mentat.session.BootReceiver
+import gg.savecraft.mentat.session.PhoneCommandService
 import gg.savecraft.mentat.ui.detailRes
 import gg.savecraft.mentat.ui.titleRes
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -19,6 +25,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowSettings
 
 @Config(sdk = [35])
 @RunWith(RobolectricTestRunner::class)
@@ -28,11 +35,17 @@ class AssistActivityTest {
     @Before
     fun resetPermission() {
         application = ApplicationProvider.getApplicationContext()
-        Shadows.shadowOf(application).denyPermissions(Manifest.permission.RECORD_AUDIO)
+        Shadows.shadowOf(application).denyPermissions(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.READ_CONTACTS,
+        )
     }
 
     @Test
     fun deniedRecordAudioPermissionDoesNotStartOrBindVoiceService() {
+        grantPhonePermissions()
+
         // The activity result callback only fires once the activity is started, and the
         // deprecated permission hook is what ComponentActivity routes into the result
         // registry — Robolectric has no other way to answer a permission request.
@@ -45,9 +58,116 @@ class AssistActivityTest {
             intArrayOf(PackageManager.PERMISSION_DENIED),
         )
 
-        assertNull(Shadows.shadowOf(application).peekNextStartedService())
+        assertEquals(PHONE_SERVICE, startedServiceClassName())
         assertTrue(Shadows.shadowOf(application).boundServiceConnections.isEmpty())
         assertEquals(SessionState.Failed("Permission denied"), activity.uiState.value)
+    }
+
+    @Test
+    fun phonePermissionsAreRequestedWhenMissing() {
+        grantRecordAudio()
+
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().get()
+
+        val request = Shadows.shadowOf(activity).lastRequestedPermission
+        assertArrayEquals(
+            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS),
+            request.requestedPermissions,
+        )
+    }
+
+    @Test
+    fun phonePermissionsAreNotRequestedWhenGranted() {
+        grantRecordAudio()
+        Shadows.shadowOf(application).grantPermissions(
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.READ_CONTACTS,
+        )
+
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().get()
+
+        val request = Shadows.shadowOf(activity).lastRequestedPermission
+        assertTrue(
+            request == null || request.requestedPermissions.toSet() !=
+                setOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS),
+        )
+    }
+
+    @Test
+    fun overlayAndBatterySettingsAreOpenedOnceWhenMissing() {
+        grantRecordAudio()
+        ShadowSettings.setCanDrawOverlays(false)
+        val powerManager = application.getSystemService(Context.POWER_SERVICE) as PowerManager
+        Shadows.shadowOf(powerManager).setIgnoringBatteryOptimizations(application.packageName, false)
+
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+        val intents = drainStartedActivities(activity)
+
+        val overlayIntents = intents.filter { intent ->
+            intent.action == Settings.ACTION_MANAGE_OVERLAY_PERMISSION
+        }
+        val batteryIntents = intents.filter { intent ->
+            intent.action == Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+        }
+        assertEquals(1, overlayIntents.size)
+        assertEquals(1, batteryIntents.size)
+        assertEquals("package:${application.packageName}", overlayIntents.single().dataString)
+        assertEquals("package:${application.packageName}", batteryIntents.single().dataString)
+    }
+
+    @Test
+    fun settingsAreNotOpenedWhenGranted() {
+        grantRecordAudio()
+        ShadowSettings.setCanDrawOverlays(true)
+        val powerManager = application.getSystemService(Context.POWER_SERVICE) as PowerManager
+        Shadows.shadowOf(powerManager).setIgnoringBatteryOptimizations(application.packageName, true)
+
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().get()
+        val intents = drainStartedActivities(activity)
+
+        assertTrue(intents.none { intent ->
+            intent.action == Settings.ACTION_MANAGE_OVERLAY_PERMISSION ||
+                intent.action == Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+        })
+    }
+
+    @Test
+    fun phoneCommandServiceIsStartedOnLaunch() {
+        grantRecordAudio()
+
+        Robolectric.buildActivity(AssistActivity::class.java).create()
+
+        assertTrue(startedServiceClassNames().contains(PHONE_SERVICE))
+    }
+
+    @Test
+    fun manifestDeclaresThePhonePermissions() {
+        val packageInfo = application.packageManager.getPackageInfo(
+            application.packageName,
+            PackageManager.GET_PERMISSIONS,
+        )
+        val permissions = packageInfo.requestedPermissions.orEmpty().toSet()
+        assertTrue(permissions.contains(Manifest.permission.SEND_SMS))
+        assertTrue(permissions.contains(Manifest.permission.READ_CONTACTS))
+        assertTrue(permissions.contains(Manifest.permission.SYSTEM_ALERT_WINDOW))
+        assertTrue(permissions.contains(Manifest.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS))
+        assertTrue(permissions.contains(Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE))
+        assertTrue(permissions.contains(Manifest.permission.RECEIVE_BOOT_COMPLETED))
+
+        val receiverInfo = application.packageManager.getReceiverInfo(
+            ComponentName(application, BootReceiver::class.java),
+            0,
+        )
+        assertEquals(application.packageName, receiverInfo.packageName)
+
+        val serviceInfo = application.packageManager.getServiceInfo(
+            ComponentName(application, PhoneCommandService::class.java),
+            PackageManager.GET_META_DATA,
+        )
+        assertEquals(
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            serviceInfo.foregroundServiceType,
+        )
     }
 
     @Test
@@ -57,6 +177,7 @@ class AssistActivityTest {
         Robolectric.buildActivity(AssistActivity::class.java).create()
 
         assertEquals(VOICE_SERVICE, startedServiceClassName())
+        assertTrue(startedServiceClassNames().contains(PHONE_SERVICE))
     }
 
     /**
@@ -80,6 +201,7 @@ class AssistActivityTest {
         grantRecordAudio()
         val controller = Robolectric.buildActivity(AssistActivity::class.java).create()
         assertEquals(VOICE_SERVICE, startedServiceClassName())
+        assertTrue(startedServiceClassNames().contains(PHONE_SERVICE))
 
         controller.destroy()
 
@@ -92,6 +214,7 @@ class AssistActivityTest {
         val controller = Robolectric.buildActivity(AssistActivity::class.java).create()
         val activity = controller.get()
         assertEquals(VOICE_SERVICE, startedServiceClassName())
+        assertTrue(startedServiceClassNames().contains(PHONE_SERVICE))
         // A token or connect failure leaves the started service running, so the activity
         // still owes it a stop when it goes away.
         activity.failSession("Token request failed")
@@ -184,8 +307,31 @@ class AssistActivityTest {
         Shadows.shadowOf(application).grantPermissions(Manifest.permission.RECORD_AUDIO)
     }
 
+    private fun grantPhonePermissions() {
+        Shadows.shadowOf(application).grantPermissions(
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.READ_CONTACTS,
+        )
+    }
+
     private fun startedServiceClassName(): String? =
         Shadows.shadowOf(application).peekNextStartedService()?.component?.className
+
+    private fun startedServiceClassNames(): List<String> = buildList {
+        val shadow = Shadows.shadowOf(application)
+        while (true) {
+            val intent = shadow.getNextStartedService() ?: break
+            intent.component?.className?.let(::add)
+        }
+    }
+
+    private fun drainStartedActivities(activity: AssistActivity): List<Intent> = buildList {
+        val shadow = Shadows.shadowOf(activity)
+        while (true) {
+            val intent = shadow.nextStartedActivity ?: break
+            add(intent)
+        }
+    }
 
     private fun stoppedServiceClassName(): String? =
         Shadows.shadowOf(application).nextStoppedService?.component?.className
@@ -202,5 +348,6 @@ class AssistActivityTest {
 
     private companion object {
         const val VOICE_SERVICE = "gg.savecraft.mentat.session.VoiceSessionService"
+        const val PHONE_SERVICE = "gg.savecraft.mentat.session.PhoneCommandService"
     }
 }

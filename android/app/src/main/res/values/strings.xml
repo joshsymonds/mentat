@@ -3,6 +3,9 @@
     <string name="voice_notification_channel">Voice session</string>
     <string name="voice_notification_title">Mentat is listening</string>
     <string name="voice_notification_text">Voice session active</string>
+    <string name="phone_notification_channel">Phone bridge</string>
+    <string name="phone_notification_title">Mentat phone bridge</string>
+    <string name="phone_notification_text">Phone command channel active</string>
     <string name="talk_settings">Settings</string>
     <string name="talk_token_endpoint">Token endpoint</string>
     <string name="talk_save">Save</string>

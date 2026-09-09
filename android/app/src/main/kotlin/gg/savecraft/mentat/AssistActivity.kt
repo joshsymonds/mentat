@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.Settings
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
@@ -21,7 +23,9 @@ import gg.savecraft.mentat.core.SessionState
 import gg.savecraft.mentat.core.SessionStateMachine
 import gg.savecraft.mentat.core.TranscriptSegment
 import gg.savecraft.mentat.session.AppSettings
+import gg.savecraft.mentat.session.PhoneCommandService
 import gg.savecraft.mentat.session.VoiceSessionService
+import gg.savecraft.mentat.session.isBatteryOptimizationIgnored
 import gg.savecraft.mentat.ui.TalkScreen
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -58,6 +62,10 @@ open class AssistActivity : ComponentActivity() {
             mutableUiState.value = SessionStateMachine().transition(SessionEvent.PermissionDenied)
         }
     }
+
+    private val phonePermissionRequest = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -105,6 +113,7 @@ open class AssistActivity : ComponentActivity() {
             }
         }
         beginVoiceSession()
+        beginPhoneBridge()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -151,6 +160,10 @@ open class AssistActivity : ComponentActivity() {
         startForegroundService(intent)
     }
 
+    protected open fun startPhoneCommandService(intent: Intent) {
+        startForegroundService(intent)
+    }
+
     protected open fun bindVoiceService(intent: Intent): Boolean =
         bindService(intent, connection, Context.BIND_AUTO_CREATE)
 
@@ -164,6 +177,49 @@ open class AssistActivity : ComponentActivity() {
             startAndBindVoiceService()
         } else {
             permissionRequest.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    private fun requestPhonePermissionsIfNeeded() {
+        val missingPermissions = listOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS)
+            .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missingPermissions.isNotEmpty()) {
+            phonePermissionRequest.launch(missingPermissions.toTypedArray())
+        }
+    }
+
+    private fun beginPhoneBridge() {
+        requestPhonePermissionsIfNeeded()
+
+        if (!Settings.canDrawOverlays(this)) {
+            runCatching {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName"),
+                    ),
+                )
+            }.onFailure { exception ->
+                Log.w("MentatAssist", "Unable to open overlay settings", exception)
+            }
+        }
+        if (!isBatteryOptimizationIgnored(this)) {
+            runCatching {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:$packageName"),
+                    ),
+                )
+            }.onFailure { exception ->
+                Log.w("MentatAssist", "Unable to open battery settings", exception)
+            }
+        }
+
+        try {
+            startPhoneCommandService(Intent(this, PhoneCommandService::class.java))
+        } catch (exception: Exception) {
+            Log.w("MentatAssist", "Unable to start phone command service", exception)
         }
     }
 
