@@ -30,6 +30,7 @@ from request import (
     turn_latency,
     turn_request,
     with_private_context,
+    without_last_user_message,
 )
 
 
@@ -433,3 +434,20 @@ class PrivateContextTest(unittest.TestCase):
             with_private_context(base, PrivateContext(about="Who he is: Josh.")),
             "# The voice\n\nBe warm.\n\nWho he is: Josh.",
         )
+
+
+class WithoutLastUserMessageTest(unittest.TestCase):
+    def test_only_the_latest_user_message_goes(self):
+        items = [
+            Message("user", "what time is it"),
+            Message("assistant", "Half past three."),
+            Message("user", "[background chatter]"),
+        ]
+        self.assertEqual(
+            [(m.role, m.text_content) for m in without_last_user_message(items)],
+            [("user", "what time is it"), ("assistant", "Half past three.")],
+        )
+
+    def test_nothing_to_remove_is_a_no_op(self):
+        items = [Message("assistant", "Hello.")]
+        self.assertEqual(without_last_user_message(items), items)

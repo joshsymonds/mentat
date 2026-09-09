@@ -141,6 +141,22 @@ def conversation_advanced(items: Iterable[Any], users_at_dispatch: int) -> bool:
     return count_user_messages(items) > users_at_dispatch
 
 
+def without_last_user_message(items: Iterable[Any]) -> list[Any]:
+    """The chat items with the most recent user message removed.
+
+    What a not_for_me call erases: the line that turned out not to be for
+    the front. Only that one — the reply it would have gotten never exists,
+    since the tool stops the response before anything is generated.
+    """
+    kept = list(items)
+    for index in range(len(kept) - 1, -1, -1):
+        item = kept[index]
+        if getattr(item, "type", None) == "message" and item.role == "user":
+            del kept[index]
+            break
+    return kept
+
+
 def recent_turns(
     items: Iterable[Any], count: int = CONSULT_WINDOW_TURNS
 ) -> list[tuple[str, str]]:

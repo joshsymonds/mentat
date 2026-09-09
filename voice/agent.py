@@ -43,12 +43,14 @@ from livekit.agents import (
     JobContext,
     RunContext,
     ModelSettings,
+    StopResponse,
     WorkerOptions,
     function_tool,
     inference,
     llm,
 )
-from livekit.plugins import silero
+from livekit.agents.voice import room_io
+from livekit.plugins import dtln, silero
 from livekit.agents.tts import _provider_format
 
 from request import (
@@ -63,6 +65,7 @@ from request import (
     turn_latency,
     turn_request,
     with_private_context,
+    without_last_user_message,
 )
 from stream import Respeller, TurnError, TurnStream
 
@@ -192,6 +195,21 @@ class FrontAgent(Agent):
         self._room_name = room_name
         self._mentat_url = mentat_url
         self._pronunciations = pronunciations
+
+    @function_tool()
+    async def not_for_me(self, ctx: RunContext) -> None:
+        """What just came through was not said to you: someone else in the
+        room, a pet, a TV, a fragment of noise, or a stray line that belongs to
+        no conversation you are having. Call this instead of replying. The
+        line is erased and you say nothing — never ask what it was."""
+        # The line is already in the context, appended before this turn's
+        # generation started; the reply it would get is stopped below before
+        # anything is generated, so this one removal leaves no trace of it.
+        pruned = self.chat_ctx.copy()
+        pruned.items = without_last_user_message(pruned.items)
+        await self.update_chat_ctx(pruned)
+        logger.info("not_for_me: a turn was erased as not addressed to the front")
+        raise StopResponse()
 
     async def tts_node(
         self, text: AsyncIterable[str], model_settings: ModelSettings
@@ -448,6 +466,14 @@ async def entrypoint(ctx: JobContext) -> None:
             mentat_url=os.environ.get("MENTAT_URL", DEFAULT_MENTAT_URL),
         ),
         room=ctx.room,
+        # Self-hosted noise suppression on the inbound track, one stateful
+        # instance per session as the plugin requires. Cleaner audio into
+        # Flux means fewer phantom words becoming turns in the first place.
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=dtln.noise_suppression(),
+            ),
+        ),
     )
 
 
