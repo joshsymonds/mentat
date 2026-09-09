@@ -152,11 +152,13 @@ async def run_all(
     # the tool is declared to the model and never executed — but a stand-in
     # front would be a second definition of the thing under measurement.
     front = agent.FrontAgent(
-        pronunciations=private.pronunciations,
         instructions=instructions,
         voice_card=voice_card,
         room_name="eval",
         mentat_url=agent.DEFAULT_MENTAT_URL,
+        # The eval never speaks, so nothing is respelled; the argument is
+        # required because production always passes the private context's.
+        pronunciations={},
     )
     model = LLM(model_name)
     limit = asyncio.Semaphore(concurrency)
