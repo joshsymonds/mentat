@@ -55,16 +55,17 @@ describe('POST /mcp', () => {
     expect(listed.tools.map((tool) => tool.name)).toEqual(['send_sms', 'open_on_phone']);
     const send = listed.tools.find((tool) => tool.name === 'send_sms');
     const open = listed.tools.find((tool) => tool.name === 'open_on_phone');
-    expect(send?.inputSchema).toMatchObject({
-      type: 'object',
-      properties: { to: { type: 'string' }, body: { type: 'string' } },
-      required: ['to', 'body'],
-    });
-    expect(open?.inputSchema).toMatchObject({
-      type: 'object',
-      properties: { uri: { type: 'string' } },
-      required: ['uri'],
-    });
+    expect(send).toBeDefined();
+    expect(open).toBeDefined();
+    expect(send?.inputSchema.type).toBe('object');
+    expect(Object.keys(send?.inputSchema.properties ?? {})).toEqual(['to', 'body']);
+    expect(send?.inputSchema.required).toEqual(['to', 'body']);
+    expect(send?.inputSchema.properties?.to).toEqual({ type: 'string' });
+    expect(send?.inputSchema.properties?.body).toEqual({ type: 'string' });
+    expect(open?.inputSchema.type).toBe('object');
+    expect(Object.keys(open?.inputSchema.properties ?? {})).toEqual(['uri']);
+    expect(open?.inputSchema.required).toEqual(['uri']);
+    expect(open?.inputSchema.properties?.uri).toEqual({ type: 'string' });
     await client.close();
     bridge.close();
   });
@@ -75,7 +76,7 @@ describe('POST /mcp', () => {
       now: () => new Date('2026-09-09T12:00:00.000Z'),
     });
     const base = await serve(bridge);
-    const phone = await fetch(`${base}/v1/phone/commands`);
+    const phone = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
     if (phone.body === null) throw new Error('missing phone body');
     const reader = phone.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
     const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
@@ -105,7 +106,7 @@ describe('POST /mcp', () => {
       now: () => new Date('2026-09-09T12:00:00.000Z'),
     });
     const base = await serve(bridge);
-    const phone = await fetch(`${base}/v1/phone/commands`);
+    const phone = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
     if (phone.body === null) throw new Error('missing phone body');
     const reader = phone.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
     const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));

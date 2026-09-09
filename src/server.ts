@@ -108,6 +108,16 @@ export function createHandler(
         fail(res, 404, 'not found');
         return;
       }
+      const phoneHeader = req.headers['x-mentat-phone'];
+      const hasPhoneHeader = typeof phoneHeader === 'string'
+        ? phoneHeader.length > 0
+        : Array.isArray(phoneHeader)
+          ? phoneHeader.some((value) => value.length > 0)
+          : false;
+      if (!hasPhoneHeader) {
+        fail(res, 403, 'phone header required');
+        return;
+      }
       bridge.attach(res);
       return;
     }

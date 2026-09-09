@@ -1,5 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import { connect, type AddressInfo } from 'node:net';
+import type { ReadableStreamDefaultReader } from 'node:stream/web';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -365,11 +366,95 @@ describe('Phone routes', () => {
   it('opens the phone command stream with headers before body data', async () => {
     const bridge = new PhoneBridge(nullLogger, { heartbeatMs: 20_000 });
     const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
-    const res = await fetch(`${base}/v1/phone/commands`);
+    const res = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('application/x-ndjson');
     bridge.close();
     await res.body?.cancel();
+  });
+
+  it('rejects a command stream without the phone header without evicting the attached phone', async () => {
+    const bridge = new PhoneBridge(nullLogger, {
+      uuid: () => 'header-required',
+      now: () => new Date('2026-09-09T12:00:00.000Z'),
+    });
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
+    const first = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
+    if (first.body === null) throw new Error('missing first phone body');
+    const firstReader = first.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    let pending: Promise<string> | undefined;
+    try {
+      const rejected = await fetch(`${base}/v1/phone/commands`);
+      expect(rejected.status).toBe(403);
+      expect(await rejected.text()).toBe('{"error":"phone header required"}\n');
+
+      pending = bridge.dispatch({ kind: 'sms', to: 'Sarah', body: 'still attached' });
+      const chunk = await firstReader.read();
+      if (chunk.done) throw new Error('missing command');
+      expect(JSON.parse(new TextDecoder().decode(chunk.value))).toMatchObject({
+        id: 'header-required',
+        kind: 'sms',
+        to: 'Sarah',
+        body: 'still attached',
+      });
+    } finally {
+      bridge.close();
+      if (pending !== undefined) await expect(pending).rejects.toThrow('phone offline');
+      await firstReader.cancel();
+    }
+  });
+
+  it('writes heartbeat pings to the phone command stream', async () => {
+    const bridge = new PhoneBridge(nullLogger, { heartbeatMs: 50 });
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
+    const response = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
+    if (response.body === null) throw new Error('missing phone body');
+    const reader = response.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    try {
+      const ping = (async () => {
+        let text = '';
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) throw new Error('phone stream ended before ping');
+          text += new TextDecoder().decode(chunk.value);
+          const newline = text.indexOf('\n');
+          if (newline >= 0) {
+            const line = text.slice(0, newline);
+            if (line === '{"kind":"ping"}') return;
+            text = text.slice(newline + 1);
+          }
+        }
+      })();
+      await Promise.race([
+        ping,
+        delay(1_000).then(() => { throw new Error('timed out waiting for phone ping'); }),
+      ]);
+    } finally {
+      bridge.close();
+      await reader.cancel();
+    }
+  });
+
+  it('ends the first phone stream when a second phone connects', async () => {
+    const bridge = new PhoneBridge(nullLogger, { heartbeatMs: 20_000 });
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
+    const first = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
+    const second = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
+    if (first.body === null || second.body === null) throw new Error('missing phone body');
+    const firstReader = first.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    const secondReader = second.body.getReader();
+    try {
+      await expect(firstReader.read()).resolves.toMatchObject({ done: true });
+      const secondRead = await Promise.race([
+        secondReader.read().then((result) => result.done),
+        delay(100).then(() => false),
+      ]);
+      expect(secondRead).toBe(false);
+    } finally {
+      bridge.close();
+      await firstReader.cancel();
+      await secondReader.cancel();
+    }
   });
 
   it('resolves a pending command from the results route', async () => {
@@ -378,7 +463,7 @@ describe('Phone routes', () => {
       now: () => new Date('2026-09-09T12:00:00.000Z'),
     });
     const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
-    const stream = await fetch(`${base}/v1/phone/commands`);
+    const stream = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
     const pending = bridge.dispatch({ kind: 'sms', to: 'Sarah', body: 'late' });
     const reader = stream.body?.getReader();
     const chunk = await reader?.read();
