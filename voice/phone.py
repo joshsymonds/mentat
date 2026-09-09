@@ -205,11 +205,6 @@ class PhoneActions:
         self._key = key
         self._candidates: list[Place] = []
 
-    @property
-    def candidates(self) -> tuple[Place, ...]:
-        """The current selectable places, exposed read-only for integrations."""
-        return tuple(self._candidates)
-
     async def find_places(self, query: str, locality: str = "") -> str:
         """Search nearby places, retaining candidates only after valid parsing."""
         self._candidates.clear()
@@ -243,7 +238,9 @@ class PhoneActions:
         except asyncio.TimeoutError:
             return PHONE_UNREACHABLE
         except (TypeError, ValueError):
-            return LOCATION_UNAVAILABLE
+            if not locality.strip():
+                return LOCATION_UNAVAILABLE
+            origin = None
 
         search_query = query if origin is not None else f"{query} in {locality.strip()}"
         url, headers, body = places_request(search_query, origin, self._key)

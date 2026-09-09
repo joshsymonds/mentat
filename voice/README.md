@@ -153,10 +153,10 @@ message directly. `open` accepts absolute `http` and `https` URLs only.
 {"lat":45.5,"lng":-122.6,"accuracy_m":12.0,"age_s":1.2}
 ```
 
-The location policy accepts a current fused fix no older than five seconds. If
-that is unavailable, it accepts last-known location no older than ten minutes.
-It returns error 1602 when neither is available or no location permission is
-granted. Location is used for the current search only and is not persisted.
+The phone requests a current fused fix and waits at most five seconds for it. If
+none arrives, it falls back to the last-known location, accepted only when at
+most ten minutes old. Otherwise it returns error 1602. Location is used for the
+current search only and is not persisted.
 
 RPC errors are handled as spoken outcomes by the front:
 

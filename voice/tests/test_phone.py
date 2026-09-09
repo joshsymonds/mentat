@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from phone import (  # noqa: E402
+from phone import (
     ALARM_SET,
     DIAL_READY,
     LINK_OPENED,
@@ -315,6 +315,30 @@ class PhoneActionsTest(unittest.TestCase):
         self.assertEqual(
             self.phone.rpc_calls[0], ("pixel-shrike", "mentat.location", "{}", 10.0)
         )
+
+    def test_malformed_location_with_locality_searches_without_origin(self):
+        self.phone.response = "not json"
+        self.http.response = {
+            "places": [
+                {
+                    "id": "coffee",
+                    "displayName": {"text": "Cambridge Coffee"},
+                    "formattedAddress": "1 Main Street, Cambridge",
+                    "location": {"latitude": 52.2, "longitude": 0.1},
+                }
+            ]
+        }
+        result = run(self.actions.find_places("coffee", "Cambridge"))
+        self.assertEqual(result, "I found Cambridge Coffee on 1 Main Street.")
+        self.assertEqual(len(self.http.calls), 1)
+        self.assertEqual(self.http.calls[0][2]["textQuery"], "coffee in Cambridge")
+        self.assertNotIn("locationBias", self.http.calls[0][2])
+        self.assertNotIn("miles away", result)
+
+    def test_malformed_location_without_locality_does_not_call_http(self):
+        self.phone.response = "not json"
+        self.assertEqual(run(self.actions.find_places("coffee")), LOCATION_UNAVAILABLE)
+        self.assertEqual(self.http.calls, [])
 
     def test_http_failure_or_malformed_json_is_places_failed(self):
         self.http.error = RuntimeError("HTTP 500")

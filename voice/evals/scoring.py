@@ -31,7 +31,6 @@ PHONE_TOOL_NAMES = (
     "set_timer",
     "open_link",
 )
-KNOWN_TOOL_NAMES = (TOOL_NAME, *PHONE_TOOL_NAMES)
 
 #: The decisions the eval measures, plus the verdict for a response that is
 #: neither: an empty turn, an unknown or mixed tool call, or a failed request.
