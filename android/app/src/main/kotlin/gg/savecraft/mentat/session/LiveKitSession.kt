@@ -30,7 +30,7 @@ interface LiveKitSession {
 
     suspend fun connect(url: String, token: String)
 
-    fun setPhoneBridge(bridge: PhoneBridge) {}
+    fun registerPhoneBridge(bridge: PhoneBridge)
 
     suspend fun setMicEnabled(enabled: Boolean)
 
@@ -67,7 +67,6 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
     private val mutableTranscripts = MutableSharedFlow<TranscriptSegment>(extraBufferCapacity = 8)
     private var disconnected = false
     private var closed = false
-    private var phoneBridge: PhoneBridge? = null
 
     override val events: Flow<LiveKitEvent> = mutableEvents.asSharedFlow()
     override val transcripts: Flow<TranscriptSegment> = mutableTranscripts.asSharedFlow()
@@ -93,13 +92,12 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
         }
     }
 
-    override fun setPhoneBridge(bridge: PhoneBridge) {
-        phoneBridge = bridge
+    override fun registerPhoneBridge(bridge: PhoneBridge) {
+        bridge.register(room.localParticipant)
     }
 
     override suspend fun connect(url: String, token: String) {
         room.connect(url, token)
-        phoneBridge?.register(room.localParticipant)
     }
 
     override suspend fun setMicEnabled(enabled: Boolean) {

@@ -12,6 +12,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.shadows.ShadowLog
 import org.robolectric.annotation.Config
 
 @Config(sdk = [35])
@@ -170,6 +171,23 @@ class PhoneCommandsTest {
         }.exceptionOrNull()
 
         assertEquals(1601, (error as PhoneRpcException).code)
+    }
+
+    @Test
+    fun bridgeSuccessLogDoesNotExposeIntentData() {
+        ShadowLog.clear()
+        val bridge = PhoneBridge(location = null, launcher = {})
+        bridge.assistVisible = true
+
+        bridge.handleCommand(
+            """{"kind":"open","url":"https://example.invalid/p?marker=PHONE_LOG_SECRET"}""",
+        )
+
+        assertTrue(
+            ShadowLog.getLogsForTag("MentatAssist").none {
+                it.msg.contains("PHONE_LOG_SECRET")
+            },
+        )
     }
 
     @Test

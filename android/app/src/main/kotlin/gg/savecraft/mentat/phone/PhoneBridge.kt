@@ -56,7 +56,7 @@ class PhoneBridge(
                 exception,
             )
         }
-        Log.i(TAG, "command launched action=${intent.action} data=${intent.data}")
+        Log.i(TAG, "command launched action=${intent.action}")
         return "{\"ok\":true}"
     }
 

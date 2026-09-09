@@ -5,6 +5,7 @@ import android.os.SystemClock
 import androidx.test.core.app.ApplicationProvider
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -68,6 +69,8 @@ class PhoneLocationTest {
         val error = runCatching { phoneLocation.get() }.exceptionOrNull()
 
         assertEquals(1602, (error as PhoneRpcException).code)
+        assertFalse(source.currentCalled)
+        assertFalse(source.lastKnownCalled)
     }
 
     private fun grantLocation() {
@@ -92,6 +95,7 @@ class PhoneLocationTest {
     ) : LocationSource {
         var currentTimeoutMs: Long? = null
         var currentCalled = false
+        var lastKnownCalled = false
 
         override fun current(timeoutMs: Long): Location? {
             currentCalled = true
@@ -100,6 +104,9 @@ class PhoneLocationTest {
             return currentLocation
         }
 
-        override fun lastKnown(): Location? = lastKnownLocation
+        override fun lastKnown(): Location? {
+            lastKnownCalled = true
+            return lastKnownLocation
+        }
     }
 }

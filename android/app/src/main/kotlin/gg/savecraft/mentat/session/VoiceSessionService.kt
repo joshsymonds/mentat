@@ -43,17 +43,13 @@ open class VoiceSessionService : Service() {
     val micEnabled: StateFlow<Boolean>
         get() = controller.micEnabled
 
-    val phoneBridge: PhoneBridge
-        get() = bridge
-
     override fun onCreate() {
         super.onCreate()
         bridge = phoneBridge()
-        val session = liveKitSession()
-        session.setPhoneBridge(bridge)
         controller = VoiceSessionController(
             tokenEndpoint = tokenEndpoint(),
-            liveKitSession = session,
+            liveKitSession = liveKitSession(),
+            phoneBridge = bridge,
             stopService = ::stopVoiceService,
             scope = serviceScope,
         )
@@ -153,6 +149,7 @@ open class VoiceSessionService : Service() {
 internal class VoiceSessionController(
     private val tokenEndpoint: TokenEndpoint,
     private val liveKitSession: LiveKitSession,
+    private val phoneBridge: PhoneBridge,
     private val stopService: () -> Unit,
     private val scope: CoroutineScope,
 ) {
@@ -189,6 +186,7 @@ internal class VoiceSessionController(
         transition(SessionEvent.TokenReceived(grant))
         try {
             liveKitSession.connect(grant.url, grant.token)
+            liveKitSession.registerPhoneBridge(phoneBridge)
             liveKitSession.setMicEnabled(true)
             mutableMicEnabled.value = true
         } catch (exception: Exception) {

@@ -92,7 +92,7 @@ class AssistActivityTest {
 
     private fun assertLocationPermissionDecisionStartsSession(results: IntArray) {
         grantRecordAudio()
-        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().get()
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
         val request = Shadows.shadowOf(activity).lastRequestedPermission
 
         assertEquals(
@@ -105,6 +105,8 @@ class AssistActivityTest {
             results,
         )
         assertEquals(VOICE_SERVICE, startedServiceClassName())
+        assertNull(Shadows.shadowOf(application).nextStoppedService)
+        assertTrue(Shadows.shadowOf(application).boundServiceConnections.isNotEmpty())
     }
 
     @Test

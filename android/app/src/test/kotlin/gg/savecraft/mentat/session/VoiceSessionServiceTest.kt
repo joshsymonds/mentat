@@ -1,6 +1,7 @@
 package gg.savecraft.mentat.session
 
 import android.content.Intent
+import android.os.Looper
 import gg.savecraft.mentat.core.SessionState
 import gg.savecraft.mentat.core.TokenEndpoint
 import gg.savecraft.mentat.core.TokenFetchException
@@ -16,6 +17,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertSame
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -32,13 +34,16 @@ class VoiceSessionServiceTest {
     @Test
     fun happyPathFetchesTokenConnectsAndPublishesMicrophone() = runBlocking {
         val liveKit = FakeLiveKitSession()
-        val service = controller(liveKit)
+        val phoneBridge = PhoneBridge(location = null, launcher = {})
+        val service = controller(liveKit, phoneBridge = phoneBridge)
 
         service.start()
         liveKit.events.emit(LiveKitEvent.Connected)
 
         assertEquals(SessionState.Live, service.state.value)
         assertEquals("wss://voice.example.com" to "token", liveKit.connection)
+        assertSame(phoneBridge, liveKit.registeredPhoneBridge)
+        assertEquals(listOf("connect", "register", "mic"), liveKit.callOrder)
         assertTrue(liveKit.microphoneEnabled.value)
         assertTrue(service.micEnabled.value)
     }
@@ -60,6 +65,8 @@ class VoiceSessionServiceTest {
         service.start()
 
         assertEquals(SessionState.Failed("connection refused"), service.state.value)
+        assertNull(liveKit.registeredPhoneBridge)
+        assertEquals(listOf("connect"), liveKit.callOrder)
     }
 
     @Test
@@ -103,12 +110,24 @@ class VoiceSessionServiceTest {
 
     @Test
     fun serviceWiresPhoneBridgeBeforeStartingTheSession() {
-        val liveKit = FakeLiveKitSession()
+        val liveKit = FakeLiveKitSession(connectEvent = LiveKitEvent.Connected)
         FakeLiveKitVoiceSessionService.liveKit = liveKit
 
-        Robolectric.buildService(FakeLiveKitVoiceSessionService::class.java).create().get()
+        val service = Robolectric
+            .buildService(FakeLiveKitVoiceSessionService::class.java)
+            .create()
+            .get()
+        service.onStartCommand(Intent(), 0, 1)
+        repeat(100) {
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            if (liveKit.callOrder.size == 3) {
+                return@repeat
+            }
+            Thread.sleep(10)
+        }
 
         assertTrue(liveKit.registeredPhoneBridge != null)
+        assertEquals(listOf("connect", "register", "mic"), liveKit.callOrder)
     }
 
     @Test
@@ -232,10 +251,12 @@ class VoiceSessionServiceTest {
     private fun controller(
         liveKitSession: FakeLiveKitSession,
         tokenEndpoint: TokenEndpoint = FakeTokenEndpoint,
+        phoneBridge: PhoneBridge = PhoneBridge(location = null, launcher = {}),
         stopService: () -> Unit = {},
     ) = VoiceSessionController(
         tokenEndpoint = tokenEndpoint,
         liveKitSession = liveKitSession,
+        phoneBridge = phoneBridge,
         stopService = stopService,
         scope = scope,
     )
@@ -268,17 +289,22 @@ class VoiceSessionServiceTest {
         var disconnected = false
         var closed = false
 
+        val callOrder = mutableListOf<String>()
+
         override suspend fun connect(url: String, token: String) {
+            callOrder += "connect"
             connectFailure?.let { throw it }
             connection = url to token
             connectEvent?.let { events.emit(it) }
         }
 
-        override fun setPhoneBridge(bridge: PhoneBridge) {
+        override fun registerPhoneBridge(bridge: PhoneBridge) {
+            callOrder += "register"
             registeredPhoneBridge = bridge
         }
 
         override suspend fun setMicEnabled(enabled: Boolean) {
+            callOrder += "mic"
             setMicFailure?.let { throw it }
             microphoneEnabled.value = enabled
         }
@@ -311,7 +337,11 @@ class VoiceSessionServiceTest {
     }
 
     class FakeLiveKitVoiceSessionService : VoiceSessionService() {
+        override fun tokenEndpoint(): TokenEndpoint = FakeTokenEndpoint
+
         override fun liveKitSession(): LiveKitSession = liveKit
+
+        override fun startForegroundNotification() {}
 
         companion object {
             lateinit var liveKit: FakeLiveKitSession
