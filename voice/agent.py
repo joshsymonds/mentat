@@ -69,6 +69,24 @@ DEFAULT_MENTAT_URL = "http://127.0.0.1:8484"
 # than no eval, so the two read the name from one place.
 FRONT_MODEL = "openai/gpt-5.6-luna"
 
+# Words Flux mishears on its own — "Mentat" came back as "man, uh". Keyterm
+# prompting boosts recall of exactly these; Deepgram caps the list at 100
+# terms totalling 1200 characters, and the terms are plain words, no weights.
+STT_KEYTERMS = [
+    "Mentat",
+    "Luna",
+    "Josh",
+    "ultraviolet",
+    "gnomon",
+    "vermissian",
+    "ninuan",
+    "bluedesert",
+    "echelon",
+    "Home Assistant",
+    "Tailscale",
+    "LiveKit",
+]
+
 # A consult legitimately runs for minutes while the daemon uses tools; only the
 # connect and the gap between chunks are bounded.
 TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_read=600)
@@ -292,7 +310,11 @@ async def entrypoint(ctx: JobContext) -> None:
         # The docs' two-argument form is the one agents 1.6.10 takes:
         # "deepgram/flux-general" is a model literal it knows and `language`
         # is a separate keyword, not a ":en" suffix on the model string.
-        stt=inference.STT("deepgram/flux-general", language="en"),
+        stt=inference.STT(
+            "deepgram/flux-general",
+            language="en",
+            extra_kwargs={"keyterm": STT_KEYTERMS},
+        ),
         # Luna is the front's own voice, fast enough to hold a conversation
         # with the depth delegated to ask_mentat.
         #
