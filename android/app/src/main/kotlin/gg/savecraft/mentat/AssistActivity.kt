@@ -50,6 +50,7 @@ open class AssistActivity : ComponentActivity() {
     private var stateJob: Job? = null
     private var transcriptJob: Job? = null
     private var micJob: Job? = null
+    private var activityStarted = false
 
     internal val uiState: StateFlow<SessionState> = mutableUiState.asStateFlow()
 
@@ -58,7 +59,7 @@ open class AssistActivity : ComponentActivity() {
     ) { granted ->
         if (granted) {
             startAndBindVoiceService()
-            requestPhonePermissionsIfNeeded()
+            requestLocationPermissions()
         } else {
             mutableUiState.value = SessionStateMachine().transition(SessionEvent.PermissionDenied)
             requestPhonePermissionsIfNeeded()
@@ -69,9 +70,22 @@ open class AssistActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { }
 
+    // Android runs one runtime-permission request at a time, so the phone permissions
+    // wait for the location decision, which itself waits for the microphone decision.
+    // A cancelled request (the platform's answer to a concurrent one) carries no
+    // decision and does not continue the chain; the next launch asks again.
+    private val locationPermissionRequest = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { results ->
+        if (results.isNotEmpty()) {
+            requestPhonePermissionsIfNeeded()
+        }
+    }
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             service = (binder as VoiceSessionService.LocalBinder).service()
+            service!!.setAssistVisible(activityStarted)
             stateJob = activityScope.launch {
                 service!!.state.collect { mutableUiState.value = it }
             }
@@ -123,6 +137,18 @@ open class AssistActivity : ComponentActivity() {
         setIntent(intent)
         logAssistIntent()
         beginVoiceSession()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        activityStarted = true
+        service?.setAssistVisible(true)
+    }
+
+    override fun onStop() {
+        activityStarted = false
+        service?.setAssistVisible(false)
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -177,6 +203,7 @@ open class AssistActivity : ComponentActivity() {
     private fun beginVoiceSession() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             startAndBindVoiceService()
+            requestLocationPermissions()
         } else {
             permissionRequest.launch(Manifest.permission.RECORD_AUDIO)
         }
@@ -191,10 +218,6 @@ open class AssistActivity : ComponentActivity() {
     }
 
     private fun beginPhoneBridge() {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            requestPhonePermissionsIfNeeded()
-        }
-
         if (!Settings.canDrawOverlays(this)) {
             runCatching {
                 startActivity(
@@ -225,6 +248,15 @@ open class AssistActivity : ComponentActivity() {
         } catch (exception: Exception) {
             Log.w("MentatAssist", "Unable to start phone command service", exception)
         }
+    }
+
+    private fun requestLocationPermissions() {
+        locationPermissionRequest.launch(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+            ),
+        )
     }
 
     private fun startAndBindVoiceService() {

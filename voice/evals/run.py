@@ -27,6 +27,7 @@ no recipe.
 
 from __future__ import annotations
 
+import os
 import argparse
 import asyncio
 import sys
@@ -44,6 +45,7 @@ from livekit.agents.llm.utils import parse_function_arguments
 from livekit.agents.voice.generation import update_instructions
 
 import agent
+from request import PRIVATE_CONTEXT_ENV, load_private_context, with_private_context
 from scoring import (
     Response,
     Result,
@@ -142,6 +144,10 @@ async def run_all(
     sockets.
     """
     instructions, voice_card = agent.load_persona()
+    # The same fold production does, so an eval with MENTAT_VOICE_PRIVATE set
+    # scores the persona the room actually hears; unset scores the public one.
+    private = load_private_context(os.environ.get(PRIVATE_CONTEXT_ENV))
+    instructions = with_private_context(instructions, private)
     # Constructed exactly as entrypoint constructs it. Nothing here consults —
     # the tool is declared to the model and never executed — but a stand-in
     # front would be a second definition of the thing under measurement.
@@ -150,6 +156,9 @@ async def run_all(
         voice_card=voice_card,
         room_name="eval",
         mentat_url=agent.DEFAULT_MENTAT_URL,
+        # The eval never speaks, so nothing is respelled; the argument is
+        # required because production always passes the private context's.
+        pronunciations={},
     )
     model = LLM(model_name)
     limit = asyncio.Semaphore(concurrency)

@@ -323,6 +323,22 @@ let
     pythonImportsCheck = [ "livekit.plugins.silero" ];
   };
 
+  # Self-hosted noise suppression (DTLN, MIT) run in-process on the agent's
+  # inbound audio. LiveKit's own Krisp models need LiveKit Cloud transport,
+  # which this SFU is not. The ~4MB ONNX weights ship inside the wheel.
+  livekit-plugins-dtln = wheelPackage {
+    pname = "livekit-plugins-dtln";
+    wheelName = "livekit_plugins_dtln";
+    version = "0.1.5";
+    hash = "sha256-lc8OrAug6ChDUii1p7GRvyXITodpJf9KmtvohVWsk0Q=";
+    dependencies = [
+      livekit-agents
+      py.numpy
+      py.onnxruntime
+    ];
+    pythonImportsCheck = [ "livekit.plugins.dtln" ];
+  };
+
 in
 assert pythonVersionOk;
 
@@ -331,6 +347,7 @@ assert pythonVersionOk;
 (pkgs.python3.withPackages (_: [
   livekit-agents
   livekit-plugins-silero
+  livekit-plugins-dtln
 ])).overrideAttrs
   (old: {
     # Nix builds are sandboxed without network access, so loading the VAD here
@@ -344,7 +361,7 @@ assert pythonVersionOk;
       from importlib.resources import files
 
       import livekit.agents
-      from livekit.plugins import silero
+      from livekit.plugins import dtln, silero
 
       assert livekit.agents.__version__.startswith("1.6."), livekit.agents.__version__
 
@@ -353,6 +370,9 @@ assert pythonVersionOk;
       assert str(onnx).startswith("/nix/store/"), f"silero_vad.onnx outside the store: {onnx}"
 
       silero.VAD.load()
+      # Same proof for the DTLN weights: constructing the processor runs its
+      # warmup pass, which needs both ONNX files out of the store.
+      dtln.noise_suppression()
       PY
     '';
   })

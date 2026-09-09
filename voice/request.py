@@ -15,7 +15,10 @@ next to voice/stream.py. Everything agent.py does beyond this is glue.
 
 from __future__ import annotations
 
+import tomllib
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 #: mentat session ids are namespaced so a daemon shared with other surfaces
@@ -53,6 +56,68 @@ CONSULT_TURN_CHARS = 500
 #: written by hand and the split has to survive editing around it.
 VOICE_CARD_MARKER = "---VOICE-CARD---"
 
+#: Environment variable naming the private-context file (see PrivateContext).
+PRIVATE_CONTEXT_ENV = "MENTAT_VOICE_PRIVATE"
+
+
+@dataclass(frozen=True)
+class PrivateContext:
+    """What the front knows about Josh that must never sit in the repository.
+
+    The repository is public, so persona.md carries the voice and nothing
+    about the person. This file — a TOML document deployed as a secret,
+    never a store path — carries the rest: a paragraph of who he is for the
+    instructions, the names that speech recognition should expect, and the
+    words the synthesizer says wrong from the spelling alone.
+    """
+
+    about: str = ""
+    keyterms: tuple[str, ...] = ()
+    pronunciations: Mapping[str, str] = field(default_factory=dict)
+
+
+def parse_private_context(text: str) -> PrivateContext:
+    """The private-context TOML: `about`, `keyterms`, `[pronunciations]`."""
+    data = tomllib.loads(text)
+    unknown = set(data) - {"about", "keyterms", "pronunciations"}
+    if unknown:
+        raise ValueError(f"private context has unknown keys: {sorted(unknown)}")
+    about = data.get("about", "")
+    keyterms = data.get("keyterms", [])
+    pronunciations = data.get("pronunciations", {})
+    if not isinstance(about, str):
+        raise ValueError("private context: about must be a string")
+    if not isinstance(keyterms, list) or not all(isinstance(k, str) for k in keyterms):
+        raise ValueError("private context: keyterms must be a list of strings")
+    if not isinstance(pronunciations, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in pronunciations.items()
+    ):
+        raise ValueError("private context: pronunciations must map strings to strings")
+    return PrivateContext(
+        about=about.strip(),
+        keyterms=tuple(keyterms),
+        pronunciations=dict(pronunciations),
+    )
+
+
+def load_private_context(path: str | None) -> PrivateContext:
+    """The private context at `path`, or an empty one when no path is set.
+
+    Empty is a supported deployment (a dev room, CI, a fresh host): the voice
+    still works, it just knows no one. A path that is set but unreadable is
+    not — that is a broken deploy and raises.
+    """
+    if not path:
+        return PrivateContext()
+    return parse_private_context(Path(path).read_text())
+
+
+def with_private_context(instructions: str, private: PrivateContext) -> str:
+    """The front's instructions with the private paragraph folded in."""
+    if not private.about:
+        return instructions
+    return f"{instructions}\n\n{private.about}"
+
 
 def count_user_messages(items: Iterable[Any]) -> int:
     """How many user messages the chat context holds right now."""
@@ -74,6 +139,22 @@ def conversation_advanced(items: Iterable[Any], users_at_dispatch: int) -> bool:
     afterwards, has to be reoriented before it is spoken.
     """
     return count_user_messages(items) > users_at_dispatch
+
+
+def without_last_user_message(items: Iterable[Any]) -> list[Any]:
+    """The chat items with the most recent user message removed.
+
+    What a not_for_me call erases: the line that turned out not to be for
+    the front. Only that one — the reply it would have gotten never exists,
+    since the tool stops the response before anything is generated.
+    """
+    kept = list(items)
+    for index in range(len(kept) - 1, -1, -1):
+        item = kept[index]
+        if getattr(item, "type", None) == "message" and item.role == "user":
+            del kept[index]
+            break
+    return kept
 
 
 def recent_turns(

@@ -19,6 +19,7 @@
     fileset = lib.fileset.unions [
       ../voice/agent.py
       ../voice/persona.md
+      ../voice/phone.py
       ../voice/request.py
       ../voice/stream.py
       ../voice/assets/earcon.wav
@@ -132,7 +133,20 @@ in {
 
       environmentFile = lib.mkOption {
         type = lib.types.str;
-        description = "EnvironmentFile supplying LIVEKIT_API_KEY/SECRET and LIVEKIT_INFERENCE_API_KEY/SECRET. An agenix-decrypted path, never a store path.";
+        description = "EnvironmentFile supplying LIVEKIT_API_KEY/SECRET and LIVEKIT_INFERENCE_API_KEY/SECRET; it may also carry the optional MENTAT_PLACES_API_KEY. An agenix-decrypted path, never a store path.";
+      };
+
+      privateContextFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          TOML file of what the voice knows about its person — `about`
+          (a paragraph folded into the instructions), `keyterms` (names for
+          speech recognition), `[pronunciations]` (word = respelling for the
+          synthesizer). The repository is public, so this never lives in it:
+          an agenix-decrypted path, root-readable, handed to the unit as a
+          systemd credential. Null means the voice knows no one.
+        '';
       };
     };
   };
@@ -292,6 +306,11 @@ in {
         # the daemon's: nothing here belongs next to the SDK's ~/.claude.
         HOME = "/var/lib/mentat-voice";
         XDG_CACHE_HOME = "/var/lib/mentat-voice/cache";
+      } // lib.optionalAttrs (cfg.voice.privateContextFile != null) {
+        # %d is systemd's credentials directory, populated by LoadCredential
+        # below and readable by the transient user — the only way a
+        # root-owned secret reaches a DynamicUser service.
+        MENTAT_VOICE_PRIVATE = "%d/private";
       };
 
       serviceConfig = {
@@ -308,6 +327,8 @@ in {
         RestartSec = "5s";
 
         EnvironmentFile = cfg.voice.environmentFile;
+        LoadCredential = lib.optional (cfg.voice.privateContextFile != null)
+          "private:${cfg.voice.privateContextFile}";
         # `start` is the agents CLI's production mode (dev enables reload and
         # debug logging). livekit-agents ships no console script, so the
         # interpreter runs the file directly.

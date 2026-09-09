@@ -35,15 +35,25 @@ class AssistActivityTest {
     @Before
     fun resetPermission() {
         application = ApplicationProvider.getApplicationContext()
+        // Every permission the activity may request starts denied.
         Shadows.shadowOf(application).denyPermissions(
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.SEND_SMS,
             Manifest.permission.READ_CONTACTS,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
         )
     }
 
+    /**
+     * With every permission missing, the microphone is asked first and the location
+     * request follows its grant. The location-to-phone step is covered by
+     * [phonePermissionsAreRequestedWhenMissing]: a request chained behind one answered
+     * through onRequestPermissionsResult is cancelled by the platform's one-at-a-time
+     * rule, so it cannot be answered in the same test.
+     */
     @Test
-    fun allDeniedPermissionsRequestAudioBeforePhonePermissions() {
+    fun allDeniedPermissionsRequestAudioThenLocation() {
         val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
 
         val audioRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
@@ -59,10 +69,10 @@ class AssistActivityTest {
         assertTrue(startedServices.contains(VOICE_SERVICE))
         assertTrue(startedServices.contains(PHONE_SERVICE))
         assertTrue(Shadows.shadowOf(application).boundServiceConnections.isNotEmpty())
-        val phoneRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        val locationRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
         assertArrayEquals(
-            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS),
-            phoneRequest.requestedPermissions,
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            locationRequest.requestedPermissions,
         )
     }
 
@@ -112,7 +122,12 @@ class AssistActivityTest {
     fun phonePermissionsAreRequestedWhenMissing() {
         grantRecordAudio()
 
-        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().get()
+        // Result callbacks bind on start, so the chained request needs a started activity.
+        // A result delivered through onRequestPermissionsResult leaves the platform's
+        // one-request-at-a-time flag set, so the follow-up request is recorded by the
+        // shadow and then cancelled: lastRequestedPermission shows the attempt.
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+        answerLocationRequest(activity)
 
         val request = Shadows.shadowOf(activity).lastRequestedPermission
         assertArrayEquals(
@@ -129,9 +144,15 @@ class AssistActivityTest {
             Manifest.permission.READ_CONTACTS,
         )
 
-        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().get()
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+        answerLocationRequest(activity)
 
-        assertNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        // The location request stays the last one: nothing followed it.
+        val request = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        assertArrayEquals(
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            request.requestedPermissions,
+        )
     }
 
     @Test
@@ -209,6 +230,65 @@ class AssistActivityTest {
             android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
             serviceInfo.foregroundServiceType,
         )
+    }
+
+    @Test
+    fun microphoneGrantStartsSessionBeforeRequestingLocationPermissions() {
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+        val microphoneRequest = Shadows.shadowOf(activity).lastRequestedPermission
+
+        activity.onRequestPermissionsResult(
+            microphoneRequest.requestCode,
+            microphoneRequest.requestedPermissions,
+            intArrayOf(PackageManager.PERMISSION_GRANTED),
+        )
+
+        val locationRequest = Shadows.shadowOf(activity).lastRequestedPermission
+        assertTrue(startedServiceClassNames().contains(VOICE_SERVICE))
+        assertEquals(
+            listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            locationRequest.requestedPermissions.toList(),
+        )
+    }
+
+    @Test
+    fun preciseLocationPermissionDecisionStartsVoiceService() {
+        assertLocationPermissionDecisionStartsSession(
+            intArrayOf(PackageManager.PERMISSION_GRANTED, PackageManager.PERMISSION_GRANTED),
+        )
+    }
+
+    @Test
+    fun approximateLocationPermissionDecisionStartsVoiceService() {
+        assertLocationPermissionDecisionStartsSession(
+            intArrayOf(PackageManager.PERMISSION_DENIED, PackageManager.PERMISSION_GRANTED),
+        )
+    }
+
+    @Test
+    fun deniedLocationPermissionDecisionStartsVoiceService() {
+        assertLocationPermissionDecisionStartsSession(
+            intArrayOf(PackageManager.PERMISSION_DENIED, PackageManager.PERMISSION_DENIED),
+        )
+    }
+
+    private fun assertLocationPermissionDecisionStartsSession(results: IntArray) {
+        grantRecordAudio()
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+        val request = Shadows.shadowOf(activity).lastRequestedPermission
+
+        assertEquals(
+            listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            request.requestedPermissions.toList(),
+        )
+        activity.onRequestPermissionsResult(
+            request.requestCode,
+            request.requestedPermissions,
+            results,
+        )
+        assertEquals(VOICE_SERVICE, startedServiceClassName())
+        assertNull(Shadows.shadowOf(application).nextStoppedService)
+        assertTrue(Shadows.shadowOf(application).boundServiceConnections.isNotEmpty())
     }
 
     @Test
@@ -346,6 +426,16 @@ class AssistActivityTest {
 
     private fun grantRecordAudio() {
         Shadows.shadowOf(application).grantPermissions(Manifest.permission.RECORD_AUDIO)
+    }
+
+    /** Delivers a denied location decision so the phone-permission request that follows it can run. */
+    private fun answerLocationRequest(activity: AssistActivity) {
+        val request = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        activity.onRequestPermissionsResult(
+            request.requestCode,
+            request.requestedPermissions,
+            IntArray(request.requestedPermissions.size) { PackageManager.PERMISSION_DENIED },
+        )
     }
 
     private fun grantPhonePermissions() {

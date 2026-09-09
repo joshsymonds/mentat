@@ -24,11 +24,11 @@ sys.path.insert(0, str(VOICE / "evals"))
 
 from request import CONSULT_WINDOW_TURNS
 from scoring import (
-    ARG_KEYS,
     CONSULT,
     DIRECT,
     HISTORY_TURNS,
     INVALID,
+    PHONE_TOOL_NAMES,
     SKIP_CATEGORY,
     TOOL_NAME,
     Response,
@@ -109,9 +109,17 @@ class ScenarioSchemaTest(unittest.TestCase):
             parse_scenario(scenario(expected="consult"), "line 2")
         self.assertIn("expected", str(caught.exception))
 
-    def test_expect_must_be_consult_or_direct(self):
+    def test_expect_accepts_consult_direct_and_known_phone_tools(self):
+        for expected in (CONSULT, DIRECT, *PHONE_TOOL_NAMES):
+            with self.subTest(expected=expected):
+                parsed = parse_scenario(scenario(expect=expected), "line 3")
+                self.assertEqual(parsed.expect, expected)
         with self.assertRaises(ScenarioError):
             parse_scenario(scenario(expect="maybe"), "line 3")
+
+    def test_expect_rejects_unknown_tool_names(self):
+        with self.assertRaises(ScenarioError):
+            parse_scenario(scenario(expect="search_web"), "line 3")
 
     def test_empty_strings_are_errors(self):
         for field in ("id", "category", "utterance", "note"):
@@ -138,11 +146,20 @@ class ScenarioSchemaTest(unittest.TestCase):
         with self.assertRaises(ScenarioError):
             parse_scenario(scenario(history=[*ok, ["user", "three"]]), "line 7")
 
-    def test_expect_args_keys_are_the_tools_own_knobs(self):
+    def test_expect_args_keys_are_the_expected_tools_own_knobs(self):
         with self.assertRaises(ScenarioError) as caught:
             parse_scenario(scenario(expect_args={"temperature": "hot"}), "line 8")
         self.assertIn("temperature", str(caught.exception))
-        self.assertEqual(ARG_KEYS, ("effort", "model"))
+        parsed = parse_scenario(
+            scenario(expect="find_places", expect_args={"locality": "Beaverton"}),
+            "line 8",
+        )
+        self.assertEqual(parsed.expect_args, {"locality": "Beaverton"})
+        with self.assertRaises(ScenarioError):
+            parse_scenario(
+                scenario(expect="find_places", expect_args={"choice": "2"}),
+                "line 8",
+            )
 
     def test_expect_args_on_a_direct_scenario_is_an_error(self):
         # Nothing to check them against: a direct answer calls no tool, so the
@@ -210,7 +227,21 @@ class RealScenarioFileTest(unittest.TestCase):
 
     def test_both_decisions_are_represented(self):
         expectations = {s.expect for s in self.scenarios if s.scored}
-        self.assertEqual(expectations, {CONSULT, DIRECT})
+        self.assertEqual(expectations, {CONSULT, DIRECT, *PHONE_TOOL_NAMES})
+
+    def test_phone_category_has_the_required_scenarios(self):
+        phone = [s for s in self.scenarios if s.category == "phone"]
+        self.assertGreaterEqual(len(phone), 12)
+        self.assertTrue(any(s.expect == "find_places" for s in phone))
+        self.assertTrue(
+            any(
+                s.expect == "navigate_to" and s.expect_args == {"choice": "2"}
+                for s in phone
+            )
+        )
+        self.assertTrue(
+            any(s.expect == "find_places" and s.expect_args.get("locality") for s in phone)
+        )
 
     def test_the_named_categories_are_covered(self):
         # The categories the epic asks for by name; a file that quietly lost
@@ -252,6 +283,11 @@ class ClassifyTest(unittest.TestCase):
     def test_plain_text_is_a_direct_answer(self):
         self.assertEqual(classify(Response(text="Rome, and it's not close.")), DIRECT)
 
+    def test_each_known_phone_tool_classifies_as_its_own_name(self):
+        for name in PHONE_TOOL_NAMES:
+            with self.subTest(name=name):
+                self.assertEqual(classify(Response(tool_calls=(ToolCall(name, {}),))), name)
+
     def test_a_holding_line_before_the_call_is_still_a_consult(self):
         # The front often says something while reaching for the tool; the text
         # riding along with the call must not read as an answer.
@@ -266,6 +302,20 @@ class ClassifyTest(unittest.TestCase):
         # mute as a pass.
         self.assertEqual(classify(Response()), INVALID)
         self.assertEqual(classify(Response(text="   ")), INVALID)
+
+    def test_a_response_with_expected_tool_and_another_tool_is_invalid(self):
+        self.assertEqual(
+            classify(
+                Response(
+                    tool_calls=(
+                        ToolCall("find_places", {"query": "Trader Joe's"}),
+                        ToolCall(TOOL_NAME, {"question": "q?"}),
+                    )
+                )
+            ),
+            INVALID,
+    PHONE_TOOL_NAMES,
+        )
 
     def test_a_call_to_some_other_tool_is_neither(self):
         # Only ask_mentat is declared, so this is a hallucinated name; it is
@@ -318,6 +368,22 @@ class JudgeTest(unittest.TestCase):
     def test_an_invalid_response_is_a_miss_either_way(self):
         self.assertFalse(judge(self.CONSULT_CASE, Response()).hit)
         self.assertFalse(judge(self.DIRECT_CASE, Response()).hit)
+
+    def test_expected_phone_arguments_must_match(self):
+        phone_case = Scenario(
+            id="phone-pick",
+            category="phone",
+            utterance="the second one",
+            expect="navigate_to",
+            note="pick the listed place",
+            expect_args={"choice": "2"},
+        )
+        self.assertTrue(
+            judge(phone_case, Response(tool_calls=(ToolCall("navigate_to", {"choice": "2"}),))).hit
+        )
+        self.assertFalse(
+            judge(phone_case, Response(tool_calls=(ToolCall("navigate_to", {"choice": "1"}),))).hit
+        )
 
     def test_expected_arguments_must_match(self):
         self.assertTrue(

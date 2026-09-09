@@ -14,6 +14,8 @@ dispatching the consult, and a pad plays under it until the answer lands
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Mapping
 
 
 class TurnError(Exception):
@@ -96,3 +98,55 @@ class TurnStream:
         # than this adapter: nothing to say, and forward compatibility means a
         # newer daemon must not break the turn.
         return None
+
+
+class Respeller:
+    """Rewrites whole words on their way to the TTS, and only there.
+
+    A name the voice mispronounces is fixed by handing the synthesizer a
+    respelling ("Symonds" -> "Sigh-monds") while the caption keeps the real
+    spelling — the transcript is produced from the model's text, not from
+    what the TTS was given, so the substitution never shows on a screen.
+
+    Text arrives in model-sized chunks that split words anywhere, so a
+    trailing run of word characters is held back until the next chunk or
+    flush decides where the word ends. Matching is whole-word and
+    case-sensitive: an entry for "Symonds" leaves "symonds" and "Symondson"
+    alone.
+    """
+
+    _pattern: re.Pattern[str] | None
+    _tail: str
+
+    def __init__(self, respellings: Mapping[str, str]) -> None:
+        self._map = dict(respellings)
+        self._pattern = (
+            re.compile(
+                r"\b("
+                + "|".join(re.escape(w) for w in sorted(self._map, key=len, reverse=True))
+                + r")\b"
+            )
+            if self._map
+            else None
+        )
+        self._tail = ""
+
+    def feed(self, chunk: str) -> str:
+        """The text safe to speak so far, respelled; the rest waits."""
+        text = self._tail + chunk
+        held = re.search(r"\w+\Z", text)
+        if held:
+            ready, self._tail = text[: held.start()], text[held.start() :]
+        else:
+            ready, self._tail = text, ""
+        return self._respell(ready)
+
+    def flush(self) -> str:
+        """Whatever was held back, now that the text has ended."""
+        out, self._tail = self._respell(self._tail), ""
+        return out
+
+    def _respell(self, text: str) -> str:
+        if self._pattern is None or not text:
+            return text
+        return self._pattern.sub(lambda m: self._map[m.group(1)], text)
