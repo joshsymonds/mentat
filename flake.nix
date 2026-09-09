@@ -95,6 +95,7 @@
     # Python interpreter with livekit-agents + the Silero VAD plugin, for the
     # voice agent. Built from upstream wheels; see nix/voice-env.nix.
     voice-env = import ./nix/voice-env.nix { inherit pkgs; };
+    public-env = import ./nix/public-env.nix { inherit pkgs; };
   in {
     devShells.${system} = {
       # Emulator-bearing shell: the e2e and live lanes boot a device.
@@ -107,11 +108,13 @@
       mentatd = mentatd;
       default = mentatd;
       voice-env = voice-env;
+      public-env = public-env;
     };
 
     nixosModules.default = import ./nix/module.nix {
       mentatdPackage = mentatd;
       voiceEnvPackage = voice-env;
+      publicEnvPackage = public-env;
     };
 
     checks.${system} = {
@@ -155,6 +158,17 @@
           };
         };
 
+        withPublic = evalMentat {
+          public = {
+            enable = true;
+            baseUrl = "https://mcp.example.com";
+            accessConfigUrl = "https://mcp.example.com/.well-known/openid-configuration";
+            accessClientIdFile = "/run/agenix/mentat-public-client-id";
+            accessClientSecretFile = "/run/agenix/mentat-public-client-secret";
+            jwtSecretFile = "/run/agenix/mentat-public-jwt-secret";
+          };
+        };
+
         observed = {
           daemonEnv = deployed.systemd.services.mentatd.environment;
           daemonService = deployed.systemd.services.mentatd.serviceConfig;
@@ -166,6 +180,9 @@
           voiceEnv = withVoice.systemd.services.mentat-voice.environment;
           voiceExecStart = withVoice.systemd.services.mentat-voice.serviceConfig.ExecStart;
           voiceService = withVoice.systemd.services.mentat-voice.serviceConfig;
+          publicEnv = withPublic.systemd.services.mentat-public.environment;
+          publicService = withPublic.systemd.services.mentat-public.serviceConfig;
+          publicExecStart = withPublic.systemd.services.mentat-public.serviceConfig.ExecStart;
         };
       in
       # The voice sub-block defaults OFF: the config ultraviolet deploys today
@@ -178,6 +195,34 @@
         "voice-off mentatd EnvironmentFile changed: ${builtins.toJSON observed.daemonService.EnvironmentFile}";
       assert lib.assertMsg (!(observed.daemonService ? UnsetEnvironment))
         "voice-off mentatd unexpectedly strips inference credentials";
+      # The public front is opt-in and keeps all credentials in systemd's
+      # credential directory rather than the generated Environment= block.
+      assert lib.assertMsg (withPublic.systemd.services ? mentat-public)
+        "enabling services.mentat.public did not render mentat-public";
+      assert lib.assertMsg (builtins.removeAttrs observed.publicEnv [ "PATH" ] == {
+        ACCESS_CONFIG_URL = "https://mcp.example.com/.well-known/openid-configuration";
+        MCP_SERVER_URL = "https://mcp.example.com";
+        MENTAT_PUBLIC_LISTEN = "127.0.0.1:8486";
+        MENTAT_PUBLIC_BACKEND = "http://127.0.0.1:8484/mcp";
+        HOME = "/var/lib/mentat-public";
+      })
+        "public front environment changed: ${builtins.toJSON observed.publicEnv}";
+      assert lib.assertMsg (observed.publicService.DynamicUser or false)
+        "public front must run as a DynamicUser";
+      assert lib.assertMsg (observed.publicService.StateDirectory == "mentat-public")
+        "public front StateDirectory changed: ${toString observed.publicService.StateDirectory}";
+      assert lib.assertMsg (observed.publicService.LoadCredential == [
+        "access-client-id:/run/agenix/mentat-public-client-id"
+        "access-client-secret:/run/agenix/mentat-public-client-secret"
+        "jwt-secret:/run/agenix/mentat-public-jwt-secret"
+      ])
+        "public front credentials changed: ${builtins.toJSON observed.publicService.LoadCredential}";
+      assert lib.assertMsg (observed.publicService.PrivateTmp && observed.publicService.NoNewPrivileges && observed.publicService.ProtectSystem == "strict" && observed.publicService.ProtectHome)
+        "public front hardening changed";
+      assert lib.assertMsg (lib.hasSuffix "/front.py'" observed.publicExecStart)
+        "public front does not execute the packaged front.py: ${observed.publicExecStart}";
+      assert lib.assertMsg (observed.publicEnv.MENTAT_PUBLIC_LISTEN == "127.0.0.1:8486")
+        "public front is not loopback-bound: ${observed.publicEnv.MENTAT_PUBLIC_LISTEN}";
       # Voice opts mentatd into the signing credentials and public client URL,
       # while keeping the inference credentials confined to the agent.
       assert lib.assertMsg

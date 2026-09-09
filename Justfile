@@ -1,5 +1,5 @@
 # lint + test (default)
-default: lint test test-ha test-voice
+default: lint test test-ha test-voice test-public
 
 # eslint (strict-type-checked) + tsc --strict + knip
 lint:
@@ -16,6 +16,10 @@ test-ha:
 # Voice stream adapter (voice/): stdlib-only, no livekit install needed
 test-voice:
     python3 -m unittest discover -s voice/tests
+
+# Public OAuth front (public/): FastMCP and Uvicorn from the flake environment
+test-public:
+    "$(nix build .#public-env --no-link --print-out-paths)/bin/python" -m unittest discover -s public/tests
 
 # Score the front's consult-vs-answer judgment: online, needs LIVEKIT_INFERENCE_*
 # Never in `default`: this one spends tokens (a fraction of a cent) against real

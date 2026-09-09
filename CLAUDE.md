@@ -18,6 +18,7 @@ parsed stream-json itself is archived on `go-v2`).
 just            # lint + test (default)
 just lint       # eslint (strict-type-checked) + tsc --strict + knip
 just test       # vitest, offline (no claude binary, no network)
+just test-public # public OAuth front tests in the flake Python environment
 npx vitest run test/claudecode.test.ts -t "name"   # single test
 MENTAT_CLAUDE_BIN=$(command -v claude) node scripts/record-fixture.ts <name>
                 # record a real SDK turn → test/fixtures/<name>.jsonl (spends tokens)
@@ -56,6 +57,12 @@ Data flows through three altitudes, the SDK owning everything below them:
    stateless phone tools. `SessionTracker` + `src/janitor.ts` expire idle children
    (in-flight turns never expire); `src/config.ts` is env-first (`MENTAT_*`);
    `src/main.ts` assembles the daemon.
+
+4. **`public/`** is the OAuth front for off-tailnet MCP clients: a FastMCP proxy
+   over the daemon's loopback `/mcp`, fronted by an OAuth 2.1 authorization server
+   that delegates authentication to Cloudflare Access. It fails closed on missing
+   credentials or invalid tokens; `mentatd` itself remains unauthenticated and
+   loopback-bound.
 
 ## Invariants to preserve
 

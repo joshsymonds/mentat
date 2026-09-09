@@ -2,7 +2,7 @@
 # evolves in the same commit as the code it deploys; the consuming flake
 # (nix-config) supplies host concerns: the pinned claude binary, the agenix
 # secrets file, and network placement.
-{ mentatdPackage, voiceEnvPackage }:
+{ mentatdPackage, voiceEnvPackage, publicEnvPackage }:
 { config, lib, pkgs, ... }: let
   cfg = config.services.mentat;
 
@@ -23,6 +23,16 @@
       ../voice/request.py
       ../voice/stream.py
       ../voice/assets/earcon.wav
+    ];
+  };
+
+  # Keep the public front's source in the deployment closure without copying
+  # its tests or any unrelated repository files.
+  publicSource = lib.fileset.toSource {
+    root = ../public;
+    fileset = lib.fileset.unions [
+      ../public/__init__.py
+      ../public/front.py
     ];
   };
 in {
@@ -96,6 +106,41 @@ in {
         type = lib.types.strMatching "[0-9]{2}:[0-9]{2}";
         default = "09:00";
         description = "Host-local HH:MM the reminder fires.";
+      };
+    };
+
+    public = {
+      enable = lib.mkEnableOption "the OAuth-authenticated public MCP front";
+
+      listenPort = lib.mkOption {
+        type = lib.types.port;
+        default = 8486;
+        description = "Loopback port for the public OAuth front.";
+      };
+
+      baseUrl = lib.mkOption {
+        type = lib.types.str;
+        description = "Externally reachable HTTPS base URL advertised by the public OAuth front.";
+      };
+
+      accessConfigUrl = lib.mkOption {
+        type = lib.types.str;
+        description = "Cloudflare Access OIDC discovery URL.";
+      };
+
+      accessClientIdFile = lib.mkOption {
+        type = lib.types.str;
+        description = "Root-readable runtime path containing the Cloudflare Access client ID.";
+      };
+
+      accessClientSecretFile = lib.mkOption {
+        type = lib.types.str;
+        description = "Root-readable runtime path containing the Cloudflare Access client secret.";
+      };
+
+      jwtSecretFile = lib.mkOption {
+        type = lib.types.str;
+        description = "Root-readable runtime path containing the persistent FastMCP JWT signing secret.";
       };
     };
 
@@ -218,6 +263,46 @@ in {
         # mentatd needs the signing pair to mint join tokens, but must never see
         # the inference credentials that share the voice agent's secrets file.
         UnsetEnvironment = [ "LIVEKIT_INFERENCE_API_KEY" "LIVEKIT_INFERENCE_API_SECRET" ];
+      };
+    };
+
+    systemd.services.mentat-public = lib.mkIf cfg.public.enable {
+      description = "mentat public OAuth MCP front";
+      after = [ "network-online.target" "mentatd.service" ];
+      wants = [ "network-online.target" "mentatd.service" ];
+      wantedBy = [ "multi-user.target" ];
+
+      environment = {
+        ACCESS_CONFIG_URL = cfg.public.accessConfigUrl;
+        MCP_SERVER_URL = cfg.public.baseUrl;
+        MENTAT_PUBLIC_LISTEN = "127.0.0.1:${toString cfg.public.listenPort}";
+        MENTAT_PUBLIC_BACKEND = "http://127.0.0.1:${toString cfg.listenPort}/mcp";
+        HOME = "/var/lib/mentat-public";
+      };
+
+      # PID 1 opens the host's agenix paths and exposes only these three files
+      # to the transient service identity. Secrets never enter the Nix store or
+      # the generated unit's Environment= block.
+      serviceConfig = {
+        Type = "simple";
+        DynamicUser = true;
+        Restart = "always";
+        RestartSec = "5s";
+        ExecStart = "${pkgs.runtimeShell} -c 'export ACCESS_CLIENT_ID=\"$(cat \"$CREDENTIALS_DIRECTORY/access-client-id\")\"; export ACCESS_CLIENT_SECRET=\"$(cat \"$CREDENTIALS_DIRECTORY/access-client-secret\")\"; export MCP_JWT_SECRET=\"$(cat \"$CREDENTIALS_DIRECTORY/jwt-secret\")\"; exec ${lib.getExe' publicEnvPackage "python"} ${publicSource}/front.py'";
+
+        LoadCredential = [
+          "access-client-id:${cfg.public.accessClientIdFile}"
+          "access-client-secret:${cfg.public.accessClientSecretFile}"
+          "jwt-secret:${cfg.public.jwtSecretFile}"
+        ];
+
+        StateDirectory = "mentat-public";
+        WorkingDirectory = "/var/lib/mentat-public";
+
+        PrivateTmp = true;
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
       };
     };
 
