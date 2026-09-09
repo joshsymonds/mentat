@@ -6,16 +6,27 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
 import gg.savecraft.mentat.core.SessionState
+import gg.savecraft.mentat.core.TranscriptSegment
+import gg.savecraft.mentat.phone.PhoneBridge
 import gg.savecraft.mentat.session.BootReceiver
+import gg.savecraft.mentat.session.LiveKitEvent
+import gg.savecraft.mentat.session.LiveKitSession
 import gg.savecraft.mentat.session.PhoneCommandService
+import gg.savecraft.mentat.session.VoiceSessionService
 import gg.savecraft.mentat.ui.detailRes
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import gg.savecraft.mentat.ui.titleRes
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -318,6 +329,36 @@ class AssistActivityTest {
     }
 
     @Test
+    fun externallyEndedServiceFinishesTheActivityAfterTwoSecondsWithoutStoppingAgain() {
+        grantRecordAudio()
+        val endedService = Robolectric
+            .buildService(EndedStateVoiceSessionService::class.java)
+            .create()
+            .get()
+        val serviceIntent = Intent(application, VoiceSessionService::class.java)
+        Shadows.shadowOf(application).setComponentNameAndServiceForBindServiceForIntent(
+            serviceIntent,
+            ComponentName(application, EndedStateVoiceSessionService::class.java),
+            endedService.onBind(serviceIntent),
+        )
+        Shadows.shadowOf(application).setBindServiceCallsOnServiceConnectedDirectly(true)
+
+        val controller = Robolectric
+            .buildActivity(EndedObservationActivity::class.java)
+            .create()
+        Shadows.shadowOf(application).setBindServiceCallsOnServiceConnectedDirectly(false)
+        val activity = controller.get()
+        assertEquals(SessionState.Ended, activity.uiState.value)
+        assertFalse(activity.isFinishing)
+
+        Shadows.shadowOf(Looper.getMainLooper()).idleFor(2, TimeUnit.SECONDS)
+
+        assertTrue(activity.isFinishing)
+        assertNull(Shadows.shadowOf(application).nextStoppedService)
+        controller.destroy()
+    }
+
+    @Test
     fun destroyingTheActivityStopsTheVoiceSession() {
         grantRecordAudio()
         val controller = Robolectric.buildActivity(AssistActivity::class.java).create()
@@ -475,6 +516,33 @@ class AssistActivityTest {
 
     class UnbindableAssistActivity : AssistActivity() {
         override fun bindVoiceService(intent: Intent): Boolean = false
+    }
+
+    class EndedObservationActivity : AssistActivity() {
+        override fun startVoiceService(intent: Intent) {}
+
+        override fun startPhoneCommandService(intent: Intent) {}
+    }
+
+    class EndedStateVoiceSessionService : VoiceSessionService() {
+        override val state: StateFlow<SessionState> = MutableStateFlow(SessionState.Ended)
+
+        override fun liveKitSession(): LiveKitSession = NoopLiveKitSession
+    }
+
+    private object NoopLiveKitSession : LiveKitSession {
+        override val events = MutableSharedFlow<LiveKitEvent>()
+        override val transcripts = MutableSharedFlow<TranscriptSegment>()
+
+        override suspend fun connect(url: String, token: String) {}
+
+        override fun registerPhoneBridge(bridge: PhoneBridge) {}
+
+        override suspend fun setMicEnabled(enabled: Boolean) {}
+
+        override suspend fun disconnect() {}
+
+        override fun close() {}
     }
 
     private companion object {

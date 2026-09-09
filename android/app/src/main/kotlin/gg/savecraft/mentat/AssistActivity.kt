@@ -10,7 +10,9 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -39,6 +41,8 @@ import kotlinx.coroutines.launch
 
 open class AssistActivity : ComponentActivity() {
     private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val finishHandler = Handler(Looper.getMainLooper())
+    private val finishAfterRemoteEnd = Runnable { finish() }
     private val mutableUiState = MutableStateFlow<SessionState>(SessionState.Idle)
     private val uiTranscript = MutableStateFlow<List<TranscriptSegment>>(emptyList())
     private val uiMicEnabled = MutableStateFlow(false)
@@ -87,7 +91,16 @@ open class AssistActivity : ComponentActivity() {
             service = (binder as VoiceSessionService.LocalBinder).service()
             service!!.setAssistVisible(activityStarted)
             stateJob = activityScope.launch {
-                service!!.state.collect { mutableUiState.value = it }
+                service!!.state.collect { state ->
+                    mutableUiState.value = state
+                    if (state == SessionState.Ended && !endRequested) {
+                        finishHandler.removeCallbacks(finishAfterRemoteEnd)
+                        finishHandler.postDelayed(
+                            finishAfterRemoteEnd,
+                            REMOTE_END_FINISH_DELAY_MS,
+                        )
+                    }
+                }
             }
             transcriptJob = activityScope.launch {
                 service!!.transcript.collect { uiTranscript.value = it }
@@ -152,6 +165,7 @@ open class AssistActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        finishHandler.removeCallbacks(finishAfterRemoteEnd)
         // A failed session can still have a running service behind it — a token or connect
         // failure does not stop one — so only an already-ended session skips the stop.
         if (uiState.value != SessionState.Ended) {
@@ -293,6 +307,7 @@ open class AssistActivity : ComponentActivity() {
     }
 
     private companion object {
+        const val REMOTE_END_FINISH_DELAY_MS = 2_000L
         const val SERVICE_START_FAILED = "Unable to start voice service"
         const val SERVICE_BIND_FAILED = "Unable to bind voice session"
     }

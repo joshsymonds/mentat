@@ -11,8 +11,22 @@ class LiveKitSessionTest {
         assertEquals(SessionEvent.ConnectionLost, LiveKitSession.eventFor(LiveKitEvent.Reconnecting))
         assertEquals(SessionEvent.Reconnected, LiveKitSession.eventFor(LiveKitEvent.Reconnected))
         assertEquals(
-            SessionEvent.ReconnectFailed("server closed"),
-            LiveKitSession.eventFor(LiveKitEvent.Disconnected("server closed")),
+            SessionEvent.EndRequested,
+            LiveKitSession.eventFor(
+                LiveKitEvent.Disconnected("ROOM_DELETED", graceful = true),
+            ),
+        )
+        assertEquals(
+            SessionEvent.EndRequested,
+            LiveKitSession.eventFor(
+                LiveKitEvent.Disconnected("PARTICIPANT_REMOVED", graceful = true),
+            ),
+        )
+        assertEquals(
+            SessionEvent.ReconnectFailed("CONNECTION_TIMEOUT"),
+            LiveKitSession.eventFor(
+                LiveKitEvent.Disconnected("CONNECTION_TIMEOUT", graceful = false),
+            ),
         )
     }
 
