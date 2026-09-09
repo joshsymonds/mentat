@@ -43,6 +43,51 @@ class AssistActivityTest {
     }
 
     @Test
+    fun allDeniedPermissionsRequestAudioBeforePhonePermissions() {
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+
+        val audioRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        assertArrayEquals(arrayOf(Manifest.permission.RECORD_AUDIO), audioRequest.requestedPermissions)
+
+        activity.onRequestPermissionsResult(
+            audioRequest.requestCode,
+            audioRequest.requestedPermissions,
+            intArrayOf(PackageManager.PERMISSION_GRANTED),
+        )
+
+        val startedServices = startedServiceClassNames()
+        assertTrue(startedServices.contains(VOICE_SERVICE))
+        assertTrue(startedServices.contains(PHONE_SERVICE))
+        assertTrue(Shadows.shadowOf(application).boundServiceConnections.isNotEmpty())
+        val phoneRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        assertArrayEquals(
+            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS),
+            phoneRequest.requestedPermissions,
+        )
+    }
+
+    @Test
+    fun deniedRecordAudioPermissionRequestsPhonePermissionsAfterAudioResult() {
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+
+        val audioRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        assertArrayEquals(arrayOf(Manifest.permission.RECORD_AUDIO), audioRequest.requestedPermissions)
+
+        activity.onRequestPermissionsResult(
+            audioRequest.requestCode,
+            audioRequest.requestedPermissions,
+            intArrayOf(PackageManager.PERMISSION_DENIED),
+        )
+
+        assertEquals(SessionState.Failed("Permission denied"), activity.uiState.value)
+        val phoneRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        assertArrayEquals(
+            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS),
+            phoneRequest.requestedPermissions,
+        )
+    }
+
+    @Test
     fun deniedRecordAudioPermissionDoesNotStartOrBindVoiceService() {
         grantPhonePermissions()
 
@@ -86,11 +131,7 @@ class AssistActivityTest {
 
         val activity = Robolectric.buildActivity(AssistActivity::class.java).create().get()
 
-        val request = Shadows.shadowOf(activity).lastRequestedPermission
-        assertTrue(
-            request == null || request.requestedPermissions.toSet() !=
-                setOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS),
-        )
+        assertNull(Shadows.shadowOf(activity).lastRequestedPermission)
     }
 
     @Test

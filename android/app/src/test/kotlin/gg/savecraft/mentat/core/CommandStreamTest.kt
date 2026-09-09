@@ -8,6 +8,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -22,10 +23,12 @@ class CommandStreamTest {
     @Test
     fun readsCommandsPostsResultsAndReconnectsAfterDrop() = runBlocking {
         val commandRequests = AtomicInteger()
+        val commandPhoneHeader = AtomicReference<String?>()
         val results = ConcurrentLinkedQueue<String>()
         val bothCommands = CountDownLatch(2)
         val server = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0)
         server.createContext("/v1/phone/commands") { exchange ->
+            commandPhoneHeader.set(exchange.requestHeaders.getFirst("X-Mentat-Phone"))
             val request = commandRequests.incrementAndGet()
             exchange.responseHeaders.add("Content-Type", "application/x-ndjson")
             exchange.sendResponseHeaders(200, 0)
@@ -67,6 +70,7 @@ class CommandStreamTest {
         try {
             withTimeout(5_000) { while (commandRequests.get() < 2) delay(10) }
             assertTrue(bothCommands.await(5, TimeUnit.SECONDS))
+            assertEquals("1", commandPhoneHeader.get())
             executor.cancel()
             executor.join()
             assertEquals(listOf("one", "two"), results.map { JSONObject(it).getString("id") }.toList())
@@ -93,5 +97,13 @@ class CommandStreamTest {
         assertEquals("ok", result.getString("status"))
         assertEquals("sent", result.getString("detail"))
         assertEquals(PhoneCommand.Ping, PhoneCommand.parse(JSONObject("{\"kind\":\"ping\"}")))
+    }
+
+    @Test
+    fun defaultBackoffUsesCappedExponentialSchedule() {
+        assertEquals(
+            listOf(1_000L, 2_000L, 4_000L, 8_000L, 16_000L, 32_000L, 60_000L, 60_000L),
+            (0..7).map(::defaultBackoffMillis),
+        )
     }
 }

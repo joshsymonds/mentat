@@ -11,6 +11,9 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
+internal fun defaultBackoffMillis(attempt: Int): Long =
+    (1_000L shl attempt.coerceAtMost(6)).coerceAtMost(60_000L)
+
 interface CommandStream {
     suspend fun run(handler: suspend (PhoneCommand) -> PhoneResult)
     fun close()
@@ -57,6 +60,7 @@ class HttpCommandStream(
             connection.readTimeout = readTimeoutMillis
             connection.requestMethod = "GET"
             connection.setRequestProperty("Accept", "application/x-ndjson")
+            connection.setRequestProperty("X-Mentat-Phone", "1")
             if (connection.responseCode != HttpURLConnection.HTTP_OK) {
                 throw IOException("Command endpoint returned HTTP ${connection.responseCode}")
             }
@@ -111,8 +115,5 @@ class HttpCommandStream(
     private companion object {
         const val DEFAULT_CONNECT_TIMEOUT_MILLIS = 10_000
         const val DEFAULT_READ_TIMEOUT_MILLIS = 45_000
-
-        fun defaultBackoffMillis(attempt: Int): Long =
-            (1_000L shl attempt.coerceAtMost(6)).coerceAtMost(60_000L)
     }
 }

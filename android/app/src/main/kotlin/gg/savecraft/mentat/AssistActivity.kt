@@ -58,8 +58,10 @@ open class AssistActivity : ComponentActivity() {
     ) { granted ->
         if (granted) {
             startAndBindVoiceService()
+            requestPhonePermissionsIfNeeded()
         } else {
             mutableUiState.value = SessionStateMachine().transition(SessionEvent.PermissionDenied)
+            requestPhonePermissionsIfNeeded()
         }
     }
 
@@ -189,7 +191,9 @@ open class AssistActivity : ComponentActivity() {
     }
 
     private fun beginPhoneBridge() {
-        requestPhonePermissionsIfNeeded()
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            requestPhonePermissionsIfNeeded()
+        }
 
         if (!Settings.canDrawOverlays(this)) {
             runCatching {

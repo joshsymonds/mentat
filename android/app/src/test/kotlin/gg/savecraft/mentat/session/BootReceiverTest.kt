@@ -22,5 +22,14 @@ class BootReceiverTest {
             PhoneCommandService::class.java.name,
             Shadows.shadowOf(application).peekNextStartedService()?.component?.className,
         )
+
+        val receivers = application.packageManager.queryBroadcastReceivers(
+            Intent(Intent.ACTION_BOOT_COMPLETED).setPackage(application.packageName),
+            0,
+        )
+        assertEquals(
+            listOf(BootReceiver::class.java.name),
+            receivers.mapNotNull { it.activityInfo?.name },
+        )
     }
 }
