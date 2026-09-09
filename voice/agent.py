@@ -83,7 +83,11 @@ DELIVERY_RULE = (
     "neutral or content, not forced brighter; go to excited, sympathetic, "
     "joking, or apologetic only when the line itself is that. A pause goes "
     "before the part that matters and nowhere else. The delivery should shift "
-    "the way a real voice does across a conversation, not perform."
+    "the way a real voice does across a conversation, not perform. One thing "
+    "the tag list above leaves out: this voice does laugh. Write the literal "
+    "text [laughter] where the laugh goes, as its own word, and it is voiced. "
+    "It is rare — only when something is actually funny, never at your own "
+    "line, and never as a substitute for saying the thing."
 )
 
 # Under expressive mode the SDK batches sentences up to the provider's chunk
