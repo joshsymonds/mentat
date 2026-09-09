@@ -5,7 +5,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <application android:label="@string/app_name">
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name">
         <!--
             Exported because assist dispatch is a system-initiated launch: the platform
             starts this activity when the user triggers the assistant, and an unexported
@@ -24,6 +26,22 @@
             <intent-filter>
                 <action android:name="android.intent.action.ASSIST" />
                 <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+        <!--
+            The launcher entry is deliberately a separate component from the assist one.
+            Any app can start a launcher activity, so it carries no permission, and it is
+            what "open Mentat" resolves to when the car button is owned by another
+            assistant (Android Auto routes the steering wheel button to Google's). The
+            session it opens is as visible as any other: a foreground activity plus the
+            microphone foreground-service notification.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
         <service
