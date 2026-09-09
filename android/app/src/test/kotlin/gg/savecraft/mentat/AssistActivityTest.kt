@@ -356,6 +356,10 @@ class AssistActivityTest {
         assertTrue(activity.isFinishing)
         assertNull(Shadows.shadowOf(application).nextStoppedService)
         controller.destroy()
+
+        assertEquals(0, endedService.session.disconnectCalls)
+        assertEquals(0, endedService.session.closeCalls)
+        assertNull(Shadows.shadowOf(application).nextStoppedService)
     }
 
     @Test
@@ -526,13 +530,16 @@ class AssistActivityTest {
 
     class EndedStateVoiceSessionService : VoiceSessionService() {
         override val state: StateFlow<SessionState> = MutableStateFlow(SessionState.Ended)
+        val session = NoopLiveKitSession()
 
-        override fun liveKitSession(): LiveKitSession = NoopLiveKitSession
+        override fun liveKitSession(): LiveKitSession = session
     }
 
-    private object NoopLiveKitSession : LiveKitSession {
+    class NoopLiveKitSession : LiveKitSession {
         override val events = MutableSharedFlow<LiveKitEvent>()
         override val transcripts = MutableSharedFlow<TranscriptSegment>()
+        var disconnectCalls = 0
+        var closeCalls = 0
 
         override suspend fun connect(url: String, token: String) {}
 
@@ -540,9 +547,13 @@ class AssistActivityTest {
 
         override suspend fun setMicEnabled(enabled: Boolean) {}
 
-        override suspend fun disconnect() {}
+        override suspend fun disconnect() {
+            disconnectCalls += 1
+        }
 
-        override fun close() {}
+        override fun close() {
+            closeCalls += 1
+        }
     }
 
     private companion object {

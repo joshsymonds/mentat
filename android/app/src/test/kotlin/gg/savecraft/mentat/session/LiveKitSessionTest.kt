@@ -2,10 +2,22 @@ package gg.savecraft.mentat.session
 
 import gg.savecraft.mentat.core.SessionEvent
 import gg.savecraft.mentat.core.TranscriptSegment
+import io.livekit.android.events.DisconnectReason
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LiveKitSessionTest {
+    @Test
+    fun disconnectReasonsClassifyGracefulEnds() {
+        assertTrue(LiveKitSession.gracefulDisconnect(DisconnectReason.ROOM_DELETED))
+        assertTrue(LiveKitSession.gracefulDisconnect(DisconnectReason.PARTICIPANT_REMOVED))
+        assertFalse(LiveKitSession.gracefulDisconnect(DisconnectReason.CLIENT_INITIATED))
+        assertFalse(LiveKitSession.gracefulDisconnect(DisconnectReason.CONNECTION_TIMEOUT))
+        assertFalse(LiveKitSession.gracefulDisconnect(DisconnectReason.SERVER_SHUTDOWN))
+    }
+
     @Test
     fun roomEventsMapToSessionEvents() {
         assertEquals(SessionEvent.ConnectionLost, LiveKitSession.eventFor(LiveKitEvent.Reconnecting))

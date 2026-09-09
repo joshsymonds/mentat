@@ -40,6 +40,10 @@ interface LiveKitSession {
     fun close()
 
     companion object {
+        fun gracefulDisconnect(reason: DisconnectReason): Boolean =
+            reason == DisconnectReason.ROOM_DELETED ||
+                reason == DisconnectReason.PARTICIPANT_REMOVED
+
         fun eventFor(event: LiveKitEvent): SessionEvent? = when (event) {
             LiveKitEvent.Connected -> SessionEvent.RoomConnected
             LiveKitEvent.Reconnecting -> SessionEvent.ConnectionLost
@@ -143,8 +147,7 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
             disconnected = true
             LiveKitEvent.Disconnected(
                 reason = error?.message ?: reason.name,
-                graceful = reason == DisconnectReason.ROOM_DELETED ||
-                    reason == DisconnectReason.PARTICIPANT_REMOVED,
+                graceful = LiveKitSession.gracefulDisconnect(reason),
             )
         }
         else -> null
