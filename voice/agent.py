@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import aiohttp
-from livekit import agents
+from livekit import agents, rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -48,6 +48,7 @@ from livekit.agents import (
 )
 from livekit.plugins import silero
 
+from phone import PhoneActions, RpcFailure
 from request import (
     consult_envelope,
     conversation_advanced,
@@ -147,11 +148,47 @@ class FrontAgent(Agent):
         voice_card: str,
         room_name: str,
         mentat_url: str,
+        room: rtc.Room | None = None,
     ) -> None:
         super().__init__(instructions=instructions)
         self._voice_card = voice_card
         self._room_name = room_name
         self._mentat_url = mentat_url
+
+        async def perform_rpc(
+            identity: str, method: str, payload: str, timeout: float
+        ) -> str:
+            if room is None:
+                raise RpcFailure(1401, "no room")
+            try:
+                return await room.local_participant.perform_rpc(
+                    destination_identity=identity,
+                    method=method,
+                    payload=payload,
+                    response_timeout=timeout,
+                )
+            except rtc.RpcError as error:
+                raise RpcFailure(int(error.code), str(error.message)) from error
+
+        async def post_json(
+            url: str, headers: Mapping[str, str], body: Mapping[str, Any]
+        ) -> Any:
+            async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+                async with http.post(url, headers=headers, json=body) as response:
+                    if response.status != 200:
+                        raise aiohttp.ClientResponseError(
+                            response.request_info,
+                            response.history,
+                            status=response.status,
+                        )
+                    return await response.json()
+
+        self._phone_actions = PhoneActions(
+            perform_rpc,
+            post_json,
+            lambda: room.remote_participants if room is not None else (),
+            os.environ.get("MENTAT_PLACES_API_KEY", ""),
+        )
 
     @function_tool(
         # CANCELLABLE puts the framework's cancel tool in front of the model,
@@ -179,7 +216,12 @@ class FrontAgent(Agent):
         deserves. Send it anything about his life or his systems, anything
         that needs a lookup or an action, anything about the current state of
         the world, and any question where a quick answer would really be a
-        guess. Do not answer those from your own head.
+        guess. Use find_places and navigate_to for navigation, dial for
+        dialing, send_text for texting, set_alarm for alarms, set_timer for
+        timers and open_link for links instead of this tool. Place questions
+        such as hours, reviews or distance, and
+        contact lookups, still belong here. Do not answer these from your own
+        head.
 
         Ask in full sentences, and carry over whatever context the question
         needs to stand on its own: Mentat cannot hear Josh, it only reads what
@@ -233,6 +275,72 @@ class FrontAgent(Agent):
         # Nothing left to say. Returning None after an update is what stops
         # the framework generating a reply on top of the answer just spoken.
         return None
+
+    @function_tool
+    async def find_places(
+        self, ctx: RunContext, query: str, locality: str = ""
+    ) -> str:
+        """Search places near the phone for the place he named.
+
+        Pass locality only after LOCATION_UNAVAILABLE, using the place he named.
+        A spoken description gives up to three matches; LOCATION_UNAVAILABLE,
+        PHONE_UNREACHABLE, PLACES_UNCONFIGURED, PLACES_FAILED and NO_RESULTS are
+        token-prefixed instructions to act on, never text to read aloud verbatim.
+        """
+        return await self._phone_actions.find_places(query, locality)
+
+    @function_tool
+    async def navigate_to(self, ctx: RunContext, choice: int) -> str:
+        """Navigate to the 1-based choice in the most recent find_places result.
+
+        A confirmation means navigation started; token-prefixed NO_CANDIDATES,
+        PHONE_NOT_IN_FRONT, PHONE_UNREACHABLE or PHONE_REFUSED means it did not.
+        """
+        return await self._phone_actions.navigate_to(choice)
+
+    @function_tool
+    async def dial(self, ctx: RunContext, number: str) -> str:
+        """Open the dialer with the number prefilled without placing a call.
+
+        A token-prefixed return means the dialer did not open; do not read it aloud.
+        """
+        return await self._phone_actions.dial(number)
+
+    @function_tool
+    async def send_text(self, ctx: RunContext, number: str, body: str) -> str:
+        """Open messaging with a drafted message, which is not sent automatically.
+
+        A token-prefixed return means the message was not opened; do not read it aloud.
+        """
+        return await self._phone_actions.send_text(number, body)
+
+    @function_tool
+    async def set_alarm(
+        self, ctx: RunContext, hour: int, minute: int, label: str = ""
+    ) -> str:
+        """Set an alarm silently on the phone without opening a confirmation screen.
+
+        A token-prefixed return means the alarm was not set; do not read it aloud.
+        """
+        return await self._phone_actions.set_alarm(hour, minute, label)
+
+    @function_tool
+    async def set_timer(
+        self, ctx: RunContext, minutes: int, seconds: int = 0, label: str = ""
+    ) -> str:
+        """Start a timer on the phone without opening a confirmation screen.
+
+        A token-prefixed return means the timer did not start; do not read it aloud.
+        """
+        return await self._phone_actions.set_timer(minutes, seconds, label)
+
+    @function_tool
+    async def open_link(self, ctx: RunContext, url: str) -> str:
+        """Open an absolute link in the phone's browser or another suitable app.
+
+        A token-prefixed return means the link did not open; do not read it aloud.
+        """
+        return await self._phone_actions.open_link(url)
 
     async def _consult(self, envelope: str, effort: str, model: str) -> str:
         """One mentatd turn, collected whole rather than spoken as it streams.
@@ -373,6 +481,7 @@ async def entrypoint(ctx: JobContext) -> None:
             voice_card=voice_card,
             room_name=ctx.room.name,
             mentat_url=os.environ.get("MENTAT_URL", DEFAULT_MENTAT_URL),
+            room=ctx.room,
         ),
         room=ctx.room,
     )
