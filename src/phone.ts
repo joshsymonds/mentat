@@ -34,11 +34,10 @@ export class PhoneBridge {
   private attached: ServerResponse | undefined;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   private readonly pending = new Map<string, PendingCommand>();
+  private readonly logger: Logger;
 
-  constructor(
-    private readonly logger: Logger,
-    deps: PhoneBridgeDeps = {},
-  ) {
+  constructor(logger: Logger, deps: PhoneBridgeDeps = {}) {
+    this.logger = logger;
     this.now = deps.now ?? (() => new Date());
     this.uuid = deps.uuid ?? randomUUID;
     this.timeoutMs = deps.timeoutMs ?? 15_000;
