@@ -331,7 +331,9 @@ async def entrypoint(ctx: JobContext) -> None:
         # httpx connection pool, and keeping it warm is most of the difference
         # between a ~0.85s first token and a wait the caller can hear.
         llm=inference.LLM(FRONT_MODEL),
-        tts=inference.TTS("cartesia/sonic-3"),
+        # Sonic 3.6: Cartesia's current GA model, routed by the gateway from the
+        # string alone — agents 1.6.10 predates it, so it is not a known literal.
+        tts=inference.TTS("cartesia/sonic-3.6"),
         # Flux emits end-of-turn itself, so waiting out a silence window after
         # it would only add latency to every reply. (Spelled as turn_handling
         # rather than the turn_detection/min_endpointing_delay arguments: those
