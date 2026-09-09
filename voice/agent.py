@@ -47,6 +47,7 @@ from livekit.agents import (
     llm,
 )
 from livekit.plugins import silero
+from livekit.agents.tts import _provider_format
 
 from request import (
     consult_envelope,
@@ -72,6 +73,31 @@ FRONT_MODEL = "openai/gpt-5.6-luna"
 # Words Flux mishears on its own — "Mentat" came back as "man, uh". Keyterm
 # prompting boosts recall of exactly these; Deepgram caps the list at 100
 # terms totalling 1200 characters, and the terms are plain words, no weights.
+# Cartesia's Daniel, from the Sonic 3.6 recommended voices.
+TTS_VOICE = "47c38ca4-5f35-497b-b1a3-415245fb35e1"
+
+# Appended to the expressive-mode tag instructions. The default template
+# already lists the tags; this is the persona's rule for when to reach for one.
+DELIVERY_RULE = (
+    "Choose each label from what the words already carry. A plain answer is "
+    "neutral or content, not forced brighter; go to excited, sympathetic, "
+    "joking, or apologetic only when the line itself is that. A pause goes "
+    "before the part that matters and nowhere else. The delivery should shift "
+    "the way a real voice does across a conversation, not perform."
+)
+
+# Under expressive mode the SDK batches sentences up to the provider's chunk
+# size before the first TTS request, to keep prosody continuous across a turn.
+# Cartesia's entry is 400 characters — longer than most of Luna's replies, so
+# first audio would wait for the whole turn. Cartesia's emotion tags are per
+# sentence anyway, so one sentence at a time loses nothing and keeps the
+# time-to-first-audio the journal already measures. The table is private to
+# agents 1.6.10 (pinned in nix/voice-env.nix); the assert makes a bump that
+# moves it fail at worker start rather than silently batch again.
+EXPRESSIVE_BATCH_CHARS = 120
+assert "cartesia" in _provider_format._MAX_INPUT_LEN, "agents SDK moved the TTS chunking table"
+_provider_format._MAX_INPUT_LEN["cartesia"] = EXPRESSIVE_BATCH_CHARS
+
 STT_KEYTERMS = [
     "Mentat",
     "Luna",
@@ -333,7 +359,11 @@ async def entrypoint(ctx: JobContext) -> None:
         llm=inference.LLM(FRONT_MODEL),
         # Sonic 3.6: Cartesia's current GA model, routed by the gateway from the
         # string alone — agents 1.6.10 predates it, so it is not a known literal.
-        tts=inference.TTS("cartesia/sonic-3.6"),
+        tts=inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE),
+        # Luna marks up her own delivery: the session tells her which tags the
+        # TTS renders (emotion, speed, volume, pauses) and the appended rule
+        # keeps them rare — a tag is a shift in the voice, not decoration.
+        expressive={"tts_instructions_append": DELIVERY_RULE},
         # Flux emits end-of-turn itself, so waiting out a silence window after
         # it would only add latency to every reply. (Spelled as turn_handling
         # rather than the turn_detection/min_endpointing_delay arguments: those
