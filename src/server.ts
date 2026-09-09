@@ -14,6 +14,8 @@ import {
   type Event,
 } from './backend.ts';
 import type { Logger } from './log.ts';
+import { handleMcp } from './mcp.ts';
+import type { PhoneBridge } from './phone.ts';
 import type { TokenIssuer } from './voicetoken.ts';
 import { errorLine, toWireLine } from './wire.ts';
 
@@ -75,6 +77,7 @@ export function createHandler(
   tracker: SessionTracker,
   logger: Logger,
   issuer?: TokenIssuer,
+  bridge?: PhoneBridge,
 ): RequestListener {
   return (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/voice/token' && issuer !== undefined) {
@@ -95,6 +98,67 @@ export function createHandler(
       handleConversation(backend, tracker, logger, req, res).catch((error: unknown) => {
         logger.error('conversation handler failed', { error: String(error) });
         if (!res.destroyed) {
+          res.destroy();
+        }
+      });
+      return;
+    }
+    if (req.url === '/v1/phone/commands') {
+      if (req.method !== 'GET' || bridge === undefined) {
+        fail(res, 404, 'not found');
+        return;
+      }
+      bridge.attach(res);
+      return;
+    }
+    if (req.url === '/v1/phone/results') {
+      if (req.method !== 'POST' || bridge === undefined) {
+        fail(res, 404, 'not found');
+        return;
+      }
+      readJsonBody(req, res).then((body) => {
+        if (body === undefined) {
+          return;
+        }
+        if (!isPhoneResult(body)) {
+          fail(res, 400, 'id, status, and detail are required');
+          return;
+        }
+        bridge.complete(body);
+        res.writeHead(204);
+        res.end();
+      }).catch((error: unknown) => {
+        logger.error('phone result handler failed', { error: String(error) });
+        if (!res.destroyed) {
+          res.destroy();
+        }
+      });
+      return;
+    }
+    if (req.url === '/mcp') {
+      if (req.method === 'GET' || req.method === 'DELETE') {
+        res.writeHead(405, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Method not allowed.' },
+          id: null,
+        }) + '\n');
+        return;
+      }
+      if (req.method !== 'POST' || bridge === undefined) {
+        fail(res, 404, 'not found');
+        return;
+      }
+      readJsonBody(req, res).then((body) => {
+        if (body !== undefined) {
+          return handleMcp(bridge, req, res, body);
+        }
+        return undefined;
+      }).catch((error: unknown) => {
+        logger.error('MCP handler failed', { error: String(error) });
+        if (!res.headersSent && !res.destroyed) {
+          fail(res, 500, 'internal');
+        } else if (!res.destroyed) {
           res.destroy();
         }
       });
@@ -171,29 +235,8 @@ async function readTurnRequest(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<TurnRequest | undefined> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  try {
-    for await (const chunk of req) {
-      const buffer = chunk as Buffer;
-      size += buffer.length;
-      if (size > MAX_REQUEST_BYTES) {
-        fail(res, 413, 'request body too large');
-        return undefined;
-      }
-      chunks.push(buffer);
-    }
-  } catch {
-    // The client aborted mid-body; there is nobody to answer.
-    res.destroy();
-    return undefined;
-  }
-
-  let body: unknown;
-  try {
-    body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  } catch {
-    fail(res, 400, 'invalid JSON body');
+  const body = await readJsonBody(req, res);
+  if (body === undefined) {
     return undefined;
   }
   if (body === null || typeof body !== 'object') {
@@ -225,6 +268,48 @@ async function readTurnRequest(
     ...(effort !== undefined && { effort: effort as Effort }),
     ...(model !== undefined && { model }),
   };
+}
+
+async function readJsonBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    for await (const chunk of req) {
+      const buffer = chunk as Buffer;
+      size += buffer.length;
+      if (size > MAX_REQUEST_BYTES) {
+        fail(res, 413, 'request body too large');
+        return undefined;
+      }
+      chunks.push(buffer);
+    }
+  } catch {
+    res.destroy();
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+  } catch {
+    fail(res, 400, 'invalid JSON body');
+    return undefined;
+  }
+}
+
+function isPhoneResult(value: unknown): value is { id: string; status: 'ok' | 'error'; detail: string } {
+  if (value === null || typeof value !== 'object') {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === 'string' &&
+    record.id !== '' &&
+    (record.status === 'ok' || record.status === 'error') &&
+    typeof record.detail === 'string'
+  );
 }
 
 function parseMeta(value: unknown): Record<string, string> | undefined {

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AtCapacityError, type Backend, type Event, type Turn } from '../src/backend.ts';
 import { nullLogger, type Logger } from '../src/log.ts';
+import { PhoneBridge } from '../src/phone.ts';
 import { SessionTracker, createHandler } from '../src/server.ts';
 import type { TokenIssuer } from '../src/voicetoken.ts';
 
@@ -75,8 +76,9 @@ async function serve(
   tracker = new SessionTracker(),
   issuer?: TokenIssuer,
   logger: Logger = nullLogger,
+  bridge?: PhoneBridge,
 ): Promise<string> {
-  const server = createServer(createHandler(backend, tracker, logger, issuer));
+  const server = createServer(createHandler(backend, tracker, logger, issuer, bridge));
   servers.push(server);
   await new Promise<void>((resolve) => {
     server.listen(0, '127.0.0.1', resolve);
@@ -356,6 +358,55 @@ describe('POST /v1/voice/token', () => {
 
     expect(res.status).toBe(404);
     expect(await res.text()).toBe('{"error":"not found"}\n');
+  });
+});
+
+describe('Phone routes', () => {
+  it('opens the phone command stream with headers before body data', async () => {
+    const bridge = new PhoneBridge(nullLogger, { heartbeatMs: 20_000 });
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
+    const res = await fetch(`${base}/v1/phone/commands`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('application/x-ndjson');
+    bridge.close();
+    await res.body?.cancel();
+  });
+
+  it('resolves a pending command from the results route', async () => {
+    const bridge = new PhoneBridge(nullLogger, {
+      uuid: () => 'server-command',
+      now: () => new Date('2026-09-09T12:00:00.000Z'),
+    });
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
+    const stream = await fetch(`${base}/v1/phone/commands`);
+    const pending = bridge.dispatch({ kind: 'sms', to: 'Sarah', body: 'late' });
+    const reader = stream.body?.getReader();
+    const chunk = await reader?.read();
+    if (chunk === undefined || chunk.done || chunk.value === undefined) throw new Error('missing command');
+    expect(new TextDecoder().decode(chunk.value as Uint8Array)).toBe(
+      '{"id":"server-command","kind":"sms","to":"Sarah","body":"late","expires_at":"' +
+        '2026-09-09T12:00:15.000Z' +
+        '"}\n',
+    );
+    const result = await fetch(`${base}/v1/phone/results`, {
+      method: 'POST',
+      body: JSON.stringify({ id: 'server-command', status: 'ok', detail: 'sent' }),
+    });
+    expect(result.status).toBe(204);
+    await expect(pending).resolves.toBe('sent');
+    bridge.close();
+    await reader?.cancel();
+  });
+
+  it('rejects malformed phone results and method mismatches', async () => {
+    const bridge = new PhoneBridge(nullLogger);
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
+    for (const body of ['not json', JSON.stringify({ status: 'ok', detail: 'sent' }), JSON.stringify({ id: 'x', status: 'bad', detail: 'sent' })]) {
+      const res = await fetch(`${base}/v1/phone/results`, { method: 'POST', body });
+      expect(res.status).toBe(400);
+    }
+    expect((await fetch(`${base}/mcp`)).status).toBe(405);
+    expect((await fetch(`${base}/mcp`, { method: 'DELETE' })).status).toBe(405);
   });
 });
 

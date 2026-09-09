@@ -51,9 +51,11 @@ Data flows through three altitudes, the SDK owning everything below them:
    response streams events as NDJSON lines **byte-compatible with the v2 Go wire
    format** (key order, omitempty semantics — pinned by golden tests in
    `test/wire.test.ts`). Mid-stream failures become a terminal `{"kind":"error"}`
-   line because the 200 already shipped. `SessionTracker` + `src/janitor.ts` expire
-   idle children (in-flight turns never expire); `src/config.ts` is env-first
-   (`MENTAT_*`); `src/main.ts` assembles the daemon.
+   line because the 200 already shipped. Phone commands use the
+   `/v1/phone/commands` and `/v1/phone/results` routes, while `/mcp` exposes the
+   stateless phone tools. `SessionTracker` + `src/janitor.ts` expire idle children
+   (in-flight turns never expire); `src/config.ts` is env-first (`MENTAT_*`);
+   `src/main.ts` assembles the daemon.
 
 ## Invariants to preserve
 

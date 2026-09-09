@@ -9,6 +9,7 @@ import { ClaudeCode } from './claudecode.ts';
 import { loadConfig } from './config.ts';
 import { startJanitor } from './janitor.ts';
 import { jsonLogger } from './log.ts';
+import { PhoneBridge } from './phone.ts';
 import { allowAllPolicy } from './policy.ts';
 import { SessionTracker, createHandler } from './server.ts';
 import { createTokenIssuer } from './voicetoken.ts';
@@ -39,7 +40,8 @@ try {
   const tracker = new SessionTracker();
   const issuer =
     config.voiceToken !== undefined ? createTokenIssuer(config.voiceToken) : undefined;
-  const server = createServer(createHandler(backend, tracker, logger, issuer));
+  const bridge = new PhoneBridge(logger);
+  const server = createServer(createHandler(backend, tracker, logger, issuer, bridge));
   const stopJanitor = startJanitor(tracker, backend, config.sessionTtlMs, logger);
 
   server.listen(config.listen.port, config.listen.host, () => {
@@ -51,6 +53,7 @@ try {
   const shutdown = (): void => {
     logger.info('shutting down');
     stopJanitor();
+    bridge.close();
     server.close(() => {
       void backend.close().finally(() => {
         process.exit(exitCode);

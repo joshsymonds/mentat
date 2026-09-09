@@ -1,0 +1,154 @@
+import { EventEmitter } from 'node:events';
+import type { ServerResponse } from 'node:http';
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { nullLogger } from '../src/log.ts';
+import { PhoneBridge } from '../src/phone.ts';
+
+type FakeResponse = EventEmitter & {
+  destroyed: boolean;
+  ended: boolean;
+  chunks: string[];
+  writeHead: (status: number, headers?: Record<string, string>) => void;
+  flushHeaders: () => void;
+  write: (chunk: string) => boolean;
+  end: () => void;
+};
+
+function response(): FakeResponse {
+  const emitter = new EventEmitter() as FakeResponse;
+  emitter.destroyed = false;
+  emitter.ended = false;
+  emitter.chunks = [];
+  emitter.writeHead = () => undefined;
+  emitter.flushHeaders = () => undefined;
+  emitter.write = (chunk: string): boolean => {
+    emitter.chunks.push(chunk);
+    return true;
+  };
+  emitter.end = (): void => {
+    emitter.ended = true;
+    emitter.destroyed = true;
+    emitter.emit('close');
+  };
+  return emitter;
+}
+
+function bridgeAt(
+  now: Date = new Date('2026-09-09T12:00:00.000Z'),
+  timeoutMs = 15_000,
+  heartbeatMs = 20_000,
+): { bridge: PhoneBridge; setNow: (value: Date) => void } {
+  let current = now;
+  const bridge = new PhoneBridge(nullLogger, {
+    now: () => current,
+    uuid: () => 'command-id',
+    timeoutMs,
+    heartbeatMs,
+  });
+  return { bridge, setNow: (value) => (current = value) };
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe('PhoneBridge', () => {
+  it('rejects dispatch immediately while the phone is offline', async () => {
+    const { bridge } = bridgeAt();
+    await expect(bridge.dispatch({ kind: 'sms', to: 'Sarah', body: 'late' })).rejects.toThrow(
+      'phone offline',
+    );
+  });
+
+  it('writes SMS and open commands with an expiration timestamp', async () => {
+    const { bridge } = bridgeAt();
+    const phone = response();
+    bridge.attach(phone as unknown as ServerResponse);
+
+    const sms = bridge.dispatch({ kind: 'sms', to: 'Sarah', body: 'late' });
+    expect(phone.chunks).toEqual([
+      '{"id":"command-id","kind":"sms","to":"Sarah","body":"late","expires_at":"2026-09-09T12:00:15.000Z"}\n',
+    ]);
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'sent' })).toBe(true);
+    await expect(sms).resolves.toBe('sent');
+
+    const open = bridge.dispatch({ kind: 'open', uri: 'google.navigation:q=Union+Station' });
+    expect(phone.chunks.at(-1)).toBe(
+      '{"id":"command-id","kind":"open","uri":"google.navigation:q=Union+Station","expires_at":"2026-09-09T12:00:15.000Z"}\n',
+    );
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'launched' })).toBe(true);
+    await expect(open).resolves.toBe('launched');
+  });
+
+  it('resolves successful results and rejects error results with the detail', async () => {
+    const { bridge } = bridgeAt();
+    const phone = response();
+    bridge.attach(phone as unknown as ServerResponse);
+
+    const success = bridge.dispatch({ kind: 'sms', to: 'Sarah', body: 'late' });
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'sent to +15555550123' })).toBe(
+      true,
+    );
+    await expect(success).resolves.toBe('sent to +15555550123');
+
+    const failure = bridge.dispatch({ kind: 'open', uri: 'geo:0,0?q=Union+Station' });
+    expect(bridge.complete({ id: 'command-id', status: 'error', detail: 'not launched' })).toBe(true);
+    await expect(failure).rejects.toThrow('not launched');
+  });
+
+  it('times out once and ignores late or unknown results', async () => {
+    vi.useFakeTimers();
+    const { bridge } = bridgeAt();
+    const phone = response();
+    bridge.attach(phone as unknown as ServerResponse);
+    const pending = bridge.dispatch({ kind: 'sms', to: 'Sarah', body: 'late' });
+
+    const timedOut = expect(pending).rejects.toThrow('timed out: outcome unknown');
+    await vi.advanceTimersByTimeAsync(15_000);
+    await timedOut;
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'late' })).toBe(false);
+    expect(bridge.complete({ id: 'unknown', status: 'ok', detail: 'unknown' })).toBe(false);
+    expect(phone.chunks).toHaveLength(1);
+  });
+
+  it('sends heartbeat pings while attached and stops when detached', async () => {
+    vi.useFakeTimers();
+    const { bridge } = bridgeAt(undefined, 15_000, 20_000);
+    const phone = response();
+    bridge.attach(phone as unknown as ServerResponse);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(phone.chunks).toEqual(['{"kind":"ping"}\n']);
+    bridge.close();
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(phone.chunks).toEqual(['{"kind":"ping"}\n']);
+  });
+
+  it('replaces an attached stream and closes the old one', () => {
+    const { bridge } = bridgeAt();
+    const first = response();
+    const second = response();
+    bridge.attach(first as unknown as ServerResponse);
+    bridge.attach(second as unknown as ServerResponse);
+    expect(first.ended).toBe(true);
+    expect(second.ended).toBe(false);
+  });
+
+  it('closes the stream and rejects every pending command', async () => {
+    let nextId = 0;
+    const bridge = new PhoneBridge(nullLogger, { uuid: () => `close-${String(nextId++)}` });
+    const phone = response();
+    bridge.attach(phone as unknown as ServerResponse);
+    const first = bridge.dispatch({ kind: 'sms', to: 'Sarah', body: 'late' });
+    const second = bridge.dispatch({ kind: 'open', uri: 'https://example.test' });
+
+    const firstRejection = expect(first).rejects.toThrow('phone offline');
+    const secondRejection = expect(second).rejects.toThrow('phone offline');
+    bridge.close();
+    expect(phone.ended).toBe(true);
+    await firstRejection;
+    await secondRejection;
+  });
+});
