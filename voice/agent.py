@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import AsyncIterable, Mapping
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -41,6 +42,7 @@ from livekit.agents import (
     ConversationItemAddedEvent,
     JobContext,
     RunContext,
+    ModelSettings,
     WorkerOptions,
     function_tool,
     inference,
@@ -50,15 +52,19 @@ from livekit.plugins import silero
 from livekit.agents.tts import _provider_format
 
 from request import (
+    PRIVATE_CONTEXT_ENV,
+    PrivateContext,
     consult_envelope,
     conversation_advanced,
     count_user_messages,
     recent_turns,
+    load_private_context,
     split_persona,
     turn_latency,
     turn_request,
+    with_private_context,
 )
-from stream import TurnError, TurnStream
+from stream import Respeller, TurnError, TurnStream
 
 logger = logging.getLogger("mentat.voice")
 
@@ -73,6 +79,8 @@ FRONT_MODEL = "openai/gpt-5.6-luna"
 # Words Flux mishears on its own — "Mentat" came back as "man, uh". Keyterm
 # prompting boosts recall of exactly these; Deepgram caps the list at 100
 # terms totalling 1200 characters, and the terms are plain words, no weights.
+# Only the public vocabulary lives here; the people and places come from the
+# private context (request.PrivateContext), which is never in the repository.
 # Cartesia's Daniel, from the Sonic 3.6 recommended voices.
 TTS_VOICE = "47c38ca4-5f35-497b-b1a3-415245fb35e1"
 
@@ -177,11 +185,29 @@ class FrontAgent(Agent):
         voice_card: str,
         room_name: str,
         mentat_url: str,
+        pronunciations: Mapping[str, str],
     ) -> None:
         super().__init__(instructions=instructions)
         self._voice_card = voice_card
         self._room_name = room_name
         self._mentat_url = mentat_url
+        self._pronunciations = pronunciations
+
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ):  # type: ignore[override]  # the SDK's own signature; return type is its AudioFrame stream
+        """The default TTS path, fed respelled text so names are said right."""
+
+        async def respelled() -> AsyncIterable[str]:
+            respeller = Respeller(self._pronunciations)
+            async for chunk in text:
+                if out := respeller.feed(chunk):
+                    yield out
+            if out := respeller.flush():
+                yield out
+
+        async for frame in Agent.default.tts_node(self, respelled(), model_settings):
+            yield frame
 
     @function_tool(
         # CANCELLABLE puts the framework's cancel tool in front of the model,
@@ -327,6 +353,16 @@ def prewarm(proc: agents.JobProcess) -> None:
     listening; the worker warms up idle instead.
     """
     proc.userdata["vad"] = silero.VAD.load()
+    # Loaded here rather than per job so a broken file fails the worker at
+    # start, once, instead of every room at its first utterance.
+    private = load_private_context(os.environ.get(PRIVATE_CONTEXT_ENV))
+    proc.userdata["private"] = private
+    logger.info(
+        "private context: about=%d words, keyterms=%d, pronunciations=%d",
+        len(private.about.split()),
+        len(private.keyterms),
+        len(private.pronunciations),
+    )
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -334,6 +370,8 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
 
     instructions, voice_card = load_persona()
+    private: PrivateContext = ctx.proc.userdata["private"]
+    instructions = with_private_context(instructions, private)
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -343,7 +381,7 @@ async def entrypoint(ctx: JobContext) -> None:
         stt=inference.STT(
             "deepgram/flux-general",
             language="en",
-            extra_kwargs={"keyterm": STT_KEYTERMS},
+            extra_kwargs={"keyterm": [*STT_KEYTERMS, *private.keyterms]},
         ),
         # Luna is the front's own voice, fast enough to hold a conversation
         # with the depth delegated to ask_mentat.
@@ -403,6 +441,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await session.start(
         agent=FrontAgent(
+            pronunciations=private.pronunciations,
             instructions=instructions,
             voice_card=voice_card,
             room_name=ctx.room.name,

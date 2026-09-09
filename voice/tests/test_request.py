@@ -19,13 +19,17 @@ from request import (
     TURN_META,
     TURN_MODEL,
     VOICE_CARD_MARKER,
+    PrivateContext,
     consult_envelope,
     conversation_advanced,
     count_user_messages,
+    load_private_context,
+    parse_private_context,
     recent_turns,
     split_persona,
     turn_latency,
     turn_request,
+    with_private_context,
 )
 
 
@@ -390,3 +394,42 @@ class TurnLatencyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrivateContextTest(unittest.TestCase):
+    def test_full_document_parses(self):
+        ctx = parse_private_context(
+            'about = """\nWho he is: a person.\n"""\n'
+            'keyterms = ["Symonds", "Olive"]\n'
+            "[pronunciations]\n"
+            'Symonds = "Sigh-monds"\n'
+        )
+        self.assertEqual(ctx.about, "Who he is: a person.")
+        self.assertEqual(ctx.keyterms, ("Symonds", "Olive"))
+        self.assertEqual(ctx.pronunciations, {"Symonds": "Sigh-monds"})
+
+    def test_missing_sections_default_to_empty(self):
+        ctx = parse_private_context('keyterms = ["Olive"]\n')
+        self.assertEqual(ctx.about, "")
+        self.assertEqual(ctx.pronunciations, {})
+
+    def test_unknown_keys_and_wrong_types_are_refused(self):
+        # A typo must not silently become a file that carries nothing.
+        with self.assertRaises(ValueError):
+            parse_private_context('abuot = "x"\n')
+        with self.assertRaises(ValueError):
+            parse_private_context('keyterms = "Olive"\n')
+        with self.assertRaises(ValueError):
+            parse_private_context("[pronunciations]\nSymonds = 3\n")
+
+    def test_no_path_means_an_empty_context(self):
+        self.assertEqual(load_private_context(None), PrivateContext())
+        self.assertEqual(load_private_context(""), PrivateContext())
+
+    def test_about_is_folded_into_the_instructions(self):
+        base = "# The voice\n\nBe warm."
+        self.assertEqual(with_private_context(base, PrivateContext()), base)
+        self.assertEqual(
+            with_private_context(base, PrivateContext(about="Who he is: Josh.")),
+            "# The voice\n\nBe warm.\n\nWho he is: Josh.",
+        )

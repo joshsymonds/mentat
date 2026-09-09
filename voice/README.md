@@ -6,6 +6,28 @@ anything with memory or tools. Deployed on ultraviolet as the `mentat-voice`
 systemd unit (see `nix/module.nix`); the SFU, mentatd, and the agent all share
 that host, so the agent talks to both over loopback.
 
+## Private context
+
+The repository is public, so `persona.md` describes the voice and nothing
+about the person. Who Josh is lives in a TOML file the deploy hands the unit
+as a systemd credential (`services.mentat.voice.privateContextFile`, an
+agenix secret in nix-config), named to the agent by `MENTAT_VOICE_PRIVATE`:
+
+```toml
+about = """
+Who he is: ...one paragraph, folded into the instructions on every turn.
+"""
+keyterms = ["Symonds", "Olive"]          # names speech recognition should expect
+
+[pronunciations]                         # word = what the synthesizer is handed
+Symonds = "Sigh-monds"                   # captions keep the real spelling
+```
+
+Unset means the voice knows no one (dev rooms, CI); a set but unreadable
+path fails the worker at start. To run a dev room with it, add
+`MENTAT_VOICE_PRIVATE=/run/agenix/mentat-voice-private` to the launch
+environment in step 2.
+
 ## Testing branch code in a live room
 
 Audio changes can't be accepted from unit tests — someone has to listen. The
