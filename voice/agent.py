@@ -23,11 +23,11 @@ straight from the environment.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
-from collections.abc import AsyncIterable, Mapping
-from collections.abc import Mapping
+from collections.abc import AsyncIterable, Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,6 +42,7 @@ from livekit.agents import (
     ConversationItemAddedEvent,
     JobContext,
     RunContext,
+    get_job_context,
     ModelSettings,
     StopResponse,
     WorkerOptions,
@@ -56,12 +57,14 @@ from livekit.agents.tts import _provider_format
 from phone import PhoneActions, RpcFailure
 from request import (
     PRIVATE_CONTEXT_ENV,
+    EndingPolicy,
     PrivateContext,
     consult_envelope,
     conversation_advanced,
     count_user_messages,
     recent_turns,
     load_private_context,
+    run_close_sequence,
     split_persona,
     turn_latency,
     turn_request,
@@ -191,12 +194,16 @@ class FrontAgent(Agent):
         mentat_url: str,
         pronunciations: Mapping[str, str],
         room: rtc.Room | None = None,
+        ending_policy: EndingPolicy | None = None,
+        ending_changed: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(instructions=instructions)
         self._voice_card = voice_card
         self._room_name = room_name
         self._mentat_url = mentat_url
         self._pronunciations = pronunciations
+        self._ending_policy = ending_policy or EndingPolicy()
+        self._ending_changed = ending_changed or (lambda: None)
 
         async def perform_rpc(
             identity: str, method: str, payload: str, timeout: float
@@ -247,6 +254,37 @@ class FrontAgent(Agent):
         await self.update_chat_ctx(pruned)
         logger.info("not_for_me: a turn was erased as not addressed to the front")
         raise StopResponse()
+
+    @function_tool()
+    async def end_conversation(
+        self,
+        ctx: RunContext,
+        reason: Literal["signoff", "done"],
+        farewell: str = "",
+    ) -> None:
+        """End the conversation after a sign-off or a completed request."""
+        if self._ending_policy.consult_in_flight:
+            return None
+
+        self._ending_policy.end_requested(reason)
+        logger.info("end_conversation: reason=%s", reason)
+        await ctx.wait_for_playout()
+        if self._ending_policy.pending_reason != reason:
+            self._ending_changed()
+            return None
+
+        if reason == "signoff":
+            handle = ctx.session.say(farewell)
+            await handle
+            delivered = not handle.interrupted and handle.exception() is None
+        else:
+            handle = ctx.speech_handle
+            delivered = not handle.interrupted and handle.exception() is None
+
+        if self._ending_policy.playout_finished(delivered) == "close":
+            ctx.session.shutdown()
+        self._ending_changed()
+        return None
 
     async def tts_node(
         self, text: AsyncIterable[str], model_settings: ModelSettings
@@ -317,38 +355,49 @@ class FrontAgent(Agent):
         # Counted before control goes back to the front, so the holding line
         # it is about to speak cannot be mistaken for the caller talking on.
         baseline = count_user_messages(self.chat_ctx.items)
-        await ctx.update(CONSULT_CUE)
+        self._ending_policy.consult_started()
+        self._ending_changed()
 
         try:
-            envelope = consult_envelope(
-                self._voice_card,
-                # No rolling summary is kept yet — deferred by design; the
-                # envelope drops the section entirely when it is blank.
-                summary="",
-                last_turns=recent_turns(self.chat_ctx.items),
-                question=question,
-            )
-            answer = await self._consult(envelope, effort, model)
-            if not answer:
-                # A turn that spent itself on tools can finish cleanly with no
-                # text at all. Saying an empty string would leave the caller
-                # listening to nothing, which sounds exactly like a hang — so
-                # an answer with nothing in it is a failed consult, and gets
-                # the same apology as one that never arrived.
-                raise TurnError("turn produced no speakable text")
-        except (TurnError, aiohttp.ClientError, TimeoutError) as err:
-            logger.warning("consult failed: %s", err)
-            return CONSULT_FAILED
+            await ctx.update(CONSULT_CUE)
+            try:
+                envelope = consult_envelope(
+                    self._voice_card,
+                    # No rolling summary is kept yet — deferred by design; the
+                    # envelope drops the section entirely when it is blank.
+                    summary="",
+                    last_turns=recent_turns(self.chat_ctx.items),
+                    question=question,
+                )
+                answer = await self._consult(envelope, effort, model)
+                if not answer:
+                    # A turn that spent itself on tools can finish cleanly with
+                    # no text at all. Saying an empty string would leave the
+                    # caller listening to nothing, which sounds exactly like a
+                    # hang — so an answer with nothing in it is a failed consult,
+                    # and gets the same apology as one that never arrived.
+                    raise TurnError("turn produced no speakable text")
+            except (TurnError, aiohttp.ClientError, TimeoutError) as err:
+                logger.warning("consult failed: %s", err)
+                return CONSULT_FAILED
 
-        prefix = (
-            REORIENTATION_PREFIX
-            if conversation_advanced(self.chat_ctx.items, baseline)
-            else ""
-        )
-        await ctx.session.say(prefix + answer)
-        # Nothing left to say. Returning None after an update is what stops
-        # the framework generating a reply on top of the answer just spoken.
-        return None
+            prefix = (
+                REORIENTATION_PREFIX
+                if conversation_advanced(self.chat_ctx.items, baseline)
+                else ""
+            )
+            spoken = prefix + answer
+            handle = ctx.session.say(spoken)
+            await handle
+            delivered = not handle.interrupted and handle.exception() is None
+            self._ending_policy.consult_answered(answer, delivered)
+            self._ending_changed()
+            # Nothing left to say. Returning None after an update is what stops
+            # the framework generating a reply on top of the answer just spoken.
+            return None
+        finally:
+            self._ending_policy.consult_finished()
+            self._ending_changed()
 
     @function_tool
     async def find_places(
@@ -498,6 +547,7 @@ async def entrypoint(ctx: JobContext) -> None:
     instructions, voice_card = load_persona()
     private: PrivateContext = ctx.proc.userdata["private"]
     instructions = with_private_context(instructions, private)
+    ending_policy = EndingPolicy()
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -552,6 +602,61 @@ async def entrypoint(ctx: JobContext) -> None:
     # session for state changes, and a consult can start on the first utterance.
     await background.start(room=ctx.room, agent_session=session)
 
+    timer_task: asyncio.Task[None] | None = None
+
+    async def _wait_for_deadline(seconds: float) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        if ending_policy.elapsed(seconds) == "close":
+            session.shutdown()
+
+    def _rearm_timer() -> None:
+        nonlocal timer_task
+        if timer_task is not None:
+            timer_task.cancel()
+            timer_task = None
+        if ending_policy.deadline is not None:
+            timer_task = asyncio.create_task(_wait_for_deadline(ending_policy.deadline))
+
+    cleanup_task: asyncio.Task[None] | None = None
+
+    async def _delete_room() -> None:
+        await ctx.delete_room()
+
+    async def _shutdown_job() -> None:
+        get_job_context().shutdown()
+
+    @session.on("close")
+    def _on_close(_: Any) -> None:
+        nonlocal cleanup_task, timer_task
+        if timer_task is not None:
+            timer_task.cancel()
+            timer_task = None
+        if cleanup_task is None:
+            logger.info("voice session closing")
+            cleanup_task = asyncio.create_task(
+                run_close_sequence(
+                    background.aclose,
+                    _delete_room,
+                    _shutdown_job,
+                    logger.error,
+                )
+            )
+
+    async def _await_cleanup() -> None:
+        if cleanup_task is not None:
+            await cleanup_task
+
+    ctx.add_shutdown_callback(_await_cleanup)
+
+    @session.on("user_state_changed")
+    def _on_user_state(ev: Any) -> None:
+        if ev.new_state == "speaking":
+            ending_policy.user_spoke()
+            _rearm_timer()
+
     # One bing per turn, debounced: the acknowledgment means "I heard you",
     # and a turn only needs hearing once — re-entries into thinking within the
     # window are the same turn's plumbing, not a new utterance.
@@ -560,6 +665,12 @@ async def entrypoint(ctx: JobContext) -> None:
     @session.on("agent_state_changed")
     def _bing(ev: AgentStateChangedEvent) -> None:
         nonlocal last_bing
+        if ev.new_state == "listening":
+            ending_policy.agent_listening()
+            _rearm_timer()
+        elif ev.new_state in {"thinking", "speaking"}:
+            ending_policy.agent_busy()
+            _rearm_timer()
         now = time.monotonic()
         if ev.new_state == "thinking" and now - last_bing >= EARCON_MIN_INTERVAL_S:
             last_bing = now
@@ -573,6 +684,8 @@ async def entrypoint(ctx: JobContext) -> None:
             room_name=ctx.room.name,
             mentat_url=os.environ.get("MENTAT_URL", DEFAULT_MENTAT_URL),
             room=ctx.room,
+            ending_policy=ending_policy,
+            ending_changed=_rearm_timer,
         ),
         room=ctx.room,
         # Self-hosted noise suppression on the inbound track, one stateful
