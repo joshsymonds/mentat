@@ -157,6 +157,9 @@ async def run_all(
         voice_card=voice_card,
         room_name="eval",
         mentat_url=agent.DEFAULT_MENTAT_URL,
+        # The eval never speaks, so nothing is respelled; the argument is
+        # required because production always passes the private context's.
+        pronunciations={},
     )
     model = LLM(model_name)
     limit = asyncio.Semaphore(concurrency)
