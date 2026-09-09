@@ -46,6 +46,7 @@ open class AssistActivity : ComponentActivity() {
     private var stateJob: Job? = null
     private var transcriptJob: Job? = null
     private var micJob: Job? = null
+    private var activityStarted = false
 
     internal val uiState: StateFlow<SessionState> = mutableUiState.asStateFlow()
 
@@ -54,14 +55,20 @@ open class AssistActivity : ComponentActivity() {
     ) { granted ->
         if (granted) {
             startAndBindVoiceService()
+            requestLocationPermissions()
         } else {
             mutableUiState.value = SessionStateMachine().transition(SessionEvent.PermissionDenied)
         }
     }
 
+    private val locationPermissionRequest = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { }
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             service = (binder as VoiceSessionService.LocalBinder).service()
+            service!!.setAssistVisible(activityStarted)
             stateJob = activityScope.launch {
                 service!!.state.collect { mutableUiState.value = it }
             }
@@ -114,6 +121,18 @@ open class AssistActivity : ComponentActivity() {
         beginVoiceSession()
     }
 
+    override fun onStart() {
+        super.onStart()
+        activityStarted = true
+        service?.setAssistVisible(true)
+    }
+
+    override fun onStop() {
+        activityStarted = false
+        service?.setAssistVisible(false)
+        super.onStop()
+    }
+
     override fun onDestroy() {
         // A failed session can still have a running service behind it — a token or connect
         // failure does not stop one — so only an already-ended session skips the stop.
@@ -162,9 +181,19 @@ open class AssistActivity : ComponentActivity() {
     private fun beginVoiceSession() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             startAndBindVoiceService()
+            requestLocationPermissions()
         } else {
             permissionRequest.launch(Manifest.permission.RECORD_AUDIO)
         }
+    }
+
+    private fun requestLocationPermissions() {
+        locationPermissionRequest.launch(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+            ),
+        )
     }
 
     private fun startAndBindVoiceService() {

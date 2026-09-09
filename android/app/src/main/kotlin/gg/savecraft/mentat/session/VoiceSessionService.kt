@@ -16,6 +16,7 @@ import gg.savecraft.mentat.core.SessionStateMachine
 import gg.savecraft.mentat.core.TokenEndpoint
 import gg.savecraft.mentat.core.Transcript
 import gg.savecraft.mentat.core.TranscriptSegment
+import gg.savecraft.mentat.phone.PhoneBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -32,6 +33,7 @@ open class VoiceSessionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val binder = LocalBinder()
     private lateinit var controller: VoiceSessionController
+    private lateinit var bridge: PhoneBridge
     private var started = false
 
     val state: StateFlow<SessionState>
@@ -41,11 +43,17 @@ open class VoiceSessionService : Service() {
     val micEnabled: StateFlow<Boolean>
         get() = controller.micEnabled
 
+    val phoneBridge: PhoneBridge
+        get() = bridge
+
     override fun onCreate() {
         super.onCreate()
+        bridge = phoneBridge()
+        val session = liveKitSession()
+        session.setPhoneBridge(bridge)
         controller = VoiceSessionController(
             tokenEndpoint = tokenEndpoint(),
-            liveKitSession = liveKitSession(),
+            liveKitSession = session,
             stopService = ::stopVoiceService,
             scope = serviceScope,
         )
@@ -103,6 +111,12 @@ open class VoiceSessionService : Service() {
     protected open fun tokenEndpoint(): TokenEndpoint = HttpTokenEndpoint(AppSettings(this).tokenEndpointUrl)
 
     protected open fun liveKitSession(): LiveKitSession = AndroidLiveKitSession(this)
+
+    protected open fun phoneBridge(): PhoneBridge = PhoneBridge(this)
+
+    fun setAssistVisible(visible: Boolean) {
+        bridge.assistVisible = visible
+    }
 
     protected open fun stopVoiceService() {
         stopSelf()

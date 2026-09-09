@@ -6,6 +6,7 @@ import gg.savecraft.mentat.core.TokenEndpoint
 import gg.savecraft.mentat.core.TokenFetchException
 import gg.savecraft.mentat.core.TokenGrant
 import gg.savecraft.mentat.core.TranscriptSegment
+import gg.savecraft.mentat.phone.PhoneBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -98,6 +99,16 @@ class VoiceSessionServiceTest {
         assertTrue(liveKit.closed)
         assertTrue(stopped)
         assertEquals(SessionState.Ended, service.state.value)
+    }
+
+    @Test
+    fun serviceWiresPhoneBridgeBeforeStartingTheSession() {
+        val liveKit = FakeLiveKitSession()
+        FakeLiveKitVoiceSessionService.liveKit = liveKit
+
+        Robolectric.buildService(FakeLiveKitVoiceSessionService::class.java).create().get()
+
+        assertTrue(liveKit.registeredPhoneBridge != null)
     }
 
     @Test
@@ -253,6 +264,7 @@ class VoiceSessionServiceTest {
         override val transcripts = MutableSharedFlow<TranscriptSegment>()
         val microphoneEnabled = MutableStateFlow(false)
         var connection: Pair<String, String>? = null
+        var registeredPhoneBridge: PhoneBridge? = null
         var disconnected = false
         var closed = false
 
@@ -260,6 +272,10 @@ class VoiceSessionServiceTest {
             connectFailure?.let { throw it }
             connection = url to token
             connectEvent?.let { events.emit(it) }
+        }
+
+        override fun setPhoneBridge(bridge: PhoneBridge) {
+            registeredPhoneBridge = bridge
         }
 
         override suspend fun setMicEnabled(enabled: Boolean) {

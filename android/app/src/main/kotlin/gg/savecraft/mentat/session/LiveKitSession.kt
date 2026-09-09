@@ -3,6 +3,7 @@ package gg.savecraft.mentat.session
 import android.content.Context
 import gg.savecraft.mentat.core.SessionEvent
 import gg.savecraft.mentat.core.TranscriptSegment
+import gg.savecraft.mentat.phone.PhoneBridge
 import io.livekit.android.LiveKit
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.events.collect
@@ -28,6 +29,8 @@ interface LiveKitSession {
     val transcripts: Flow<TranscriptSegment>
 
     suspend fun connect(url: String, token: String)
+
+    fun setPhoneBridge(bridge: PhoneBridge) {}
 
     suspend fun setMicEnabled(enabled: Boolean)
 
@@ -64,6 +67,7 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
     private val mutableTranscripts = MutableSharedFlow<TranscriptSegment>(extraBufferCapacity = 8)
     private var disconnected = false
     private var closed = false
+    private var phoneBridge: PhoneBridge? = null
 
     override val events: Flow<LiveKitEvent> = mutableEvents.asSharedFlow()
     override val transcripts: Flow<TranscriptSegment> = mutableTranscripts.asSharedFlow()
@@ -89,8 +93,13 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
         }
     }
 
+    override fun setPhoneBridge(bridge: PhoneBridge) {
+        phoneBridge = bridge
+    }
+
     override suspend fun connect(url: String, token: String) {
         room.connect(url, token)
+        phoneBridge?.register(room.localParticipant)
     }
 
     override suspend fun setMicEnabled(enabled: Boolean) {

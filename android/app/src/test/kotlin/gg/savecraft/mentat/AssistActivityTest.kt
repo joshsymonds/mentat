@@ -51,6 +51,63 @@ class AssistActivityTest {
     }
 
     @Test
+    fun microphoneGrantStartsSessionBeforeRequestingLocationPermissions() {
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+        val microphoneRequest = Shadows.shadowOf(activity).lastRequestedPermission
+
+        activity.onRequestPermissionsResult(
+            microphoneRequest.requestCode,
+            microphoneRequest.requestedPermissions,
+            intArrayOf(PackageManager.PERMISSION_GRANTED),
+        )
+
+        val locationRequest = Shadows.shadowOf(activity).lastRequestedPermission
+        assertEquals(VOICE_SERVICE, startedServiceClassName())
+        assertEquals(
+            listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            locationRequest.requestedPermissions.toList(),
+        )
+    }
+
+    @Test
+    fun preciseLocationPermissionDecisionStartsVoiceService() {
+        assertLocationPermissionDecisionStartsSession(
+            intArrayOf(PackageManager.PERMISSION_GRANTED, PackageManager.PERMISSION_GRANTED),
+        )
+    }
+
+    @Test
+    fun approximateLocationPermissionDecisionStartsVoiceService() {
+        assertLocationPermissionDecisionStartsSession(
+            intArrayOf(PackageManager.PERMISSION_DENIED, PackageManager.PERMISSION_GRANTED),
+        )
+    }
+
+    @Test
+    fun deniedLocationPermissionDecisionStartsVoiceService() {
+        assertLocationPermissionDecisionStartsSession(
+            intArrayOf(PackageManager.PERMISSION_DENIED, PackageManager.PERMISSION_DENIED),
+        )
+    }
+
+    private fun assertLocationPermissionDecisionStartsSession(results: IntArray) {
+        grantRecordAudio()
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().get()
+        val request = Shadows.shadowOf(activity).lastRequestedPermission
+
+        assertEquals(
+            listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            request.requestedPermissions.toList(),
+        )
+        activity.onRequestPermissionsResult(
+            request.requestCode,
+            request.requestedPermissions,
+            results,
+        )
+        assertEquals(VOICE_SERVICE, startedServiceClassName())
+    }
+
+    @Test
     fun grantedRecordAudioPermissionStartsVoiceService() {
         grantRecordAudio()
 
