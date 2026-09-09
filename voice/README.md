@@ -49,7 +49,7 @@ ssh ultraviolet sudo systemctl stop mentat-voice   # restart when done!
 
 ### 1. Stage the branch files on ultraviolet
 
-The agent is a flat directory: `agent.py persona.md request.py stream.py
+The agent is a flat directory: `agent.py persona.md request.py stream.py phone.py
 assets/*.wav`. Copy those to a private scratch dir with a writable HOME for
 the livekit plugin caches. `mktemp -d`, not a fixed name: a predictable
 `/tmp` path with `mkdir -p` silently reuses a directory another local user
@@ -58,7 +58,7 @@ could have pre-created, and step 2 executes code out of this directory.
 ```sh
 dev=$(ssh ultraviolet 'mktemp -d /tmp/mentat-voice-dev.XXXXXX')
 ssh ultraviolet "mkdir -p $dev/assets $dev/home/cache"
-scp voice/agent.py voice/persona.md voice/request.py voice/stream.py ultraviolet:$dev/
+scp voice/agent.py voice/persona.md voice/request.py voice/stream.py voice/phone.py ultraviolet:$dev/
 scp voice/assets/*.wav ultraviolet:$dev/assets/
 ```
 
