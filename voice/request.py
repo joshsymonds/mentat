@@ -65,6 +65,15 @@ DONE_GRACE_S = 6.0
 #: Seconds of total silence while listening before the front closes.
 IDLE_S = 30.0
 
+DEFAULT_FAREWELL = "Talk later."
+
+
+def farewell_line(farewell: str) -> str:
+    """Return one spoken line because R1 requires speech when the schema
+    supplies nothing.
+    """
+    return " ".join(farewell.split()) or DEFAULT_FAREWELL
+
 
 class EndingPolicy:
     """Pure state machine for model-requested and silent conversation ends.
@@ -79,6 +88,7 @@ class EndingPolicy:
         self._deadline_kind: str | None = None
         self._requested_reason: str | None = None
         self._consult_in_flight = False
+        self._user_speaking = False
 
     @property
     def deadline(self) -> float | None:
@@ -117,14 +127,14 @@ class EndingPolicy:
             return None
         if reason == "signoff":
             return "close"
-        if reason == "done":
+        if reason == "done" and not self._user_speaking:
             self._deadline = DONE_GRACE_S
             self._deadline_kind = "done"
         return None
 
     def consult_answered(self, text: str, delivered: bool) -> None:
         """Arm the short close window for a delivered, non-question answer."""
-        if delivered and not text.strip().endswith("?"):
+        if delivered and not text.strip().endswith("?") and not self._user_speaking:
             self._deadline = DONE_GRACE_S
             self._deadline_kind = "done"
         else:
@@ -140,20 +150,30 @@ class EndingPolicy:
     def consult_finished(self) -> None:
         """Resume the idle close window after a consult finishes."""
         self._consult_in_flight = False
-        if self._deadline is None:
+        if self._deadline is None and not self._user_speaking:
             self._deadline = IDLE_S
             self._deadline_kind = "idle"
         return None
 
     def user_spoke(self) -> str | None:
         """Cancel any pending close when Josh starts another utterance."""
+        self._user_speaking = True
         had_request = self._requested_reason is not None
         self._requested_reason = None
         return "cancel" if self._clear_deadline() or had_request else None
 
+    def user_quiet(self) -> None:
+        """Record that Josh stopped speaking."""
+        self._user_speaking = False
+        return None
+
     def agent_listening(self) -> None:
         """Arm idle closure when the agent is listening for a new turn."""
-        if not self._consult_in_flight and self._deadline is None:
+        if (
+            not self._consult_in_flight
+            and self._deadline is None
+            and not self._user_speaking
+        ):
             self._deadline = IDLE_S
             self._deadline_kind = "idle"
         return None

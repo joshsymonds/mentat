@@ -60,6 +60,7 @@ from request import (
     EndingPolicy,
     PrivateContext,
     consult_envelope,
+    farewell_line,
     conversation_advanced,
     count_user_messages,
     recent_turns,
@@ -274,12 +275,14 @@ class FrontAgent(Agent):
             return None
 
         if reason == "signoff":
-            handle = ctx.session.say(farewell)
+            handle = ctx.session.say(farewell_line(farewell))
             await handle
             delivered = not handle.interrupted and handle.exception() is None
         else:
             handle = ctx.speech_handle
-            delivered = not handle.interrupted and handle.exception() is None
+            # The owning speech handle is still running while this tool runs;
+            # reading exception() here raises InvalidStateError.
+            delivered = not handle.interrupted
 
         if self._ending_policy.playout_finished(delivered) == "close":
             ctx.session.shutdown()
@@ -655,6 +658,9 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_user_state(ev: Any) -> None:
         if ev.new_state == "speaking":
             ending_policy.user_spoke()
+            _rearm_timer()
+        elif ev.new_state in {"listening", "away"}:
+            ending_policy.user_quiet()
             _rearm_timer()
 
     # One bing per turn, debounced: the acknowledgment means "I heard you",

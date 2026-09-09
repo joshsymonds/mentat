@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from request import (
     CONSULT_TURN_CHARS,
+    DEFAULT_FAREWELL,
     DONE_GRACE_S,
     IDLE_S,
     CONSULT_WINDOW_TURNS,
@@ -23,6 +24,7 @@ from request import (
     VOICE_CARD_MARKER,
     EndingPolicy,
     PrivateContext,
+    farewell_line,
     run_close_sequence,
     consult_envelope,
     conversation_advanced,
@@ -457,6 +459,18 @@ class WithoutLastUserMessageTest(unittest.TestCase):
         self.assertEqual(without_last_user_message(items), items)
 
 
+class FarewellLineTest(unittest.TestCase):
+    def test_blank_farewell_uses_default(self):
+        self.assertEqual(farewell_line(""), DEFAULT_FAREWELL)
+        self.assertEqual(farewell_line(" \n\t"), DEFAULT_FAREWELL)
+
+    def test_multiline_farewell_becomes_one_line(self):
+        self.assertEqual(farewell_line("See you\nlater."), "See you later.")
+
+    def test_single_line_farewell_is_unchanged(self):
+        self.assertEqual(farewell_line("Bye for now."), "Bye for now.")
+
+
 class EndingPolicyTest(unittest.TestCase):
     """The policy that decides when a voice session may close."""
 
@@ -526,8 +540,31 @@ class EndingPolicyTest(unittest.TestCase):
         policy = EndingPolicy()
         policy.consult_started()
         self.assertIsNone(policy.end_requested("signoff"))
+        self.assertIsNone(policy.pending_reason)
         self.assertIsNone(policy.end_requested("done"))
+        self.assertIsNone(policy.pending_reason)
+        self.assertIsNone(policy.playout_finished(delivered=True))
         self.assertIsNone(policy.deadline)
+
+    def test_user_speech_during_consult_blocks_done_window(self):
+        policy = EndingPolicy()
+        policy.consult_started()
+        policy.user_spoke()
+        policy.consult_answered("The answer is complete.", delivered=True)
+        policy.consult_finished()
+        self.assertIsNone(policy.deadline)
+        self.assertNotEqual(policy.elapsed(DONE_GRACE_S), "close")
+
+    def test_user_speech_blocks_idle_window_until_quiet(self):
+        policy = EndingPolicy()
+        policy.user_spoke()
+        policy.agent_listening()
+        self.assertIsNone(policy.deadline)
+        self.assertNotEqual(policy.elapsed(IDLE_S), "close")
+
+        policy.user_quiet()
+        policy.agent_listening()
+        self.assertEqual(policy.deadline, IDLE_S)
 
     def test_idle_listening_arms_thirty_seconds(self):
         policy = EndingPolicy()
