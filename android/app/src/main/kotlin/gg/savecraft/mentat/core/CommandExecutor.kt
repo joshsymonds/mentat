@@ -9,6 +9,7 @@ sealed class SmsSendOutcome {
     data object Sent : SmsSendOutcome()
     data class Failed(val resultCode: Int) : SmsSendOutcome()
     data object Unknown : SmsSendOutcome()
+    data object Expired : SmsSendOutcome()
 }
 
 interface SmsSender {
@@ -86,6 +87,7 @@ class CommandExecutor(
             SmsSendOutcome.Sent -> PhoneResult(command.id, "ok", "sent to $number")
             is SmsSendOutcome.Failed -> PhoneResult(command.id, "error", "send failed: ${outcome.resultCode}")
             SmsSendOutcome.Unknown -> PhoneResult(command.id, "error", "outcome unknown")
+            SmsSendOutcome.Expired -> PhoneResult(command.id, "error", "expired")
         }
     }
 

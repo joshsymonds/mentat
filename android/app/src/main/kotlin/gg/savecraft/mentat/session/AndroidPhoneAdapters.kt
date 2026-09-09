@@ -96,6 +96,9 @@ class AndroidSmsSender(
                     )
                 }
             }
+            if (!clock.now().isBefore(deadline)) {
+                return@withContext SmsSendOutcome.Expired
+            }
             try {
                 gateway.send(number, parts, sentIntents)
             } catch (exception: SecurityException) {
@@ -129,10 +132,10 @@ class AndroidContactResolver(
         if (!hasPermission) {
             return emptyList()
         }
-        val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_FILTER_URI
-            .buildUpon()
-            .appendPath(Uri.encode(name))
-            .build()
+        val uri = Uri.withAppendedPath(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_FILTER_URI,
+            Uri.encode(name),
+        )
         val projection = arrayOf(
             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
             ContactsContract.CommonDataKinds.Phone.NUMBER,

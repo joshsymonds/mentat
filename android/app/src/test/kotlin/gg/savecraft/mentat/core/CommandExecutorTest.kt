@@ -76,6 +76,12 @@ class CommandExecutorTest {
     }
 
     @Test
+    fun expiredSmsOutcomeIsReportedAsExpired() = runBlocking {
+        val result = executor(sms = FakeSmsSender(SmsSendOutcome.Expired)).execute(smsCommand())
+        assertEquals(PhoneResult("id", "error", "expired"), result)
+    }
+
+    @Test
     fun unknownSmsOutcomeDoesNotReplayAndNextCommandCanProceed() = runBlocking {
         val sms = FakeSmsSender(SmsSendOutcome.Unknown)
         val first = executor(sms = sms).execute(smsCommand())
