@@ -400,16 +400,16 @@ class PrivateContextTest(unittest.TestCase):
     def test_full_document_parses(self):
         ctx = parse_private_context(
             'about = """\nWho he is: a person.\n"""\n'
-            'keyterms = ["Symonds", "Olive"]\n'
+            'keyterms = ["Symonds", "Rosalind"]\n'
             "[pronunciations]\n"
             'Symonds = "Sigh-monds"\n'
         )
         self.assertEqual(ctx.about, "Who he is: a person.")
-        self.assertEqual(ctx.keyterms, ("Symonds", "Olive"))
+        self.assertEqual(ctx.keyterms, ("Symonds", "Rosalind"))
         self.assertEqual(ctx.pronunciations, {"Symonds": "Sigh-monds"})
 
     def test_missing_sections_default_to_empty(self):
-        ctx = parse_private_context('keyterms = ["Olive"]\n')
+        ctx = parse_private_context('keyterms = ["Rosalind"]\n')
         self.assertEqual(ctx.about, "")
         self.assertEqual(ctx.pronunciations, {})
 
@@ -418,7 +418,7 @@ class PrivateContextTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_private_context('abuot = "x"\n')
         with self.assertRaises(ValueError):
-            parse_private_context('keyterms = "Olive"\n')
+            parse_private_context('keyterms = "Rosalind"\n')
         with self.assertRaises(ValueError):
             parse_private_context("[pronunciations]\nSymonds = 3\n")
 

@@ -17,7 +17,7 @@ agenix secret in nix-config), named to the agent by `MENTAT_VOICE_PRIVATE`:
 about = """
 Who he is: ...one paragraph, folded into the instructions on every turn.
 """
-keyterms = ["Symonds", "Olive"]          # names speech recognition should expect
+keyterms = ["Symonds", "Rosalind"]          # names speech recognition should expect
 
 [pronunciations]                         # word = what the synthesizer is handed
 Symonds = "Sigh-monds"                   # captions keep the real spelling
