@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import AsyncIterable, Mapping
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -41,24 +42,33 @@ from livekit.agents import (
     ConversationItemAddedEvent,
     JobContext,
     RunContext,
+    ModelSettings,
+    StopResponse,
     WorkerOptions,
     function_tool,
     inference,
     llm,
 )
-from livekit.plugins import silero
+from livekit.agents.voice import room_io
+from livekit.plugins import dtln, silero
+from livekit.agents.tts import _provider_format
 
 from phone import PhoneActions, RpcFailure
 from request import (
+    PRIVATE_CONTEXT_ENV,
+    PrivateContext,
     consult_envelope,
     conversation_advanced,
     count_user_messages,
     recent_turns,
+    load_private_context,
     split_persona,
     turn_latency,
     turn_request,
+    with_private_context,
+    without_last_user_message,
 )
-from stream import TurnError, TurnStream
+from stream import Respeller, TurnError, TurnStream
 
 logger = logging.getLogger("mentat.voice")
 
@@ -73,6 +83,37 @@ FRONT_MODEL = "openai/gpt-5.6-luna"
 # Words Flux mishears on its own — "Mentat" came back as "man, uh". Keyterm
 # prompting boosts recall of exactly these; Deepgram caps the list at 100
 # terms totalling 1200 characters, and the terms are plain words, no weights.
+# Only the public vocabulary lives here; the people and places come from the
+# private context (request.PrivateContext), which is never in the repository.
+# Cartesia's Daniel, from the Sonic 3.6 recommended voices.
+TTS_VOICE = "47c38ca4-5f35-497b-b1a3-415245fb35e1"
+
+# Appended to the expressive-mode tag instructions. The default template
+# already lists the tags; this is the persona's rule for when to reach for one.
+DELIVERY_RULE = (
+    "Choose each label from what the words already carry. A plain answer is "
+    "neutral or content, not forced brighter; go to excited, sympathetic, "
+    "joking, or apologetic only when the line itself is that. A pause goes "
+    "before the part that matters and nowhere else. The delivery should shift "
+    "the way a real voice does across a conversation, not perform. One thing "
+    "the tag list above leaves out: this voice does laugh. Write the literal "
+    "text [laughter] where the laugh goes, as its own word, and it is voiced. "
+    "It is rare — only when something is actually funny, never at your own "
+    "line, and never as a substitute for saying the thing."
+)
+
+# Under expressive mode the SDK batches sentences up to the provider's chunk
+# size before the first TTS request, to keep prosody continuous across a turn.
+# Cartesia's entry is 400 characters — longer than most of Luna's replies, so
+# first audio would wait for the whole turn. Cartesia's emotion tags are per
+# sentence anyway, so one sentence at a time loses nothing and keeps the
+# time-to-first-audio the journal already measures. The table is private to
+# agents 1.6.10 (pinned in nix/voice-env.nix); the assert makes a bump that
+# moves it fail at worker start rather than silently batch again.
+EXPRESSIVE_BATCH_CHARS = 120
+assert "cartesia" in _provider_format._MAX_INPUT_LEN, "agents SDK moved the TTS chunking table"
+_provider_format._MAX_INPUT_LEN["cartesia"] = EXPRESSIVE_BATCH_CHARS
+
 STT_KEYTERMS = [
     "Mentat",
     "Luna",
@@ -148,12 +189,14 @@ class FrontAgent(Agent):
         voice_card: str,
         room_name: str,
         mentat_url: str,
+        pronunciations: Mapping[str, str],
         room: rtc.Room | None = None,
     ) -> None:
         super().__init__(instructions=instructions)
         self._voice_card = voice_card
         self._room_name = room_name
         self._mentat_url = mentat_url
+        self._pronunciations = pronunciations
 
         async def perform_rpc(
             identity: str, method: str, payload: str, timeout: float
@@ -189,6 +232,37 @@ class FrontAgent(Agent):
             lambda: room.remote_participants if room is not None else (),
             os.environ.get("MENTAT_PLACES_API_KEY", ""),
         )
+
+    @function_tool()
+    async def not_for_me(self, ctx: RunContext) -> None:
+        """What just came through was not said to you: someone else in the
+        room, a pet, a TV, a fragment of noise, or a stray line that belongs to
+        no conversation you are having. Call this instead of replying. The
+        line is erased and you say nothing — never ask what it was."""
+        # The line is already in the context, appended before this turn's
+        # generation started; the reply it would get is stopped below before
+        # anything is generated, so this one removal leaves no trace of it.
+        pruned = self.chat_ctx.copy()
+        pruned.items = without_last_user_message(pruned.items)
+        await self.update_chat_ctx(pruned)
+        logger.info("not_for_me: a turn was erased as not addressed to the front")
+        raise StopResponse()
+
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ):  # type: ignore[override]  # the SDK's own signature; return type is its AudioFrame stream
+        """The default TTS path, fed respelled text so names are said right."""
+
+        async def respelled() -> AsyncIterable[str]:
+            respeller = Respeller(self._pronunciations)
+            async for chunk in text:
+                if out := respeller.feed(chunk):
+                    yield out
+            if out := respeller.flush():
+                yield out
+
+        async for frame in Agent.default.tts_node(self, respelled(), model_settings):
+            yield frame
 
     @function_tool(
         # CANCELLABLE puts the framework's cancel tool in front of the model,
@@ -405,6 +479,16 @@ def prewarm(proc: agents.JobProcess) -> None:
     listening; the worker warms up idle instead.
     """
     proc.userdata["vad"] = silero.VAD.load()
+    # Loaded here rather than per job so a broken file fails the worker at
+    # start, once, instead of every room at its first utterance.
+    private = load_private_context(os.environ.get(PRIVATE_CONTEXT_ENV))
+    proc.userdata["private"] = private
+    logger.info(
+        "private context: about=%d words, keyterms=%d, pronunciations=%d",
+        len(private.about.split()),
+        len(private.keyterms),
+        len(private.pronunciations),
+    )
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -412,6 +496,8 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
 
     instructions, voice_card = load_persona()
+    private: PrivateContext = ctx.proc.userdata["private"]
+    instructions = with_private_context(instructions, private)
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -421,7 +507,7 @@ async def entrypoint(ctx: JobContext) -> None:
         stt=inference.STT(
             "deepgram/flux-general",
             language="en",
-            extra_kwargs={"keyterm": STT_KEYTERMS},
+            extra_kwargs={"keyterm": [*STT_KEYTERMS, *private.keyterms]},
         ),
         # Luna is the front's own voice, fast enough to hold a conversation
         # with the depth delegated to ask_mentat.
@@ -441,7 +527,11 @@ async def entrypoint(ctx: JobContext) -> None:
         llm=inference.LLM(FRONT_MODEL),
         # Sonic 3.6: Cartesia's current GA model, routed by the gateway from the
         # string alone — agents 1.6.10 predates it, so it is not a known literal.
-        tts=inference.TTS("cartesia/sonic-3.6"),
+        tts=inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE),
+        # Luna marks up her own delivery: the session tells her which tags the
+        # TTS renders (emotion, speed, volume, pauses) and the appended rule
+        # keeps them rare — a tag is a shift in the voice, not decoration.
+        expressive={"tts_instructions_append": DELIVERY_RULE},
         # Flux emits end-of-turn itself, so waiting out a silence window after
         # it would only add latency to every reply. (Spelled as turn_handling
         # rather than the turn_detection/min_endpointing_delay arguments: those
@@ -477,6 +567,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await session.start(
         agent=FrontAgent(
+            pronunciations=private.pronunciations,
             instructions=instructions,
             voice_card=voice_card,
             room_name=ctx.room.name,
@@ -484,6 +575,14 @@ async def entrypoint(ctx: JobContext) -> None:
             room=ctx.room,
         ),
         room=ctx.room,
+        # Self-hosted noise suppression on the inbound track, one stateful
+        # instance per session as the plugin requires. Cleaner audio into
+        # Flux means fewer phantom words becoming turns in the first place.
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=dtln.noise_suppression(),
+            ),
+        ),
     )
 
 

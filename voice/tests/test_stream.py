@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from stream import LineSplitter, TurnError, TurnStream
+from stream import LineSplitter, Respeller, TurnError, TurnStream
 
 DONE_OK = (
     b'{"kind":"done","done":{"text":"Hi.","is_error":false,'
@@ -177,3 +177,37 @@ class LineSplitterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RespellerTest(unittest.TestCase):
+    def setUp(self):
+        self.respeller = Respeller({"Symonds": "Sigh-monds"})
+
+    def test_whole_word_is_respelled_and_the_rest_left_alone(self):
+        out = self.respeller.feed("Josh Symonds is here. ") + self.respeller.flush()
+        self.assertEqual(out, "Josh Sigh-monds is here. ")
+
+    def test_a_word_split_across_chunks_is_still_one_word(self):
+        # The model streams tokens, and a name can land as "Sym" + "onds".
+        out = self.respeller.feed("Josh Sym")
+        out += self.respeller.feed("onds called.")
+        out += self.respeller.flush()
+        self.assertEqual(out, "Josh Sigh-monds called.")
+
+    def test_a_trailing_word_is_held_until_flush(self):
+        # Nothing after "Symonds" yet, so it cannot be known to have ended.
+        self.assertEqual(self.respeller.feed("Call Symonds"), "Call ")
+        self.assertEqual(self.respeller.flush(), "Sigh-monds")
+
+    def test_matching_is_whole_word_and_case_sensitive(self):
+        out = self.respeller.feed("symonds and Symondson stay; ") + self.respeller.flush()
+        self.assertEqual(out, "symonds and Symondson stay; ")
+
+    def test_markup_passes_through_untouched(self):
+        text = '<expr type="expression" label="joking"/> Symonds, really? [laughter]'
+        out = self.respeller.feed(text) + self.respeller.flush()
+        self.assertEqual(out, '<expr type="expression" label="joking"/> Sigh-monds, really? [laughter]')
+
+    def test_empty_map_is_a_passthrough(self):
+        plain = Respeller({})
+        self.assertEqual(plain.feed("Hello there") + plain.flush(), "Hello there")
