@@ -19,14 +19,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-#: The one tool the front is given. A call to any other name is a hallucinated
-#: tool rather than a consult, and is scored as neither.
+#: The consult tool and the phone tools the front is given. Calls to any other
+#: name are hallucinated tools and score as invalid.
 TOOL_NAME = "ask_mentat"
+PHONE_TOOL_NAMES = (
+    "find_places",
+    "navigate_to",
+    "dial",
+    "send_text",
+    "set_alarm",
+    "set_timer",
+    "open_link",
+)
+KNOWN_TOOL_NAMES = (TOOL_NAME, *PHONE_TOOL_NAMES)
 
-#: The two decisions the eval measures, and the verdict for a response that is
-#: neither — an empty turn, a call to a tool that does not exist, or a request
-#: that failed. Those are not direct answers, and counting them as one would
-#: score a mute as a pass.
+#: The decisions the eval measures, plus the verdict for a response that is
+#: neither: an empty turn, an unknown or mixed tool call, or a failed request.
 CONSULT = "consult"
 DIRECT = "direct"
 INVALID = "invalid"
@@ -36,9 +44,17 @@ INVALID = "invalid"
 #: (a consult already in flight), so a pass or fail here would be noise.
 SKIP_CATEGORY = "skip"
 
-#: The knobs ask_mentat takes beyond the question itself, and the only keys an
-#: `expect_args` may name.
-ARG_KEYS = ("effort", "model")
+#: Argument names accepted by `expect_args`, keyed by the expected tool.
+TOOL_ARGUMENT_KEYS = {
+    TOOL_NAME: frozenset(("question", "effort", "model")),
+    "find_places": frozenset(("query", "locality")),
+    "navigate_to": frozenset(("choice",)),
+    "dial": frozenset(("number",)),
+    "send_text": frozenset(("number", "body")),
+    "set_alarm": frozenset(("hour", "minute", "label")),
+    "set_timer": frozenset(("minutes", "seconds", "label")),
+    "open_link": frozenset(("url",)),
+}
 
 #: How many turns of prior conversation a scenario may carry. The same window
 #: request.CONSULT_WINDOW_TURNS gives a real consult — a scenario with more
@@ -129,10 +145,9 @@ def parse_scenario(raw: Any, where: str) -> Scenario:
     }
 
     expect = raw["expect"]
-    if expect not in (CONSULT, DIRECT):
-        raise ScenarioError(
-            f"{where}: expect is {expect!r}, not {CONSULT!r} or {DIRECT!r}"
-        )
+    if expect not in (CONSULT, DIRECT, *PHONE_TOOL_NAMES):
+        allowed = (CONSULT, DIRECT, *PHONE_TOOL_NAMES)
+        raise ScenarioError(f"{where}: expect is {expect!r}, not one of {allowed}")
 
     return Scenario(
         **text_fields,
@@ -173,25 +188,29 @@ def load_scenarios(path: Path) -> list[Scenario]:
 
 
 def classify(response: Response) -> str:
-    """Which decision the front made: CONSULT, DIRECT, or neither.
+    """Classify text or exactly one known tool call.
 
-    A holding line spoken alongside the tool call is still a consult — the
-    front reaching for Mentat usually says something first, and that text is
-    not the answer.
+    A holding line spoken alongside one tool call does not change the tool's
+    classification. Multiple calls are invalid even when one is the expected
+    tool: the response took more than one action and cannot satisfy a single
+    scenario label.
     """
     if response.error:
         return INVALID
-    if any(call.name == TOOL_NAME for call in response.tool_calls):
-        return CONSULT
     if response.tool_calls:
-        return INVALID
+        if len(response.tool_calls) != 1:
+            return INVALID
+        name = response.tool_calls[0].name
+        if name == TOOL_NAME:
+            return CONSULT
+        return name if name in PHONE_TOOL_NAMES else INVALID
     return DIRECT if response.text.strip() else INVALID
 
 
-def consult_arguments(response: Response) -> Mapping[str, Any]:
-    """The arguments of the consult, or nothing if there was no consult."""
+def tool_arguments(response: Response, tool_name: str) -> Mapping[str, Any]:
+    """The arguments for one named tool, or nothing if it was not called."""
     for call in response.tool_calls:
-        if call.name == TOOL_NAME:
+        if call.name == tool_name:
             return call.arguments
     return {}
 
@@ -209,7 +228,8 @@ def judge(scenario: Scenario, response: Response) -> Result:
         return Result(scenario=scenario, response=response, got=got, hit=None)
     hit = got == scenario.expect
     if hit and scenario.expect_args:
-        arguments = consult_arguments(response)
+        expected_tool = TOOL_NAME if scenario.expect == CONSULT else scenario.expect
+        arguments = tool_arguments(response, expected_tool)
         hit = all(
             str(arguments.get(key, "")) == value
             for key, value in scenario.expect_args.items()
@@ -327,13 +347,18 @@ def _expect_args(value: Any, expect: str, where: str) -> Mapping[str, str]:
         raise ScenarioError(
             f"{where}: expect_args is {type(value).__name__}, not an object"
         )
-    if value and expect != CONSULT:
+    if value and expect == DIRECT:
         raise ScenarioError(
             f"{where}: expect_args on a {expect!r} scenario, which calls no tool"
         )
+    if not value:
+        return {}
+    allowed = TOOL_ARGUMENT_KEYS[TOOL_NAME if expect == CONSULT else expect]
     for key, argument in value.items():
-        if key not in ARG_KEYS:
-            raise ScenarioError(f"{where}: expect_args has unknown key {key!r}")
+        if key not in allowed:
+            raise ScenarioError(
+                f"{where}: expect_args key {key!r} is not accepted by {expect!r}"
+            )
         _text(argument, f"{where}: expect_args[{key!r}]")
     return dict(value)
 

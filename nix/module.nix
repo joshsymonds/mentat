@@ -132,7 +132,7 @@ in {
 
       environmentFile = lib.mkOption {
         type = lib.types.str;
-        description = "EnvironmentFile supplying LIVEKIT_API_KEY/SECRET and LIVEKIT_INFERENCE_API_KEY/SECRET. An agenix-decrypted path, never a store path.";
+        description = "EnvironmentFile supplying LIVEKIT_API_KEY/SECRET and LIVEKIT_INFERENCE_API_KEY/SECRET; it may also carry the optional MENTAT_PLACES_API_KEY. An agenix-decrypted path, never a store path.";
       };
     };
   };

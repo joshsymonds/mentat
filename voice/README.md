@@ -118,3 +118,72 @@ ssh ultraviolet sudo systemctl start mentat-voice
 and how `agent.py` uses them. Sound files are generated, not authored — see
 `assets/generate.py`; `tests/test_assets.py` re-derives them and fails on
 drift.
+
+## Phone control
+
+The voice agent reaches the Android phone through two LiveKit remote procedure
+call (RPC) methods. The phone registers `mentat.command` and `mentat.location`
+when it joins the room. The phone is the trust boundary: the front sends only
+the closed `kind` values below, and never supplies an Android action,
+component, extras, or an arbitrary scheme.
+
+`mentat.command` accepts one JSON object with one of these payloads:
+
+```json
+{"kind":"navigate","name":"Trader Joe's","address":"123 Main St","place_id":"ChIJ...","lat":45.5,"lng":-122.6}
+{"kind":"dial","number":"503-555-0199"}
+{"kind":"sms","number":"503-555-0199","body":"I'll be ten minutes late"}
+{"kind":"alarm","hour":7,"minute":30,"label":"wake up"}
+{"kind":"timer","seconds":300,"label":"tea"}
+{"kind":"open","url":"https://example.com"}
+```
+
+The optional `label` may be omitted for `alarm` and `timer`. `navigate` opens
+Google Maps with an `ACTION_VIEW` directions URL whose destination is
+`name + ", " + address`, plus `destination_place_id`,
+`travelmode=driving`, and `dir_action=navigate`, targeted to the Google Maps
+package. The phone maps the other kinds to their corresponding typed Android
+intents. It returns `{"ok":true}` after launching. Dial and SMS open their
+prefilled apps for a tap-to-confirm action; they do not place a call or send a
+message directly. `open` accepts absolute `http` and `https` URLs only.
+
+`mentat.location` accepts `{}` and returns a fresh location when possible:
+
+```json
+{"lat":45.5,"lng":-122.6,"accuracy_m":12.0,"age_s":1.2}
+```
+
+The location policy accepts a current fused fix no older than five seconds. If
+that is unavailable, it accepts last-known location no older than ten minutes.
+It returns error 1602 when neither is available or no location permission is
+granted. Location is used for the current search only and is not persisted.
+
+RPC errors are handled as spoken outcomes by the front:
+
+| Code | Meaning | Front behavior |
+| --- | --- | --- |
+| 1600 | Invalid or refused command, including an unknown kind, missing or invalid field, or a non-HTTP(S) link | Return `PHONE_REFUSED` and say it could not carry out that phone action. |
+| 1601 | No phone activity can handle the requested intent | Return `PHONE_REFUSED` and say the phone could not open that action. |
+| 1602 | Location is unavailable or permission is denied | Return `LOCATION_UNAVAILABLE`; ask roughly where Josh is, then search again with that locality. |
+| 1603 | The assist screen is not in front | Return `PHONE_NOT_IN_FRONT`; tell Josh to tap the side button first. |
+
+The phone launches an action only while the Mentat talk screen is visible. It
+never queues or retries a command after another app covers that screen. Tap the
+side button first, then repeat the request. A browser-only room reports the
+phone-unreachable result instead of raising an error.
+
+The Places search key is optional for local development and lives in the voice
+unit's agenix environment file. Create a billed Google Cloud project and a
+Places-only key from a shell authenticated as Josh:
+
+```sh
+gcloud projects create mentat-voice-places
+gcloud billing accounts list
+gcloud billing projects link mentat-voice-places --billing-account=<the listed open account>
+gcloud services enable places.googleapis.com --project=mentat-voice-places
+gcloud services api-keys create --project=mentat-voice-places --display-name=mentat-voice --api-target=service=places.googleapis.com
+gcloud services api-keys get-key-string <resource name from the create output>
+```
+
+Put the resulting value in the voice environment file as
+`MENTAT_PLACES_API_KEY=<key>`.
