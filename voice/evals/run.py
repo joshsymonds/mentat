@@ -146,13 +146,13 @@ async def run_all(
     instructions, voice_card = agent.load_persona()
     # The same fold production does, so an eval with MENTAT_VOICE_PRIVATE set
     # scores the persona the room actually hears; unset scores the public one.
-    instructions = with_private_context(
-        instructions, load_private_context(os.environ.get(PRIVATE_CONTEXT_ENV))
-    )
+    private = load_private_context(os.environ.get(PRIVATE_CONTEXT_ENV))
+    instructions = with_private_context(instructions, private)
     # Constructed exactly as entrypoint constructs it. Nothing here consults —
     # the tool is declared to the model and never executed — but a stand-in
     # front would be a second definition of the thing under measurement.
     front = agent.FrontAgent(
+        pronunciations=private.pronunciations,
         instructions=instructions,
         voice_card=voice_card,
         room_name="eval",
