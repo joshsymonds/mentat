@@ -55,6 +55,19 @@ class ConfigTests(unittest.TestCase):
     def test_token_expiry_defaults_to_ten_years(self) -> None:
         self.assertEqual(load_config(self.env).token_expiry, 315360000)
 
+    def test_server_url_is_canonical_with_one_trailing_slash(self) -> None:
+        without_slash = load_config(self.env)
+        with_slash = load_config({**self.env, "MCP_SERVER_URL": "https://front.example/"})
+        self.assertEqual(without_slash.server_url, "https://front.example/")
+        self.assertEqual(without_slash.server_url, with_slash.server_url)
+
+    def test_max_clients_defaults_to_thirty_two_and_requires_positive_integer(self) -> None:
+        self.assertEqual(load_config(self.env).max_clients, 32)
+        with self.assertRaisesRegex(ConfigError, "MENTAT_PUBLIC_MAX_CLIENTS"):
+            load_config({**self.env, "MENTAT_PUBLIC_MAX_CLIENTS": "0"})
+        with self.assertRaisesRegex(ConfigError, "MENTAT_PUBLIC_MAX_CLIENTS"):
+            load_config({**self.env, "MENTAT_PUBLIC_MAX_CLIENTS": "not-an-integer"})
+
     def test_main_reports_missing_configuration_and_exits(self) -> None:
         stderr = io.StringIO()
         with patch.dict(os.environ, {}, clear=True), contextlib.redirect_stderr(stderr):

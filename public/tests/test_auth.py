@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import tempfile
 import time
@@ -12,9 +11,7 @@ from unittest.mock import patch
 
 from authlib.jose import JsonWebKey, JsonWebToken
 import fastmcp
-from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
 from fastmcp.server.auth.providers.jwt import JWTVerifier
-from fastmcp.server.auth.oauth_proxy import OAuthProxy
 from mcp.server.auth.provider import AuthorizationParams
 from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
@@ -29,22 +26,23 @@ _PUBLIC_PEM = _RSA_KEY.as_pem(is_private=False).decode()
 _ISSUER = "https://test.cloudflareaccess.com"
 
 
-def _make_token(*, expired: bool = False, issuer: str = _ISSUER) -> str:
+def _make_token(*, expired: bool = False, issuer: str = _ISSUER, include_scope: bool = True) -> str:
     now = int(time.time())
     payload = {
         "sub": "test-user",
         "iss": issuer,
         "exp": now - 3600 if expired else now + 3600,
         "iat": now - 7200,
-        "scope": "openid",
     }
+    if include_scope:
+        payload["scope"] = "openid"
     return JsonWebToken(["RS256"]).encode(
         {"alg": "RS256"}, payload, _PRIVATE_PEM
     ).decode()
 
 
-def _make_verifier(cls):
-    return cls(public_key=_PUBLIC_PEM, issuer=_ISSUER)
+def _make_verifier(cls, required_scopes: list[str] | None = None):
+    return cls(public_key=_PUBLIC_PEM, issuer=_ISSUER, required_scopes=required_scopes)
 
 
 class NoExpiryVerifierTests(unittest.IsolatedAsyncioTestCase):
@@ -56,6 +54,15 @@ class NoExpiryVerifierTests(unittest.IsolatedAsyncioTestCase):
         assert result is not None
         self.assertIsNone(result.expires_at)
         self.assertEqual(result.scopes, ["openid"])
+
+    async def test_token_without_scope_claim_is_accepted(self) -> None:
+        result = await _make_verifier(NoExpiryJWTVerifier, ["openid"]).load_access_token(
+            _make_token(include_scope=False)
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.scopes, [])
+        self.assertIsNone(result.expires_at)
 
     async def test_bad_signature_is_rejected(self) -> None:
         other_key = JsonWebKey.generate_key("RSA", 2048, is_private=True)
