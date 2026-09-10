@@ -5,12 +5,21 @@ import type { Logger } from './log.ts';
 
 export type PhoneCommand =
   | { kind: 'sms'; to: string; body: string }
-  | { kind: 'open'; uri: string };
+  | { kind: 'open'; uri: string }
+  | { kind: 'conversations'; limit: number }
+  | { kind: 'messages'; conversation: string; limit: number; before?: string }
+  | { kind: 'search'; query: string; limit: number; before?: string };
 
 export interface PhoneResult {
   id: string;
   status: 'ok' | 'error';
   detail: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface PhoneOutcome {
+  detail: string;
+  payload?: Record<string, unknown>;
 }
 
 export interface PhoneBridgeDeps {
@@ -21,7 +30,7 @@ export interface PhoneBridgeDeps {
 }
 
 interface PendingCommand {
-  resolve: (detail: string) => void;
+  resolve: (outcome: PhoneOutcome) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -74,7 +83,7 @@ export class PhoneBridge {
     }, this.heartbeatMs);
   }
 
-  dispatch(command: PhoneCommand): Promise<string> {
+  dispatch(command: PhoneCommand): Promise<PhoneOutcome> {
     const res = this.attached;
     if (res === undefined || res.destroyed) {
       if (res?.destroyed) {
@@ -86,7 +95,7 @@ export class PhoneBridge {
     const id = this.uuid();
     const expiresAt = new Date(this.now().getTime() + this.timeoutMs).toISOString();
     const wireCommand = { id, ...command, expires_at: expiresAt };
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<PhoneOutcome>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error('timed out: outcome unknown'));
@@ -111,7 +120,10 @@ export class PhoneBridge {
     this.pending.delete(result.id);
     clearTimeout(command.timer);
     if (result.status === 'ok') {
-      command.resolve(result.detail);
+      command.resolve({
+        detail: result.detail,
+        ...(result.payload !== undefined && { payload: result.payload }),
+      });
     } else {
       command.reject(new Error(result.detail));
     }

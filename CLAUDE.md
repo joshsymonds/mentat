@@ -54,7 +54,8 @@ Data flows through three altitudes, the SDK owning everything below them:
    `test/wire.test.ts`). Mid-stream failures become a terminal `{"kind":"error"}`
    line because the 200 already shipped. Phone commands use the
    `/v1/phone/commands` and `/v1/phone/results` routes, while `/mcp` exposes the
-   stateless phone tools. `SessionTracker` + `src/janitor.ts` expire idle children
+   stateless phone tools send_sms, open_on_phone, list_conversations, read_conversation,
+   and search_messages. `SessionTracker` + `src/janitor.ts` expire idle children
    (in-flight turns never expire); `src/config.ts` is env-first (`MENTAT_*`);
    `src/main.ts` assembles the daemon.
 

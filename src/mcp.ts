@@ -5,10 +5,46 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
 
-import type { PhoneBridge } from './phone.ts';
+import type { PhoneBridge, PhoneOutcome } from './phone.ts';
+
+const SUPPORTED_CHANNELS = ['sms'] as const;
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function channelError(value: string) {
+  return {
+    isError: true as const,
+    content: [{ type: 'text' as const, text: `unsupported channel ${value}; supported channels: sms` }],
+  };
+}
+
+function conversationChannel(id: string): string | undefined {
+  return /^([^:]+):/.exec(id)?.[1];
+}
+
+function supportedChannel(value: string): boolean {
+  return SUPPORTED_CHANNELS.some((channel) => channel === value);
+}
+
+function validBefore(value: string): boolean {
+  return !Number.isNaN(Date.parse(value)) || /^\d+:[a-z]+:[A-Za-z0-9]+$/.test(value);
+}
+
+function malformedResult() {
+  return {
+    isError: true as const,
+    content: [{ type: 'text' as const, text: 'malformed result' }],
+  };
+}
+
+function payloadResult(outcome: PhoneOutcome) {
+  if (outcome.payload === undefined) {
+    return malformedResult();
+  }
+  const text = JSON.stringify(outcome.payload);
+  return { content: [{ type: 'text' as const, text }] };
 }
 
 export async function handleMcp(
@@ -26,8 +62,8 @@ export async function handleMcp(
     },
     async ({ to, body: message }) => {
       try {
-        const text = await bridge.dispatch({ kind: 'sms', to, body: message });
-        return { content: [{ type: 'text' as const, text }] };
+        const outcome = await bridge.dispatch({ kind: 'sms', to, body: message });
+        return { content: [{ type: 'text' as const, text: outcome.detail }] };
       } catch (error) {
         return {
           isError: true,
@@ -45,8 +81,96 @@ export async function handleMcp(
     },
     async ({ uri }) => {
       try {
-        const text = await bridge.dispatch({ kind: 'open', uri });
-        return { content: [{ type: 'text' as const, text }] };
+        const outcome = await bridge.dispatch({ kind: 'open', uri });
+        return { content: [{ type: 'text' as const, text: outcome.detail }] };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: errorText(error) }],
+        };
+      }
+    },
+  );
+  server.registerTool(
+    'list_conversations',
+    {
+      description: 'List SMS conversations newest first. Defaults to 20, caps at 100, and ids use sms:<thread>.',
+      inputSchema: { channel: z.string().optional(), limit: z.number().int().min(1).optional() },
+    },
+    async ({ channel, limit }) => {
+      if (channel !== undefined && !supportedChannel(channel)) {
+        return channelError(channel);
+      }
+      try {
+        const outcome = await bridge.dispatch({
+          kind: 'conversations',
+          limit: Math.min(limit ?? 20, 100),
+        });
+        return payloadResult(outcome);
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: errorText(error) }],
+        };
+      }
+    },
+  );
+  server.registerTool(
+    'read_conversation',
+    {
+      description:
+        'Read messages by sms:<thread> id, phone number, or contact name. Defaults to 50, caps at 200, and before accepts an ISO time or previous next.',
+      inputSchema: {
+        conversation: z.string(),
+        limit: z.number().int().min(1).optional(),
+        before: z.string().refine(validBefore).optional(),
+      },
+    },
+    async ({ conversation, limit, before }) => {
+      const channel = conversationChannel(conversation);
+      if (channel !== undefined && !supportedChannel(channel)) {
+        return channelError(channel);
+      }
+      try {
+        const outcome = await bridge.dispatch({
+          kind: 'messages',
+          conversation,
+          limit: Math.min(limit ?? 50, 200),
+          ...(before !== undefined && { before }),
+        });
+        return payloadResult(outcome);
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: errorText(error) }],
+        };
+      }
+    },
+  );
+  server.registerTool(
+    'search_messages',
+    {
+      description:
+        'Search SMS message bodies. Defaults to 30, caps at 100, and before accepts an ISO time or previous next; ids use sms:<thread>.',
+      inputSchema: {
+        query: z.string(),
+        channel: z.string().optional(),
+        limit: z.number().int().min(1).optional(),
+        before: z.string().refine(validBefore).optional(),
+      },
+    },
+    async ({ query, channel, limit, before }) => {
+      if (channel !== undefined && !supportedChannel(channel)) {
+        return channelError(channel);
+      }
+      try {
+        const outcome = await bridge.dispatch({
+          kind: 'search',
+          query,
+          limit: Math.min(limit ?? 30, 100),
+          ...(before !== undefined && { before }),
+        });
+        return payloadResult(outcome);
       } catch (error) {
         return {
           isError: true,

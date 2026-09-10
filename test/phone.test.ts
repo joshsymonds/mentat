@@ -72,14 +72,43 @@ describe('PhoneBridge', () => {
       '{"id":"command-id","kind":"sms","to":"Sarah","body":"late","expires_at":"2026-09-09T12:00:15.000Z"}\n',
     ]);
     expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'sent' })).toBe(true);
-    await expect(sms).resolves.toBe('sent');
+    await expect(sms).resolves.toEqual({ detail: 'sent' });
+
+    const messages = bridge.dispatch({
+      kind: 'messages',
+      conversation: 'sms:12',
+      limit: 7,
+      before: '1789001656600:sms:s12',
+    });
+    expect(phone.chunks.at(-1)).toBe(
+      '{"id":"command-id","kind":"messages","conversation":"sms:12","limit":7,' +
+        '"before":"1789001656600:sms:s12","expires_at":"2026-09-09T12:00:15.000Z"}\n',
+    );
+    expect(bridge.complete({
+      id: 'command-id',
+      status: 'ok',
+      detail: 'read',
+      payload: { messages: [{ id: 'sms:s12' }] },
+    })).toBe(true);
+    await expect(messages).resolves.toEqual({
+      detail: 'read',
+      payload: { messages: [{ id: 'sms:s12' }] },
+    });
+
+    const conversations = bridge.dispatch({ kind: 'conversations', limit: 3 });
+    expect(phone.chunks.at(-1)).toBe(
+      '{"id":"command-id","kind":"conversations","limit":3,' +
+        '"expires_at":"2026-09-09T12:00:15.000Z"}\n',
+    );
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'listed' })).toBe(true);
+    await expect(conversations).resolves.toEqual({ detail: 'listed' });
 
     const open = bridge.dispatch({ kind: 'open', uri: 'google.navigation:q=Union+Station' });
     expect(phone.chunks.at(-1)).toBe(
       '{"id":"command-id","kind":"open","uri":"google.navigation:q=Union+Station","expires_at":"2026-09-09T12:00:15.000Z"}\n',
     );
     expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'launched' })).toBe(true);
-    await expect(open).resolves.toBe('launched');
+    await expect(open).resolves.toEqual({ detail: 'launched' });
   });
 
   it('resolves successful results and rejects error results with the detail', async () => {
@@ -91,7 +120,7 @@ describe('PhoneBridge', () => {
     expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'sent to +15555550123' })).toBe(
       true,
     );
-    await expect(success).resolves.toBe('sent to +15555550123');
+    await expect(success).resolves.toEqual({ detail: 'sent to +15555550123' });
 
     const failure = bridge.dispatch({ kind: 'open', uri: 'geo:0,0?q=Union+Station' });
     expect(bridge.complete({ id: 'command-id', status: 'error', detail: 'not launched' })).toBe(true);

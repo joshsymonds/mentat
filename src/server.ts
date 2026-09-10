@@ -309,7 +309,9 @@ async function readJsonBody(
   }
 }
 
-function isPhoneResult(value: unknown): value is { id: string; status: 'ok' | 'error'; detail: string } {
+function isPhoneResult(
+  value: unknown,
+): value is { id: string; status: 'ok' | 'error'; detail: string; payload?: Record<string, unknown> } {
   if (value === null || typeof value !== 'object') {
     return false;
   }
@@ -318,7 +320,9 @@ function isPhoneResult(value: unknown): value is { id: string; status: 'ok' | 'e
     typeof record.id === 'string' &&
     record.id !== '' &&
     (record.status === 'ok' || record.status === 'error') &&
-    typeof record.detail === 'string'
+    typeof record.detail === 'string' &&
+    (record.payload === undefined ||
+      (record.payload !== null && typeof record.payload === 'object' && !Array.isArray(record.payload)))
   );
 }
 

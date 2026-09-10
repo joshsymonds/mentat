@@ -382,7 +382,7 @@ describe('Phone routes', () => {
     const first = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
     if (first.body === null) throw new Error('missing first phone body');
     const firstReader = first.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
-    let pending: Promise<string> | undefined;
+    let pending: ReturnType<PhoneBridge['dispatch']> | undefined;
     try {
       const rejected = await fetch(`${base}/v1/phone/commands`);
       expect(rejected.status).toBe(403);
@@ -478,9 +478,48 @@ describe('Phone routes', () => {
       body: JSON.stringify({ id: 'server-command', status: 'ok', detail: 'sent' }),
     });
     expect(result.status).toBe(204);
-    await expect(pending).resolves.toBe('sent');
+    await expect(pending).resolves.toEqual({ detail: 'sent' });
     bridge.close();
     await reader?.cancel();
+  });
+
+  it('accepts object payloads and preserves UTF-8 and escaped text', async () => {
+    const bridge = new PhoneBridge(nullLogger, { uuid: () => 'payload-command' });
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
+    const stream = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
+    const pending = bridge.dispatch({ kind: 'conversations', limit: 1 });
+    const reader = stream.body?.getReader();
+    const chunk = await reader?.read();
+    if (chunk === undefined || chunk.done || chunk.value === undefined) throw new Error('missing command');
+    const result = await fetch(`${base}/v1/phone/results`, {
+      method: 'POST',
+      body: JSON.stringify({
+        id: 'payload-command',
+        status: 'ok',
+        detail: 'héllo ☃',
+        payload: { text: 'quote " and newline \\n preserved' },
+      }),
+    });
+    expect(result.status).toBe(204);
+    await expect(pending).resolves.toEqual({
+      detail: 'héllo ☃',
+      payload: { text: 'quote " and newline \\n preserved' },
+    });
+    bridge.close();
+    await reader?.cancel();
+  });
+
+  it('rejects non-object phone result payloads', async () => {
+    const bridge = new PhoneBridge(nullLogger);
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), undefined, nullLogger, bridge);
+    for (const payload of [[], null, 'x', 1]) {
+      const res = await fetch(`${base}/v1/phone/results`, {
+        method: 'POST',
+        body: JSON.stringify({ id: 'payload', status: 'ok', detail: 'sent', payload }),
+      });
+      expect(res.status).toBe(400);
+      expect(await res.text()).toBe('{"error":"id, status, and detail are required"}\n');
+    }
   });
 
   it('rejects malformed phone results and method mismatches', async () => {
