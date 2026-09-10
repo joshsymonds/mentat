@@ -29,7 +29,11 @@ function supportedChannel(value: string): boolean {
 }
 
 function validBefore(value: string): boolean {
-  return !Number.isNaN(Date.parse(value)) || /^\d+:[a-z]+:[A-Za-z0-9]+$/.test(value);
+  return (
+    (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/.test(value) &&
+      !Number.isNaN(Date.parse(value))) ||
+    /^\d+:[a-z]+:[A-Za-z0-9]+$/.test(value)
+  );
 }
 
 function malformedResult() {

@@ -1,6 +1,6 @@
 import type { ReadableStreamDefaultReader } from 'node:stream/web';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
@@ -290,6 +290,68 @@ describe('POST /mcp', () => {
     await reader.cancel();
   });
 
+  it('requires strict ISO datetime before values and dispatches valid forms', async () => {
+    const invalidBridge = new PhoneBridge(nullLogger);
+    const dispatch = vi.spyOn(invalidBridge, 'dispatch');
+    const invalidBase = await serve(invalidBridge);
+    const invalidClient = new Client({ name: 'test-client', version: '1.0.0' });
+    const invalidTransport = new StreamableHTTPClientTransport(new URL(`${invalidBase}/mcp`));
+    await invalidClient.connect(invalidTransport as Transport);
+
+    for (const args of [
+      { name: 'read_conversation', arguments: { conversation: 'sms:12', before: 'September 9, 2026' } },
+      { name: 'search_messages', arguments: { query: 'hello', before: '9/9/2026' } },
+    ]) {
+      const result = await invalidClient.callTool(args);
+      expect(result).toMatchObject({ isError: true });
+      expect((result.content as { text: string }[])[0]?.text).not.toBe('phone offline');
+    }
+    expect(dispatch).not.toHaveBeenCalled();
+    await invalidClient.close();
+    invalidBridge.close();
+
+    const bridge = new PhoneBridge(nullLogger, { uuid: () => 'mcp-valid-before' });
+    const base = await serve(bridge);
+    const phone = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
+    if (phone.body === null) throw new Error('missing phone body');
+    const reader = phone.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    await client.connect(transport as Transport);
+
+    const cases = [
+      {
+        name: 'read_conversation',
+        args: { conversation: 'sms:12', before: '2026-09-09T00:00:00Z' },
+        command: { kind: 'messages', conversation: 'sms:12', before: '2026-09-09T00:00:00Z' },
+      },
+      {
+        name: 'read_conversation',
+        args: { conversation: 'sms:12', before: '2026-09-09T00:00:00.000+02:00' },
+        command: { kind: 'messages', conversation: 'sms:12', before: '2026-09-09T00:00:00.000+02:00' },
+      },
+      {
+        name: 'search_messages',
+        args: { query: 'hello', before: '1789001656600:sms:s12' },
+        command: { kind: 'search', query: 'hello', before: '1789001656600:sms:s12' },
+      },
+    ] as const;
+    for (const testCase of cases) {
+      const call = client.callTool({ name: testCase.name, arguments: testCase.args });
+      const command = JSON.parse(await readLine(reader)) as Record<string, unknown>;
+      expect(command).toMatchObject(testCase.command);
+      await fetch(`${base}/v1/phone/results`, {
+        method: 'POST',
+        body: JSON.stringify({ id: command.id, status: 'ok', detail: 'ok', payload: { messages: [] } }),
+      });
+      await expect(call).resolves.toMatchObject({ content: [{ type: 'text', text: '{"messages":[]}' }] });
+    }
+
+    await client.close();
+    bridge.close();
+    await reader.cancel();
+  });
+
   it('applies read defaults and clamps before dispatch', async () => {
     let nextId = 0;
     const bridge = new PhoneBridge(nullLogger, {
@@ -359,6 +421,19 @@ describe('POST /mcp', () => {
     });
     expect(result.isError).toBe(true);
     expect(result).toMatchObject({ isError: true, content: [{ type: 'text', text: 'phone offline' }] });
+
+    for (const args of [
+      { name: 'list_conversations', arguments: {} },
+      { name: 'read_conversation', arguments: { conversation: 'sms:12' } },
+      { name: 'search_messages', arguments: { query: 'x' } },
+    ]) {
+      const readResult = await client.callTool(args);
+      expect(readResult).toMatchObject({
+        isError: true,
+        content: [{ type: 'text', text: 'phone offline' }],
+      });
+    }
+
     await client.close();
     bridge.close();
   });

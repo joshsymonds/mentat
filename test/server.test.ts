@@ -497,13 +497,13 @@ describe('Phone routes', () => {
         id: 'payload-command',
         status: 'ok',
         detail: 'héllo ☃',
-        payload: { text: 'quote " and newline \\n preserved' },
+        payload: { text: 'héllo ☃ "quoted"\nline two' },
       }),
     });
     expect(result.status).toBe(204);
     await expect(pending).resolves.toEqual({
       detail: 'héllo ☃',
-      payload: { text: 'quote " and newline \\n preserved' },
+      payload: { text: 'héllo ☃ "quoted"\nline two' },
     });
     bridge.close();
     await reader?.cancel();
