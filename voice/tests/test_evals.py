@@ -25,10 +25,13 @@ sys.path.insert(0, str(VOICE / "evals"))
 from request import CONSULT_WINDOW_TURNS
 from scoring import (
     CONSULT,
+    DONE,
     DIRECT,
+    END_TOOL_NAME,
     HISTORY_TURNS,
     INVALID,
     PHONE_TOOL_NAMES,
+    SIGNOFF,
     SKIP_CATEGORY,
     TOOL_NAME,
     Response,
@@ -116,6 +119,27 @@ class ScenarioSchemaTest(unittest.TestCase):
                 self.assertEqual(parsed.expect, expected)
         with self.assertRaises(ScenarioError):
             parse_scenario(scenario(expect="maybe"), "line 3")
+
+    def test_expect_accepts_signoff_and_done(self):
+        for expected in (SIGNOFF, DONE):
+            with self.subTest(expected=expected):
+                parsed = parse_scenario(scenario(expect=expected), "line 3")
+                self.assertEqual(parsed.expect, expected)
+
+    def test_end_conversation_accepts_only_farewell_and_reason_arguments(self):
+        for expected, key, value in (
+            (SIGNOFF, "farewell", "Goodbye"),
+            (DONE, "reason", DONE),
+        ):
+            with self.subTest(expected=expected, key=key):
+                parsed = parse_scenario(
+                    scenario(expect=expected, expect_args={key: value}), "line 3"
+                )
+                self.assertEqual(parsed.expect_args, {key: value})
+        with self.assertRaises(ScenarioError):
+            parse_scenario(
+                scenario(expect=SIGNOFF, expect_args={"question": "nope"}), "line 3"
+            )
 
     def test_expect_rejects_unknown_tool_names(self):
         with self.assertRaises(ScenarioError):
@@ -227,7 +251,7 @@ class RealScenarioFileTest(unittest.TestCase):
 
     def test_both_decisions_are_represented(self):
         expectations = {s.expect for s in self.scenarios if s.scored}
-        self.assertEqual(expectations, {CONSULT, DIRECT, *PHONE_TOOL_NAMES})
+        self.assertEqual(expectations, {CONSULT, DIRECT, SIGNOFF, DONE, *PHONE_TOOL_NAMES})
 
     def test_phone_category_has_the_required_scenarios(self):
         phone = [s for s in self.scenarios if s.category == "phone"]
@@ -287,6 +311,19 @@ class ClassifyTest(unittest.TestCase):
         for name in PHONE_TOOL_NAMES:
             with self.subTest(name=name):
                 self.assertEqual(classify(Response(tool_calls=(ToolCall(name, {}),))), name)
+
+    def test_end_conversation_classifies_by_reason(self):
+        for reason, expected in ((SIGNOFF, SIGNOFF), (DONE, DONE)):
+            with self.subTest(reason=reason):
+                response = Response(
+                    tool_calls=(ToolCall(END_TOOL_NAME, {"reason": reason}),)
+                )
+                self.assertEqual(classify(response), expected)
+
+        for arguments in ({}, {"reason": "maybe"}):
+            with self.subTest(arguments=arguments):
+                response = Response(tool_calls=(ToolCall(END_TOOL_NAME, arguments),))
+                self.assertEqual(classify(response), INVALID)
 
     def test_a_holding_line_before_the_call_is_still_a_consult(self):
         # The front often says something while reaching for the tool; the text
@@ -364,6 +401,24 @@ class JudgeTest(unittest.TestCase):
     def test_missing_the_expectation_is_a_miss(self):
         self.assertFalse(judge(self.CONSULT_CASE, Response(text="you're free")).hit)
         self.assertFalse(judge(self.DIRECT_CASE, consulted()).hit)
+
+    def test_signoff_requires_end_conversation_not_plain_text(self):
+        signoff_case = Scenario(
+            id="end-signoff",
+            category="ending",
+            utterance="Thanks, that's all, bye",
+            expect=SIGNOFF,
+            note="the user is clearly signing off",
+        )
+        self.assertTrue(
+            judge(
+                signoff_case,
+                Response(
+                    tool_calls=(ToolCall(END_TOOL_NAME, {"reason": SIGNOFF}),)
+                ),
+            ).hit
+        )
+        self.assertFalse(judge(signoff_case, Response(text="Goodbye")).hit)
 
     def test_an_invalid_response_is_a_miss_either_way(self):
         self.assertFalse(judge(self.CONSULT_CASE, Response()).hit)

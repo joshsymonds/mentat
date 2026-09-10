@@ -36,7 +36,7 @@ open class VoiceSessionService : Service() {
     private lateinit var bridge: PhoneBridge
     private var started = false
 
-    val state: StateFlow<SessionState>
+    open val state: StateFlow<SessionState>
         get() = controller.state
     val transcript: StateFlow<List<TranscriptSegment>>
         get() = controller.transcript
@@ -115,6 +115,7 @@ open class VoiceSessionService : Service() {
     }
 
     protected open fun stopVoiceService() {
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
@@ -209,10 +210,16 @@ internal class VoiceSessionController(
     }
 
     suspend fun end() {
+        end(disconnect = true)
+    }
+
+    private suspend fun end(disconnect: Boolean) {
         ending = true
         transition(SessionEvent.EndRequested)
         try {
-            liveKitSession.disconnect()
+            if (disconnect) {
+                liveKitSession.disconnect()
+            }
         } finally {
             try {
                 close()
@@ -234,8 +241,12 @@ internal class VoiceSessionController(
         }
     }
 
-    private fun onLiveKitEvent(event: LiveKitEvent) {
+    private suspend fun onLiveKitEvent(event: LiveKitEvent) {
         if (ending) {
+            return
+        }
+        if (event is LiveKitEvent.Disconnected && event.graceful) {
+            end(disconnect = false)
             return
         }
         if (event is LiveKitEvent.Disconnected && state.value == SessionState.Live) {

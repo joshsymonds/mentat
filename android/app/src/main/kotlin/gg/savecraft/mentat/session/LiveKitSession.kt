@@ -5,6 +5,7 @@ import gg.savecraft.mentat.core.SessionEvent
 import gg.savecraft.mentat.core.TranscriptSegment
 import gg.savecraft.mentat.phone.PhoneBridge
 import io.livekit.android.LiveKit
+import io.livekit.android.events.DisconnectReason
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.events.collect
 import io.livekit.android.room.Room
@@ -21,7 +22,7 @@ sealed interface LiveKitEvent {
     data object Connected : LiveKitEvent
     data object Reconnecting : LiveKitEvent
     data object Reconnected : LiveKitEvent
-    data class Disconnected(val reason: String) : LiveKitEvent
+    data class Disconnected(val reason: String, val graceful: Boolean) : LiveKitEvent
 }
 
 interface LiveKitSession {
@@ -39,11 +40,19 @@ interface LiveKitSession {
     fun close()
 
     companion object {
+        fun gracefulDisconnect(reason: DisconnectReason): Boolean =
+            reason == DisconnectReason.ROOM_DELETED ||
+                reason == DisconnectReason.PARTICIPANT_REMOVED
+
         fun eventFor(event: LiveKitEvent): SessionEvent? = when (event) {
             LiveKitEvent.Connected -> SessionEvent.RoomConnected
             LiveKitEvent.Reconnecting -> SessionEvent.ConnectionLost
             LiveKitEvent.Reconnected -> SessionEvent.Reconnected
-            is LiveKitEvent.Disconnected -> SessionEvent.ReconnectFailed(event.reason)
+            is LiveKitEvent.Disconnected -> if (event.graceful) {
+                SessionEvent.EndRequested
+            } else {
+                SessionEvent.ReconnectFailed(event.reason)
+            }
         }
 
         fun transcriptSegmentFor(
@@ -134,7 +143,13 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
         is RoomEvent.Connected -> LiveKitEvent.Connected
         is RoomEvent.Reconnecting -> LiveKitEvent.Reconnecting
         is RoomEvent.Reconnected -> LiveKitEvent.Reconnected
-        is RoomEvent.Disconnected -> LiveKitEvent.Disconnected(error?.message ?: reason.name)
+        is RoomEvent.Disconnected -> {
+            disconnected = true
+            LiveKitEvent.Disconnected(
+                reason = error?.message ?: reason.name,
+                graceful = LiveKitSession.gracefulDisconnect(reason),
+            )
+        }
         else -> null
     }
 }

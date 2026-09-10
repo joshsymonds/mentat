@@ -14,12 +14,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from request import (
     CONSULT_TURN_CHARS,
+    DEFAULT_FAREWELL,
+    DONE_GRACE_S,
+    IDLE_S,
     CONSULT_WINDOW_TURNS,
     TURN_EFFORT,
     TURN_META,
     TURN_MODEL,
     VOICE_CARD_MARKER,
+    EndingPolicy,
     PrivateContext,
+    farewell_line,
+    run_close_sequence,
     consult_envelope,
     conversation_advanced,
     count_user_messages,
@@ -451,3 +457,182 @@ class WithoutLastUserMessageTest(unittest.TestCase):
     def test_nothing_to_remove_is_a_no_op(self):
         items = [Message("assistant", "Hello.")]
         self.assertEqual(without_last_user_message(items), items)
+
+
+class FarewellLineTest(unittest.TestCase):
+    def test_blank_farewell_uses_default(self):
+        self.assertEqual(farewell_line(""), DEFAULT_FAREWELL)
+        self.assertEqual(farewell_line(" \n\t"), DEFAULT_FAREWELL)
+
+    def test_multiline_farewell_becomes_one_line(self):
+        self.assertEqual(farewell_line("See you\nlater."), "See you later.")
+
+    def test_single_line_farewell_is_unchanged(self):
+        self.assertEqual(farewell_line("Bye for now."), "Bye for now.")
+
+
+class EndingPolicyTest(unittest.TestCase):
+    """The policy that decides when a voice session may close."""
+
+    def test_signoff_closes_only_after_successful_farewell_playout(self):
+        policy = EndingPolicy()
+        self.assertIsNone(policy.end_requested("signoff"))
+        self.assertIsNone(policy.playout_finished(delivered=False))
+        self.assertIsNone(policy.deadline)
+
+        policy.end_requested("signoff")
+        self.assertEqual(policy.playout_finished(delivered=True), "close")
+        self.assertIsNone(policy.deadline)
+
+    def test_done_arms_six_second_window_only_after_successful_playout(self):
+        policy = EndingPolicy()
+        policy.end_requested("done")
+        self.assertIsNone(policy.deadline)
+        self.assertIsNone(policy.playout_finished(delivered=False))
+        self.assertIsNone(policy.deadline)
+
+        policy.end_requested("done")
+        self.assertIsNone(policy.playout_finished(delivered=True))
+        self.assertEqual(policy.deadline, DONE_GRACE_S)
+        self.assertIsNone(policy.elapsed(DONE_GRACE_S - 0.1))
+        self.assertEqual(policy.elapsed(DONE_GRACE_S), "close")
+
+    def test_user_speech_cancels_done_window(self):
+        policy = EndingPolicy()
+        policy.end_requested("done")
+        policy.playout_finished(delivered=True)
+        self.assertEqual(policy.user_spoke(), "cancel")
+        self.assertIsNone(policy.deadline)
+        self.assertIsNone(policy.elapsed(DONE_GRACE_S))
+
+    def test_user_speech_during_playback_cancels_pending_done(self):
+        policy = EndingPolicy()
+        policy.end_requested("done")
+        self.assertEqual(policy.user_spoke(), "cancel")
+        self.assertIsNone(policy.playout_finished(delivered=True))
+        self.assertIsNone(policy.deadline)
+
+    def test_consult_answer_arms_only_for_delivered_non_question(self):
+        policy = EndingPolicy()
+        policy.agent_listening()
+        policy.consult_started()
+        self.assertIsNone(policy.consult_answered("Here is the answer.", delivered=False))
+        self.assertIsNone(policy.deadline)
+        policy.consult_finished()
+        self.assertEqual(policy.deadline, IDLE_S)
+
+        policy = EndingPolicy()
+        policy.agent_listening()
+        policy.consult_started()
+        self.assertIsNone(policy.consult_answered("Do you want more?", delivered=True))
+        policy.consult_finished()
+        self.assertEqual(policy.deadline, IDLE_S)
+
+        policy = EndingPolicy()
+        policy.agent_listening()
+        policy.consult_started()
+        self.assertIsNone(policy.consult_answered("The answer is complete.", delivered=True))
+        self.assertEqual(policy.deadline, DONE_GRACE_S)
+        policy.consult_finished()
+        self.assertEqual(policy.deadline, DONE_GRACE_S)
+
+    def test_model_end_request_is_ignored_during_consult(self):
+        policy = EndingPolicy()
+        policy.consult_started()
+        self.assertIsNone(policy.end_requested("signoff"))
+        self.assertIsNone(policy.pending_reason)
+        self.assertIsNone(policy.end_requested("done"))
+        self.assertIsNone(policy.pending_reason)
+        self.assertIsNone(policy.playout_finished(delivered=True))
+        self.assertIsNone(policy.deadline)
+
+    def test_user_speech_during_consult_blocks_done_window(self):
+        policy = EndingPolicy()
+        policy.consult_started()
+        policy.user_spoke()
+        policy.consult_answered("The answer is complete.", delivered=True)
+        policy.consult_finished()
+        self.assertIsNone(policy.deadline)
+        self.assertNotEqual(policy.elapsed(DONE_GRACE_S), "close")
+
+    def test_user_speech_blocks_idle_window_until_quiet(self):
+        policy = EndingPolicy()
+        policy.user_spoke()
+        policy.agent_listening()
+        self.assertIsNone(policy.deadline)
+        self.assertNotEqual(policy.elapsed(IDLE_S), "close")
+
+        policy.user_quiet()
+        policy.agent_listening()
+        self.assertEqual(policy.deadline, IDLE_S)
+
+    def test_idle_listening_arms_thirty_seconds(self):
+        policy = EndingPolicy()
+        self.assertIsNone(policy.agent_listening())
+        self.assertEqual(policy.deadline, IDLE_S)
+        self.assertEqual(policy.elapsed(IDLE_S), "close")
+
+    def test_user_speech_resets_idle_deadline(self):
+        policy = EndingPolicy()
+        policy.agent_listening()
+        self.assertEqual(policy.user_spoke(), "cancel")
+        self.assertIsNone(policy.deadline)
+
+    def test_consult_suppresses_idle_then_rearms_without_new_listening(self):
+        policy = EndingPolicy()
+        policy.agent_listening()
+        policy.consult_started()
+        self.assertIsNone(policy.deadline)
+        policy.consult_finished()
+        self.assertEqual(policy.deadline, IDLE_S)
+        self.assertEqual(policy.elapsed(IDLE_S), "close")
+
+    def test_busy_cancels_idle_and_listening_rearms_after_question(self):
+        policy = EndingPolicy()
+        policy.agent_listening()
+        self.assertEqual(policy.agent_busy(), "cancel")
+        self.assertIsNone(policy.deadline)
+        policy.agent_listening()
+        self.assertEqual(policy.deadline, IDLE_S)
+
+
+class CloseSequenceTest(unittest.TestCase):
+    def test_teardown_order_and_job_shutdown_are_unconditional(self):
+        order = []
+        logs = []
+
+        async def close_player():
+            order.append("close_player")
+
+        async def delete_room():
+            order.append("delete_room")
+
+        async def shutdown_job():
+            order.append("shutdown_job")
+
+        import asyncio
+
+        asyncio.run(run_close_sequence(close_player, delete_room, shutdown_job, logs.append))
+        self.assertEqual(order, ["close_player", "delete_room", "shutdown_job"])
+        self.assertEqual(logs, [])
+
+    def test_room_delete_failure_is_logged_and_job_shutdown_still_runs(self):
+        order = []
+        logs = []
+
+        async def close_player():
+            order.append("close_player")
+
+        async def delete_room():
+            order.append("delete_room")
+            raise RuntimeError("room already gone")
+
+        async def shutdown_job():
+            order.append("shutdown_job")
+
+        import asyncio
+
+        asyncio.run(run_close_sequence(close_player, delete_room, shutdown_job, logs.append))
+        self.assertEqual(order, ["close_player", "delete_room", "shutdown_job"])
+        self.assertEqual(len(logs), 1)
+        self.assertIn("room already gone", logs[0])

@@ -9,9 +9,12 @@ import gg.savecraft.mentat.core.TokenGrant
 import gg.savecraft.mentat.core.TranscriptSegment
 import gg.savecraft.mentat.phone.PhoneBridge
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -202,13 +205,35 @@ class VoiceSessionServiceTest {
     }
 
     @Test
+    fun gracefulRemoteDisconnectEndsTheSessionWithoutReconnecting() = runBlocking {
+        val liveKit = FakeLiveKitSession()
+        var stopped = false
+        val states = mutableListOf<SessionState>()
+        val service = controller(liveKit, stopService = { stopped = true })
+        val stateJob = launch(start = CoroutineStart.UNDISPATCHED) {
+            service.state.collect(states::add)
+        }
+
+        service.start()
+        liveKit.events.emit(LiveKitEvent.Connected)
+        liveKit.events.emit(LiveKitEvent.Disconnected("ROOM_DELETED", graceful = true))
+        stateJob.cancel()
+
+        assertEquals(SessionState.Ended, service.state.value)
+        assertFalse(states.contains(SessionState.Reconnecting))
+        assertTrue(stopped)
+        assertFalse(liveKit.disconnected)
+        assertTrue(liveKit.closed)
+    }
+
+    @Test
     fun terminalDisconnectFromLiveFailsTheSession() = runBlocking {
         val liveKit = FakeLiveKitSession()
         val service = controller(liveKit)
 
         service.start()
         liveKit.events.emit(LiveKitEvent.Connected)
-        liveKit.events.emit(LiveKitEvent.Disconnected("server closed"))
+        liveKit.events.emit(LiveKitEvent.Disconnected("server closed", graceful = false))
 
         assertEquals(SessionState.Failed("server closed"), service.state.value)
     }

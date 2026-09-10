@@ -22,6 +22,7 @@ from typing import Any
 #: The consult tool and the phone tools the front is given. Calls to any other
 #: name are hallucinated tools and score as invalid.
 TOOL_NAME = "ask_mentat"
+END_TOOL_NAME = "end_conversation"
 PHONE_TOOL_NAMES = (
     "find_places",
     "navigate_to",
@@ -36,6 +37,8 @@ PHONE_TOOL_NAMES = (
 #: neither: an empty turn, an unknown or mixed tool call, or a failed request.
 CONSULT = "consult"
 DIRECT = "direct"
+SIGNOFF = "signoff"
+DONE = "done"
 INVALID = "invalid"
 
 #: Scenarios in this category are run and reported but not scored: their
@@ -53,6 +56,7 @@ TOOL_ARGUMENT_KEYS = {
     "set_alarm": frozenset(("hour", "minute", "label")),
     "set_timer": frozenset(("minutes", "seconds", "label")),
     "open_link": frozenset(("url",)),
+    END_TOOL_NAME: frozenset(("farewell", "reason")),
 }
 
 #: How many turns of prior conversation a scenario may carry. The same window
@@ -144,8 +148,8 @@ def parse_scenario(raw: Any, where: str) -> Scenario:
     }
 
     expect = raw["expect"]
-    if expect not in (CONSULT, DIRECT, *PHONE_TOOL_NAMES):
-        allowed = (CONSULT, DIRECT, *PHONE_TOOL_NAMES)
+    if expect not in (CONSULT, DIRECT, SIGNOFF, DONE, *PHONE_TOOL_NAMES):
+        allowed = (CONSULT, DIRECT, SIGNOFF, DONE, *PHONE_TOOL_NAMES)
         raise ScenarioError(f"{where}: expect is {expect!r}, not one of {allowed}")
 
     return Scenario(
@@ -199,10 +203,13 @@ def classify(response: Response) -> str:
     if response.tool_calls:
         if len(response.tool_calls) != 1:
             return INVALID
-        name = response.tool_calls[0].name
-        if name == TOOL_NAME:
+        call = response.tool_calls[0]
+        if call.name == TOOL_NAME:
             return CONSULT
-        return name if name in PHONE_TOOL_NAMES else INVALID
+        if call.name == END_TOOL_NAME:
+            reason = call.arguments.get("reason")
+            return reason if reason in (SIGNOFF, DONE) else INVALID
+        return call.name if call.name in PHONE_TOOL_NAMES else INVALID
     return DIRECT if response.text.strip() else INVALID
 
 
@@ -227,7 +234,13 @@ def judge(scenario: Scenario, response: Response) -> Result:
         return Result(scenario=scenario, response=response, got=got, hit=None)
     hit = got == scenario.expect
     if hit and scenario.expect_args:
-        expected_tool = TOOL_NAME if scenario.expect == CONSULT else scenario.expect
+        expected_tool = (
+            TOOL_NAME
+            if scenario.expect == CONSULT
+            else END_TOOL_NAME
+            if scenario.expect in (SIGNOFF, DONE)
+            else scenario.expect
+        )
         arguments = tool_arguments(response, expected_tool)
         hit = all(
             str(arguments.get(key, "")) == value
@@ -352,7 +365,14 @@ def _expect_args(value: Any, expect: str, where: str) -> Mapping[str, str]:
         )
     if not value:
         return {}
-    allowed = TOOL_ARGUMENT_KEYS[TOOL_NAME if expect == CONSULT else expect]
+    expected_tool = (
+        TOOL_NAME
+        if expect == CONSULT
+        else END_TOOL_NAME
+        if expect in (SIGNOFF, DONE)
+        else expect
+    )
+    allowed = TOOL_ARGUMENT_KEYS[expected_tool]
     for key, argument in value.items():
         if key not in allowed:
             raise ScenarioError(

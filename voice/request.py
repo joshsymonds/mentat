@@ -16,7 +16,7 @@ next to voice/stream.py. Everything agent.py does beyond this is glue.
 from __future__ import annotations
 
 import tomllib
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,6 +58,159 @@ VOICE_CARD_MARKER = "---VOICE-CARD---"
 
 #: Environment variable naming the private-context file (see PrivateContext).
 PRIVATE_CONTEXT_ENV = "MENTAT_VOICE_PRIVATE"
+
+#: Seconds of silence after a completed answer before the front closes.
+DONE_GRACE_S = 6.0
+
+#: Seconds of total silence while listening before the front closes.
+IDLE_S = 30.0
+
+DEFAULT_FAREWELL = "Talk later."
+
+
+def farewell_line(farewell: str) -> str:
+    """Return one spoken line because R1 requires speech when the schema
+    supplies nothing.
+    """
+    return " ".join(farewell.split()) or DEFAULT_FAREWELL
+
+
+class EndingPolicy:
+    """Pure state machine for model-requested and silent conversation ends.
+
+    The front's event handlers call these methods as state changes happen. A
+    deadline is a duration, not a wall-clock timestamp, so the entrypoint can
+    replace one timer task whenever a new event changes it.
+    """
+
+    def __init__(self) -> None:
+        self._deadline: float | None = None
+        self._deadline_kind: str | None = None
+        self._requested_reason: str | None = None
+        self._consult_in_flight = False
+        self._user_speaking = False
+
+    @property
+    def deadline(self) -> float | None:
+        """The current silence deadline, or ``None`` when no timer is armed."""
+        return self._deadline
+
+    @property
+    def consult_in_flight(self) -> bool:
+        """Whether Mentat is currently working on a consult."""
+        return self._consult_in_flight
+
+    @property
+    def pending_reason(self) -> str | None:
+        """The model-requested end waiting for its speech to finish."""
+        return self._requested_reason
+
+    def _clear_deadline(self) -> bool:
+        had_deadline = self._deadline is not None
+        self._deadline = None
+        self._deadline_kind = None
+        return had_deadline
+
+    def end_requested(self, reason: str) -> None:
+        """Record a model-requested sign-off or completed-answer close."""
+        if self._consult_in_flight or reason not in {"signoff", "done"}:
+            return None
+        self._requested_reason = reason
+        self._clear_deadline()
+        return None
+
+    def playout_finished(self, delivered: bool) -> str | None:
+        """Resolve an end request once its associated speech is terminal."""
+        reason = self._requested_reason
+        self._requested_reason = None
+        if not delivered:
+            return None
+        if reason == "signoff":
+            return "close"
+        if reason == "done" and not self._user_speaking:
+            self._deadline = DONE_GRACE_S
+            self._deadline_kind = "done"
+        return None
+
+    def consult_answered(self, text: str, delivered: bool) -> None:
+        """Arm the short close window for a delivered, non-question answer."""
+        if delivered and not text.strip().endswith("?") and not self._user_speaking:
+            self._deadline = DONE_GRACE_S
+            self._deadline_kind = "done"
+        else:
+            self._clear_deadline()
+        return None
+
+    def consult_started(self) -> str | None:
+        """Suppress idle closure while Mentat is working."""
+        self._consult_in_flight = True
+        self._requested_reason = None
+        return "cancel" if self._clear_deadline() else None
+
+    def consult_finished(self) -> None:
+        """Resume the idle close window after a consult finishes."""
+        self._consult_in_flight = False
+        if self._deadline is None and not self._user_speaking:
+            self._deadline = IDLE_S
+            self._deadline_kind = "idle"
+        return None
+
+    def user_spoke(self) -> str | None:
+        """Cancel any pending close when Josh starts another utterance."""
+        self._user_speaking = True
+        had_request = self._requested_reason is not None
+        self._requested_reason = None
+        return "cancel" if self._clear_deadline() or had_request else None
+
+    def user_quiet(self) -> None:
+        """Record that Josh stopped speaking."""
+        self._user_speaking = False
+        return None
+
+    def agent_listening(self) -> None:
+        """Arm idle closure when the agent is listening for a new turn."""
+        if (
+            not self._consult_in_flight
+            and self._deadline is None
+            and not self._user_speaking
+        ):
+            self._deadline = IDLE_S
+            self._deadline_kind = "idle"
+        return None
+
+    def agent_busy(self) -> str | None:
+        """Stop idle closure while the agent is speaking or thinking."""
+        if self._deadline_kind == "idle":
+            return "cancel" if self._clear_deadline() else None
+        return None
+
+    def elapsed(self, seconds: float) -> str | None:
+        """Close when an armed deadline has elapsed outside a consult."""
+        if self._consult_in_flight or self._deadline is None:
+            return None
+        if seconds < self._deadline:
+            return None
+        self._clear_deadline()
+        return "close"
+
+
+async def run_close_sequence(
+    close_player: Callable[[], Awaitable[None]],
+    delete_room: Callable[[], Awaitable[None]],
+    shutdown_job: Callable[[], Awaitable[None]],
+    log: Callable[[str], None],
+) -> None:
+    """Close audio, delete the room, and always shut down the job."""
+    try:
+        await close_player()
+    except Exception as error:
+        log(f"close: audio cleanup failed: {error}")
+    try:
+        await delete_room()
+    except Exception as error:
+        log(f"close: room deletion failed: {error}")
+    finally:
+        await shutdown_job()
 
 
 @dataclass(frozen=True)
