@@ -50,6 +50,7 @@ class AssistActivityTest {
         Shadows.shadowOf(application).denyPermissions(
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.SEND_SMS,
+            Manifest.permission.READ_SMS,
             Manifest.permission.READ_CONTACTS,
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION,
@@ -103,7 +104,7 @@ class AssistActivityTest {
         assertEquals(SessionState.Failed("Permission denied"), activity.uiState.value)
         val phoneRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
         assertArrayEquals(
-            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS),
+            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_SMS, Manifest.permission.READ_CONTACTS),
             phoneRequest.requestedPermissions,
         )
     }
@@ -142,7 +143,7 @@ class AssistActivityTest {
 
         val request = Shadows.shadowOf(activity).lastRequestedPermission
         assertArrayEquals(
-            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS),
+            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_SMS, Manifest.permission.READ_CONTACTS),
             request.requestedPermissions,
         )
     }
@@ -152,6 +153,7 @@ class AssistActivityTest {
         grantRecordAudio()
         Shadows.shadowOf(application).grantPermissions(
             Manifest.permission.SEND_SMS,
+            Manifest.permission.READ_SMS,
             Manifest.permission.READ_CONTACTS,
         )
 
@@ -221,6 +223,7 @@ class AssistActivityTest {
         )
         val permissions = packageInfo.requestedPermissions.orEmpty().toSet()
         assertTrue(permissions.contains(Manifest.permission.SEND_SMS))
+        assertTrue(permissions.contains(Manifest.permission.READ_SMS))
         assertTrue(permissions.contains(Manifest.permission.READ_CONTACTS))
         assertTrue(permissions.contains(Manifest.permission.SYSTEM_ALERT_WINDOW))
         assertTrue(permissions.contains(Manifest.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS))
@@ -486,6 +489,7 @@ class AssistActivityTest {
     private fun grantPhonePermissions() {
         Shadows.shadowOf(application).grantPermissions(
             Manifest.permission.SEND_SMS,
+            Manifest.permission.READ_SMS,
             Manifest.permission.READ_CONTACTS,
         )
     }

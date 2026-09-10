@@ -72,6 +72,7 @@ open class PhoneCommandService : Service() {
             smsSender = AndroidSmsSender(this, SystemClock),
             contactResolver = AndroidContactResolver(this),
             intentLauncher = AndroidIntentLauncher(this),
+            messageStore = AndroidMessageStore(this),
             clock = SystemClock,
         )
 

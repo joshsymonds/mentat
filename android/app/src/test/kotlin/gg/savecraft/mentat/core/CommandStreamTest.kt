@@ -100,6 +100,30 @@ class CommandStreamTest {
     }
 
     @Test
+    fun parsesReadCommandsWithOptionalBefore() {
+        val expires = Instant.parse("2026-09-10T00:00:00Z")
+        assertEquals(
+            PhoneCommand.Conversations("c", 20, expires),
+            PhoneCommand.parse(JSONObject("{\"kind\":\"conversations\",\"id\":\"c\",\"limit\":20,\"expires_at\":\"2026-09-10T00:00:00Z\"}")),
+        )
+        assertEquals(
+            PhoneCommand.Messages("m", "sms:42", 50, "123:sms:s1", expires),
+            PhoneCommand.parse(JSONObject("{\"kind\":\"messages\",\"id\":\"m\",\"conversation\":\"sms:42\",\"limit\":50,\"before\":\"123:sms:s1\",\"expires_at\":\"2026-09-10T00:00:00Z\"}")),
+        )
+        assertEquals(
+            PhoneCommand.Search("s", "hello", 30, null, expires),
+            PhoneCommand.parse(JSONObject("{\"kind\":\"search\",\"id\":\"s\",\"query\":\"hello\",\"limit\":30,\"expires_at\":\"2026-09-10T00:00:00Z\"}")),
+        )
+    }
+
+    @Test
+    fun resultPayloadIsAnObjectAndIsOmittedWhenAbsent() {
+        val payload = JSONObject().put("messages", org.json.JSONArray().put(JSONObject().put("body", "a")))
+        assertEquals(payload.toString(), PhoneResult("x", "ok", "done", payload).toJson().getJSONObject("payload").toString())
+        assertTrue(!PhoneResult("x", "ok", "done").toJson().has("payload"))
+    }
+
+    @Test
     fun defaultBackoffUsesCappedExponentialSchedule() {
         assertEquals(
             listOf(1_000L, 2_000L, 4_000L, 8_000L, 16_000L, 32_000L, 60_000L, 60_000L),

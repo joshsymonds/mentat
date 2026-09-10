@@ -224,7 +224,7 @@ open class AssistActivity : ComponentActivity() {
     }
 
     private fun requestPhonePermissionsIfNeeded() {
-        val missingPermissions = listOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS)
+        val missingPermissions = listOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_SMS, Manifest.permission.READ_CONTACTS)
             .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missingPermissions.isNotEmpty()) {
             phonePermissionRequest.launch(missingPermissions.toTypedArray())

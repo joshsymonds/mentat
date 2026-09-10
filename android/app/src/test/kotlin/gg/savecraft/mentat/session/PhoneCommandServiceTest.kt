@@ -7,7 +7,12 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
+import gg.savecraft.mentat.core.Attachment
+import gg.savecraft.mentat.core.Boundary
 import gg.savecraft.mentat.core.Clock
+import gg.savecraft.mentat.core.ConversationRow
+import gg.savecraft.mentat.core.MessageRow
+import gg.savecraft.mentat.core.MessageStore
 import gg.savecraft.mentat.core.CommandExecutor
 import gg.savecraft.mentat.core.CommandStream
 import gg.savecraft.mentat.core.ContactMatch
@@ -60,6 +65,7 @@ class PhoneCommandServiceTest {
             smsSender = AllowingSmsSender(),
             contactResolver = EmptyContactResolver(),
             intentLauncher = launcher,
+            messageStore = EmptyMessageStore(),
             clock = FixedClock(Instant.parse("2026-09-09T00:00:00Z")),
         )
         val service = Robolectric.buildService(FakePhoneCommandService::class.java).create().get()
@@ -127,6 +133,14 @@ class PhoneCommandServiceTest {
         }
     }
 
+    private class EmptyMessageStore : MessageStore {
+        override val hasPermission: Boolean = true
+        override fun conversations(limit: Int): List<ConversationRow> = emptyList()
+        override fun messages(threadId: Long, limit: Int, before: Boundary?): List<MessageRow> = emptyList()
+        override fun search(query: String, limit: Int, before: Boundary?): List<MessageRow> = emptyList()
+        override fun directThreadsFor(numbers: List<String>): List<Pair<Long, gg.savecraft.mentat.core.Participant>> = emptyList()
+    }
+
     private class AllowingSmsSender : SmsSender {
         override val hasPermission: Boolean = true
         override suspend fun send(number: String, body: String, deadline: Instant): SmsSendOutcome =
@@ -154,6 +168,7 @@ class PhoneCommandServiceTest {
         smsSender = AllowingSmsSender(),
         contactResolver = EmptyContactResolver(),
         intentLauncher = launcher,
+        messageStore = EmptyMessageStore(),
         clock = FixedClock(Instant.parse("2026-09-09T00:00:00Z")),
     )
 
