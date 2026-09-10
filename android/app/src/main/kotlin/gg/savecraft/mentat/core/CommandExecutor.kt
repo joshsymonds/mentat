@@ -85,7 +85,7 @@ class CommandExecutor(
         }
         val boundary = parseBoundary(command.before)
             ?: if (command.before == null) null else return PhoneResult(command.id, "error", "invalid before")
-        val rows = withContext(Dispatchers.IO) { messageStore.messages(threadId, command.limit, boundary) }
+        val rows = withContext(Dispatchers.IO) { messageStore.messages(threadId, command.limit + 1, boundary) }
         return pageResult(command.id, rows, command.limit, "messages")
     }
 
@@ -98,7 +98,7 @@ class CommandExecutor(
         }
         val boundary = parseBoundary(command.before)
             ?: if (command.before == null) null else return PhoneResult(command.id, "error", "invalid before")
-        val rows = withContext(Dispatchers.IO) { messageStore.search(command.query, command.limit, boundary) }
+        val rows = withContext(Dispatchers.IO) { messageStore.search(command.query, command.limit + 1, boundary) }
         return pageResult(command.id, rows, command.limit, "matches")
     }
 
@@ -160,7 +160,9 @@ class CommandExecutor(
     private fun classifyConversation(value: String): ConversationSelection {
         val explicit = EXPLICIT_ID.matchEntire(value)
         if (explicit != null) {
-            return ConversationSelection.Thread(explicit.groupValues[1].toLong())
+            val threadId = explicit.groupValues[1].toLongOrNull()
+                ?: return ConversationSelection.Error("not found")
+            return ConversationSelection.Thread(threadId)
         }
         if (isDialableNumber(value)) {
             return directSelection(listOf(value))
@@ -188,7 +190,8 @@ class CommandExecutor(
         if (value == null) return null
         val cursor = CURSOR.matchEntire(value)
         if (cursor != null) {
-            return Boundary(cursor.groupValues[1].toLong(), cursor.groupValues[2])
+            val timeMs = cursor.groupValues[1].toLongOrNull() ?: return null
+            return Boundary(timeMs, cursor.groupValues[2])
         }
         return runCatching { Boundary(Instant.parse(value).toEpochMilli(), null) }.getOrNull()
     }
@@ -196,30 +199,34 @@ class CommandExecutor(
     private fun pageResult(id: String, rows: List<MessageRow>, limit: Int, detailNoun: String): PhoneResult {
         val retained = mutableListOf<MessageRow>()
         for (row in rows) {
+            if (retained.size >= limit) break
             if (retained.isEmpty()) {
                 retained += row
                 continue
             }
             val candidate = retained + row
-            if (payloadBytes(candidate) <= PAGE_BUDGET_BYTES) {
+            if (payloadBytes(candidate, cursorFor(row)) <= PAGE_BUDGET_BYTES) {
                 retained += row
             } else {
                 break
             }
         }
+        val hasNext = retained.isNotEmpty() && retained.size < rows.size
         val messages = JSONArray()
         retained.asReversed().forEach { messages.put(messageJson(it)) }
         val payload = JSONObject().put("messages", messages)
-        if (retained.isNotEmpty() && (retained.size < rows.size || rows.size >= limit)) {
+        if (hasNext) {
             payload.put("next", cursorFor(retained.last()))
         }
         return PhoneResult(id, "ok", "${retained.size} $detailNoun", payload)
     }
 
-    private fun payloadBytes(rows: List<MessageRow>): Int {
+    private fun payloadBytes(rows: List<MessageRow>, next: String?): Int {
         val messages = JSONArray()
-        rows.forEach { messages.put(messageJson(it)) }
-        return JSONObject().put("messages", messages).toString().toByteArray(StandardCharsets.UTF_8).size
+        rows.asReversed().forEach { messages.put(messageJson(it)) }
+        val payload = JSONObject().put("messages", messages)
+        next?.let { payload.put("next", it) }
+        return payload.toString().toByteArray(StandardCharsets.UTF_8).size
     }
 
     private fun conversationJson(row: ConversationRow): JSONObject {

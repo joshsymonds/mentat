@@ -82,6 +82,94 @@ class CommandStreamTest {
     }
 
     @Test
+    fun streamsReadCommandsAndSerializesPayloads() = runBlocking {
+        val commandRequests = AtomicInteger()
+        val beforeSeen = AtomicReference<String?>()
+        val results = ConcurrentLinkedQueue<String>()
+        val threeResults = CountDownLatch(3)
+        val server = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0)
+        server.createContext("/v1/phone/commands") { exchange ->
+            val request = commandRequests.incrementAndGet()
+            exchange.responseHeaders.add("Content-Type", "application/x-ndjson")
+            exchange.sendResponseHeaders(200, 0)
+            exchange.responseBody.bufferedWriter().use { writer ->
+                if (request == 1) {
+                    writer.appendLine("{\"id\":\"c\",\"kind\":\"conversations\",\"limit\":20,\"expires_at\":\"2026-09-10T00:00:00Z\"}")
+                    writer.appendLine("{\"id\":\"m\",\"kind\":\"messages\",\"conversation\":\"sms:42\",\"limit\":50,\"before\":\"123:sms:s1\",\"expires_at\":\"2026-09-10T00:00:00Z\"}")
+                    writer.appendLine("{\"id\":\"s\",\"kind\":\"search\",\"query\":\"hello\",\"limit\":30,\"expires_at\":\"2026-09-10T00:00:00Z\"}")
+                } else {
+                    writer.appendLine("{\"kind\":\"ping\"}")
+                }
+                writer.flush()
+            }
+        }
+        server.createContext("/v1/phone/results") { exchange ->
+            results.add(exchange.requestBody.bufferedReader().use { it.readText() })
+            exchange.sendResponseHeaders(204, -1)
+            exchange.close()
+            threeResults.countDown()
+        }
+        server.start()
+
+        val stream = HttpCommandStream(
+            "http://127.0.0.1:${server.address.port}",
+            backoffMillis = { 0L },
+        )
+        val runner = launch {
+            stream.run { command ->
+                when (command) {
+                    is PhoneCommand.Conversations -> PhoneResult(
+                        command.id,
+                        "ok",
+                        "conversations",
+                        JSONObject().put("conversations", org.json.JSONArray()),
+                    )
+                    is PhoneCommand.Messages -> {
+                        beforeSeen.set(command.before)
+                        PhoneResult(
+                            command.id,
+                            "ok",
+                            "messages",
+                            JSONObject().put("messages", org.json.JSONArray().put(JSONObject().put("id", "sms:s1"))),
+                        )
+                    }
+                    is PhoneCommand.Search -> PhoneResult(
+                        command.id,
+                        "ok",
+                        "search",
+                        JSONObject().put("messages", org.json.JSONArray()),
+                    )
+                    else -> error("unexpected command $command")
+                }
+            }
+        }
+
+        try {
+            withTimeout(5_000) { while (commandRequests.get() < 1) delay(10) }
+            assertTrue("requests=${commandRequests.get()}, results=${results.size}", threeResults.await(5, TimeUnit.SECONDS))
+            assertEquals("123:sms:s1", beforeSeen.get())
+            val byId = results.associateBy { JSONObject(it).getString("id") }
+            assertEquals(
+                JSONObject().put("conversations", org.json.JSONArray()).toString(),
+                JSONObject(requireNotNull(byId["c"])).getJSONObject("payload").toString(),
+            )
+            assertEquals(
+                JSONObject().put("messages", org.json.JSONArray().put(JSONObject().put("id", "sms:s1"))).toString(),
+                JSONObject(requireNotNull(byId["m"])).getJSONObject("payload").toString(),
+            )
+            assertEquals(
+                JSONObject().put("messages", org.json.JSONArray()).toString(),
+                JSONObject(requireNotNull(byId["s"])).getJSONObject("payload").toString(),
+            )
+        } finally {
+            stream.close()
+            runner.cancel()
+            runner.join()
+            server.stop(0)
+        }
+    }
+
+    @Test
     fun parsesAndEncodesPhoneMessages() {
         val command = PhoneCommand.parse(
             JSONObject(

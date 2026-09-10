@@ -1,6 +1,7 @@
 package gg.savecraft.mentat.session
 
 import android.Manifest
+import java.io.ByteArrayInputStream
 import android.app.Application
 import android.content.ContentProvider
 import android.content.ContentValues
@@ -62,6 +63,23 @@ class AndroidMessageStoreTest {
     }
 
     @Test
+    fun mmsSearchReadsTextColumnsAndStreamBackedTextParts() {
+        provider.includeStreamBackedMms = true
+        Shadows.shadowOf(application.contentResolver).registerInputStreamSupplier(
+            Uri.parse("content://mms/part/104"),
+            { ByteArrayInputStream("stream says Needle here".toByteArray()) },
+        )
+        val store = AndroidMessageStore(application)
+
+        val streamMatch = store.search("needle", 10, null)
+        assertEquals(listOf("m11"), streamMatch.map { it.id })
+        assertEquals("stream says Needle here", streamMatch.single().body)
+
+        val textColumnMatch = store.search("hello", 10, null)
+        assertEquals(listOf("m10"), textColumnMatch.map { it.id })
+    }
+
+    @Test
     fun phoneLookupIsCachedPerCallAndDirectNumberMatchesCanonicalAddress() {
         provider.phoneLookupQueries = 0
         AndroidMessageStore(application).conversations(20)
@@ -101,6 +119,7 @@ class AndroidMessageStoreTest {
         var inserts = 0
         var threadIdQueries = 0
         var useCursorRows = false
+        var includeStreamBackedMms = false
 
         override fun onCreate(): Boolean = true
 
@@ -144,9 +163,24 @@ class AndroidMessageStoreTest {
                     MatrixCursor(arrayOf("_id", "thread_id", "date", "msg_box", "read"))
                 } else if (uri.path?.startsWith("/part") == true) {
                     MatrixCursor(arrayOf("_id", "mid", "ct", "text", "name", "cl")).apply {
-                        addRow(arrayOf(101L, 10L, "text/plain", "hello from mms", null, null))
-                        addRow(arrayOf(102L, 10L, "application/smil", "<smil>", null, null))
-                        addRow(arrayOf(103L, 10L, "image/jpeg", null, "photo.jpg", "fallback.jpg"))
+                        val parts = mutableListOf(
+                            arrayOf<Any?>(101L, 10L, "text/plain", "hello from mms", null, null),
+                            arrayOf<Any?>(102L, 10L, "application/smil", "<smil>", null, null),
+                            arrayOf<Any?>(103L, 10L, "image/jpeg", null, "photo.jpg", "fallback.jpg"),
+                        )
+                        if (includeStreamBackedMms) {
+                            parts += arrayOf(104L, 11L, "text/plain", null, null, null)
+                        }
+                        parts.filter { row ->
+                            if (selection?.contains("text LIKE") != true) return@filter true
+                            val contentType = row[2] as String
+                            val text = row[3] as String?
+                            val wantedType = selectionArgs?.getOrNull(0)
+                            val pattern = selectionArgs?.getOrNull(1).orEmpty()
+                                .removePrefix("%").removeSuffix("%")
+                            contentType == wantedType && (text?.contains(pattern, ignoreCase = true) == true ||
+                                (text == null && selection.contains("text IS NULL")))
+                        }.forEach(::addRow)
                     }
                 } else if (uri.path?.matches(Regex("/\\d+/addr")) == true) {
                     MatrixCursor(arrayOf("address", "type")).apply { addRow(arrayOf("+15551212121", 137)) }

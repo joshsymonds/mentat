@@ -1,6 +1,11 @@
 package gg.savecraft.mentat.session
 
 import android.app.Application
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.database.Cursor
+import android.database.MatrixCursor
+import android.net.Uri
 import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.Intent
@@ -23,6 +28,7 @@ import gg.savecraft.mentat.core.PhoneResult
 import gg.savecraft.mentat.core.SmsSendOutcome
 import gg.savecraft.mentat.core.SmsSender
 import java.io.File
+import kotlinx.coroutines.runBlocking
 import java.time.Instant
 import javax.xml.parsers.DocumentBuilderFactory
 import org.junit.Assert.assertEquals
@@ -32,6 +38,7 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
+import org.robolectric.shadows.ShadowContentResolver
 import org.robolectric.annotation.Config
 
 @Config(sdk = [35])
@@ -76,6 +83,25 @@ class PhoneCommandServiceTest {
         assertTrue(stream.handlerInvoked)
         assertEquals(listOf("https://example.test"), launcher.launchedUris)
         assertEquals(PhoneResult("open-id", "ok", "launched"), stream.result)
+    }
+
+    @Test
+    fun productionExecutorUsesAndroidMessageStore() = runBlocking {
+        val application = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(application).grantPermissions(android.Manifest.permission.READ_SMS)
+        val provider = RecordingMmsSmsProvider()
+        ShadowContentResolver.registerProviderInternal("mms-sms", provider)
+        val service = Robolectric.buildService(ProductionPhoneCommandService::class.java).create().get()
+
+        service.productionExecutor().execute(
+            PhoneCommand.Conversations(
+                id = "c",
+                limit = 5,
+                expiresAt = Instant.parse("2999-01-01T00:00:00Z"),
+            ),
+        )
+
+        assertEquals(listOf("content://mms-sms/conversations?simple=true"), provider.queries)
     }
 
     @Test
@@ -131,6 +157,34 @@ class PhoneCommandServiceTest {
             lateinit var stream: FakeCommandStream
             lateinit var executor: CommandExecutor
         }
+    }
+
+    class ProductionPhoneCommandService : PhoneCommandService() {
+        override fun commandStream(): CommandStream = FakeCommandStream()
+
+        fun productionExecutor(): CommandExecutor = super.commandExecutor()
+    }
+
+    private class RecordingMmsSmsProvider : ContentProvider() {
+        val queries = mutableListOf<String>()
+
+        override fun onCreate(): Boolean = true
+
+        override fun query(
+            uri: Uri,
+            projection: Array<out String>?,
+            selection: String?,
+            selectionArgs: Array<out String>?,
+            sortOrder: String?,
+        ): Cursor {
+            queries += uri.toString()
+            return MatrixCursor(arrayOf("_id", "recipient_ids", "date"))
+        }
+
+        override fun getType(uri: Uri): String? = null
+        override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+        override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+        override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
     }
 
     private class EmptyMessageStore : MessageStore {

@@ -182,7 +182,7 @@ class AndroidMessageStore(
         query(
             MMS_PART_URI,
             arrayOf(COLUMN_ID, COLUMN_MID, COLUMN_CONTENT_TYPE, COLUMN_TEXT, COLUMN_NAME, COLUMN_CONTENT_LOCATION),
-            "$COLUMN_CONTENT_TYPE=? AND $COLUMN_TEXT LIKE ? ESCAPE '\\'",
+            "$COLUMN_CONTENT_TYPE=? AND ($COLUMN_TEXT LIKE ? ESCAPE '\\' OR $COLUMN_TEXT IS NULL)",
             arrayOf(TEXT_PLAIN, pattern),
             null,
         )?.use { cursor ->
@@ -249,8 +249,6 @@ class AndroidMessageStore(
                 val contentType = cursor.string(COLUMN_CONTENT_TYPE) ?: continue
                 val text = partText(cursor, contentType)
                 parts += MmsPart(
-                    id = id,
-                    mid = mid,
                     contentType = contentType,
                     text = text,
                     name = cursor.string(COLUMN_NAME),
@@ -363,8 +361,6 @@ class AndroidMessageStore(
     )
 
     private data class MmsPart(
-        val id: Long,
-        val mid: Long,
         val contentType: String,
         val text: String?,
         val name: String?,

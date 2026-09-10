@@ -1,7 +1,9 @@
 package gg.savecraft.mentat.core
 
 import android.content.ActivityNotFoundException
+import java.nio.charset.StandardCharsets
 import java.time.Instant
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -143,6 +145,60 @@ class CommandExecutorTest {
     }
 
     @Test
+    fun expiredMessagesAndSearchDoNotCallStore() = runBlocking {
+        val store = FakeMessageStore()
+        assertEquals(
+            PhoneResult("m", "error", "expired"),
+            executor(store = store, now = expiry).execute(
+                PhoneCommand.Messages("m", "sms:42", 2, null, expiry),
+            ),
+        )
+        assertEquals(
+            PhoneResult("s", "error", "expired"),
+            executor(store = store, now = expiry).execute(
+                PhoneCommand.Search("s", "needle", 2, null, expiry),
+            ),
+        )
+        assertEquals(0, store.messagesCalls)
+        assertEquals(0, store.searchCalls)
+    }
+
+    @Test
+    fun missingReadPermissionRejectsMessagesAndSearchBeforeStoreQuery() = runBlocking {
+        val store = FakeMessageStore(hasPermission = false)
+        assertEquals(
+            PhoneResult("m", "error", "permission denied"),
+            executor(store = store).execute(
+                PhoneCommand.Messages("m", "sms:42", 2, null, expiry),
+            ),
+        )
+        assertEquals(
+            PhoneResult("s", "error", "permission denied"),
+            executor(store = store).execute(
+                PhoneCommand.Search("s", "needle", 2, null, expiry),
+            ),
+        )
+        assertEquals(0, store.messagesCalls)
+        assertEquals(0, store.searchCalls)
+    }
+
+    @Test
+    fun overflowingExplicitThreadIdReturnsNotFoundInsteadOfThrowing() = runBlocking {
+        val result = executor().execute(
+            PhoneCommand.Messages("m", "sms:9223372036854775808", 2, null, expiry),
+        )
+        assertEquals(PhoneResult("m", "error", "not found"), result)
+    }
+
+    @Test
+    fun overflowingCursorEpochReturnsInvalidBeforeInsteadOfThrowing() = runBlocking {
+        val result = executor().execute(
+            PhoneCommand.Messages("m", "sms:42", 2, "9223372036854775808:sms:s1", expiry),
+        )
+        assertEquals(PhoneResult("m", "error", "invalid before"), result)
+    }
+
+    @Test
     fun conversationsUseEnvelopeAndPreviewCap() = runBlocking {
         val store = FakeMessageStore(conversationRows = listOf(
             ConversationRow(42, listOf(Participant("Mum", "+15551212")), "in", "x".repeat(201), 1_000, 3, 2),
@@ -170,15 +226,109 @@ class CommandExecutorTest {
     }
 
     @Test
-    fun oversizedFirstMessageIsRetainedAndBudgetSpillsLaterRows() = runBlocking {
-        val rows = (300 downTo 1).map { id ->
-            MessageRow("s$id", 42, "in", null, "x".repeat(2_000), id.toLong(), emptyList())
-        }
+    fun exactlyLimitRowsDoNotInventNextAndAnExtraRowProvidesNext() = runBlocking {
+        val rows = listOf(
+            MessageRow("s2", 42, "in", null, "new", 2_000, emptyList()),
+            MessageRow("s1", 42, "in", null, "old", 1_000, emptyList()),
+        )
         val store = FakeMessageStore(messageRows = rows)
-        val result = executor(store = store).execute(PhoneCommand.Messages("m", "sms:42", 300, null, expiry))
+        val exact = executor(store = store).execute(PhoneCommand.Messages("exact", "sms:42", 2, null, expiry))
+        assertEquals(false, exact.payload!!.has("next"))
+
+        store.messageRows = rows + MessageRow("s0", 42, "in", null, "older", 0, emptyList())
+        val extra = executor(store = store).execute(PhoneCommand.Messages("extra", "sms:42", 2, null, expiry))
+        assertEquals("1000:sms:s1", extra.payload!!.getString("next"))
+    }
+
+    @Test
+    fun searchUsesSameExtraRowPagingRule() = runBlocking {
+        val store = FakeMessageStore(messageRows = listOf(
+            MessageRow("s2", 42, "in", null, "new", 2_000, emptyList()),
+            MessageRow("s1", 42, "in", null, "old", 1_000, emptyList()),
+        ))
+        val exact = executor(store = store).execute(PhoneCommand.Search("exact", "needle", 2, null, expiry))
+        assertEquals(false, exact.payload!!.has("next"))
+
+        store.messageRows += MessageRow("s0", 42, "in", null, "older", 0, emptyList())
+        val extra = executor(store = store).execute(PhoneCommand.Search("extra", "needle", 2, null, expiry))
+        assertEquals("1000:sms:s1", extra.payload!!.getString("next"))
+    }
+
+    @Test
+    fun finalBudgetIncludesNextAndKeepsTheSpilledRowReachable() = runBlocking {
+        val second = MessageRow("s1", 42, "in", null, "old", 1_000, emptyList())
+        var attachmentNameLength = 524_288
+        fun firstRow() = MessageRow(
+            "s2", 42, "in", null, "new", 2_000,
+            listOf(Attachment("application/octet-stream", "x".repeat(attachmentNameLength))),
+        )
+        while (serializedMessages(listOf(firstRow(), second), null) > 512 * 1024) {
+            attachmentNameLength -= 1
+        }
+        val rows = listOf(firstRow(), second)
+        val withoutNext = serializedMessages(rows, null)
+        val withNext = serializedMessages(rows, "1000:sms:s1")
+        assertTrue(withoutNext <= 512 * 1024)
+        assertTrue(withoutNext >= 512 * 1024 - 64)
+        assertTrue(withNext > 512 * 1024)
+
+        val store = FakeMessageStore(messageRows = rows)
+        val first = executor(store = store).execute(PhoneCommand.Messages("a", "sms:42", 1, null, expiry))
+        assertEquals(1, first.payload!!.getJSONArray("messages").length())
+        assertEquals("2000:sms:s2", first.payload!!.getString("next"))
+        assertTrue(first.payload.toString().toByteArray(StandardCharsets.UTF_8).size <= 512 * 1024)
+
+        val secondPage = executor(store = store).execute(
+            PhoneCommand.Messages("b", "sms:42", 1, first.payload.getString("next"), expiry),
+        )
+        assertEquals(listOf("sms:s1"), listOf(secondPage.payload!!.getJSONArray("messages").getJSONObject(0).getString("id")))
+    }
+
+    @Test
+    fun oversizedFirstRecordIsRetainedEvenWhenAloneOverBudget() = runBlocking {
+        val row = MessageRow(
+            "s1", 42, "in", null, "body", 1_000,
+            (1..300).map { Attachment("application/octet-stream", "x".repeat(2_000)) },
+        )
+        val result = executor(store = FakeMessageStore(messageRows = listOf(row))).execute(
+            PhoneCommand.Messages("m", "sms:42", 1, null, expiry),
+        )
         val payload = result.payload!!
-        assertTrue(payload.getJSONArray("messages").length() in 1 until rows.size)
-        assertTrue(payload.has("next"))
+        assertEquals(1, payload.getJSONArray("messages").length())
+        assertTrue(payload.toString().toByteArray(StandardCharsets.UTF_8).size > 512 * 1024)
+        assertEquals(false, payload.has("next"))
+    }
+
+    @Test
+    fun emptyReadEnvelopesHaveNoNextCursor() = runBlocking {
+        val store = FakeMessageStore()
+        val conversations = executor(store = store).execute(PhoneCommand.Conversations("c", 20, expiry))
+        val messages = executor(store = store).execute(PhoneCommand.Messages("m", "sms:42", 2, null, expiry))
+        assertEquals("[]", conversations.payload!!.getJSONArray("conversations").toString())
+        assertEquals(false, conversations.payload.has("next"))
+        assertEquals("[]", messages.payload!!.getJSONArray("messages").toString())
+        assertEquals(false, messages.payload.has("next"))
+    }
+
+    @Test
+    fun searchContinuationUsesNextWithoutGapOrOverlap() = runBlocking {
+        val store = FakeMessageStore(messageRows = listOf(
+            MessageRow("s4", 42, "in", null, "four", 4_000, emptyList()),
+            MessageRow("s3", 42, "in", null, "three", 3_000, emptyList()),
+            MessageRow("s2", 42, "in", null, "two", 2_000, emptyList()),
+            MessageRow("s1", 42, "in", null, "one", 1_000, emptyList()),
+        ))
+        val first = executor(store = store).execute(PhoneCommand.Search("a", "needle", 2, null, expiry))
+        val firstIds = (0 until first.payload!!.getJSONArray("messages").length())
+            .map { first.payload.getJSONArray("messages").getJSONObject(it).getString("id") }
+        val next = first.payload.getString("next")
+        val second = executor(store = store).execute(PhoneCommand.Search("b", "needle", 2, next, expiry))
+        val secondIds = (0 until second.payload!!.getJSONArray("messages").length())
+            .map { second.payload.getJSONArray("messages").getJSONObject(it).getString("id") }
+        assertEquals(listOf("sms:s3", "sms:s4"), firstIds)
+        assertEquals(listOf("sms:s1", "sms:s2"), secondIds)
+        assertEquals(emptySet<String>(), firstIds.toSet().intersect(secondIds.toSet()))
+        assertEquals(false, second.payload.has("next"))
     }
 
     @Test
@@ -232,6 +382,16 @@ class CommandExecutorTest {
     }
 
     @Test
+    fun contactNameFoundOnlyInGroupThreadsReturnsNotFound() = runBlocking {
+        val contacts = FakeContactResolver(listOf(ContactMatch("Mum", "+15551212")))
+        val store = FakeMessageStore(directThreads = emptyList())
+        val result = executor(store = store, contacts = contacts).execute(
+            PhoneCommand.Messages("m", "Mum", 50, null, expiry),
+        )
+        assertEquals(PhoneResult("m", "error", "not found"), result)
+    }
+
+    @Test
     fun nameResolvesDirectThreadsAndReportsNotFoundOrAmbiguous() = runBlocking {
         val contacts = FakeContactResolver(listOf(ContactMatch("Mum", "+15551212")))
         val store = FakeMessageStore(directThreads = listOf(42L to Participant("Mum", "+15551212")))
@@ -255,6 +415,36 @@ class CommandExecutorTest {
     ) = CommandExecutor(sms, contacts, launcher, store, FixedClock(now))
 
     private fun smsCommand(to: String = "+15551212") = PhoneCommand.Sms("id", to, "hello", expiry)
+
+    private fun serializedMessages(rows: List<MessageRow>, next: String?): Int {
+        val messages = JSONArray()
+        rows.forEach { row ->
+            val message = JSONObject()
+                .put("id", "sms:${row.id}")
+                .put("conversation", "sms:${row.threadId}")
+                .put("channel", "sms")
+                .put("direction", row.direction)
+                .put("body", row.body.take(2_000))
+                .put("at", Instant.ofEpochMilli(row.atMs).toString())
+            row.from?.let {
+                val from = JSONObject().put("number", it.number)
+                it.name?.let { name -> from.put("name", name) }
+                message.put("from", from)
+            }
+            val attachments = JSONArray()
+            row.attachments.forEach {
+                val attachment = JSONObject().put("content_type", it.contentType)
+                it.name?.let { name -> attachment.put("name", name) }
+                attachments.put(attachment)
+            }
+            message.put("attachments", attachments)
+            if (row.body.length > 2_000) message.put("truncated", true)
+            messages.put(message)
+        }
+        val payload = JSONObject().put("messages", messages)
+        next?.let { payload.put("next", it) }
+        return payload.toString().toByteArray(StandardCharsets.UTF_8).size
+    }
     private fun openCommand() = PhoneCommand.Open("open", "https://example.com", expiry)
 
     private class FixedClock(private val value: Instant) : Clock {
@@ -290,17 +480,22 @@ class CommandExecutorTest {
         var directThreads: List<Pair<Long, Participant>> = emptyList(),
     ) : MessageStore {
         var conversationsCalls = 0
+        var messagesCalls = 0
+        var searchCalls = 0
         var directCalls = mutableListOf<List<String>>()
         var lastSearchBoundary: Boundary? = null
         override fun conversations(limit: Int): List<ConversationRow> {
             conversationsCalls += 1
             return conversationRows.take(limit)
         }
-        override fun messages(threadId: Long, limit: Int, before: Boundary?): List<MessageRow> =
-            messageRows.filter { before == null || it.atMs < before.timeMs || (it.atMs == before.timeMs && before.id != null && it.id < before.id) }.take(limit)
+        override fun messages(threadId: Long, limit: Int, before: Boundary?): List<MessageRow> {
+            messagesCalls += 1
+            return messageRows.filter { before == null || it.atMs < before.timeMs || (it.atMs == before.timeMs && before.id != null && it.id < before.id) }.take(limit)
+        }
         override fun search(query: String, limit: Int, before: Boundary?): List<MessageRow> {
+            searchCalls += 1
             lastSearchBoundary = before
-            return messages(42, limit, before)
+            return messageRows.filter { before == null || it.atMs < before.timeMs || (it.atMs == before.timeMs && before.id != null && it.id < before.id) }.take(limit)
         }
         override fun directThreadsFor(numbers: List<String>): List<Pair<Long, Participant>> {
             directCalls += numbers
