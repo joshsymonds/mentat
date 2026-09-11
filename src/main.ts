@@ -41,7 +41,14 @@ try {
   const issuer =
     config.voiceToken !== undefined ? createTokenIssuer(config.voiceToken) : undefined;
   const bridge = new PhoneBridge(logger);
-  const server = createServer(createHandler(backend, tracker, logger, issuer, bridge));
+  const mcp = {
+    bridge,
+    places: {
+      ...(config.placesApiKey !== undefined && { apiKey: config.placesApiKey }),
+      fetch: globalThis.fetch,
+    },
+  };
+  const server = createServer(createHandler(backend, tracker, logger, issuer, mcp));
   const stopJanitor = startJanitor(tracker, backend, config.sessionTtlMs, logger);
 
   server.listen(config.listen.port, config.listen.host, () => {

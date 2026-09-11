@@ -14,8 +14,7 @@ import {
   type Event,
 } from './backend.ts';
 import type { Logger } from './log.ts';
-import { handleMcp } from './mcp.ts';
-import type { PhoneBridge } from './phone.ts';
+import { handleMcp, type McpDependencies } from './mcp.ts';
 import type { TokenIssuer } from './voicetoken.ts';
 import { errorLine, toWireLine } from './wire.ts';
 
@@ -77,7 +76,7 @@ export function createHandler(
   tracker: SessionTracker,
   logger: Logger,
   issuer?: TokenIssuer,
-  bridge?: PhoneBridge,
+  mcp?: McpDependencies,
 ): RequestListener {
   return (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/voice/token' && issuer !== undefined) {
@@ -104,7 +103,7 @@ export function createHandler(
       return;
     }
     if (req.url === '/v1/phone/commands') {
-      if (req.method !== 'GET' || bridge === undefined) {
+      if (req.method !== 'GET' || mcp === undefined) {
         fail(res, 404, 'not found');
         return;
       }
@@ -118,11 +117,11 @@ export function createHandler(
         fail(res, 403, 'phone header required');
         return;
       }
-      bridge.attach(res);
+      mcp.bridge.attach(res);
       return;
     }
     if (req.url === '/v1/phone/results') {
-      if (req.method !== 'POST' || bridge === undefined) {
+      if (req.method !== 'POST' || mcp === undefined) {
         fail(res, 404, 'not found');
         return;
       }
@@ -134,7 +133,7 @@ export function createHandler(
           fail(res, 400, 'id, status, and detail are required');
           return;
         }
-        bridge.complete(body);
+        mcp.bridge.complete(body);
         res.writeHead(204);
         res.end();
       }).catch((error: unknown) => {
@@ -155,13 +154,13 @@ export function createHandler(
         }) + '\n');
         return;
       }
-      if (req.method !== 'POST' || bridge === undefined) {
+      if (req.method !== 'POST' || mcp === undefined) {
         fail(res, 404, 'not found');
         return;
       }
       readJsonBody(req, res).then((body) => {
         if (body !== undefined) {
-          return handleMcp(bridge, req, res, body);
+          return handleMcp(mcp, req, res, body);
         }
         return undefined;
       }).catch((error: unknown) => {

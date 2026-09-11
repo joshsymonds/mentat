@@ -5,12 +5,30 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { z } from 'zod';
 
-import type { PhoneBridge, PhoneOutcome } from './phone.ts';
+import { searchPlaces, type PlacesDeps, type PlacesLocation } from './places.ts';
+import type { PhoneBridge, PhoneLocationPayload, PhoneOutcome } from './phone.ts';
 
 const SUPPORTED_CHANNELS = ['sms'] as const;
+const SEND_CONFIRMATION_ERROR =
+  'Message was not sent. Call again with send=true after confirming the recipient and message with the user.';
+const LOCATION_UNAVAILABLE =
+  'I could not get a fresh phone location, so ask roughly where Josh is and call find_places again with locality.';
+const PLACES_UNCONFIGURED = 'place search is not configured on the server.';
+const NO_PLACES = 'NO_RESULTS: no places matched.';
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function errorResult(error: unknown) {
+  return {
+    isError: true as const,
+    content: [{ type: 'text' as const, text: errorText(error) }],
+  };
+}
+
+function textResult(text: string) {
+  return { content: [{ type: 'text' as const, text }] };
 }
 
 function channelError(value: string) {
@@ -51,28 +69,52 @@ function payloadResult(outcome: PhoneOutcome) {
   return { content: [{ type: 'text' as const, text }] };
 }
 
+function locationFromPayload(payload: Record<string, unknown> | undefined): PlacesLocation | undefined {
+  if (payload === undefined) {
+    return undefined;
+  }
+  const { lat, lng } = payload as Partial<PhoneLocationPayload>;
+  return typeof lat === 'number' && Number.isFinite(lat) && typeof lng === 'number' && Number.isFinite(lng)
+    ? { lat, lng }
+    : undefined;
+}
+
+export interface McpDependencies {
+  bridge: PhoneBridge;
+  places: PlacesDeps;
+}
+
 export async function handleMcp(
-  bridge: PhoneBridge,
+  deps: McpDependencies,
   req: IncomingMessage,
   res: ServerResponse,
   body: unknown,
 ): Promise<void> {
+  const { bridge, places } = deps;
   const server = new McpServer({ name: 'mentat', version: '3.0.0' });
   server.registerTool(
     'send_sms',
     {
-      description: 'Send a text message to a phone number or contact name.',
-      inputSchema: { to: z.string(), body: z.string() },
+      description:
+        'Send a text message only after the recipient and message were confirmed with the user. Set send=true only after that explicit confirmation.',
+      inputSchema: {
+        to: z.string(),
+        body: z.string(),
+        send: z.boolean().optional().describe('true only after the recipient and message were confirmed with the user'),
+      },
     },
-    async ({ to, body: message }) => {
+    async ({ to, body: message, send }) => {
+      if (send !== true) {
+        return {
+          isError: true as const,
+          content: [{ type: 'text' as const, text: SEND_CONFIRMATION_ERROR }],
+        };
+      }
       try {
         const outcome = await bridge.dispatch({ kind: 'sms', to, body: message });
-        return { content: [{ type: 'text' as const, text: outcome.detail }] };
+        return textResult(outcome.detail);
       } catch (error) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: errorText(error) }],
-        };
+        return errorResult(error);
       }
     },
   );
@@ -86,12 +128,9 @@ export async function handleMcp(
     async ({ uri }) => {
       try {
         const outcome = await bridge.dispatch({ kind: 'open', uri });
-        return { content: [{ type: 'text' as const, text: outcome.detail }] };
+        return textResult(outcome.detail);
       } catch (error) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: errorText(error) }],
-        };
+        return errorResult(error);
       }
     },
   );
@@ -112,10 +151,7 @@ export async function handleMcp(
         });
         return payloadResult(outcome);
       } catch (error) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: errorText(error) }],
-        };
+        return errorResult(error);
       }
     },
   );
@@ -144,10 +180,7 @@ export async function handleMcp(
         });
         return payloadResult(outcome);
       } catch (error) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: errorText(error) }],
-        };
+        return errorResult(error);
       }
     },
   );
@@ -176,12 +209,134 @@ export async function handleMcp(
         });
         return payloadResult(outcome);
       } catch (error) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: errorText(error) }],
-        };
+        return errorResult(error);
       }
     },
+  );
+  server.registerTool(
+    'find_places',
+    {
+      description:
+        'Search for a named place near the phone. If the phone cannot provide a fresh location, ask roughly where Josh is and call again with locality.',
+      inputSchema: { query: z.string().min(1), locality: z.string().min(1).optional() },
+    },
+    async ({ query, locality }) => {
+      if (places.apiKey === undefined || places.apiKey.trim() === '') {
+        return textResult(PLACES_UNCONFIGURED);
+      }
+      let location: PlacesLocation | undefined;
+      try {
+        const outcome = await bridge.dispatch({ kind: 'location' });
+        location = locationFromPayload(outcome.payload);
+      } catch {
+        // A locality allows the search to continue without a phone location.
+      }
+      if (location === undefined && (locality === undefined || locality.trim() === '')) {
+        return textResult(LOCATION_UNAVAILABLE);
+      }
+      try {
+        const candidates = await searchPlaces({
+          query,
+          ...(locality !== undefined && { locality }),
+          ...(location !== undefined && { location }),
+          apiKey: places.apiKey,
+          ...(places.fetch !== undefined && { fetch: places.fetch }),
+        });
+        return textResult(candidates.length === 0 ? NO_PLACES : JSON.stringify(candidates));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+  server.registerTool(
+    'navigate_to',
+    {
+      description: 'Start phone navigation to the selected place returned by find_places.',
+      inputSchema: {
+        name: z.string().min(1),
+        address: z.string().min(1),
+        place_id: z.string().min(1),
+        lat: z.number(),
+        lng: z.number(),
+      },
+    },
+    async ({ name, address, place_id, lat, lng }) => {
+      try {
+        const outcome = await bridge.dispatch({ kind: 'navigate', name, address, place_id, lat, lng });
+        return textResult(outcome.detail);
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+  server.registerTool(
+    'dial',
+    {
+      description: 'Open the phone dialer with a non-empty number prefilled without placing the call.',
+      inputSchema: { number: z.string().min(1) },
+    },
+    async ({ number }) => {
+      try {
+        const outcome = await bridge.dispatch({ kind: 'dial', number });
+        return textResult(outcome.detail);
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+  server.registerTool(
+    'set_alarm',
+    {
+      description: 'Set an alarm on the phone for the given 24-hour clock hour and minute.',
+      inputSchema: {
+        hour: z.number().int().min(0).max(23),
+        minute: z.number().int().min(0).max(59),
+        label: z.string().optional(),
+      },
+    },
+    async ({ hour, minute, label }) => {
+      try {
+        const outcome = await bridge.dispatch({
+          kind: 'alarm',
+          hour,
+          minute,
+          ...(label !== undefined && { label }),
+        });
+        return textResult(outcome.detail);
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+  server.registerTool(
+    'set_timer',
+    {
+      description: 'Start a phone timer for at least one second, with an optional label.',
+      inputSchema: {
+        seconds: z.number().int().min(1),
+        label: z.string().optional(),
+      },
+    },
+    async ({ seconds, label }) => {
+      try {
+        const outcome = await bridge.dispatch({
+          kind: 'timer',
+          seconds,
+          ...(label !== undefined && { label }),
+        });
+        return textResult(outcome.detail);
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+  server.registerTool(
+    'end_conversation',
+    {
+      description: 'End the current voice conversation after a sign-off or after completing the request.',
+      inputSchema: { reason: z.enum(['signoff', 'done']) },
+    },
+    () => textResult('Conversation ended.'),
   );
 
   const transport = new StreamableHTTPServerTransport({});

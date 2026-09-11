@@ -29,12 +29,27 @@ export type PolicyFn = (
  */
 export function allowAllPolicy(logger: Logger): PolicyFn {
   return (toolName, input, context) => {
+    const surface = context.meta.surface ?? '';
+    const user = context.meta.user ?? '';
+    if (toolName === 'mcp__mentat__end_conversation' && surface !== 'voice') {
+      logger.info('permission decision', {
+        tool: toolName,
+        decision: 'deny',
+        session_id: context.sessionId,
+        surface,
+        user,
+      });
+      return {
+        behavior: 'deny',
+        message: `mcp__mentat__end_conversation is only allowed on the voice surface; received ${surface || 'unknown'}`,
+      };
+    }
     logger.info('permission decision', {
       tool: toolName,
       decision: 'allow',
       session_id: context.sessionId,
-      surface: context.meta.surface ?? '',
-      user: context.meta.user ?? '',
+      surface,
+      user,
     });
     return { behavior: 'allow', updatedInput: input };
   };

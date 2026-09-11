@@ -22,6 +22,11 @@ describe('loadConfig', () => {
     expect(config.mcpServers).toBeUndefined();
   });
 
+  it('loads the optional Places API key', () => {
+    expect(loadConfig({ ...baseEnv, MENTAT_PLACES_API_KEY: 'places-key' }).placesApiKey).toBe('places-key');
+    expect(loadConfig({ ...baseEnv, MENTAT_PLACES_API_KEY: '' }).placesApiKey).toBeUndefined();
+  });
+
   it('loads LiveKit voice-token configuration when all variables are set', () => {
     const config = loadConfig({
       ...baseEnv,

@@ -8,7 +8,19 @@ export type PhoneCommand =
   | { kind: 'open'; uri: string }
   | { kind: 'conversations'; limit: number }
   | { kind: 'messages'; conversation: string; limit: number; before?: string }
-  | { kind: 'search'; query: string; limit: number; before?: string };
+  | { kind: 'search'; query: string; limit: number; before?: string }
+  | { kind: 'navigate'; name: string; address: string; place_id: string; lat: number; lng: number }
+  | { kind: 'dial'; number: string }
+  | { kind: 'alarm'; hour: number; minute: number; label?: string }
+  | { kind: 'timer'; seconds: number; label?: string }
+  | { kind: 'location' };
+
+export interface PhoneLocationPayload {
+  lat: number;
+  lng: number;
+  accuracy_m: number;
+  age_s: number;
+}
 
 export interface PhoneResult {
   id: string;

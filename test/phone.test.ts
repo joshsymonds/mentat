@@ -111,6 +111,61 @@ describe('PhoneBridge', () => {
     await expect(open).resolves.toEqual({ detail: 'launched' });
   });
 
+  it('writes navigation, dial, alarm, timer, and location commands with expiration timestamps', async () => {
+    const { bridge } = bridgeAt();
+    const phone = response();
+    bridge.attach(phone as unknown as ServerResponse);
+
+    const navigate = bridge.dispatch({
+      kind: 'navigate',
+      name: 'Union Station',
+      address: '800 N 6th Ave, Portland, OR',
+      place_id: 'ChIJplace',
+      lat: 45.528,
+      lng: -122.676,
+    });
+    expect(phone.chunks.at(-1)).toBe(
+      '{"id":"command-id","kind":"navigate","name":"Union Station",' +
+        '"address":"800 N 6th Ave, Portland, OR","place_id":"ChIJplace",' +
+        '"lat":45.528,"lng":-122.676,"expires_at":"2026-09-09T12:00:15.000Z"}\n',
+    );
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'started' })).toBe(true);
+    await expect(navigate).resolves.toEqual({ detail: 'started' });
+
+    const dial = bridge.dispatch({ kind: 'dial', number: '+15555550123' });
+    expect(phone.chunks.at(-1)).toBe(
+      '{"id":"command-id","kind":"dial","number":"+15555550123",' +
+        '"expires_at":"2026-09-09T12:00:15.000Z"}\n',
+    );
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'ready' })).toBe(true);
+    await expect(dial).resolves.toEqual({ detail: 'ready' });
+
+    const alarm = bridge.dispatch({ kind: 'alarm', hour: 7, minute: 30, label: 'Wake up' });
+    expect(phone.chunks.at(-1)).toBe(
+      '{"id":"command-id","kind":"alarm","hour":7,"minute":30,"label":"Wake up",' +
+        '"expires_at":"2026-09-09T12:00:15.000Z"}\n',
+    );
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'set' })).toBe(true);
+    await expect(alarm).resolves.toEqual({ detail: 'set' });
+
+    const timer = bridge.dispatch({ kind: 'timer', seconds: 90 });
+    expect(phone.chunks.at(-1)).toBe(
+      '{"id":"command-id","kind":"timer","seconds":90,' +
+        '"expires_at":"2026-09-09T12:00:15.000Z"}\n',
+    );
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'started' })).toBe(true);
+    await expect(timer).resolves.toEqual({ detail: 'started' });
+
+    const location = bridge.dispatch({ kind: 'location' });
+    expect(phone.chunks.at(-1)).toBe(
+      '{"id":"command-id","kind":"location",' +
+        '"expires_at":"2026-09-09T12:00:15.000Z"}\n',
+    );
+    const payload = { lat: 45.52, lng: -122.67, accuracy_m: 12, age_s: 3 };
+    expect(bridge.complete({ id: 'command-id', status: 'ok', detail: 'located', payload })).toBe(true);
+    await expect(location).resolves.toEqual({ detail: 'located', payload });
+  });
+
   it('resolves successful results and rejects error results with the detail', async () => {
     const { bridge } = bridgeAt();
     const phone = response();

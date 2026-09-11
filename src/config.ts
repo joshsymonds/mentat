@@ -30,6 +30,7 @@ export interface Config {
   sessionTtlMs: number;
   maxBudgetUsd?: number;
   voiceToken?: { apiKey: string; apiSecret: string; url: string };
+  placesApiKey?: string;
 }
 
 const DEFAULT_LISTEN = '127.0.0.1:8484';
@@ -43,6 +44,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   }
 
   const listen = parseListen(env.MENTAT_LISTEN ?? DEFAULT_LISTEN);
+  const placesApiKey = env.MENTAT_PLACES_API_KEY === '' ? undefined : env.MENTAT_PLACES_API_KEY;
   // Empty string means unset (Go's os.Getenv semantics): a blank
   // MENTAT_ALLOW_NON_LOOPBACK= line in an env file must not disable the guard.
   const allowNonLoopback =
@@ -104,6 +106,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       maxBudgetUsd: floatOrThrow(env.MENTAT_MAX_BUDGET_USD, 'MENTAT_MAX_BUDGET_USD'),
     }),
     ...(voiceToken !== undefined && { voiceToken }),
+    ...(placesApiKey !== undefined && { placesApiKey }),
   };
 }
 

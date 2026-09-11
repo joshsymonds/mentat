@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AtCapacityError, type Backend, type Event, type Turn } from '../src/backend.ts';
 import { nullLogger, type Logger } from '../src/log.ts';
+import type { McpDependencies } from '../src/mcp.ts';
 import { PhoneBridge } from '../src/phone.ts';
 import { SessionTracker, createHandler } from '../src/server.ts';
 import type { TokenIssuer } from '../src/voicetoken.ts';
@@ -79,7 +80,8 @@ async function serve(
   logger: Logger = nullLogger,
   bridge?: PhoneBridge,
 ): Promise<string> {
-  const server = createServer(createHandler(backend, tracker, logger, issuer, bridge));
+  const mcp: McpDependencies | undefined = bridge === undefined ? undefined : { bridge, places: {} };
+  const server = createServer(createHandler(backend, tracker, logger, issuer, mcp));
   servers.push(server);
   await new Promise<void>((resolve) => {
     server.listen(0, '127.0.0.1', resolve);

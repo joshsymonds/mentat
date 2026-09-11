@@ -8,6 +8,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { nullLogger } from '../src/log.ts';
 import { PhoneBridge } from '../src/phone.ts';
 import { SessionTracker, createHandler } from '../src/server.ts';
+import type { PlacesDeps } from '../src/places.ts';
 import type { Backend } from '../src/backend.ts';
 import { createServer, type Server } from 'node:http';
 
@@ -17,8 +18,8 @@ const backend: Backend = {
   closeSession: () => Promise.resolve(),
 };
 
-async function serve(bridge: PhoneBridge): Promise<string> {
-  const server = createServer(createHandler(backend, new SessionTracker(), nullLogger, undefined, bridge));
+async function serve(bridge: PhoneBridge, places: PlacesDeps = {}): Promise<string> {
+  const server = createServer(createHandler(backend, new SessionTracker(), nullLogger, undefined, { bridge, places }));
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -38,6 +39,18 @@ async function readLine(reader: ReadableStreamDefaultReader<Uint8Array>): Promis
   }
 }
 
+function textContent(value: unknown): string {
+  if (value === null || typeof value !== 'object') throw new Error('missing MCP result');
+  const content = (value as { content?: unknown }).content;
+  if (!Array.isArray(content)) throw new Error('missing MCP content');
+  const first = (content as unknown[])[0];
+  if (first === null || typeof first !== 'object') throw new Error('missing MCP text');
+  const type = (first as { type?: unknown }).type;
+  const text = (first as { text?: unknown }).text;
+  if (type !== 'text' || typeof text !== 'string') throw new Error('missing MCP text');
+  return text;
+}
+
 afterEach(async () => {
   for (const server of servers.splice(0)) {
     await new Promise((resolve) => server.close(resolve));
@@ -45,7 +58,7 @@ afterEach(async () => {
 });
 
 describe('POST /mcp', () => {
-  it('lists the five phone tools with required string schemas', async () => {
+  it('lists the phone tools with required string schemas', async () => {
     const bridge = new PhoneBridge(nullLogger);
     const base = await serve(bridge);
     const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
@@ -58,16 +71,23 @@ describe('POST /mcp', () => {
       'list_conversations',
       'read_conversation',
       'search_messages',
+      'find_places',
+      'navigate_to',
+      'dial',
+      'set_alarm',
+      'set_timer',
+      'end_conversation',
     ]);
     const send = listed.tools.find((tool) => tool.name === 'send_sms');
     const open = listed.tools.find((tool) => tool.name === 'open_on_phone');
     expect(send).toBeDefined();
     expect(open).toBeDefined();
     expect(send?.inputSchema.type).toBe('object');
-    expect(Object.keys(send?.inputSchema.properties ?? {})).toEqual(['to', 'body']);
+    expect(Object.keys(send?.inputSchema.properties ?? {})).toEqual(['to', 'body', 'send']);
     expect(send?.inputSchema.required).toEqual(['to', 'body']);
     expect(send?.inputSchema.properties?.to).toEqual({ type: 'string' });
     expect(send?.inputSchema.properties?.body).toEqual({ type: 'string' });
+    expect(send?.inputSchema.properties?.send).toMatchObject({ type: 'boolean' });
     expect(open?.inputSchema.type).toBe('object');
     expect(Object.keys(open?.inputSchema.properties ?? {})).toEqual(['uri']);
     expect(open?.inputSchema.required).toEqual(['uri']);
@@ -89,7 +109,7 @@ describe('POST /mcp', () => {
     const client = new Client({ name: 'test-client', version: '1.0.0' });
     await client.connect(transport as Transport);
 
-    const call = client.callTool({ name: 'send_sms', arguments: { to: 'Sarah', body: 'late' } });
+    const call = client.callTool({ name: 'send_sms', arguments: { to: 'Sarah', body: 'late', send: true } });
     const commandLine = await readLine(reader);
     expect(commandLine).toBe(
       '{"id":"mcp-sms","kind":"sms","to":"Sarah","body":"late","expires_at":"2026-09-09T12:00:15.000Z"}',
@@ -104,6 +124,30 @@ describe('POST /mcp', () => {
     await client.close();
     bridge.close();
     await reader.cancel();
+  });
+
+  it('requires explicit send confirmation before dispatching SMS', async () => {
+    const bridge = new PhoneBridge(nullLogger);
+    const dispatch = vi.spyOn(bridge, 'dispatch');
+    const base = await serve(bridge);
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+
+    const result = await client.callTool({
+      name: 'send_sms',
+      arguments: { to: 'Sarah', body: 'late' },
+    });
+    expect(result).toEqual({
+      isError: true,
+      content: [{
+        type: 'text',
+        text: 'Message was not sent. Call again with send=true after confirming the recipient and message with the user.',
+      }],
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    await client.close();
+    bridge.close();
   });
 
   it('dispatches open_on_phone and returns the phone detail text', async () => {
@@ -417,7 +461,7 @@ describe('POST /mcp', () => {
     await client.connect(transport as Transport);
     const result = await client.callTool({
       name: 'send_sms',
-      arguments: { to: 'Sarah', body: 'late' },
+      arguments: { to: 'Sarah', body: 'late', send: true },
     });
     expect(result.isError).toBe(true);
     expect(result).toMatchObject({ isError: true, content: [{ type: 'text', text: 'phone offline' }] });
@@ -437,4 +481,162 @@ describe('POST /mcp', () => {
     await client.close();
     bridge.close();
   });
+  it('finds nearby places from phone location and returns navigable candidates', async () => {
+    const placesFetch = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      const inputUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      expect(inputUrl).toBe('https://places.googleapis.com/v1/places:searchText');
+      expect(init?.headers).toMatchObject({
+        'X-Goog-Api-Key': 'places-key',
+        'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location',
+      });
+      if (typeof init?.body !== 'string') throw new Error('missing request body');
+      expect(JSON.parse(init.body)).toEqual({
+        textQuery: 'coffee',
+        pageSize: 5,
+        locationBias: {
+          circle: { center: { latitude: 45.52, longitude: -122.67 }, radius: 20000 },
+        },
+      });
+      return Promise.resolve(new Response(JSON.stringify({
+        places: [
+          { id: 'place-1', displayName: { text: 'Coffee One' }, formattedAddress: '1 Main St, Portland, OR', location: { latitude: 45.521, longitude: -122.671 } },
+          { id: 'place-2', displayName: { text: 'Coffee Two' }, formattedAddress: '2 Main St, Portland, OR', location: { latitude: 45.522, longitude: -122.672 } },
+          { id: 'place-3', displayName: { text: 'Coffee Three' }, formattedAddress: '3 Main St, Portland, OR', location: { latitude: 45.523, longitude: -122.673 } },
+          { id: 'place-4', displayName: { text: 'Coffee Four' }, formattedAddress: '4 Main St, Portland, OR', location: { latitude: 45.524, longitude: -122.674 } },
+        ],
+      })));
+    });
+    const bridge = new PhoneBridge(nullLogger, {
+      uuid: () => 'mcp-location',
+    });
+    const base = await serve(bridge, { apiKey: 'places-key', fetch: placesFetch });
+    const phone = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
+    if (phone.body === null) throw new Error('missing phone body');
+    const reader = phone.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+
+    const call = client.callTool({ name: 'find_places', arguments: { query: 'coffee' } });
+    const command = JSON.parse(await readLine(reader)) as Record<string, unknown>;
+    expect(command).toMatchObject({ kind: 'location' });
+    await fetch(`${base}/v1/phone/results`, {
+      method: 'POST',
+      body: JSON.stringify({ id: command.id, status: 'ok', detail: 'located', payload: { lat: 45.52, lng: -122.67, accuracy_m: 12, age_s: 3 } }),
+    });
+    const result = await call;
+    expect(result).toMatchObject({
+      content: [{
+        type: 'text',
+        text: JSON.stringify([
+          { name: 'Coffee One', address: '1 Main St, Portland, OR', place_id: 'place-1', lat: 45.521, lng: -122.671 },
+          { name: 'Coffee Two', address: '2 Main St, Portland, OR', place_id: 'place-2', lat: 45.522, lng: -122.672 },
+          { name: 'Coffee Three', address: '3 Main St, Portland, OR', place_id: 'place-3', lat: 45.523, lng: -122.673 },
+        ]),
+      }],
+    });
+    expect(placesFetch).toHaveBeenCalledOnce();
+    await client.close();
+    bridge.close();
+    await reader.cancel();
+  });
+
+  it('requires locality when phone location is unavailable and searches without bias after locality', async () => {
+    const placesFetch = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      if (typeof init?.body !== 'string') throw new Error('missing request body');
+      expect(JSON.parse(init.body)).toEqual({ textQuery: 'coffee in Beaverton', pageSize: 5 });
+      return Promise.resolve(new Response(JSON.stringify({ places: [] })));
+    });
+    const bridge = new PhoneBridge(nullLogger, {
+      uuid: () => 'mcp-location-error',
+    });
+    const base = await serve(bridge, { apiKey: 'places-key', fetch: placesFetch });
+    const phone = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
+    if (phone.body === null) throw new Error('missing phone body');
+    const reader = phone.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+
+    const unavailable = client.callTool({ name: 'find_places', arguments: { query: 'coffee' } });
+    const firstCommand = JSON.parse(await readLine(reader)) as unknown as Record<string, unknown>;
+    await fetch(`${base}/v1/phone/results`, {
+      method: 'POST',
+      body: JSON.stringify({ id: firstCommand.id, status: 'error', detail: 'location unavailable' }),
+    });
+    expect(textContent((await unavailable) as unknown)).toContain('ask roughly where Josh is');
+    expect(placesFetch).not.toHaveBeenCalled();
+
+    const withLocality = client.callTool({ name: 'find_places', arguments: { query: 'coffee', locality: 'Beaverton' } });
+    const secondCommand = JSON.parse(await readLine(reader)) as unknown as Record<string, unknown>;
+    await fetch(`${base}/v1/phone/results`, {
+      method: 'POST',
+      body: JSON.stringify({ id: secondCommand.id, status: 'error', detail: 'location unavailable' }),
+    });
+    expect(textContent((await withLocality) as unknown)).toContain('NO_RESULTS');
+    expect(placesFetch).toHaveBeenCalledOnce();
+    await client.close();
+    bridge.close();
+    await reader.cancel();
+  });
+
+  it('reports unconfigured place search without dispatching to the phone', async () => {
+    const bridge = new PhoneBridge(nullLogger);
+    const dispatch = vi.spyOn(bridge, 'dispatch');
+    const base = await serve(bridge);
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+    const result = await client.callTool({ name: 'find_places', arguments: { query: 'coffee' } });
+    expect(textContent(result as unknown)).toContain('place search is not configured');
+    expect(dispatch).not.toHaveBeenCalled();
+    await client.close();
+    bridge.close();
+  });
+
+  it('dispatches validated phone action tools and ends a conversation locally', async () => {
+    const ids = ['mcp-navigate', 'mcp-dial', 'mcp-alarm', 'mcp-timer'];
+    const bridge = new PhoneBridge(nullLogger, {
+      uuid: () => ids.shift() ?? 'unexpected',
+      now: () => new Date('2026-09-09T12:00:00.000Z'),
+    });
+    const base = await serve(bridge);
+    const phone = await fetch(`${base}/v1/phone/commands`, { headers: { 'X-Mentat-Phone': '1' } });
+    if (phone.body === null) throw new Error('missing phone body');
+    const reader = phone.body.getReader() as unknown as ReadableStreamDefaultReader<Uint8Array>;
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+
+    const cases = [
+      { name: 'navigate_to', arguments: { name: 'Union Station', address: '800 N 6th Ave', place_id: 'place-1', lat: 45.528, lng: -122.676 }, kind: 'navigate' },
+      { name: 'dial', arguments: { number: '+15555550123' }, kind: 'dial' },
+      { name: 'set_alarm', arguments: { hour: 7, minute: 30, label: 'Wake up' }, kind: 'alarm' },
+      { name: 'set_timer', arguments: { seconds: 90, label: 'Tea' }, kind: 'timer' },
+    ] as const;
+    for (const testCase of cases) {
+      const call = client.callTool({ name: testCase.name, arguments: testCase.arguments });
+      const command = JSON.parse(await readLine(reader)) as Record<string, unknown>;
+      expect(command).toMatchObject({ kind: testCase.kind, ...testCase.arguments });
+      await fetch(`${base}/v1/phone/results`, { method: 'POST', body: JSON.stringify({ id: command.id, status: 'ok', detail: 'ok' }) });
+      await expect(call).resolves.toMatchObject({ content: [{ type: 'text', text: 'ok' }] });
+    }
+
+    const ended = await client.callTool({ name: 'end_conversation', arguments: { reason: 'done' } });
+    expect(textContent(ended as unknown)).toContain('ended');
+
+    for (const invalid of [
+      { name: 'dial', arguments: { number: '' } },
+      { name: 'set_alarm', arguments: { hour: 24, minute: 0 } },
+      { name: 'set_alarm', arguments: { hour: 0, minute: 60 } },
+      { name: 'set_timer', arguments: { seconds: 0 } },
+    ]) {
+      const result = await client.callTool(invalid);
+      expect(result).toMatchObject({ isError: true });
+    }
+    await client.close();
+    bridge.close();
+    await reader.cancel();
+  });
+
 });
