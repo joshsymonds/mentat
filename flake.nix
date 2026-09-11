@@ -177,6 +177,7 @@
           reminderTimer = deployed.systemd.timers.mentat-reminder.timerConfig;
           voiceDaemonEnv = withVoice.systemd.services.mentatd.environment;
           voiceDaemonService = withVoice.systemd.services.mentatd.serviceConfig;
+          voiceDaemonUnsetEnvironment = withVoice.systemd.services.mentatd.serviceConfig.UnsetEnvironment;
           voiceEnv = withVoice.systemd.services.mentat-voice.environment;
           voiceExecStart = withVoice.systemd.services.mentat-voice.serviceConfig.ExecStart;
           voiceService = withVoice.systemd.services.mentat-voice.serviceConfig;
@@ -235,11 +236,8 @@
         ])
         "voice mentatd EnvironmentFile mismatch: ${builtins.toJSON observed.voiceDaemonService.EnvironmentFile}";
       assert lib.assertMsg
-        (observed.voiceDaemonService.UnsetEnvironment == [
-          "LIVEKIT_INFERENCE_API_KEY"
-          "LIVEKIT_INFERENCE_API_SECRET"
-        ])
-        "voice mentatd UnsetEnvironment mismatch: ${builtins.toJSON observed.voiceDaemonService.UnsetEnvironment}";
+        (lib.elem "OPENAI_API_KEY" observed.voiceDaemonUnsetEnvironment)
+        "voice mentatd must strip OPENAI_API_KEY: ${builtins.toJSON observed.voiceDaemonUnsetEnvironment}";
       # The agent-side URLs still come from their own settings, and the unit
       # runs the agent as a livekit worker.
       assert lib.assertMsg (observed.voiceEnv.LIVEKIT_URL == "ws://127.0.0.1:7880")

@@ -177,7 +177,7 @@ in {
 
       environmentFile = lib.mkOption {
         type = lib.types.str;
-        description = "EnvironmentFile supplying LIVEKIT_API_KEY/SECRET and LIVEKIT_INFERENCE_API_KEY/SECRET; it may also carry the optional MENTAT_PLACES_API_KEY. An agenix-decrypted path, never a store path.";
+        description = "EnvironmentFile supplying LIVEKIT_API_KEY/SECRET and OPENAI_API_KEY; it may also carry the optional MENTAT_PLACES_API_KEY. An agenix-decrypted path, never a store path.";
       };
 
       privateContextFile = lib.mkOption {
@@ -185,9 +185,9 @@ in {
         default = null;
         description = ''
           TOML file of what the voice knows about its person — `about`
-          (a paragraph folded into the instructions), `keyterms` (names for
-          speech recognition), `[pronunciations]` (word = respelling for the
-          synthesizer). The repository is public, so this never lives in it:
+          (a paragraph folded into the instructions) and `[pronunciations]`
+          (word = spoken guidance for the voice model). The repository is public,
+          so this never lives in it:
           an agenix-decrypted path, root-readable, handed to the unit as a
           systemd credential. Null means the voice knows no one.
         '';
@@ -259,9 +259,10 @@ in {
         ProtectHome = true;
       }
       // lib.optionalAttrs cfg.voice.enable {
-        # mentatd needs the signing pair to mint join tokens, but must never see
-        # the inference credentials that share the voice agent's secrets file.
-        UnsetEnvironment = [ "LIVEKIT_INFERENCE_API_KEY" "LIVEKIT_INFERENCE_API_SECRET" ];
+        # mentatd needs LIVEKIT_API_KEY/SECRET to mint join tokens and
+        # MENTAT_PLACES_API_KEY for place search, but must never see the OpenAI
+        # credential that shares the voice agent's secrets file.
+        UnsetEnvironment = [ "OPENAI_API_KEY" ];
       };
     };
 
