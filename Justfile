@@ -21,14 +21,6 @@ test-voice:
 test-public:
     "$(nix build .#public-env --no-link --print-out-paths)/bin/python" -m unittest discover -s public/tests
 
-# Score the front's consult-vs-answer judgment: online, needs LIVEKIT_INFERENCE_*
-# Never in `default`: this one spends tokens (a fraction of a cent) against real
-# Luna. The interpreter is the flake's voice-env because the runner imports
-# livekit-agents, which lives nowhere else; --no-link keeps a result/ symlink
-# out of the working tree.
-eval-voice *ARGS:
-    "$(nix build .#voice-env --no-link --print-out-paths)/bin/python" voice/evals/run.py {{ARGS}}
-
 # Create a new worktree at .worktrees/BRANCH.
 new-worktree BRANCH:
     #!/usr/bin/env bash

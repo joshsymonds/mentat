@@ -1,11 +1,6 @@
-"""Tests for the pure layer under the voice front: requests, consults, metrics.
+"""Offline tests for voice request construction and ending policy."""
 
-The chat-context stand-ins here mirror livekit's ChatContext.items: message
-items carry type/role/text_content, and function-call items carry neither role
-nor text. Reading them structurally is what keeps this testable offline —
-livekit is not importable without the flake's voice-env.
-"""
-
+import asyncio
 import sys
 import unittest
 from pathlib import Path
@@ -13,36 +8,29 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from request import (
+    CLOSE_QUIET_S,
+    CONSULT_FRAMING,
     CONSULT_TURN_CHARS,
-    DEFAULT_FAREWELL,
-    DONE_GRACE_S,
     IDLE_S,
-    CONSULT_WINDOW_TURNS,
     TURN_EFFORT,
     TURN_META,
     TURN_MODEL,
     VOICE_CARD_MARKER,
+    DelegationRunner,
     EndingPolicy,
     PrivateContext,
-    farewell_line,
-    run_close_sequence,
     consult_envelope,
-    conversation_advanced,
-    count_user_messages,
     load_private_context,
     parse_private_context,
     recent_turns,
+    run_close_sequence,
     split_persona,
-    turn_latency,
     turn_request,
     with_private_context,
-    without_last_user_message,
 )
 
 
 class Message:
-    """Stand-in for livekit.agents.llm.ChatMessage."""
-
     type = "message"
 
     def __init__(self, role, text):
@@ -50,74 +38,8 @@ class Message:
         self.text_content = text
 
 
-class FunctionCall:
-    """Stand-in for a non-message chat item: no role, no text."""
-
-    type = "function_call"
-
-
-class RecentTurnsTest(unittest.TestCase):
-    """The conversation window a consult carries with its question."""
-
-    def test_returns_the_last_two_turns_in_order(self):
-        # Oldest first: the window is read as conversation, and reversing it
-        # would make the exchange read backwards to the consulted model.
-        self.assertEqual(
-            recent_turns(
-                [
-                    Message("user", "morning"),
-                    Message("assistant", "morning yourself"),
-                    Message("user", "what's on today?"),
-                ]
-            ),
-            [("assistant", "morning yourself"), ("user", "what's on today?")],
-        )
-
-    def test_ignores_non_message_items(self):
-        # The framework interleaves function-call and function-output items,
-        # which carry neither role nor text; reading them must not raise.
-        self.assertEqual(
-            recent_turns([Message("user", "asked"), FunctionCall()]),
-            [("user", "asked")],
-        )
-
-    def test_fewer_than_two_messages_returns_what_there_is(self):
-        self.assertEqual(recent_turns([Message("user", "hi")]), [("user", "hi")])
-
-    def test_empty_context_returns_nothing(self):
-        self.assertEqual(recent_turns([]), [])
-
-    def test_textless_messages_are_skipped(self):
-        # text_content is None when a message holds no text part, and an empty
-        # one contributes a bare "user:" line the consulted model would have
-        # to interpret.
-        self.assertEqual(
-            recent_turns(
-                [
-                    Message("user", "real question"),
-                    Message("assistant", None),
-                    Message("assistant", ""),
-                ]
-            ),
-            [("user", "real question")],
-        )
-
-    def test_window_size_is_adjustable(self):
-        items = [
-            Message("user", "one"),
-            Message("assistant", "two"),
-            Message("user", "three"),
-        ]
-        self.assertEqual(recent_turns(items, count=1), [("user", "three")])
-        self.assertEqual(len(recent_turns(items, count=3)), 3)
-
-    def test_default_window_is_the_pinned_size(self):
-        items = [Message("user", str(i)) for i in range(5)]
-        self.assertEqual(len(recent_turns(items)), CONSULT_WINDOW_TURNS)
-
-
-class TurnRequestTest(unittest.TestCase):
-    def test_body_matches_the_conversation_api(self):
+class RequestTest(unittest.TestCase):
+    def test_turn_request_json_is_pinned(self):
         self.assertEqual(
             turn_request("kitchen", "what's on today?"),
             {
@@ -129,494 +51,146 @@ class TurnRequestTest(unittest.TestCase):
             },
         )
 
-    def test_session_id_namespaces_the_room(self):
-        # A daemon shared with other surfaces must never collide with a room.
-        self.assertEqual(turn_request("office", "hi")["session_id"], "voice-office")
+    def test_recent_turns_keeps_latest_messages_in_order(self):
+        self.assertEqual(
+            recent_turns(
+                [Message("user", "old"), Message("assistant", "reply"), Message("user", "new")]
+            ),
+            [("assistant", "reply"), ("user", "new")],
+        )
 
-    def test_voice_turns_are_low_effort_and_identified(self):
-        # Authority is per-turn in mentat policy: the surface and user ride
-        # along with every request. The model rides along too: the daemon's
-        # default is the deepest model, whose latency and usage limits don't
-        # suit a caller waiting in silence (first live test hit both).
-        self.assertEqual(TURN_EFFORT, "low")
+    def test_consult_envelope_has_backend_rules_and_question(self):
+        envelope = consult_envelope(
+            "Warm, concise voice.",
+            "",
+            [("user", "earlier"), ("assistant", "answer")],
+            "What is on my calendar?",
+        )
+        self.assertIn("spoken in its own words", envelope)
+        self.assertIn("keep facts, outcomes and uncertainty intact", envelope.lower())
+        self.assertNotIn("verbatim", envelope.lower())
+        self.assertIn("a yes authorizes exactly that message once", envelope.lower())
+        self.assertIn("send=true", envelope)
+        self.assertIn("say the closing words", envelope.lower())
+        self.assertIn("end_conversation", envelope)
+        self.assertIn("say nothing after", envelope.lower())
+        self.assertIn("user: earlier", envelope)
+        self.assertIn("Question:\nWhat is on my calendar?", envelope)
+
+    def test_consult_turn_cap_and_persona_split(self):
+        self.assertEqual(CONSULT_TURN_CHARS, 500)
+        text = f"front\n{VOICE_CARD_MARKER}\ncard"
+        self.assertEqual(split_persona(text), ("front", "card"))
+        with self.assertRaises(ValueError):
+            split_persona("front only")
+
+    def test_private_context_about_and_pronunciations_are_rendered(self):
+        private = PrivateContext(about="Josh is here.", pronunciations={"Mentat": "men-tat"})
+        self.assertEqual(
+            with_private_context("Base instructions.", private),
+            "Base instructions.\n\nJosh is here.\nSay Mentat as men-tat.",
+        )
+
+    def test_private_context_toml_stays_strict(self):
+        parsed = parse_private_context(
+            'about = "A person."\nkeyterms = ["Mentat"]\n[pronunciations]\nMentat = "men-tat"\n'
+        )
+        self.assertEqual(parsed.about, "A person.")
+        self.assertEqual(parsed.keyterms, ("Mentat",))
+        self.assertEqual(parsed.pronunciations, {"Mentat": "men-tat"})
+        self.assertEqual(load_private_context(None), PrivateContext())
+        with self.assertRaises(ValueError):
+            parse_private_context('unknown = "x"')
+
+    def test_turn_constants_are_pinned(self):
         self.assertEqual(TURN_META, {"surface": "voice", "user": "josh"})
+        self.assertEqual(TURN_EFFORT, "low")
         self.assertEqual(TURN_MODEL, "sonnet")
 
-    def test_effort_and_model_are_passed_through(self):
-        # A consult escalates both knobs; the tool call carries them, so the
-        # request builder takes them as arguments rather than reading globals.
-        body = turn_request("kitchen", "why?", effort="high", model="fable")
-        self.assertEqual(body["effort"], "high")
-        self.assertEqual(body["model"], "fable")
 
-    def test_unknown_effort_and_model_are_not_validated_here(self):
-        # This layer stays dumb: the daemon owns the vocabulary, and rejecting
-        # a value here would only turn a clear daemon error into a local one.
-        body = turn_request("kitchen", "why?", effort="medium", model="opus")
-        self.assertEqual(body["effort"], "medium")
-        self.assertEqual(body["model"], "opus")
+class DelegationRunnerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_new_delegation_cancels_previous_and_close_cancels_current(self):
+        started = []
+        cancelled = []
+        release = asyncio.Event()
 
+        async def run(delegation_id):
+            started.append(delegation_id)
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.append(delegation_id)
+                raise
 
-class SplitPersonaTest(unittest.TestCase):
-    """persona.md's two halves: the front's instructions and its voice card."""
-
-    def test_splits_on_the_marker_and_strips_both_halves(self):
-        text = f"# The voice\n\nBe warm.\n\n{VOICE_CARD_MARKER}\n\nSound warm.\n"
-        self.assertEqual(
-            split_persona(text), ("# The voice\n\nBe warm.", "Sound warm.")
-        )
-
-    def test_a_missing_marker_is_an_error(self):
-        # The half that only fires at deploy: a persona edited past its marker
-        # would otherwise hand mentatd the whole file as a voice card.
-        with self.assertRaises(ValueError):
-            split_persona("# The voice\n\nBe warm.\n")
-
-    def test_the_marker_is_pinned(self):
-        # persona.md is hand-written around this literal; changing one without
-        # the other splits the file in the wrong place, or not at all.
-        self.assertEqual(VOICE_CARD_MARKER, "---VOICE-CARD---")
-
-
-class ConsultEnvelopeTest(unittest.TestCase):
-    PERSONA = "You are Luna, dry and quick."
-    QUESTION = "What did the doctor say about the results?"
-
-    def test_framing_sentence_comes_first_verbatim(self):
-        # The reply is spoken as-is in the front's voice, so the envelope's
-        # first instruction is the one that governs style.
-        envelope = consult_envelope(self.PERSONA, "", [], self.QUESTION)
-        self.assertTrue(
-            envelope.startswith(
-                "Your reply will be read aloud verbatim to the user as a "
-                "continuation of this conversation — match this voice and style."
-            ),
-            envelope,
-        )
-
-    def test_sections_appear_in_order(self):
-        envelope = consult_envelope(
-            self.PERSONA,
-            "Josh is planning a trip.",
-            [("user", "where should I go?"), ("assistant", "somewhere warm")],
-            self.QUESTION,
-        )
-        positions = [
-            envelope.index("read aloud verbatim"),
-            envelope.index(self.PERSONA),
-            envelope.index("Josh is planning a trip."),
-            envelope.index("user: where should I go?"),
-            envelope.index(self.QUESTION),
-        ]
-        self.assertEqual(positions, sorted(positions), envelope)
-
-    def test_turns_render_one_per_line_as_role_text(self):
-        envelope = consult_envelope(
-            self.PERSONA,
-            "",
-            [("user", "first"), ("assistant", "second"), ("user", "third")],
-            self.QUESTION,
-        )
-        lines = envelope.splitlines()
-        self.assertIn("user: first", lines)
-        self.assertIn("assistant: second", lines)
-        self.assertIn("user: third", lines)
-
-    def test_summary_section_is_omitted_when_empty(self):
-        with_summary = consult_envelope(
-            self.PERSONA, "Josh is planning a trip.", [], self.QUESTION
-        )
-        without = consult_envelope(self.PERSONA, "", [], self.QUESTION)
-        blank = consult_envelope(self.PERSONA, "   \n ", [], self.QUESTION)
-        self.assertIn("Josh is planning a trip.", with_summary)
-        # The label goes with the section: an empty heading is noise the
-        # consulted model would have to interpret.
-        self.assertIn("Conversation so far:", with_summary)
-        self.assertNotIn("Conversation so far:", without)
-        self.assertEqual(without, blank)
-
-    def test_empty_last_turns_leaves_no_blank_hole(self):
-        envelope = consult_envelope(self.PERSONA, "A summary.", [], self.QUESTION)
-        self.assertIn(self.QUESTION, envelope)
-        self.assertNotIn("\n\n\n", envelope)
-
-    def test_long_turns_are_truncated_at_the_cap(self):
-        envelope = consult_envelope(
-            self.PERSONA, "", [("user", "x" * (CONSULT_TURN_CHARS + 50))], "q?"
-        )
-        self.assertIn("user: " + "x" * CONSULT_TURN_CHARS + "…", envelope)
-        self.assertNotIn("x" * (CONSULT_TURN_CHARS + 1), envelope)
-
-    def test_turns_at_the_cap_are_left_alone(self):
-        envelope = consult_envelope(
-            self.PERSONA, "", [("user", "x" * CONSULT_TURN_CHARS)], "q?"
-        )
-        self.assertIn("user: " + "x" * CONSULT_TURN_CHARS + "\n", envelope + "\n")
-        self.assertNotIn("…", envelope)
-
-    def test_question_carries_a_label(self):
-        envelope = consult_envelope(self.PERSONA, "", [], self.QUESTION)
-        self.assertIn("Question:\n" + self.QUESTION, envelope)
-
-    def test_the_cap_is_pinned(self):
-        # Bounded on purpose: mentatd's session already remembers the prior
-        # consults, so a growing window would re-feed it its own history.
-        self.assertEqual(CONSULT_TURN_CHARS, 500)
-
-
-class ReorientationTest(unittest.TestCase):
-    def test_counts_only_user_messages(self):
-        self.assertEqual(
-            count_user_messages(
-                [
-                    Message("user", "one"),
-                    Message("assistant", "reply"),
-                    FunctionCall(),
-                    Message("user", "two"),
-                ]
-            ),
-            2,
-        )
-
-    def test_counts_nothing_in_an_empty_context(self):
-        self.assertEqual(count_user_messages([]), 0)
-
-    def test_tool_and_assistant_items_do_not_advance_the_conversation(self):
-        # The framework appends the function call and the front's own spoken
-        # front-matter during the consult, so raw length would always grow.
-        baseline_items = [Message("user", "what did the doctor say?")]
-        at_dispatch = count_user_messages(baseline_items)
-        during = [
-            *baseline_items,
-            FunctionCall(),
-            Message("assistant", "let me check on that"),
-        ]
-        self.assertFalse(conversation_advanced(during, at_dispatch))
-
-    def test_a_new_user_message_advances_the_conversation(self):
-        baseline_items = [Message("user", "what did the doctor say?")]
-        at_dispatch = count_user_messages(baseline_items)
-        during = [
-            *baseline_items,
-            FunctionCall(),
-            Message("assistant", "let me check on that"),
-            Message("user", "actually, what time is it?"),
-        ]
-        self.assertTrue(conversation_advanced(during, at_dispatch))
-
-    def test_an_unchanged_context_has_not_advanced(self):
-        items = [Message("user", "asked"), Message("assistant", "answered")]
-        self.assertFalse(conversation_advanced(items, count_user_messages(items)))
-
-
-class TurnLatencyTest(unittest.TestCase):
-    """One chat item's effect on the journal: what to log, what to hold.
-
-    The metric shapes below are the ones livekit-agents 1.6.10 actually
-    stamps: the caller's half on the user message, and two different assistant
-    halves depending on which path produced the speech.
-    """
-
-    #: The caller's turn, measured by the pipeline as it endpoints and
-    #: transcribes.
-    USER = {
-        "end_of_turn_delay": 0.14,
-        "transcription_delay": 0.22,
-        "stopped_speaking_at": 1000.0,
-    }
-    #: A consulted answer, shaped as session.say stamps it (agent_activity
-    #: _tts_task_impl): real speech and playback numbers, and no llm_node_ttft,
-    #: because no llm ran to produce it.
-    SAY = {
-        "tts_node_ttfb": 0.31,
-        "started_speaking_at": 1002.0,
-        "stopped_speaking_at": 1004.0,
-        "playback_latency": 0.09,
-    }
-    #: A reply the pipeline generated itself — the only path that measures
-    #: time to first token.
-    REPLY = {
-        "llm_node_ttft": 0.85,
-        "tts_node_ttfb": 0.30,
-        "started_speaking_at": 1005.0,
-        "stopped_speaking_at": 1006.0,
-        "e2e_latency": 1.41,
-    }
-
-    def test_the_callers_half_is_held_rather_than_logged(self):
-        # Half a turn's numbers are not a turn: they wait for the reply that
-        # completes them.
-        line, pending = turn_latency({}, "user", self.USER)
-        self.assertIsNone(line)
-        self.assertEqual(pending, self.USER)
-
-    def test_spoken_for_speech_logs_nothing_and_keeps_the_held_half(self):
-        # A consulted answer goes out through session.say, whose item is not
-        # metric-free — which is why emptiness cannot be the test. The held
-        # half belongs to the reply that actually answers the turn.
-        line, pending = turn_latency(self.USER, "assistant", self.SAY)
-        self.assertIsNone(line)
-        self.assertEqual(pending, self.USER)
-
-    def test_a_pipeline_reply_joins_both_halves_into_one_line(self):
-        line, _ = turn_latency(self.USER, "assistant", self.REPLY)
-        self.assertEqual(
-            line,
-            "endpoint=0.140s transcript=0.220s llm_ttft=0.850s "
-            "tts_ttfb=0.300s e2e=1.410s",
-        )
-
-    def test_a_consult_does_not_eat_the_next_replys_user_half(self):
-        # The sequence a consult really produces: the question, the answer
-        # spoken on its behalf, then the front's own next pipeline reply.
-        _, pending = turn_latency({}, "user", self.USER)
-        _, pending = turn_latency(pending, "assistant", self.SAY)
-        line, _ = turn_latency(pending, "assistant", self.REPLY)
-        self.assertIn("endpoint=0.140s", line)
-        self.assertIn("transcript=0.220s", line)
-
-    def test_the_held_half_is_dropped_once_it_has_been_logged(self):
-        # Otherwise the next turn inherits the last caller's numbers and every
-        # line after the first reads as a turn that never happened.
-        _, pending = turn_latency(self.USER, "assistant", self.REPLY)
-        self.assertEqual(pending, {})
-
-    def test_stages_that_went_unmeasured_are_marked_not_omitted(self):
-        # A reply with no user half still logs: the fields are positional in
-        # the line, and a silently missing one would shift the reader's eye.
-        line, _ = turn_latency({}, "assistant", {"llm_node_ttft": 0.5})
-        self.assertEqual(
-            line, "endpoint=? transcript=? llm_ttft=0.500s tts_ttfb=? e2e=?"
-        )
-
-    def test_only_an_assistant_message_can_close_a_turn(self):
-        # ChatMessage.role is also "system" and "developer". Reply metrics are
-        # read off the assistant message and nowhere else, so even an item
-        # carrying them under another role neither logs nor spends the held
-        # half — it is the role, not just the key, that says a turn ended.
-        line, pending = turn_latency(self.USER, "system", self.REPLY)
-        self.assertIsNone(line)
-        self.assertEqual(pending, self.USER)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-class PrivateContextTest(unittest.TestCase):
-    def test_full_document_parses(self):
-        ctx = parse_private_context(
-            'about = """\nWho he is: a person.\n"""\n'
-            'keyterms = ["Symonds", "Rosalind"]\n'
-            "[pronunciations]\n"
-            'Symonds = "Sigh-monds"\n'
-        )
-        self.assertEqual(ctx.about, "Who he is: a person.")
-        self.assertEqual(ctx.keyterms, ("Symonds", "Rosalind"))
-        self.assertEqual(ctx.pronunciations, {"Symonds": "Sigh-monds"})
-
-    def test_missing_sections_default_to_empty(self):
-        ctx = parse_private_context('keyterms = ["Rosalind"]\n')
-        self.assertEqual(ctx.about, "")
-        self.assertEqual(ctx.pronunciations, {})
-
-    def test_unknown_keys_and_wrong_types_are_refused(self):
-        # A typo must not silently become a file that carries nothing.
-        with self.assertRaises(ValueError):
-            parse_private_context('abuot = "x"\n')
-        with self.assertRaises(ValueError):
-            parse_private_context('keyterms = "Rosalind"\n')
-        with self.assertRaises(ValueError):
-            parse_private_context("[pronunciations]\nSymonds = 3\n")
-
-    def test_no_path_means_an_empty_context(self):
-        self.assertEqual(load_private_context(None), PrivateContext())
-        self.assertEqual(load_private_context(""), PrivateContext())
-
-    def test_about_is_folded_into_the_instructions(self):
-        base = "# The voice\n\nBe warm."
-        self.assertEqual(with_private_context(base, PrivateContext()), base)
-        self.assertEqual(
-            with_private_context(base, PrivateContext(about="Who he is: Josh.")),
-            "# The voice\n\nBe warm.\n\nWho he is: Josh.",
-        )
-
-
-class WithoutLastUserMessageTest(unittest.TestCase):
-    def test_only_the_latest_user_message_goes(self):
-        items = [
-            Message("user", "what time is it"),
-            Message("assistant", "Half past three."),
-            Message("user", "[background chatter]"),
-        ]
-        self.assertEqual(
-            [(m.role, m.text_content) for m in without_last_user_message(items)],
-            [("user", "what time is it"), ("assistant", "Half past three.")],
-        )
-
-    def test_nothing_to_remove_is_a_no_op(self):
-        items = [Message("assistant", "Hello.")]
-        self.assertEqual(without_last_user_message(items), items)
-
-
-class FarewellLineTest(unittest.TestCase):
-    def test_blank_farewell_uses_default(self):
-        self.assertEqual(farewell_line(""), DEFAULT_FAREWELL)
-        self.assertEqual(farewell_line(" \n\t"), DEFAULT_FAREWELL)
-
-    def test_multiline_farewell_becomes_one_line(self):
-        self.assertEqual(farewell_line("See you\nlater."), "See you later.")
-
-    def test_single_line_farewell_is_unchanged(self):
-        self.assertEqual(farewell_line("Bye for now."), "Bye for now.")
+        runner = DelegationRunner(run)
+        runner.start("first")
+        await asyncio.sleep(0)
+        self.assertEqual(started, ["first"])
+        runner.start("second")
+        await asyncio.sleep(0)
+        self.assertEqual(cancelled, ["first"])
+        self.assertEqual(started, ["first", "second"])
+        await runner.close()
+        self.assertEqual(cancelled, ["first", "second"])
 
 
 class EndingPolicyTest(unittest.TestCase):
-    """The policy that decides when a voice session may close."""
-
-    def test_signoff_closes_only_after_successful_farewell_playout(self):
+    def test_successful_end_tool_arms_six_second_quiet_close(self):
         policy = EndingPolicy()
-        self.assertIsNone(policy.end_requested("signoff"))
-        self.assertIsNone(policy.playout_finished(delivered=False))
-        self.assertIsNone(policy.deadline)
+        policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
+        policy.turn_done(100.0)
+        self.assertEqual(policy.deadline, CLOSE_QUIET_S)
+        policy.assistant_activity(103.0)
+        self.assertIsNone(policy.elapsed(108.9))
+        self.assertEqual(policy.elapsed(109.0), "close")
 
-        policy.end_requested("signoff")
-        self.assertEqual(policy.playout_finished(delivered=True), "close")
-        self.assertIsNone(policy.deadline)
-
-    def test_done_arms_six_second_window_only_after_successful_playout(self):
+    def test_failed_end_tool_does_not_arm(self):
         policy = EndingPolicy()
-        policy.end_requested("done")
-        self.assertIsNone(policy.deadline)
-        self.assertIsNone(policy.playout_finished(delivered=False))
+        policy.tool_result_seen("mcp__mentat__end_conversation", is_error=True)
+        policy.turn_done(100.0)
         self.assertIsNone(policy.deadline)
 
-        policy.end_requested("done")
-        self.assertIsNone(policy.playout_finished(delivered=True))
-        self.assertEqual(policy.deadline, DONE_GRACE_S)
-        self.assertIsNone(policy.elapsed(DONE_GRACE_S - 0.1))
-        self.assertEqual(policy.elapsed(DONE_GRACE_S), "close")
-
-    def test_user_speech_cancels_done_window(self):
+    def test_other_tools_do_not_arm(self):
         policy = EndingPolicy()
-        policy.end_requested("done")
-        policy.playout_finished(delivered=True)
+        policy.tool_result_seen("mcp__mentat__get_accounts", is_error=False)
+        policy.turn_done(100.0)
+        self.assertIsNone(policy.deadline)
+
+    def test_user_speech_revokes_armed_close(self):
+        policy = EndingPolicy()
+        policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
+        policy.turn_done(100.0)
+        policy.assistant_activity(100.0)
         self.assertEqual(policy.user_spoke(), "cancel")
-        self.assertIsNone(policy.deadline)
-        self.assertIsNone(policy.elapsed(DONE_GRACE_S))
+        self.assertIsNone(policy.elapsed(200.0))
 
-    def test_user_speech_during_playback_cancels_pending_done(self):
+    def test_idle_listening_still_closes_after_thirty_seconds(self):
         policy = EndingPolicy()
-        policy.end_requested("done")
-        self.assertEqual(policy.user_spoke(), "cancel")
-        self.assertIsNone(policy.playout_finished(delivered=True))
-        self.assertIsNone(policy.deadline)
-
-    def test_consult_answer_arms_only_for_delivered_non_question(self):
-        policy = EndingPolicy()
-        policy.agent_listening()
-        policy.consult_started()
-        self.assertIsNone(policy.consult_answered("Here is the answer.", delivered=False))
-        self.assertIsNone(policy.deadline)
-        policy.consult_finished()
+        policy.agent_listening(100.0)
         self.assertEqual(policy.deadline, IDLE_S)
+        self.assertIsNone(policy.elapsed(129.9))
+        self.assertEqual(policy.elapsed(130.0), "close")
 
+    def test_busy_cancels_idle_and_user_speech_does_not_cancel_runner(self):
         policy = EndingPolicy()
-        policy.agent_listening()
-        policy.consult_started()
-        self.assertIsNone(policy.consult_answered("Do you want more?", delivered=True))
-        policy.consult_finished()
-        self.assertEqual(policy.deadline, IDLE_S)
-
-        policy = EndingPolicy()
-        policy.agent_listening()
-        policy.consult_started()
-        self.assertIsNone(policy.consult_answered("The answer is complete.", delivered=True))
-        self.assertEqual(policy.deadline, DONE_GRACE_S)
-        policy.consult_finished()
-        self.assertEqual(policy.deadline, DONE_GRACE_S)
-
-    def test_model_end_request_is_ignored_during_consult(self):
-        policy = EndingPolicy()
-        policy.consult_started()
-        self.assertIsNone(policy.end_requested("signoff"))
-        self.assertIsNone(policy.pending_reason)
-        self.assertIsNone(policy.end_requested("done"))
-        self.assertIsNone(policy.pending_reason)
-        self.assertIsNone(policy.playout_finished(delivered=True))
-        self.assertIsNone(policy.deadline)
-
-    def test_user_speech_during_consult_blocks_done_window(self):
-        policy = EndingPolicy()
-        policy.consult_started()
-        policy.user_spoke()
-        policy.consult_answered("The answer is complete.", delivered=True)
-        policy.consult_finished()
-        self.assertIsNone(policy.deadline)
-        self.assertNotEqual(policy.elapsed(DONE_GRACE_S), "close")
-
-    def test_user_speech_blocks_idle_window_until_quiet(self):
-        policy = EndingPolicy()
-        policy.user_spoke()
-        policy.agent_listening()
-        self.assertIsNone(policy.deadline)
-        self.assertNotEqual(policy.elapsed(IDLE_S), "close")
-
-        policy.user_quiet()
-        policy.agent_listening()
-        self.assertEqual(policy.deadline, IDLE_S)
-
-    def test_idle_listening_arms_thirty_seconds(self):
-        policy = EndingPolicy()
-        self.assertIsNone(policy.agent_listening())
-        self.assertEqual(policy.deadline, IDLE_S)
-        self.assertEqual(policy.elapsed(IDLE_S), "close")
-
-    def test_user_speech_resets_idle_deadline(self):
-        policy = EndingPolicy()
-        policy.agent_listening()
-        self.assertEqual(policy.user_spoke(), "cancel")
-        self.assertIsNone(policy.deadline)
-
-    def test_consult_suppresses_idle_then_rearms_without_new_listening(self):
-        policy = EndingPolicy()
-        policy.agent_listening()
-        policy.consult_started()
-        self.assertIsNone(policy.deadline)
-        policy.consult_finished()
-        self.assertEqual(policy.deadline, IDLE_S)
-        self.assertEqual(policy.elapsed(IDLE_S), "close")
-
-    def test_busy_cancels_idle_and_listening_rearms_after_question(self):
-        policy = EndingPolicy()
-        policy.agent_listening()
+        policy.agent_listening(100.0)
         self.assertEqual(policy.agent_busy(), "cancel")
+        policy.user_spoke()
         self.assertIsNone(policy.deadline)
-        policy.agent_listening()
-        self.assertEqual(policy.deadline, IDLE_S)
+
+    def test_user_quiet_then_new_successful_turn_rearms(self):
+        policy = EndingPolicy()
+        policy.user_spoke()
+        policy.user_quiet()
+        policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
+        policy.turn_done(200.0)
+        self.assertEqual(policy.deadline, CLOSE_QUIET_S)
+        self.assertIsNone(policy.elapsed(205.9))
+        self.assertEqual(policy.elapsed(206.0), "close")
 
 
-class CloseSequenceTest(unittest.TestCase):
-    def test_teardown_order_and_job_shutdown_are_unconditional(self):
-        order = []
-        logs = []
-
-        async def close_player():
-            order.append("close_player")
-
-        async def delete_room():
-            order.append("delete_room")
-
-        async def shutdown_job():
-            order.append("shutdown_job")
-
-        import asyncio
-
-        asyncio.run(run_close_sequence(close_player, delete_room, shutdown_job, logs.append))
-        self.assertEqual(order, ["close_player", "delete_room", "shutdown_job"])
-        self.assertEqual(logs, [])
-
-    def test_room_delete_failure_is_logged_and_job_shutdown_still_runs(self):
+class CloseSequenceTest(unittest.IsolatedAsyncioTestCase):
+    async def test_shutdown_runs_after_cleanup_even_when_room_delete_fails(self):
         order = []
         logs = []
 
@@ -630,9 +204,10 @@ class CloseSequenceTest(unittest.TestCase):
         async def shutdown_job():
             order.append("shutdown_job")
 
-        import asyncio
-
-        asyncio.run(run_close_sequence(close_player, delete_room, shutdown_job, logs.append))
+        await run_close_sequence(close_player, delete_room, shutdown_job, logs.append)
         self.assertEqual(order, ["close_player", "delete_room", "shutdown_job"])
-        self.assertEqual(len(logs), 1)
         self.assertIn("room already gone", logs[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

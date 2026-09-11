@@ -1,80 +1,65 @@
 # Voice surface
 
-Front, the LiveKit voice agent: `agent.py` joins a LiveKit room, runs local
-turns through LiveKit Cloud STT/TTS, and consults mentatd (`ask_mentat`) for
-anything with memory or tools. Deployed on ultraviolet as the `mentat-voice`
-systemd unit (see `nix/module.nix`); the SFU, mentatd, and the agent all share
-that host, so the agent talks to both over loopback.
+The voice worker joins a LiveKit room and runs GPT-Live-1 in client delegation
+mode. GPT-Live handles the conversation and hands backend requests to the
+worker. The worker streams each request to mentatd, then feeds the response
+back as commentary while it arrives. The daemon owns memory, systems, lookups,
+and actions. The worker runs on ultraviolet beside mentatd and reaches it over
+loopback.
 
 ## Private context
 
-The repository is public, so `persona.md` describes the voice and nothing
-about the person. Who Josh is lives in a TOML file the deploy hands the unit
-as a systemd credential (`services.mentat.voice.privateContextFile`, an
-agenix secret in nix-config), named to the agent by `MENTAT_VOICE_PRIVATE`:
+The repository is public, so `persona.md` contains the voice and no private
+facts. Deployment supplies a TOML file as `MENTAT_VOICE_PRIVATE`:
 
 ```toml
 about = """
-Who he is: ...one paragraph, folded into the instructions on every turn.
+Who he is: ...one paragraph, folded into the worker instructions.
 """
-keyterms = ["Symonds", "Rosalind"]          # names speech recognition should expect
+keyterms = ["Symonds", "Rosalind"]
 
-[pronunciations]                         # word = what the synthesizer is handed
-Symonds = "Sigh-monds"                   # captions keep the real spelling
+[pronunciations]
+Symonds = "Sigh-monds"
 ```
 
-Unset means the voice knows no one (dev rooms, CI); a set but unreadable
-path fails the worker at start. To run a dev room with it, add
+Unset means a development room has no private context. A set but unreadable
+path fails the worker at startup. To run a dev room with it, add
 `MENTAT_VOICE_PRIVATE=/run/agenix/mentat-voice-private` to the launch
 environment in step 2.
 
 ## Testing branch code in a live room
 
-Audio changes can't be accepted from unit tests — someone has to listen. The
-workflow below runs *branch* agent code against the *production* SFU and
-mentatd on ultraviolet, in a throwaway room, without redeploying anything.
+Audio changes need a real room. Run branch code against the production SFU and
+mentatd in a throwaway room without redeploying the worker.
 
-The mechanism is the LiveKit Agents CLI `connect` mode: `agent.py connect
---room <name>` pins one process to one named room instead of registering for
-dispatch. Use a unique room name per test (e.g. `dev-<feature>-<rev>`).
-
-**Stop the production worker first.** `mentat-voice` registers with no
-`agent_name`, so the SFU dispatches it into *every* new room — including your
-dev room, where its (old) audio will play on top of your branch agent's.
-Verified the hard way 2026-08-21: two agents in the room, both audible.
+Stop the production worker first so it does not join the development room.
 
 ```sh
-ssh ultraviolet sudo systemctl stop mentat-voice   # restart when done!
+ssh ultraviolet sudo systemctl stop mentat-voice
 ```
 
 ### 1. Stage the branch files on ultraviolet
 
-The agent is a flat directory: `agent.py persona.md request.py stream.py phone.py
-assets/*.wav`. Copy those to a private scratch dir with a writable HOME for
-the livekit plugin caches. `mktemp -d`, not a fixed name: a predictable
-`/tmp` path with `mkdir -p` silently reuses a directory another local user
-could have pre-created, and step 2 executes code out of this directory.
+The deployed worker needs `agent.py`, `persona.md`, `request.py`, `stream.py`,
+and `assets/earcon.wav`. Copy them to a private scratch directory with a
+writable home for plugin caches. Use `mktemp -d` rather than a predictable
+path.
 
 ```sh
 dev=$(ssh ultraviolet 'mktemp -d /tmp/mentat-voice-dev.XXXXXX')
 ssh ultraviolet "mkdir -p $dev/assets $dev/home/cache"
-scp voice/agent.py voice/persona.md voice/request.py voice/stream.py voice/phone.py ultraviolet:$dev/
-scp voice/assets/*.wav ultraviolet:$dev/assets/
+scp voice/agent.py voice/persona.md voice/request.py voice/stream.py ultraviolet:$dev/
+scp voice/assets/earcon.wav ultraviolet:$dev/assets/
 ```
 
 ### 2. Launch the agent pinned to a dev room
 
-Run it with the production secrets and the same python env as the unit
-(`systemctl cat mentat-voice` shows the store path in `ExecStart`). Loopback
-URLs because everything is co-located; a distinct `MENTAT_VOICE_HTTP_PORT`
-because the unit owns 8482; `timeout` so a forgotten process can't outlive
-the session by more than an hour. Root is needed only to read the agenix
-secrets — the agent itself runs as `nobody` via `setpriv`, mirroring the
-production unit's `DynamicUser` isolation (a network-facing agent should not
-hold a privileged identity, dev run or not):
+Load the production secrets, including `OPENAI_API_KEY`, from the environment
+file. Use loopback URLs, a distinct health port, a writable home, and a
+bounded timeout around the process. Keep credentials out of command arguments.
 
 ```sh
-ssh ultraviolet sudo env DEV_DIR=$dev DEV_ROOM=dev-myfeature-$(git rev-parse --short HEAD) \
+ssh ultraviolet sudo env DEV_DIR=$dev DEV_ROOM=dev-myfeature-<rev> \
   DEV_PY=<python-from-unit> \
   bash -c 'set -euo pipefail
     set -a; . /run/agenix/mentat-voice-env; set +a
@@ -90,17 +75,19 @@ ssh ultraviolet sudo env DEV_DIR=$dev DEV_ROOM=dev-myfeature-$(git rev-parse --s
     printf "%s\n" "$!" >"$DEV_DIR/agent.pid"'
 ```
 
-Confirm startup: `sudo grep -E 'starting worker|job-' $dev/agent.log`.
+Confirm startup with `sudo grep -E 'starting worker|job-' $dev/agent.log`.
+The LiveKit Agents 1.8.1 `connect --room <name>` mode still exists, behind a
+deprecation warning. Use a unique room name for every test.
 
 ### 3. Mint a join token and join from a browser
 
-Credentials go in the environment, never on `lk`'s argv —
-`/proc/<pid>/cmdline` is world-readable (same rule as the `voice-token`
-script in nix-config, which does exactly this for the pinned `office` room):
+Credentials go in environment variables rather than the `lk` command line.
+Mint a short-lived token, open the printed browser URL on the tailnet, allow
+the microphone, and talk.
 
 ```sh
 ssh ultraviolet sudo bash -c 'set -euo pipefail
-  keyfile=/run/agenix/livekit-keys   # one-line YAML: <api-key>: <api-secret>
+  keyfile=/run/agenix/livekit-keys
   export LIVEKIT_API_KEY=$(sed -n "s/^\([^:[:space:]]\+\)[[:space:]]*:.*$/\1/p" "$keyfile" | head -n1)
   export LIVEKIT_API_SECRET=$(sed -n "s/^[^:]\+:[[:space:]]*\(.\+\)$/\1/p" "$keyfile" | head -n1)
   token=$(lk token create --join --room dev-myfeature-<rev> \
@@ -108,9 +95,10 @@ ssh ultraviolet sudo bash -c 'set -euo pipefail
   printf "https://meet.livekit.io/custom?liveKitUrl=wss%%3A%%2F%%2Fultraviolet.tail82223.ts.net%%3A7443&token=%s\n" "$token"'
 ```
 
-Open the printed URL in a browser on the tailnet, allow the microphone, talk.
-The token is a real (if short-lived) room credential — treat the URL
-accordingly.
+The connect job stops after the room has no human participant for several
+minutes or when the last human leaves. The SFU remains authoritative about
+participants, and the worker log shows delegation, stream, and disconnect
+events.
 
 ### Gotchas
 
@@ -123,8 +111,9 @@ accordingly.
   `lk room participants list <room>` (same env vars as token minting, plus
   `LIVEKIT_URL=ws://127.0.0.1:7880`).
 - **Watch the log during the test.** `sudo tail -F $dev/agent.log` filtered
-  for `turn latency|consult|ERROR|Traceback|disconnected` shows every turn
+  for `session duration|delegation failed|voice session closing|ERROR|Traceback|disconnected` shows every turn
   land in real time. rtc_session errors during teardown are normal.
+
 
 ### 4. Clean up
 
@@ -133,70 +122,21 @@ ssh ultraviolet "sudo sh -c 'kill \$(cat $dev/agent.pid) 2>/dev/null; rm -rf $de
 ssh ultraviolet sudo systemctl start mentat-voice
 ```
 
-## Tests
-
-`just test-voice` (part of `just`) runs the offline unittest suite in
-`tests/`, including the asset-wiring contract that pins which sounds exist
-and how `agent.py` uses them. Sound files are generated, not authored — see
-`assets/generate.py`; `tests/test_assets.py` re-derives them and fails on
-drift.
-
 ## Phone control
 
-The voice agent reaches the Android phone through two LiveKit remote procedure
-call (RPC) methods. The phone registers `mentat.command` and `mentat.location`
-when it joins the room. The phone is the trust boundary: the front sends only
-the closed `kind` values below, and never supplies an Android action,
-component, extras, or an arbitrary scheme.
+Phone actions are Mentat MCP tools executed by the Android bridge service.
+The voice worker delegates navigation, dialing, texting, alarms, timers, links,
+and place searches to mentatd. mentatd applies the send confirmation rule and
+returns the action result before the voice reports completion.
 
-`mentat.command` accepts one JSON object with one of these payloads:
-
-```json
-{"kind":"navigate","name":"Trader Joe's","address":"123 Main St","place_id":"ChIJ...","lat":45.5,"lng":-122.6}
-{"kind":"dial","number":"503-555-0199"}
-{"kind":"sms","number":"503-555-0199","body":"I'll be ten minutes late"}
-{"kind":"alarm","hour":7,"minute":30,"label":"wake up"}
-{"kind":"timer","seconds":300,"label":"tea"}
-{"kind":"open","url":"https://example.com"}
-```
-
-The optional `label` may be omitted for `alarm` and `timer`. `navigate` opens
-Google Maps with an `ACTION_VIEW` directions URL whose destination is
-`name + ", " + address`, plus `destination_place_id`,
-`travelmode=driving`, and `dir_action=navigate`, targeted to the Google Maps
-package. The phone maps the other kinds to their corresponding typed Android
-intents. It returns `{"ok":true}` after launching. Dial and SMS open their
-prefilled apps for a tap-to-confirm action; they do not place a call or send a
-message directly. `open` accepts absolute `http` and `https` URLs only.
-
-`mentat.location` accepts `{}` and returns a fresh location when possible:
-
-```json
-{"lat":45.5,"lng":-122.6,"accuracy_m":12.0,"age_s":1.2}
-```
-
-The phone requests a current fused fix and waits at most five seconds for it. If
-none arrives, it falls back to the last-known location, accepted only when at
-most ten minutes old. Otherwise it returns error 1602. Location is used for the
-current search only and is not persisted.
-
-RPC errors are handled as spoken outcomes by the front:
-
-| Code | Meaning | Front behavior |
-| --- | --- | --- |
-| 1600 | Invalid or refused command, including an unknown kind, missing or invalid field, or a non-HTTP(S) link | Return `PHONE_REFUSED` and say it could not carry out that phone action. |
-| 1601 | No phone activity can handle the requested intent | Return `PHONE_REFUSED` and say the phone could not open that action. |
-| 1602 | Location is unavailable or permission is denied | Return `LOCATION_UNAVAILABLE`; ask roughly where Josh is, then search again with that locality. |
-| 1603 | The assist screen is not in front | Return `PHONE_NOT_IN_FRONT`; tell Josh to tap the side button first. |
-
-The phone launches an action only while the Mentat talk screen is visible. It
-never queues or retries a command after another app covers that screen. Tap the
-side button first, then repeat the request. A browser-only room reports the
-phone-unreachable result instead of raising an error.
+The bridge is the location boundary. It supplies a fresh location only for a
+place search and never persists that location. If no fresh or acceptably recent
+fix exists, the backend reports that location is unavailable and asks for a
+rough locality.
 
 The Places search key is optional for local development and lives in the voice
-unit's agenix environment file. Create a billed Google Cloud project and a
-Places-only key from a shell authenticated as Josh:
+unit's environment file, which mentatd also loads. Create a billed Google Cloud
+project and a Places-only key from a shell authenticated as Josh:
 
 ```sh
 gcloud projects create mentat-voice-places
@@ -209,3 +149,10 @@ gcloud services api-keys get-key-string <resource name from the create output>
 
 Put the resulting value in the voice environment file as
 `MENTAT_PLACES_API_KEY=<key>`.
+
+## Tests
+
+`just test-voice` runs the offline standard-library unittest suite in
+`voice/tests`. It covers request construction, ending policy, NDJSON streaming,
+commentary byte limits, source wiring, and the earcon asset. The earcon is
+generated by `assets/generate.py` and checked for deterministic regeneration.
