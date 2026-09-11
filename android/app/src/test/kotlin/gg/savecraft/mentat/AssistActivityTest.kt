@@ -322,8 +322,35 @@ class AssistActivityTest {
 
     @Test
     fun approximateLocationPermissionDecisionStartsVoiceService() {
-        assertLocationPermissionDecisionStartsSession(
+        grantRecordAudio()
+        val activity = Robolectric.buildActivity(RelaunchableAssistActivity::class.java).create().start().get()
+        val request = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        Shadows.shadowOf(application).grantPermissions(Manifest.permission.ACCESS_COARSE_LOCATION)
+
+        activity.onRequestPermissionsResult(
+            request.requestCode,
+            request.requestedPermissions,
             intArrayOf(PackageManager.PERMISSION_DENIED),
+        )
+
+        assertEquals(VOICE_SERVICE, startedServiceClassName())
+        assertNull(Shadows.shadowOf(application).nextStoppedService)
+        assertTrue(Shadows.shadowOf(application).boundServiceConnections.isNotEmpty())
+        val phoneRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        assertArrayEquals(
+            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_SMS, Manifest.permission.READ_CONTACTS),
+            phoneRequest.requestedPermissions,
+        )
+        assertTrue(drainStartedActivities(activity).none { intent ->
+            intent.action == Settings.ACTION_APPLICATION_DETAILS_SETTINGS
+        })
+
+        activity.relaunch()
+
+        val relaunchRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        assertArrayEquals(
+            arrayOf(Manifest.permission.SEND_SMS, Manifest.permission.READ_SMS, Manifest.permission.READ_CONTACTS),
+            relaunchRequest.requestedPermissions,
         )
     }
 
@@ -563,6 +590,12 @@ class AssistActivityTest {
 
     private fun stoppedServiceClassName(): String? =
         Shadows.shadowOf(application).nextStoppedService?.component?.className
+
+    class RelaunchableAssistActivity : AssistActivity() {
+        fun relaunch() {
+            onNewIntent(Intent())
+        }
+    }
 
     class UnstartableAssistActivity : AssistActivity() {
         override fun startVoiceService(intent: Intent) {

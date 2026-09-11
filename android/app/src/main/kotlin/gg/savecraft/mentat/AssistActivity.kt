@@ -55,7 +55,6 @@ open class AssistActivity : ComponentActivity() {
     private var stateJob: Job? = null
     private var transcriptJob: Job? = null
     private var micJob: Job? = null
-    private var activityStarted = false
 
     internal val uiState: StateFlow<SessionState> = mutableUiState.asStateFlow()
 
@@ -152,16 +151,6 @@ open class AssistActivity : ComponentActivity() {
         setIntent(intent)
         logAssistIntent()
         beginVoiceSession()
-    }
-
-    override fun onStart() {
-        super.onStart()
-        activityStarted = true
-    }
-
-    override fun onStop() {
-        activityStarted = false
-        super.onStop()
     }
 
     override fun onDestroy() {
