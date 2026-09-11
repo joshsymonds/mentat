@@ -93,12 +93,13 @@ class RequestTest(unittest.TestCase):
 
     def test_private_context_toml_stays_strict(self):
         parsed = parse_private_context(
-            'about = "A person."\nkeyterms = ["Mentat"]\n[pronunciations]\nMentat = "men-tat"\n'
+            'about = "A person."\n[pronunciations]\nMentat = "men-tat"\n'
         )
         self.assertEqual(parsed.about, "A person.")
-        self.assertEqual(parsed.keyterms, ("Mentat",))
         self.assertEqual(parsed.pronunciations, {"Mentat": "men-tat"})
         self.assertEqual(load_private_context(None), PrivateContext())
+        with self.assertRaises(ValueError):
+            parse_private_context('keyterms = ["Mentat"]')
         with self.assertRaises(ValueError):
             parse_private_context('unknown = "x"')
 
@@ -108,41 +109,109 @@ class RequestTest(unittest.TestCase):
         self.assertEqual(TURN_MODEL, "sonnet")
 
 
+class Delegation:
+    def __init__(self, delegation_id):
+        self.id = delegation_id
+
+
 class DelegationRunnerTest(unittest.IsolatedAsyncioTestCase):
     async def test_new_delegation_cancels_previous_and_close_cancels_current(self):
         started = []
         cancelled = []
         release = asyncio.Event()
 
-        async def run(delegation_id):
-            started.append(delegation_id)
+        async def run(delegation):
+            started.append(delegation)
             try:
                 await release.wait()
             except asyncio.CancelledError:
-                cancelled.append(delegation_id)
+                cancelled.append(delegation)
                 raise
 
-        runner = DelegationRunner(run)
-        runner.start("first")
+        runner = DelegationRunner(run, lambda _id, _error: None)
+        first = Delegation("first")
+        second = Delegation("second")
+        runner.start(first)
         await asyncio.sleep(0)
-        self.assertEqual(started, ["first"])
-        runner.start("second")
+        self.assertEqual(started, [first])
+        runner.start(second)
         await asyncio.sleep(0)
-        self.assertEqual(cancelled, ["first"])
-        self.assertEqual(started, ["first", "second"])
+        self.assertEqual(cancelled, [first])
+        self.assertEqual(started, [first, second])
         await runner.close()
-        self.assertEqual(cancelled, ["first", "second"])
+        self.assertEqual(cancelled, [first, second])
+
+    async def test_cancelled_before_first_step_does_not_leave_bookkeeping(self):
+        received = []
+        release = asyncio.Event()
+
+        async def run(delegation):
+            received.append(delegation)
+            await release.wait()
+
+        runner = DelegationRunner(run, lambda _id, _error: None)
+        first = Delegation("first")
+        second = Delegation("second")
+        runner.start(first)
+        runner.start(second)
+        await asyncio.sleep(0)
+        self.assertEqual(received, [second])
+        self.assertFalse(hasattr(runner, "_pending"))
+        await runner.close()
+
+    async def test_finished_and_closed_task_errors_are_reported_and_retrieved(self):
+        errors = []
+        uncaught = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: uncaught.append(context))
+        try:
+            async def raises(_delegation):
+                raise RuntimeError("finished")
+
+            runner = DelegationRunner(raises, lambda delegation_id, error: errors.append((delegation_id, error)))
+            runner.start(Delegation("finished"))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(errors[0][0], "finished")
+            self.assertIsInstance(errors[0][1], RuntimeError)
+            self.assertEqual(str(errors[0][1]), "finished")
+
+            async def raises_on_cancel(_delegation):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise RuntimeError("closed")
+
+            runner = DelegationRunner(
+                raises_on_cancel,
+                lambda delegation_id, error: errors.append((delegation_id, error)),
+            )
+            runner.start(Delegation("closed"))
+            await asyncio.sleep(0)
+            await runner.close()
+            await asyncio.sleep(0)
+            self.assertEqual(errors[1][0], "closed")
+            self.assertIsInstance(errors[1][1], RuntimeError)
+            self.assertEqual(str(errors[1][1]), "closed")
+            self.assertFalse(
+                any("Task exception was never retrieved" in context.get("message", "") for context in uncaught)
+            )
+        finally:
+            loop.set_exception_handler(previous_handler)
 
 
 class EndingPolicyTest(unittest.TestCase):
-    def test_successful_end_tool_arms_six_second_quiet_close(self):
+    def test_successful_end_tool_waits_for_speech_to_finish_before_closing(self):
         policy = EndingPolicy()
         policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
-        policy.turn_done(100.0)
+        policy.agent_speaking()
+        policy.turn_done(103.0)
         self.assertEqual(policy.deadline, CLOSE_QUIET_S)
-        policy.assistant_activity(103.0)
-        self.assertIsNone(policy.elapsed(108.9))
-        self.assertEqual(policy.elapsed(109.0), "close")
+        self.assertIsNone(policy.elapsed(120.0))
+        policy.agent_quiet(121.0)
+        self.assertIsNone(policy.elapsed(126.9))
+        self.assertEqual(policy.elapsed(127.0), "close")
 
     def test_failed_end_tool_does_not_arm(self):
         policy = EndingPolicy()
@@ -156,12 +225,23 @@ class EndingPolicyTest(unittest.TestCase):
         policy.turn_done(100.0)
         self.assertIsNone(policy.deadline)
 
+    def test_new_delegation_cancels_ending_policy(self):
+        policy = EndingPolicy()
+        policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
+        policy.turn_done(100.0)
+        self.assertEqual(policy.deadline, CLOSE_QUIET_S)
+        policy.delegation_started()
+        self.assertIsNone(policy.deadline)
+        self.assertIsNone(policy.elapsed(200.0))
+        policy.turn_done(300.0)
+        self.assertIsNone(policy.deadline)
+
     def test_user_speech_revokes_armed_close(self):
         policy = EndingPolicy()
         policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
         policy.turn_done(100.0)
-        policy.assistant_activity(100.0)
-        self.assertEqual(policy.user_spoke(), "cancel")
+        policy.user_spoke()
+        self.assertIsNone(policy.deadline)
         self.assertIsNone(policy.elapsed(200.0))
 
     def test_idle_listening_still_closes_after_thirty_seconds(self):
@@ -174,7 +254,8 @@ class EndingPolicyTest(unittest.TestCase):
     def test_busy_cancels_idle_and_user_speech_does_not_cancel_runner(self):
         policy = EndingPolicy()
         policy.agent_listening(100.0)
-        self.assertEqual(policy.agent_busy(), "cancel")
+        policy.agent_busy()
+        self.assertIsNone(policy.deadline)
         policy.user_spoke()
         self.assertIsNone(policy.deadline)
 

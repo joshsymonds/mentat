@@ -16,6 +16,20 @@ class AgentSourceContractTest(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
+
+    def test_agent_handles_turn_done_and_turn_failure(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        self.assertIn("TurnDone", source)
+        self.assertIn("TurnFailure", source)
+
+    def test_request_has_no_keyterms_context(self):
+        source = (Path(__file__).resolve().parents[1] / "request.py").read_text()
+        self.assertNotIn("keyterms", source)
+
+    def test_policy_cancellation_helpers_return_no_tokens(self):
+        source = (Path(__file__).resolve().parents[1] / "request.py").read_text()
+        self.assertNotIn('return "cancel"', source)
+
     def test_old_front_and_tools_are_absent(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         self.assertNotIn("user_input_transcribed", source)
@@ -30,6 +44,8 @@ class AgentSourceContractTest(unittest.TestCase):
             "PhoneActions",
             "session.say",
             "_provider_format",
+            "keyterms",
+            "_pending",
         ):
             self.assertNotIn(forbidden, source)
 

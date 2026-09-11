@@ -43,6 +43,7 @@ class EndingPolicy:
         self._armed_at: float | None = None
         self._end_tool_succeeded = False
         self._user_speaking = False
+        self._agent_speaking = False
 
     @property
     def deadline(self) -> float | None:
@@ -52,35 +53,41 @@ class EndingPolicy:
             return IDLE_S
         return None
 
-    def _clear_deadline(self) -> bool:
-        had_deadline = self._deadline_kind is not None
+    def _clear_deadline(self) -> None:
         self._deadline_kind = None
         self._armed_at = None
-        return had_deadline
 
     def tool_result_seen(self, name: str, is_error: bool) -> None:
         """Remember whether the successful call-ending tool was observed."""
         if name == END_CONVERSATION_TOOL:
             self._end_tool_succeeded = not is_error
 
+    def delegation_started(self) -> None:
+        """Cancel an ending when a newer backend delegation begins."""
+        self._clear_deadline()
+        self._end_tool_succeeded = False
+
     def turn_done(self, now: float) -> None:
         """Arm the close window after a successful ending tool and clean turn."""
         if self._end_tool_succeeded and not self._user_speaking:
             self._deadline_kind = "tool"
             self._armed_at = now
-        return None
 
-    def assistant_activity(self, now: float) -> None:
-        """Reset the close clock when assistant speech starts or stops."""
+    def agent_speaking(self) -> None:
+        """Pause close countdown while the assistant is speaking."""
+        self._agent_speaking = True
+
+    def agent_quiet(self, now: float) -> None:
+        """Start a pending close countdown when assistant speech ends."""
+        self._agent_speaking = False
         if self._deadline_kind == "tool":
             self._armed_at = now
-        return None
 
-    def user_spoke(self) -> str | None:
+    def user_spoke(self) -> None:
         """Revoke a pending close when the caller speaks again."""
         self._user_speaking = True
         self._end_tool_succeeded = False
-        return "cancel" if self._clear_deadline() else None
+        self._clear_deadline()
 
     def user_quiet(self) -> None:
         self._user_speaking = False
@@ -90,16 +97,16 @@ class EndingPolicy:
         if not self._user_speaking and self._deadline_kind is None:
             self._deadline_kind = "idle"
             self._armed_at = now
-        return None
 
-    def agent_busy(self) -> str | None:
+    def agent_busy(self) -> None:
         """Cancel idle closure while the assistant is working."""
         if self._deadline_kind == "idle":
-            return "cancel" if self._clear_deadline() else None
-        return None
+            self._clear_deadline()
 
     def elapsed(self, now: float) -> str | None:
         """Return ``close`` once the active silence window has elapsed."""
+        if self._agent_speaking:
+            return None
         if self._deadline_kind is None or self._armed_at is None:
             return None
         window = CLOSE_QUIET_S if self._deadline_kind == "tool" else IDLE_S
@@ -112,24 +119,47 @@ class EndingPolicy:
 class DelegationRunner:
     """Own one cancellable backend delegation task at a time."""
 
-    def __init__(self, run: Callable[[str], Awaitable[None]]) -> None:
+    def __init__(
+        self,
+        run: Callable[[Any], Awaitable[None]],
+        on_error: Callable[[str, BaseException], None],
+    ) -> None:
         self._run = run
+        self._on_error = on_error
         self._task: asyncio.Task[None] | None = None
 
-    def start(self, delegation_id: str) -> asyncio.Task[None]:
+    def start(self, delegation: Any) -> asyncio.Task[None]:
         """Start a delegation, cancelling the previous one first."""
         if self._task is not None and not self._task.done():
             self._task.cancel()
-        self._task = asyncio.create_task(self._run(delegation_id), name=f"delegation:{delegation_id}")
-        return self._task
+        task = asyncio.create_task(self._run(delegation), name=f"delegation:{delegation.id}")
+        task.add_done_callback(
+            lambda completed, delegation_id=str(delegation.id): self._task_done(
+                delegation_id, completed
+            )
+        )
+        self._task = task
+        return task
+
+    def _task_done(self, delegation_id: str, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            self._on_error(delegation_id, error)
 
     async def close(self) -> None:
         """Cancel and drain the in-flight delegation, if any."""
         task = self._task
         self._task = None
-        if task is not None and not task.done():
+        if task is None:
+            return
+        if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def run_close_sequence(
@@ -156,30 +186,25 @@ class PrivateContext:
     """Private deployment context kept outside the public repository."""
 
     about: str = ""
-    keyterms: tuple[str, ...] = ()
     pronunciations: Mapping[str, str] = field(default_factory=dict)
 
 
 def parse_private_context(text: str) -> PrivateContext:
     """Parse the strict private-context TOML document."""
     data = tomllib.loads(text)
-    unknown = set(data) - {"about", "keyterms", "pronunciations"}
+    unknown = set(data) - {"about", "pronunciations"}
     if unknown:
         raise ValueError(f"private context has unknown keys: {sorted(unknown)}")
     about = data.get("about", "")
-    keyterms = data.get("keyterms", [])
     pronunciations = data.get("pronunciations", {})
     if not isinstance(about, str):
         raise ValueError("private context: about must be a string")
-    if not isinstance(keyterms, list) or not all(isinstance(k, str) for k in keyterms):
-        raise ValueError("private context: keyterms must be a list of strings")
     if not isinstance(pronunciations, dict) or not all(
         isinstance(k, str) and isinstance(v, str) for k, v in pronunciations.items()
     ):
         raise ValueError("private context: pronunciations must map strings to strings")
     return PrivateContext(
         about=about.strip(),
-        keyterms=tuple(keyterms),
         pronunciations=dict(pronunciations),
     )
 

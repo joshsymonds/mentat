@@ -39,7 +39,7 @@ from request import (
     turn_request,
     with_private_context,
 )
-from stream import CommentaryChunker, ToolResult, TurnError, TurnStream
+from stream import CommentaryChunker, ToolResult, TurnDone, TurnError, TurnFailure, TurnStream
 
 logger = logging.getLogger("mentat.voice")
 
@@ -81,8 +81,7 @@ class FrontAgent(Agent):
         self._background = background
         self._ending_policy = ending_policy
         self._ending_changed = ending_changed
-        self._pending: dict[str, GPTLiveDelegation] = {}
-        self._delegations = DelegationRunner(self._run_delegation)
+        self._delegations = DelegationRunner(self._run_delegation, self._on_delegation_error)
 
     async def on_enter(self) -> None:
         self.duplex_session.on("delegation_created", self._on_delegation_created)
@@ -92,14 +91,20 @@ class FrontAgent(Agent):
 
     def _on_delegation_created(self, delegation: GPTLiveDelegation) -> None:
         """A plugin read-loop callback that must hand work to an asyncio task."""
-        self._pending[delegation.id] = delegation
+        self._ending_policy.delegation_started()
+        self._ending_changed()
         self._background.play(AudioConfig(str(EARCON_PATH)))
-        self._delegations.start(delegation.id)
+        self._delegations.start(delegation)
 
-    async def _run_delegation(self, delegation_id: str) -> None:
-        delegation = self._pending.get(delegation_id)
-        if delegation is None:
-            return
+    def _on_delegation_error(self, delegation_id: str, error: BaseException) -> None:
+        logger.exception(
+            "delegation failed unexpectedly: %s (%s)",
+            delegation_id,
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+    async def _run_delegation(self, delegation: GPTLiveDelegation) -> None:
         try:
             await self._stream_backend(delegation)
         except asyncio.CancelledError:
@@ -110,8 +115,6 @@ class FrontAgent(Agent):
                 CONSULT_FAILED,
                 delegation_id=delegation.id,
             )
-        finally:
-            self._pending.pop(delegation_id, None)
 
     async def _stream_backend(self, delegation: GPTLiveDelegation) -> None:
         envelope = consult_envelope(
@@ -131,6 +134,7 @@ class FrontAgent(Agent):
             ) as response:
                 if response.status != 200:
                     raise TurnError(f"daemon answered HTTP {response.status}")
+                done_seen = False
                 async for data in response.content.iter_any():
                     for item in turn.feed(data):
                         if isinstance(item, str):
@@ -145,11 +149,21 @@ class FrontAgent(Agent):
                                 end_tool_succeeded = True
                             self._ending_policy.tool_result_seen(item.name, item.is_error)
                             self._ending_changed()
+                        elif isinstance(item, TurnFailure):
+                            raise TurnError(item.message)
+                        elif isinstance(item, TurnDone):
+                            for chunk in chunker.flush():
+                                saw_text = True
+                                self.duplex_session.append_commentary(
+                                    chunk,
+                                    delegation_id=delegation.id,
+                                )
+                            done_seen = True
+                            break
+                    if done_seen:
+                        break
         if not turn.done:
             raise TurnError("stream ended without done")
-        for chunk in chunker.flush():
-            saw_text = True
-            self.duplex_session.append_commentary(chunk, delegation_id=delegation.id)
         if not saw_text and not end_tool_succeeded:
             raise TurnError("turn produced no commentary")
         self._ending_policy.turn_done(time.monotonic())
@@ -173,9 +187,8 @@ def prewarm(proc: agents.JobProcess) -> None:
     private = load_private_context(os.environ.get(PRIVATE_CONTEXT_ENV))
     proc.userdata["private"] = private
     logger.info(
-        "private context: about=%d words, keyterms=%d, pronunciations=%d",
+        "private context: about=%d words, pronunciations=%d",
         len(private.about.split()),
-        len(private.keyterms),
         len(private.pronunciations),
     )
 
@@ -255,9 +268,9 @@ async def entrypoint(ctx: JobContext) -> None:
         elif new_state in {"thinking", "speaking"}:
             ending_policy.agent_busy()
         if new_state == "speaking" and old_state != "speaking":
-            ending_policy.assistant_activity(time.monotonic())
+            ending_policy.agent_speaking()
         elif old_state == "speaking" and new_state != "speaking":
-            ending_policy.assistant_activity(time.monotonic())
+            ending_policy.agent_quiet(time.monotonic())
         _rearm_timer()
 
     agent = FrontAgent(

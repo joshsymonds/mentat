@@ -11,7 +11,9 @@ from stream import (
     LineSplitter,
     ToolResult,
     ToolStart,
+    TurnDone,
     TurnError,
+    TurnFailure,
     TurnStream,
 )
 
@@ -117,24 +119,28 @@ class TurnStreamTest(unittest.TestCase):
 
     def test_clean_done_completes_the_turn(self):
         stream = TurnStream()
-        self.assertEqual(stream.feed(DONE_OK), [])
+        self.assertEqual(
+            stream.feed(b'{"kind":"text_delta","text":"partial"}\n' + DONE_OK),
+            ["partial", TurnDone()],
+        )
         self.assertTrue(stream.done)
 
-    def test_error_done_and_error_line_raise(self):
-        with self.assertRaises(TurnError):
-            TurnStream().feed(DONE_ERR)
-        with self.assertRaises(TurnError):
-            TurnStream().feed(b'{"kind":"error","message":"backend died"}\n')
+    def test_error_done_and_error_line_return_terminal_failures(self):
+        self.assertEqual(TurnStream().feed(DONE_ERR), [TurnFailure("failed")])
+        self.assertEqual(
+            TurnStream().feed(b'{"kind":"error","message":"backend died"}\n'),
+            [TurnFailure("backend died")],
+        )
 
-    def test_text_before_error_in_one_feed_is_discarded(self):
+    def test_text_before_error_in_one_feed_is_preserved(self):
         stream = TurnStream()
-        surfaced = None
-        with self.assertRaises(TurnError):
-            surfaced = stream.feed(
+        self.assertEqual(
+            stream.feed(
                 b'{"kind":"text_delta","text":"partial"}\n'
                 b'{"kind":"error","message":"backend died"}\n'
-            )
-        self.assertIsNone(surfaced)
+            ),
+            ["partial", TurnFailure("backend died")],
+        )
 
     def test_malformed_lines_raise(self):
         with self.assertRaises(TurnError):

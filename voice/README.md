@@ -16,8 +16,6 @@ facts. Deployment supplies a TOML file as `MENTAT_VOICE_PRIVATE`:
 about = """
 Who he is: ...one paragraph, folded into the worker instructions.
 """
-keyterms = ["Symonds", "Rosalind"]
-
 [pronunciations]
 Symonds = "Sigh-monds"
 ```

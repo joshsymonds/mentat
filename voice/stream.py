@@ -24,6 +24,16 @@ class ToolStart:
     name: str
 
 
+@dataclass(frozen=True)
+class TurnFailure:
+    message: str
+
+
+@dataclass(frozen=True)
+class TurnDone:
+    pass
+
+
 class LineSplitter:
     """Split a chunked UTF-8 byte stream into complete NDJSON lines."""
 
@@ -43,16 +53,18 @@ class TurnStream:
         self._splitter = LineSplitter()
         self.done = False
 
-    def feed(self, data: bytes) -> list[str | ToolResult | ToolStart]:
+    def feed(self, data: bytes) -> list[str | ToolResult | ToolStart | TurnFailure | TurnDone]:
         """Return items for complete lines in ``data``."""
-        items: list[str | ToolResult | ToolStart] = []
+        items: list[str | ToolResult | ToolStart | TurnFailure | TurnDone] = []
         for line in self._splitter.feed(data):
             item = self._consume(line)
             if item is not None:
                 items.append(item)
+                if isinstance(item, (TurnFailure, TurnDone)):
+                    break
         return items
 
-    def _consume(self, line: str) -> str | ToolResult | ToolStart | None:
+    def _consume(self, line: str) -> str | ToolResult | ToolStart | TurnFailure | TurnDone | None:
         try:
             event = json.loads(line)
         except ValueError as err:
@@ -69,12 +81,13 @@ class TurnStream:
         if kind == "tool_result":
             return ToolResult(str(event.get("tool", "")), bool(event.get("is_error", False)))
         if kind == "error":
-            raise TurnError(str(event.get("message", "unknown daemon error")))
+            return TurnFailure(str(event.get("message", "unknown daemon error")))
         if kind == "done":
             done = event.get("done", {})
             if isinstance(done, Mapping) and done.get("is_error"):
-                raise TurnError(str(done.get("text", "turn failed")))
+                return TurnFailure(str(done.get("text", "turn failed")))
             self.done = True
+            return TurnDone()
         return None
 
 
