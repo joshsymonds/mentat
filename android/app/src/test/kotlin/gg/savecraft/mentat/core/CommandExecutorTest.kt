@@ -1,6 +1,7 @@
 package gg.savecraft.mentat.core
 
 import android.content.ActivityNotFoundException
+import android.content.Intent
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import org.json.JSONArray
@@ -9,7 +10,12 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
+@Config(sdk = [35])
+@RunWith(RobolectricTestRunner::class)
 class CommandExecutorTest {
     private val expiry = Instant.parse("2026-09-10T00:00:00Z")
 
@@ -122,6 +128,78 @@ class CommandExecutorTest {
         val launcher = FakeIntentLauncher(exception = ActivityNotFoundException())
         val result = executor(launcher = launcher).execute(openCommand())
         assertEquals(PhoneResult("open", "error", "no handler"), result)
+    }
+
+    @Test
+    fun navigateExecutorLaunchesMapsIntent() = runBlocking {
+        val launcher = FakeIntentLauncher()
+        val command = PhoneCommand.Navigate(
+            "navigate",
+            "Trader Joe's",
+            "123 Main St",
+            "ChIJabc",
+            40.1,
+            -73.2,
+            expiry,
+        )
+
+        val result = executor(launcher = launcher).execute(command)
+
+        assertEquals(PhoneResult("navigate", "ok", "launched"), result)
+        val intent = launcher.intents.single()
+        assertEquals(Intent.ACTION_VIEW, intent.action)
+        assertEquals(
+            "https://www.google.com/maps/dir/?api=1&destination=Trader%20Joe%27s%2C%20123%20Main%20St&destination_place_id=ChIJabc&travelmode=driving&dir_action=navigate",
+            intent.dataString,
+        )
+        assertEquals("com.google.android.apps.maps", intent.`package`)
+    }
+
+    @Test
+    fun dialExecutorLaunchesDialIntent() = runBlocking {
+        val launcher = FakeIntentLauncher()
+
+        val result = executor(launcher = launcher).execute(
+            PhoneCommand.Dial("dial", "+15551212", expiry),
+        )
+
+        assertEquals(PhoneResult("dial", "ok", "launched"), result)
+        val intent = launcher.intents.single()
+        assertEquals(Intent.ACTION_DIAL, intent.action)
+        assertEquals("tel:+15551212", intent.dataString)
+    }
+
+    @Test
+    fun alarmExecutorLaunchesAlarmIntent() = runBlocking {
+        val launcher = FakeIntentLauncher()
+
+        val result = executor(launcher = launcher).execute(
+            PhoneCommand.Alarm("alarm", 7, 30, "Wake up", expiry),
+        )
+
+        assertEquals(PhoneResult("alarm", "ok", "launched"), result)
+        val intent = launcher.intents.single()
+        assertEquals(android.provider.AlarmClock.ACTION_SET_ALARM, intent.action)
+        assertEquals(7, intent.getIntExtra(android.provider.AlarmClock.EXTRA_HOUR, -1))
+        assertEquals(30, intent.getIntExtra(android.provider.AlarmClock.EXTRA_MINUTES, -1))
+        assertEquals("Wake up", intent.getStringExtra(android.provider.AlarmClock.EXTRA_MESSAGE))
+        assertTrue(intent.getBooleanExtra(android.provider.AlarmClock.EXTRA_SKIP_UI, false))
+    }
+
+    @Test
+    fun timerExecutorLaunchesTimerIntent() = runBlocking {
+        val launcher = FakeIntentLauncher()
+
+        val result = executor(launcher = launcher).execute(
+            PhoneCommand.Timer("timer", 90, "Tea", expiry),
+        )
+
+        assertEquals(PhoneResult("timer", "ok", "launched"), result)
+        val intent = launcher.intents.single()
+        assertEquals(android.provider.AlarmClock.ACTION_SET_TIMER, intent.action)
+        assertEquals(90, intent.getIntExtra(android.provider.AlarmClock.EXTRA_LENGTH, -1))
+        assertEquals("Tea", intent.getStringExtra(android.provider.AlarmClock.EXTRA_MESSAGE))
+        assertTrue(intent.getBooleanExtra(android.provider.AlarmClock.EXTRA_SKIP_UI, false))
     }
 
     @Test
@@ -508,9 +586,11 @@ class CommandExecutorTest {
         private val exception: Exception? = null,
     ) : IntentLauncher {
         val uris = mutableListOf<String>()
+        val intents = mutableListOf<Intent>()
         override fun canDrawOverlays(): Boolean = overlay
-        override fun launch(uri: String) {
-            uris += uri
+        override fun launch(intent: Intent) {
+            intents += intent
+            uris += intent.dataString.orEmpty()
             exception?.let { throw it }
         }
     }

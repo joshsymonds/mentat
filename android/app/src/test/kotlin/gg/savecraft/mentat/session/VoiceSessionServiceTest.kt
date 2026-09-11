@@ -7,7 +7,6 @@ import gg.savecraft.mentat.core.TokenEndpoint
 import gg.savecraft.mentat.core.TokenFetchException
 import gg.savecraft.mentat.core.TokenGrant
 import gg.savecraft.mentat.core.TranscriptSegment
-import gg.savecraft.mentat.phone.PhoneBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -20,7 +19,6 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
-import org.junit.Assert.assertSame
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -37,16 +35,14 @@ class VoiceSessionServiceTest {
     @Test
     fun happyPathFetchesTokenConnectsAndPublishesMicrophone() = runBlocking {
         val liveKit = FakeLiveKitSession()
-        val phoneBridge = PhoneBridge(location = null, launcher = {})
-        val service = controller(liveKit, phoneBridge = phoneBridge)
+        val service = controller(liveKit)
 
         service.start()
         liveKit.events.emit(LiveKitEvent.Connected)
 
         assertEquals(SessionState.Live, service.state.value)
         assertEquals("wss://voice.example.com" to "token", liveKit.connection)
-        assertSame(phoneBridge, liveKit.registeredPhoneBridge)
-        assertEquals(listOf("connect", "register", "mic"), liveKit.callOrder)
+        assertEquals(listOf("connect", "mic"), liveKit.callOrder)
         assertTrue(liveKit.microphoneEnabled.value)
         assertTrue(service.micEnabled.value)
     }
@@ -68,7 +64,6 @@ class VoiceSessionServiceTest {
         service.start()
 
         assertEquals(SessionState.Failed("connection refused"), service.state.value)
-        assertNull(liveKit.registeredPhoneBridge)
         assertEquals(listOf("connect"), liveKit.callOrder)
     }
 
@@ -109,28 +104,6 @@ class VoiceSessionServiceTest {
         assertTrue(liveKit.closed)
         assertTrue(stopped)
         assertEquals(SessionState.Ended, service.state.value)
-    }
-
-    @Test
-    fun serviceWiresPhoneBridgeBeforeStartingTheSession() {
-        val liveKit = FakeLiveKitSession(connectEvent = LiveKitEvent.Connected)
-        FakeLiveKitVoiceSessionService.liveKit = liveKit
-
-        val service = Robolectric
-            .buildService(FakeLiveKitVoiceSessionService::class.java)
-            .create()
-            .get()
-        service.onStartCommand(Intent(), 0, 1)
-        repeat(100) {
-            Shadows.shadowOf(Looper.getMainLooper()).idle()
-            if (liveKit.callOrder.size == 3) {
-                return@repeat
-            }
-            Thread.sleep(10)
-        }
-
-        assertTrue(liveKit.registeredPhoneBridge != null)
-        assertEquals(listOf("connect", "register", "mic"), liveKit.callOrder)
     }
 
     @Test
@@ -276,12 +249,10 @@ class VoiceSessionServiceTest {
     private fun controller(
         liveKitSession: FakeLiveKitSession,
         tokenEndpoint: TokenEndpoint = FakeTokenEndpoint,
-        phoneBridge: PhoneBridge = PhoneBridge(location = null, launcher = {}),
         stopService: () -> Unit = {},
     ) = VoiceSessionController(
         tokenEndpoint = tokenEndpoint,
         liveKitSession = liveKitSession,
-        phoneBridge = phoneBridge,
         stopService = stopService,
         scope = scope,
     )
@@ -310,7 +281,6 @@ class VoiceSessionServiceTest {
         override val transcripts = MutableSharedFlow<TranscriptSegment>()
         val microphoneEnabled = MutableStateFlow(false)
         var connection: Pair<String, String>? = null
-        var registeredPhoneBridge: PhoneBridge? = null
         var disconnected = false
         var closed = false
 
@@ -323,10 +293,6 @@ class VoiceSessionServiceTest {
             connectEvent?.let { events.emit(it) }
         }
 
-        override fun registerPhoneBridge(bridge: PhoneBridge) {
-            callOrder += "register"
-            registeredPhoneBridge = bridge
-        }
 
         override suspend fun setMicEnabled(enabled: Boolean) {
             callOrder += "mic"

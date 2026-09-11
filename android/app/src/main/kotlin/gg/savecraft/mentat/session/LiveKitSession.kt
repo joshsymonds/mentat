@@ -3,7 +3,6 @@ package gg.savecraft.mentat.session
 import android.content.Context
 import gg.savecraft.mentat.core.SessionEvent
 import gg.savecraft.mentat.core.TranscriptSegment
-import gg.savecraft.mentat.phone.PhoneBridge
 import io.livekit.android.LiveKit
 import io.livekit.android.events.DisconnectReason
 import io.livekit.android.events.RoomEvent
@@ -31,7 +30,6 @@ interface LiveKitSession {
 
     suspend fun connect(url: String, token: String)
 
-    fun registerPhoneBridge(bridge: PhoneBridge)
 
     suspend fun setMicEnabled(enabled: Boolean)
 
@@ -101,9 +99,6 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
         }
     }
 
-    override fun registerPhoneBridge(bridge: PhoneBridge) {
-        bridge.register(room.localParticipant)
-    }
 
     override suspend fun connect(url: String, token: String) {
         room.connect(url, token)

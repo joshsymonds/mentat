@@ -16,7 +16,6 @@ import gg.savecraft.mentat.core.SessionStateMachine
 import gg.savecraft.mentat.core.TokenEndpoint
 import gg.savecraft.mentat.core.Transcript
 import gg.savecraft.mentat.core.TranscriptSegment
-import gg.savecraft.mentat.phone.PhoneBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -33,7 +32,6 @@ open class VoiceSessionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val binder = LocalBinder()
     private lateinit var controller: VoiceSessionController
-    private lateinit var bridge: PhoneBridge
     private var started = false
 
     open val state: StateFlow<SessionState>
@@ -45,11 +43,9 @@ open class VoiceSessionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        bridge = phoneBridge()
         controller = VoiceSessionController(
             tokenEndpoint = tokenEndpoint(),
             liveKitSession = liveKitSession(),
-            phoneBridge = bridge,
             stopService = ::stopVoiceService,
             scope = serviceScope,
         )
@@ -108,11 +104,6 @@ open class VoiceSessionService : Service() {
 
     protected open fun liveKitSession(): LiveKitSession = AndroidLiveKitSession(this)
 
-    protected open fun phoneBridge(): PhoneBridge = PhoneBridge(this)
-
-    fun setAssistVisible(visible: Boolean) {
-        bridge.assistVisible = visible
-    }
 
     protected open fun stopVoiceService() {
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -150,7 +141,6 @@ open class VoiceSessionService : Service() {
 internal class VoiceSessionController(
     private val tokenEndpoint: TokenEndpoint,
     private val liveKitSession: LiveKitSession,
-    private val phoneBridge: PhoneBridge,
     private val stopService: () -> Unit,
     private val scope: CoroutineScope,
 ) {
@@ -187,7 +177,6 @@ internal class VoiceSessionController(
         transition(SessionEvent.TokenReceived(grant))
         try {
             liveKitSession.connect(grant.url, grant.token)
-            liveKitSession.registerPhoneBridge(phoneBridge)
             liveKitSession.setMicEnabled(true)
             mutableMicEnabled.value = true
         } catch (exception: Exception) {

@@ -6,6 +6,7 @@
     <string name="phone_notification_channel">Phone bridge</string>
     <string name="phone_notification_title">Mentat phone bridge</string>
     <string name="phone_notification_text">Phone command channel active</string>
+    <string name="background_location_permission_rationale">Allow all the time in Settings to answer location requests while Mentat is not open.</string>
     <string name="talk_settings">Settings</string>
     <string name="talk_token_endpoint">Token endpoint</string>
     <string name="talk_save">Save</string>

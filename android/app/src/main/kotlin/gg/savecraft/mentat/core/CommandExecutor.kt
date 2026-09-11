@@ -1,6 +1,7 @@
 package gg.savecraft.mentat.core
 
 import android.content.ActivityNotFoundException
+import android.content.Intent
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import kotlinx.coroutines.Dispatchers
@@ -29,7 +30,7 @@ interface ContactResolver {
 
 interface IntentLauncher {
     fun canDrawOverlays(): Boolean
-    fun launch(uri: String)
+    fun launch(intent: Intent)
 }
 
 interface Clock {
@@ -46,11 +47,17 @@ class CommandExecutor(
     private val intentLauncher: IntentLauncher,
     private val messageStore: MessageStore,
     private val clock: Clock = SystemClock,
+    private val phoneLocation: PhoneLocation? = null,
 ) {
     suspend fun execute(command: PhoneCommand): PhoneResult {
         return when (command) {
+            is PhoneCommand.Navigate,
+            is PhoneCommand.Dial,
+            is PhoneCommand.Alarm,
+            is PhoneCommand.Timer,
+            is PhoneCommand.Open -> executeIntent(command)
             is PhoneCommand.Sms -> executeSms(command)
-            is PhoneCommand.Open -> executeOpen(command)
+            is PhoneCommand.Location -> executeLocation(command)
             is PhoneCommand.Conversations -> executeConversations(command)
             is PhoneCommand.Messages -> executeMessages(command)
             is PhoneCommand.Search -> executeSearch(command)
@@ -142,19 +149,30 @@ class CommandExecutor(
         }
     }
 
-    private fun executeOpen(command: PhoneCommand.Open): PhoneResult {
+    private fun executeIntent(command: PhoneCommand): PhoneResult {
+        val id = requireNotNull(command.id)
+        val expiresAt = requireNotNull(command.expiresAt)
+        if (expired(expiresAt)) {
+            return PhoneResult(id, "error", "expired")
+        }
+        if (!intentLauncher.canDrawOverlays()) {
+            return PhoneResult(id, "error", "overlay permission missing")
+        }
+        return try {
+            intentLauncher.launch(PhoneIntents.intentFor(command))
+            PhoneResult(id, "ok", "launched")
+        } catch (_: ActivityNotFoundException) {
+            PhoneResult(id, "error", "no handler")
+        }
+    }
+
+    private fun executeLocation(command: PhoneCommand.Location): PhoneResult {
         if (expired(command.expiresAt)) {
             return PhoneResult(command.id, "error", "expired")
         }
-        if (!intentLauncher.canDrawOverlays()) {
-            return PhoneResult(command.id, "error", "overlay permission missing")
-        }
-        return try {
-            intentLauncher.launch(command.uri)
-            PhoneResult(command.id, "ok", "launched")
-        } catch (_: ActivityNotFoundException) {
-            PhoneResult(command.id, "error", "no handler")
-        }
+        val payload = phoneLocation?.get()
+            ?: return PhoneResult(command.id, "error", "location unavailable")
+        return PhoneResult(command.id, "ok", "location", payload)
     }
 
     private fun classifyConversation(value: String): ConversationSelection {

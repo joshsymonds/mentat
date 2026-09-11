@@ -4,8 +4,11 @@ import android.Manifest
 import android.app.Application
 import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -24,6 +27,39 @@ class MainActivityTest {
     @Before
     fun setUp() {
         application = ApplicationProvider.getApplicationContext()
+        Shadows.shadowOf(application).denyPermissions(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+        )
+    }
+
+    @Test
+    fun firstRunRequestsForegroundFineLocationOnly() {
+        Shadows.shadowOf(application).grantPermissions(Manifest.permission.RECORD_AUDIO)
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).create().start().get()
+        val request = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+
+        assertArrayEquals(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), request.requestedPermissions)
+    }
+
+    @Test
+    fun grantingForegroundLocationOffersBackgroundSettingsPath() {
+        Shadows.shadowOf(application).grantPermissions(Manifest.permission.RECORD_AUDIO)
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).create().start().get()
+        val request = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        activity.onRequestPermissionsResult(
+            request.requestCode,
+            request.requestedPermissions,
+            intArrayOf(PackageManager.PERMISSION_GRANTED),
+        )
+
+        val settingsIntent = Shadows.shadowOf(activity).nextStartedActivity
+        assertEquals(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, settingsIntent?.action)
+        assertEquals("package:${application.packageName}", settingsIntent?.dataString)
     }
 
     /**

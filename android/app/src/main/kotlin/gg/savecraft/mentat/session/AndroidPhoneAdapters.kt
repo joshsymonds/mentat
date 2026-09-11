@@ -159,10 +159,8 @@ class AndroidIntentLauncher(
 ) : IntentLauncher {
     override fun canDrawOverlays(): Boolean = Settings.canDrawOverlays(context)
 
-    override fun launch(uri: String) {
-        context.startActivity(
-            Intent(Intent.ACTION_VIEW, Uri.parse(uri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-        )
+    override fun launch(intent: Intent) {
+        context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 }
 

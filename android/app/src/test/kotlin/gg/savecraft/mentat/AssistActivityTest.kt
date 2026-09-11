@@ -12,7 +12,6 @@ import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
 import gg.savecraft.mentat.core.SessionState
 import gg.savecraft.mentat.core.TranscriptSegment
-import gg.savecraft.mentat.phone.PhoneBridge
 import gg.savecraft.mentat.session.BootReceiver
 import gg.savecraft.mentat.session.LiveKitEvent
 import gg.savecraft.mentat.session.LiveKitSession
@@ -37,6 +36,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowSettings
+import org.robolectric.shadows.ShadowToast
 
 @Config(sdk = [35])
 @RunWith(RobolectricTestRunner::class)
@@ -54,6 +54,7 @@ class AssistActivityTest {
             Manifest.permission.READ_CONTACTS,
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.ACCESS_BACKGROUND_LOCATION,
         )
     }
 
@@ -83,7 +84,7 @@ class AssistActivityTest {
         assertTrue(Shadows.shadowOf(application).boundServiceConnections.isNotEmpty())
         val locationRequest = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
         assertArrayEquals(
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
             locationRequest.requestedPermissions,
         )
     }
@@ -163,8 +164,52 @@ class AssistActivityTest {
         // The location request stays the last one: nothing followed it.
         val request = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
         assertArrayEquals(
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
             request.requestedPermissions,
+        )
+    }
+
+    @Test
+    fun alreadyGrantedForegroundLocationDoesNotOfferBackgroundSettings() {
+        grantRecordAudio()
+        Shadows.shadowOf(application).grantPermissions(Manifest.permission.ACCESS_FINE_LOCATION)
+        ShadowSettings.setCanDrawOverlays(true)
+        val powerManager = application.getSystemService(Context.POWER_SERVICE) as PowerManager
+        Shadows.shadowOf(powerManager).setIgnoringBatteryOptimizations(application.packageName, true)
+
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+        val intents = drainStartedActivities(activity)
+
+        assertTrue(intents.none { intent ->
+            intent.action == Settings.ACTION_APPLICATION_DETAILS_SETTINGS
+        })
+    }
+
+    @Test
+    fun foregroundLocationGrantOffersBackgroundSettingsWithRationale() {
+        grantRecordAudio()
+        ShadowSettings.setCanDrawOverlays(true)
+        val powerManager = application.getSystemService(Context.POWER_SERVICE) as PowerManager
+        Shadows.shadowOf(powerManager).setIgnoringBatteryOptimizations(application.packageName, true)
+
+        val activity = Robolectric.buildActivity(AssistActivity::class.java).create().start().get()
+        val request = requireNotNull(Shadows.shadowOf(activity).lastRequestedPermission)
+        assertArrayEquals(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), request.requestedPermissions)
+
+        activity.onRequestPermissionsResult(
+            request.requestCode,
+            request.requestedPermissions,
+            intArrayOf(PackageManager.PERMISSION_GRANTED),
+        )
+
+        val settingsIntents = drainStartedActivities(activity).filter { intent ->
+            intent.action == Settings.ACTION_APPLICATION_DETAILS_SETTINGS
+        }
+        val settingsIntent = settingsIntents.single()
+        assertEquals("package:${application.packageName}", settingsIntent.dataString)
+        assertEquals(
+            "Allow all the time in Settings to answer location requests while Mentat is not open.",
+            ShadowToast.getTextOfLatestToast(),
         )
     }
 
@@ -228,6 +273,8 @@ class AssistActivityTest {
         assertTrue(permissions.contains(Manifest.permission.SYSTEM_ALERT_WINDOW))
         assertTrue(permissions.contains(Manifest.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS))
         assertTrue(permissions.contains(Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE))
+        assertTrue(permissions.contains(Manifest.permission.ACCESS_BACKGROUND_LOCATION))
+        assertTrue(permissions.contains(Manifest.permission.FOREGROUND_SERVICE_LOCATION))
         assertTrue(permissions.contains(Manifest.permission.RECEIVE_BOOT_COMPLETED))
 
         val receiverInfo = application.packageManager.getReceiverInfo(
@@ -241,7 +288,8 @@ class AssistActivityTest {
             PackageManager.GET_META_DATA,
         )
         assertEquals(
-            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
             serviceInfo.foregroundServiceType,
         )
     }
@@ -260,7 +308,7 @@ class AssistActivityTest {
         val locationRequest = Shadows.shadowOf(activity).lastRequestedPermission
         assertTrue(startedServiceClassNames().contains(VOICE_SERVICE))
         assertEquals(
-            listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            listOf(Manifest.permission.ACCESS_FINE_LOCATION),
             locationRequest.requestedPermissions.toList(),
         )
     }
@@ -268,21 +316,21 @@ class AssistActivityTest {
     @Test
     fun preciseLocationPermissionDecisionStartsVoiceService() {
         assertLocationPermissionDecisionStartsSession(
-            intArrayOf(PackageManager.PERMISSION_GRANTED, PackageManager.PERMISSION_GRANTED),
+            intArrayOf(PackageManager.PERMISSION_GRANTED),
         )
     }
 
     @Test
     fun approximateLocationPermissionDecisionStartsVoiceService() {
         assertLocationPermissionDecisionStartsSession(
-            intArrayOf(PackageManager.PERMISSION_DENIED, PackageManager.PERMISSION_GRANTED),
+            intArrayOf(PackageManager.PERMISSION_DENIED),
         )
     }
 
     @Test
     fun deniedLocationPermissionDecisionStartsVoiceService() {
         assertLocationPermissionDecisionStartsSession(
-            intArrayOf(PackageManager.PERMISSION_DENIED, PackageManager.PERMISSION_DENIED),
+            intArrayOf(PackageManager.PERMISSION_DENIED),
         )
     }
 
@@ -292,7 +340,7 @@ class AssistActivityTest {
         val request = Shadows.shadowOf(activity).lastRequestedPermission
 
         assertEquals(
-            listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+            listOf(Manifest.permission.ACCESS_FINE_LOCATION),
             request.requestedPermissions.toList(),
         )
         activity.onRequestPermissionsResult(
@@ -547,7 +595,6 @@ class AssistActivityTest {
 
         override suspend fun connect(url: String, token: String) {}
 
-        override fun registerPhoneBridge(bridge: PhoneBridge) {}
 
         override suspend fun setMicEnabled(enabled: Boolean) {}
 

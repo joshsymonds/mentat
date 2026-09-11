@@ -9,6 +9,7 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
+import android.widget.Toast
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -74,13 +75,15 @@ open class AssistActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { }
 
-    // Android runs one runtime-permission request at a time, so the phone permissions
-    // wait for the location decision, which itself waits for the microphone decision.
-    // A cancelled request (the platform's answer to a concurrent one) carries no
-    // decision and does not continue the chain; the next launch asks again.
+    // Android does not permit foreground and background location in one runtime request.
+    // The foreground decision is followed by an app-details settings path for "Allow all
+    // the time", and only then does the activity request the phone permissions.
     private val locationPermissionRequest = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { results ->
+        if (results[Manifest.permission.ACCESS_FINE_LOCATION] == true) {
+            offerBackgroundLocationSettings()
+        }
         if (results.isNotEmpty()) {
             requestPhonePermissionsIfNeeded()
         }
@@ -89,7 +92,6 @@ open class AssistActivity : ComponentActivity() {
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             service = (binder as VoiceSessionService.LocalBinder).service()
-            service!!.setAssistVisible(activityStarted)
             stateJob = activityScope.launch {
                 service!!.state.collect { state ->
                     mutableUiState.value = state
@@ -142,7 +144,7 @@ open class AssistActivity : ComponentActivity() {
             }
         }
         beginVoiceSession()
-        beginPhoneBridge()
+        beginPhoneCommandService()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -155,12 +157,10 @@ open class AssistActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         activityStarted = true
-        service?.setAssistVisible(true)
     }
 
     override fun onStop() {
         activityStarted = false
-        service?.setAssistVisible(false)
         super.onStop()
     }
 
@@ -231,7 +231,7 @@ open class AssistActivity : ComponentActivity() {
         }
     }
 
-    private fun beginPhoneBridge() {
+    private fun beginPhoneCommandService() {
         if (!Settings.canDrawOverlays(this)) {
             runCatching {
                 startActivity(
@@ -265,12 +265,38 @@ open class AssistActivity : ComponentActivity() {
     }
 
     private fun requestLocationPermissions() {
-        locationPermissionRequest.launch(
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION,
-            ),
-        )
+        val foregroundGranted = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        if (foregroundGranted) {
+            requestPhonePermissionsIfNeeded()
+        } else {
+            locationPermissionRequest.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
+        }
+    }
+
+    private fun offerBackgroundLocationSettings() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        runCatching {
+            Toast.makeText(
+                this,
+                getString(R.string.background_location_permission_rationale),
+                Toast.LENGTH_LONG,
+            ).show()
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName"),
+                ),
+            )
+        }.onFailure { exception ->
+            Log.w("MentatAssist", "Unable to open background location settings", exception)
+        }
     }
 
     private fun startAndBindVoiceService() {

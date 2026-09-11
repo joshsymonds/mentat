@@ -1,16 +1,20 @@
 package gg.savecraft.mentat.session
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.IBinder
 import android.util.Log
 import gg.savecraft.mentat.R
 import gg.savecraft.mentat.core.CommandExecutor
 import gg.savecraft.mentat.core.CommandStream
 import gg.savecraft.mentat.core.HttpCommandStream
+import gg.savecraft.mentat.core.PhoneLocation
 import gg.savecraft.mentat.core.SystemClock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -74,6 +78,7 @@ open class PhoneCommandService : Service() {
             intentLauncher = AndroidIntentLauncher(this),
             messageStore = AndroidMessageStore(this),
             clock = SystemClock,
+            phoneLocation = PhoneLocation(this),
         )
 
     protected open fun startForegroundNotification() {
@@ -91,7 +96,16 @@ open class PhoneCommandService : Service() {
             .setContentText(getString(R.string.phone_notification_text))
             .setOngoing(true)
             .build()
-        startForeground(NOTIFICATION_ID, notification)
+        startForeground(NOTIFICATION_ID, notification, foregroundServiceType())
+    }
+
+    protected open fun foregroundServiceType(): Int {
+        val locationGranted = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        return ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+            if (locationGranted) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
     }
 
     private companion object {

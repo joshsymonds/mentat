@@ -1,11 +1,28 @@
 package gg.savecraft.mentat.core
 
 import java.time.Instant
+import kotlin.math.floor
 import org.json.JSONObject
 
 sealed class PhoneCommand {
     abstract val id: String?
     abstract val expiresAt: Instant?
+
+    data class Navigate(
+        override val id: String,
+        val name: String,
+        val address: String,
+        val placeId: String,
+        val lat: Double,
+        val lng: Double,
+        override val expiresAt: Instant,
+    ) : PhoneCommand()
+
+    data class Dial(
+        override val id: String,
+        val number: String,
+        override val expiresAt: Instant,
+    ) : PhoneCommand()
 
     data class Sms(
         override val id: String,
@@ -14,9 +31,29 @@ sealed class PhoneCommand {
         override val expiresAt: Instant,
     ) : PhoneCommand()
 
+    data class Alarm(
+        override val id: String,
+        val hour: Int,
+        val minute: Int,
+        val label: String?,
+        override val expiresAt: Instant,
+    ) : PhoneCommand()
+
+    data class Timer(
+        override val id: String,
+        val seconds: Int,
+        val label: String?,
+        override val expiresAt: Instant,
+    ) : PhoneCommand()
+
     data class Open(
         override val id: String,
         val uri: String,
+        override val expiresAt: Instant,
+    ) : PhoneCommand()
+
+    data class Location(
+        override val id: String,
         override val expiresAt: Instant,
     ) : PhoneCommand()
 
@@ -48,47 +85,134 @@ sealed class PhoneCommand {
     }
 
     companion object {
-        fun parse(json: JSONObject): PhoneCommand {
-            return when (json.getString("kind")) {
-                "sms" -> Sms(
-                    id = json.getString("id"),
-                    to = json.getString("to"),
-                    body = json.getString("body"),
-                    expiresAt = Instant.parse(json.getString("expires_at")),
-                )
-                "open" -> Open(
-                    id = json.getString("id"),
-                    uri = json.getString("uri"),
-                    expiresAt = Instant.parse(json.getString("expires_at")),
-                )
-                "conversations" -> Conversations(
-                    id = json.getString("id"),
-                    limit = json.getInt("limit"),
-                    expiresAt = Instant.parse(json.getString("expires_at")),
-                )
-                "messages" -> Messages(
-                    id = json.getString("id"),
-                    conversation = json.getString("conversation"),
-                    limit = json.getInt("limit"),
-                    before = json.stringOrNull("before"),
-                    expiresAt = Instant.parse(json.getString("expires_at")),
-                )
-                "search" -> Search(
-                    id = json.getString("id"),
-                    query = json.getString("query"),
-                    limit = json.getInt("limit"),
-                    before = json.stringOrNull("before"),
-                    expiresAt = Instant.parse(json.getString("expires_at")),
-                )
-                "ping" -> Ping
-                else -> throw IllegalArgumentException("Unknown phone command kind")
-            }
+        fun parse(line: String): PhoneCommand = parse(JSONObject(line))
+
+        fun parse(json: JSONObject): PhoneCommand = when (requiredString(json, "kind")) {
+            "navigate" -> Navigate(
+                id = requiredString(json, "id"),
+                name = requiredString(json, "name"),
+                address = requiredString(json, "address"),
+                placeId = requiredString(json, "place_id"),
+                lat = requiredDouble(json, "lat", -90.0, 90.0),
+                lng = requiredDouble(json, "lng", -180.0, 180.0),
+                expiresAt = requiredInstant(json),
+            )
+
+            "dial" -> Dial(
+                id = requiredString(json, "id"),
+                number = requiredString(json, "number"),
+                expiresAt = requiredInstant(json),
+            )
+
+            "sms" -> Sms(
+                id = requiredString(json, "id"),
+                to = requiredString(json, "to"),
+                body = requiredString(json, "body"),
+                expiresAt = requiredInstant(json),
+            )
+
+            "alarm" -> Alarm(
+                id = requiredString(json, "id"),
+                hour = requiredInt(json, "hour", 0, 23),
+                minute = requiredInt(json, "minute", 0, 59),
+                label = optionalString(json, "label"),
+                expiresAt = requiredInstant(json),
+            )
+
+            "timer" -> Timer(
+                id = requiredString(json, "id"),
+                seconds = requiredInt(json, "seconds", 0, Int.MAX_VALUE),
+                label = optionalString(json, "label"),
+                expiresAt = requiredInstant(json),
+            )
+
+            "open" -> Open(
+                id = requiredString(json, "id"),
+                uri = requiredString(json, "uri"),
+                expiresAt = requiredInstant(json),
+            )
+
+            "location" -> Location(
+                id = requiredString(json, "id"),
+                expiresAt = requiredInstant(json),
+            )
+
+            "conversations" -> Conversations(
+                id = requiredString(json, "id"),
+                limit = requiredInt(json, "limit", 1, 100),
+                expiresAt = requiredInstant(json),
+            )
+
+            "messages" -> Messages(
+                id = requiredString(json, "id"),
+                conversation = requiredString(json, "conversation"),
+                limit = requiredInt(json, "limit", 1, 100),
+                before = optionalString(json, "before"),
+                expiresAt = requiredInstant(json),
+            )
+
+            "search" -> Search(
+                id = requiredString(json, "id"),
+                query = requiredString(json, "query"),
+                limit = requiredInt(json, "limit", 1, 100),
+                before = optionalString(json, "before"),
+                expiresAt = requiredInstant(json),
+            )
+
+            "ping" -> Ping
+            else -> throw IllegalArgumentException("Unknown phone command kind")
         }
 
-        private fun JSONObject.stringOrNull(name: String): String? =
-            if (isNull(name)) null else optString(name, null)
+        private fun requiredString(json: JSONObject, name: String): String {
+            val value = json.opt(name)
+            if (value !is String || value.isBlank()) {
+                throw IllegalArgumentException("Missing or invalid $name")
+            }
+            return value
+        }
 
-        fun parse(line: String): PhoneCommand = parse(JSONObject(line))
+        private fun optionalString(json: JSONObject, name: String): String? {
+            if (!json.has(name) || json.isNull(name)) return null
+            val value = json.opt(name)
+            if (value !is String) throw IllegalArgumentException("Invalid $name")
+            return value
+        }
+
+        private fun requiredInstant(json: JSONObject): Instant =
+            Instant.parse(requiredString(json, "expires_at"))
+
+        private fun requiredDouble(
+            json: JSONObject,
+            name: String,
+            minimum: Double,
+            maximum: Double,
+        ): Double {
+            val value = json.opt(name) as? Number
+            val result = value?.toDouble()
+            if (result == null || !result.isFinite() || result < minimum || result > maximum) {
+                throw IllegalArgumentException("Missing or invalid $name")
+            }
+            return result
+        }
+
+        private fun requiredInt(
+            json: JSONObject,
+            name: String,
+            minimum: Int,
+            maximum: Int,
+        ): Int {
+            val result = (json.opt(name) as? Number)?.toDouble()
+            if (
+                result == null ||
+                    !result.isFinite() ||
+                    floor(result) != result ||
+                    result < minimum ||
+                    result > maximum
+            ) {
+                throw IllegalArgumentException("Missing or invalid $name")
+            }
+            return result.toInt()
+        }
     }
 }
 

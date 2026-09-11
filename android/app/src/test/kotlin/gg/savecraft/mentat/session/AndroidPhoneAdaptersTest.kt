@@ -40,7 +40,7 @@ class AndroidPhoneAdaptersTest {
 
     @Test
     fun intentLauncherStartsViewIntentWithUriAndNewTask() {
-        AndroidIntentLauncher(application).launch("https://example.test/x")
+        AndroidIntentLauncher(application).launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://example.test/x")))
 
         val started = Shadows.shadowOf(application).nextStartedActivity
         assertNotNull(started)

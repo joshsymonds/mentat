@@ -1,4 +1,4 @@
-package gg.savecraft.mentat.phone
+package gg.savecraft.mentat.core
 
 import android.location.Location
 import android.os.SystemClock
@@ -25,7 +25,7 @@ class PhoneLocationTest {
         )
         grantLocation()
 
-        val response = JSONObject(phoneLocation.get())
+        val response = requireNotNull(phoneLocation.get())
 
         assertEquals(51.5, response.getDouble("lat"), 0.00001)
         assertEquals(-0.12, response.getDouble("lng"), 0.00001)
@@ -44,7 +44,7 @@ class PhoneLocationTest {
         val phoneLocation = PhoneLocation(ApplicationProvider.getApplicationContext(), source)
         grantLocation()
 
-        val response = JSONObject(phoneLocation.get())
+        val response = requireNotNull(phoneLocation.get())
 
         assertEquals(300L, response.getLong("age_s"))
         assertEquals(51.5, response.getDouble("lat"), 0.00001)
@@ -56,9 +56,7 @@ class PhoneLocationTest {
         val phoneLocation = PhoneLocation(ApplicationProvider.getApplicationContext(), source)
         grantLocation()
 
-        val error = runCatching { phoneLocation.get() }.exceptionOrNull()
-
-        assertEquals(1602, (error as PhoneRpcException).code)
+        assertEquals(null, phoneLocation.get())
     }
 
     @Test
@@ -66,9 +64,7 @@ class PhoneLocationTest {
         val source = FakeLocationSource(currentThrows = AssertionError("source touched"))
         val phoneLocation = PhoneLocation(ApplicationProvider.getApplicationContext(), source)
 
-        val error = runCatching { phoneLocation.get() }.exceptionOrNull()
-
-        assertEquals(1602, (error as PhoneRpcException).code)
+        assertEquals(null, phoneLocation.get())
         assertFalse(source.currentCalled)
         assertFalse(source.lastKnownCalled)
     }

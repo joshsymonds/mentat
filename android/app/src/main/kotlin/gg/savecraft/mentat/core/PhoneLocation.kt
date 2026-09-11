@@ -1,4 +1,4 @@
-package gg.savecraft.mentat.phone
+package gg.savecraft.mentat.core
 
 import android.Manifest
 import android.content.Context
@@ -54,9 +54,9 @@ class PhoneLocation private constructor(
         constructorMarker = Unit,
     )
 
-    fun get(): String {
+    fun get(): JSONObject? {
         if (!permissionChecker()) {
-            throw PhoneRpcException(PhoneRpcCodes.LOCATION_UNAVAILABLE, "location unavailable")
+            return null
         }
         val current = runCatching { source.current(CURRENT_TIMEOUT_MS) }.getOrNull()
         if (current != null) {
@@ -69,16 +69,15 @@ class PhoneLocation private constructor(
                 return encode(lastKnown, ageNanos / NANOS_PER_SECOND)
             }
         }
-        throw PhoneRpcException(PhoneRpcCodes.LOCATION_UNAVAILABLE, "location unavailable")
+        return null
     }
 
-    private fun encode(location: Location, ageSeconds: Long = ageSeconds(location)): String =
+    private fun encode(location: Location, ageSeconds: Long = ageSeconds(location)): JSONObject =
         JSONObject()
             .put("lat", location.latitude)
             .put("lng", location.longitude)
             .put("accuracy_m", location.accuracy.toDouble())
             .put("age_s", ageSeconds)
-            .toString()
 
     private fun ageSeconds(location: Location): Long = ageNanos(location) / NANOS_PER_SECOND
 

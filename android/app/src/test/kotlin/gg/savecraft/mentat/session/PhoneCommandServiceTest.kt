@@ -19,6 +19,8 @@ import gg.savecraft.mentat.core.ConversationRow
 import gg.savecraft.mentat.core.MessageRow
 import gg.savecraft.mentat.core.MessageStore
 import gg.savecraft.mentat.core.CommandExecutor
+import gg.savecraft.mentat.core.LocationSource
+import gg.savecraft.mentat.core.PhoneLocation
 import gg.savecraft.mentat.core.CommandStream
 import gg.savecraft.mentat.core.ContactMatch
 import gg.savecraft.mentat.core.ContactResolver
@@ -33,6 +35,7 @@ import java.time.Instant
 import javax.xml.parsers.DocumentBuilderFactory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
@@ -44,6 +47,15 @@ import org.robolectric.annotation.Config
 @Config(sdk = [35])
 @RunWith(RobolectricTestRunner::class)
 class PhoneCommandServiceTest {
+    @Before
+    fun denyLocationPermissions() {
+        val application = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(application).denyPermissions(
+            android.Manifest.permission.ACCESS_FINE_LOCATION,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION,
+        )
+    }
+
     @Test
     fun startsForegroundOnPhoneBridgeChannelAndStopsStreamOnDestroy() {
         val stream = FakeCommandStream()
@@ -61,6 +73,65 @@ class PhoneCommandServiceTest {
         assertEquals("phone-bridge", shadow.lastForegroundNotification.channelId)
         service.onDestroy()
         assertTrue(stream.closed)
+    }
+
+    @Test
+    fun refusedLocationPermissionStartsForegroundWithSpecialUseOnlyAndAttachesStream() {
+        val application = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(application).denyPermissions(
+            android.Manifest.permission.ACCESS_FINE_LOCATION,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION,
+        )
+        val stream = FakeCommandStream()
+        FakePhoneCommandService.stream = stream
+        FakePhoneCommandService.executor = testExecutor(RecordingIntentLauncher())
+        val service = Robolectric.buildService(FakePhoneCommandService::class.java).create().get()
+
+        service.onStartCommand(Intent(), 0, 1)
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE, service.foregroundServiceTypes.single())
+        assertTrue(Shadows.shadowOf(service).isLastForegroundNotificationAttached)
+        assertTrue(stream.handlerInvoked)
+    }
+
+    @Test
+    fun grantedLocationPermissionIncludesLocationForegroundType() {
+        val application = ApplicationProvider.getApplicationContext<Application>()
+        Shadows.shadowOf(application).grantPermissions(android.Manifest.permission.ACCESS_FINE_LOCATION)
+        val stream = FakeCommandStream()
+        FakePhoneCommandService.stream = stream
+        FakePhoneCommandService.executor = testExecutor(RecordingIntentLauncher())
+        val service = Robolectric.buildService(FakePhoneCommandService::class.java).create().get()
+
+        service.onStartCommand(Intent(), 0, 1)
+
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+            service.foregroundServiceTypes.single(),
+        )
+    }
+
+    @Test
+    fun locationCommandReturnsUnavailableErrorWhenPermissionIsRefused() {
+        val stream = FakeCommandStream().apply {
+            command = PhoneCommand.Location("location-id", Instant.parse("2026-09-09T00:01:00Z"))
+        }
+        val location = PhoneLocation(
+            source = object : LocationSource {
+                override fun current(timeoutMs: Long) = null
+                override fun lastKnown() = null
+            },
+            permissionGranted = { false },
+        )
+        FakePhoneCommandService.stream = stream
+        FakePhoneCommandService.executor = testExecutor(RecordingIntentLauncher(), location)
+        val service = Robolectric.buildService(FakePhoneCommandService::class.java).create().get()
+
+        service.onStartCommand(Intent(), 0, 1)
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(PhoneResult("location-id", "error", "location unavailable"), stream.result)
     }
 
     @Test
@@ -111,7 +182,11 @@ class PhoneCommandServiceTest {
             android.content.ComponentName(application, PhoneCommandService::class.java),
             0,
         )
-        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE, info.foregroundServiceType)
+        assertEquals(
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+            info.foregroundServiceType,
+        )
     }
 
     @Test
@@ -132,16 +207,15 @@ class PhoneCommandServiceTest {
         var closed = false
         var handlerInvoked = false
         var result: PhoneResult? = null
+        var command: PhoneCommand = PhoneCommand.Open(
+            id = "open-id",
+            uri = "https://example.test",
+            expiresAt = Instant.parse("2026-09-09T00:01:00Z"),
+        )
 
         override suspend fun run(handler: suspend (PhoneCommand) -> PhoneResult) {
             handlerInvoked = true
-            result = handler(
-                PhoneCommand.Open(
-                    id = "open-id",
-                    uri = "https://example.test",
-                    expiresAt = Instant.parse("2026-09-09T00:01:00Z"),
-                ),
-            )
+            result = handler(command)
         }
 
         override fun close() {
@@ -150,6 +224,12 @@ class PhoneCommandServiceTest {
     }
 
     class FakePhoneCommandService : PhoneCommandService() {
+        val foregroundServiceTypes = mutableListOf<Int>()
+
+        override fun foregroundServiceType(): Int = super.foregroundServiceType().also {
+            foregroundServiceTypes += it
+        }
+
         override fun commandStream(): CommandStream = stream
         override fun commandExecutor(): CommandExecutor = executor
 
@@ -209,8 +289,8 @@ class PhoneCommandServiceTest {
     private class RecordingIntentLauncher : IntentLauncher {
         val launchedUris = mutableListOf<String>()
         override fun canDrawOverlays(): Boolean = true
-        override fun launch(uri: String) {
-            launchedUris += uri
+        override fun launch(intent: Intent) {
+            launchedUris += intent.dataString.orEmpty()
         }
     }
 
@@ -218,12 +298,16 @@ class PhoneCommandServiceTest {
         override fun now(): Instant = instant
     }
 
-    private fun testExecutor(launcher: IntentLauncher): CommandExecutor = CommandExecutor(
+    private fun testExecutor(
+        launcher: IntentLauncher,
+        phoneLocation: PhoneLocation? = null,
+    ): CommandExecutor = CommandExecutor(
         smsSender = AllowingSmsSender(),
         contactResolver = EmptyContactResolver(),
         intentLauncher = launcher,
         messageStore = EmptyMessageStore(),
         clock = FixedClock(Instant.parse("2026-09-09T00:00:00Z")),
+        phoneLocation = phoneLocation,
     )
 
     private fun manifestSpecialUsePropertyValue(): String {
