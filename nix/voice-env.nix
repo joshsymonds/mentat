@@ -1,14 +1,14 @@
 # Python environment for the LiveKit voice agent.
 #
-# livekit-agents 1.6.x and most of the LiveKit Python family are either absent
-# from nixpkgs or pinned older than 1.6.10 accepts (nixpkgs has livekit-api
-# 1.1.0 / livekit-protocol 1.1.2; agents wants >=1.2.0 / >=1.1.21), so they are
-# built here from upstream wheels. The OpenTelemetry family is here for the
-# same reason. Everything else comes from nixpkgs.
+# livekit-agents 1.8.x and most of the LiveKit Python family are either absent
+# from nixpkgs or pinned older than the agent line accepts, so they are built
+# here from upstream wheels. The OpenTelemetry family and OpenAI client are here
+# for the same reason. Everything else comes from nixpkgs.
 #
-# Wheels, not sdists, on purpose: the rtc SDK ships a prebuilt Rust FFI object
-# and blingfire/local-inference ship prebuilt C++ extensions. Building those
-# from source means vendoring two more toolchains to arrive at the same bytes.
+# Wheels, not sdists, on purpose: the rtc SDK ships a prebuilt Rust FFI object,
+# blingfire/local-inference ship prebuilt C++ extensions, and the pure-Python
+# packages are pinned to exact upstream releases. Building the native packages
+# from source means vendoring extra toolchains to arrive at the same bytes.
 { pkgs }:
 
 let
@@ -205,9 +205,9 @@ let
     // {
       pname = "livekit";
       wheelName = "livekit";
-      version = "1.1.14";
+      version = "1.1.18";
       platform = "manylinux_2_28_x86_64";
-      hash = "sha256-gJYsSiLdvw4OvTVj/AkPzkLfZrObkN5osWG32wGXD2g=";
+      hash = "sha256-3CRhtmj/pmylBNBciK9+pkA3L1NnKuNnFFQS43TWr/A=";
       dependencies = [
         py.aiofiles
         py.numpy
@@ -260,11 +260,42 @@ let
     pythonImportsCheck = [ "json_repair" ];
   };
 
+  # OpenAI's realtime extra requires websockets <16; nixpkgs is already on 16,
+  # so pin the newest compatible pure wheel instead of inheriting that version.
+  websockets = wheelPackage {
+    pname = "websockets";
+    wheelName = "websockets";
+    version = "15.0.1";
+    hash = "sha256-96hm+8Hpe1xhfuQRbaqgm3IhAdSjwXDHh0ULpAn5c28=";
+    pythonImportsCheck = [ "websockets" ];
+  };
+
+  # nixpkgs has 2.41.1; the OpenAI realtime plugin requires >=2.50, so this
+  # pure wheel pins the requested 2.54.0 client and supplies its realtime extra.
+  openai = wheelPackage {
+    pname = "openai";
+    wheelName = "openai";
+    version = "2.54.0";
+    hash = "sha256-iQiXiRl8zbh/FzoDFF7RWY0AeVIgyT6Wz3ErHL9eXys=";
+    dependencies = [
+      py.anyio
+      py.distro
+      py.httpx
+      py.jiter
+      py.pydantic
+      py.sniffio
+      py.tqdm
+      py.typing-extensions
+      websockets
+    ];
+    pythonImportsCheck = [ "openai" ];
+  };
+
   livekit-agents = wheelPackage {
     pname = "livekit-agents";
     wheelName = "livekit_agents";
-    version = "1.6.10";
-    hash = "sha256-isgvwOgQ0uPgH+ShpjIYLYc6iedek9B9oTbu8jvHz5k=";
+    version = "1.8.1";
+    hash = "sha256-Pp5Ocy7OvPBRLV7sJWIaNlw1ciidHxNjltihxep44qw=";
 
     # nixpkgs builds upstream's nest-asyncio v1.6.0 tag, but that tag's own
     # metadata still reports 1.5.9 (upstream forgot the bump). The bound is
@@ -291,7 +322,8 @@ let
       py.eval-type-backport
       py.nest-asyncio
       py.numpy
-      py.openai
+      py.pillow
+      openai
       py.prometheus-client
       py.protobuf
       py.psutil
@@ -313,14 +345,28 @@ let
   livekit-plugins-silero = wheelPackage {
     pname = "livekit-plugins-silero";
     wheelName = "livekit_plugins_silero";
-    version = "1.6.10";
-    hash = "sha256-9+hbnxX2CoiESnHwEShqUIHHpzc84w3oPq0tjuzDEe8=";
+    version = "1.8.1";
+    hash = "sha256-CkGrNFSgECBzyzZFejsAUTPX6tHoNvVUHv1q8Wz7SmE=";
     dependencies = [
       livekit-agents
       py.numpy
       py.onnxruntime
     ];
     pythonImportsCheck = [ "livekit.plugins.silero" ];
+  };
+
+  # The OpenAI plugin is pure Python; pin its wheel with the agent line so the
+  # realtime transport and its model helpers stay in lockstep.
+  livekit-plugins-openai = wheelPackage {
+    pname = "livekit-plugins-openai";
+    wheelName = "livekit_plugins_openai";
+    version = "1.8.1";
+    hash = "sha256-Ftnhwf6qBq/elnhT89KHCb9RCaVh5KwzgWQfFiKoI+k=";
+    dependencies = [
+      livekit-agents
+      openai
+    ];
+    pythonImportsCheck = [ "livekit.plugins.openai.realtime" ];
   };
 
   # Self-hosted noise suppression (DTLN, MIT) run in-process on the agent's
@@ -347,6 +393,7 @@ assert pythonVersionOk;
 (pkgs.python3.withPackages (_: [
   livekit-agents
   livekit-plugins-silero
+  livekit-plugins-openai
   livekit-plugins-dtln
 ])).overrideAttrs
   (old: {
@@ -363,7 +410,7 @@ assert pythonVersionOk;
       import livekit.agents
       from livekit.plugins import dtln, silero
 
-      assert livekit.agents.__version__.startswith("1.6."), livekit.agents.__version__
+      assert livekit.agents.__version__.startswith("1.8."), livekit.agents.__version__
 
       onnx = Path(str(files("livekit.plugins.silero.resources") / "silero_vad.onnx")).resolve()
       assert onnx.is_file(), f"silero_vad.onnx missing: {onnx}"
