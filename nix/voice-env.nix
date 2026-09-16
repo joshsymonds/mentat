@@ -14,12 +14,12 @@
 let
   py = pkgs.python3Packages;
 
-  # Three of the wheels below are cp313 ABI-tagged. Nothing downstream would
+  # Two of the wheels below are cp314 ABI-tagged. Nothing downstream would
   # explain a bare ImportError if nixpkgs' default interpreter moved, so say it
   # here instead.
   pythonVersionOk =
-    pkgs.lib.assertMsg (py.python.pythonVersion == "3.13")
-      "voice-env pins cp313 wheels; nixpkgs python3 is ${py.python.pythonVersion}. Re-pin the ABI-tagged wheels in nix/voice-env.nix.";
+    pkgs.lib.assertMsg (py.python.pythonVersion == "3.14")
+      "voice-env pins cp314 wheels; nixpkgs python3 is ${py.python.pythonVersion}. Re-pin the ABI-tagged wheels in nix/voice-env.nix.";
 
   # PyPI's wheel filenames use the underscored distribution name, which differs
   # from the package name for nearly everything here, hence `wheelName`.
@@ -225,10 +225,10 @@ let
       pname = "livekit-blingfire";
       wheelName = "livekit_blingfire";
       version = "1.1.0";
-      python = "cp313";
-      abi = "cp313";
+      python = "cp314";
+      abi = "cp314";
       platform = "manylinux_2_24_x86_64.manylinux_2_28_x86_64";
-      hash = "sha256-g5/u+ikQ+Z15TT89aW+VGT7oGIzGaIqNcSut4s7eeVE=";
+      hash = "sha256-21k8BEo6/zivC01PPXOarUskx0DIAlW/+soHry+eZyE=";
       pythonImportsCheck = [ "livekit.blingfire" ];
     }
   );
@@ -243,10 +243,10 @@ let
       pname = "livekit-local-inference";
       wheelName = "livekit_local_inference";
       version = "0.2.7";
-      python = "cp313";
-      abi = "cp313";
+      python = "cp314";
+      abi = "cp314";
       platform = "manylinux_2_27_x86_64.manylinux_2_28_x86_64";
-      hash = "sha256-RUxFGk3xU/WpyMe6IOhC3Vx3mTED/RwDGUhW01G+h90=";
+      hash = "sha256-epe8KTK3P3LFJGy4NQzyzX0h/GI3BT/HwaxkU1LtDz8=";
       pythonImportsCheck = [ "livekit.local_inference" ];
     }
   );
