@@ -30,31 +30,54 @@ CONSULT_WINDOW_TURNS = 2
 CONSULT_TURN_CHARS = 500
 VOICE_CARD_MARKER = "---VOICE-CARD---"
 PRIVATE_CONTEXT_ENV = "MENTAT_VOICE_PRIVATE"
-CLOSE_QUIET_S = 6.0
+CLOSE_TAIL_S = 1.0
+CLOSE_UNSPOKEN_S = 4.0
 IDLE_S = 30.0
 END_CONVERSATION_TOOL = "mcp__mentat__end_conversation"
 
 
 class EndingPolicy:
-    """Close state machine for idle and backend-requested call endings."""
+    """Close state machine for idle and backend-requested call endings.
+
+    A successful ``end_conversation`` closes the call as soon as the goodbye has
+    been spoken: a short tail after the voice goes quiet, or a short wait when no
+    goodbye starts at all. Only a newer delegation revokes it; the caller talking
+    over the goodbye ("bye!") does not.
+    """
 
     def __init__(self) -> None:
         self._deadline_kind: str | None = None
+        self._window: float | None = None
         self._armed_at: float | None = None
         self._end_tool_succeeded = False
         self._user_speaking = False
         self._agent_speaking = False
 
+    def describe(self) -> str:
+        """One log-friendly line of the state the close decision reads."""
+        return (
+            f"deadline={self._deadline_kind} end_tool={self._end_tool_succeeded} "
+            f"user_speaking={self._user_speaking} agent_speaking={self._agent_speaking}"
+        )
+
     @property
     def deadline(self) -> float | None:
-        if self._deadline_kind == "tool":
-            return CLOSE_QUIET_S
-        if self._deadline_kind == "idle":
-            return IDLE_S
-        return None
+        return self._window
+
+    def remaining(self, now: float) -> float | None:
+        """Seconds until the active window elapses, or None when none is armed."""
+        if self._window is None or self._armed_at is None:
+            return None
+        return max(0.0, self._window - (now - self._armed_at))
+
+    def _arm(self, kind: str, window: float, now: float) -> None:
+        self._deadline_kind = kind
+        self._window = window
+        self._armed_at = now
 
     def _clear_deadline(self) -> None:
         self._deadline_kind = None
+        self._window = None
         self._armed_at = None
 
     def tool_result_seen(self, name: str, is_error: bool) -> None:
@@ -68,26 +91,29 @@ class EndingPolicy:
         self._end_tool_succeeded = False
 
     def turn_done(self, now: float) -> None:
-        """Arm the close window after a successful ending tool and clean turn."""
-        if self._end_tool_succeeded and not self._user_speaking:
-            self._deadline_kind = "tool"
-            self._armed_at = now
+        """Arm the close after a successful ending tool and clean turn."""
+        if not self._end_tool_succeeded:
+            return
+        if self._agent_speaking:
+            self._arm("tool", CLOSE_TAIL_S, now)
+        else:
+            self._arm("tool", CLOSE_UNSPOKEN_S, now)
 
     def agent_speaking(self) -> None:
-        """Pause close countdown while the assistant is speaking."""
+        """Hold the close while the assistant is speaking."""
         self._agent_speaking = True
 
     def agent_quiet(self, now: float) -> None:
-        """Start a pending close countdown when assistant speech ends."""
+        """Start the short tail once the goodbye has been spoken."""
         self._agent_speaking = False
         if self._deadline_kind == "tool":
-            self._armed_at = now
+            self._arm("tool", CLOSE_TAIL_S, now)
 
     def user_spoke(self) -> None:
-        """Revoke a pending close when the caller speaks again."""
+        """Cancel the idle close; a requested ending stands."""
         self._user_speaking = True
-        self._end_tool_succeeded = False
-        self._clear_deadline()
+        if self._deadline_kind == "idle":
+            self._clear_deadline()
 
     def user_quiet(self) -> None:
         self._user_speaking = False
@@ -95,8 +121,7 @@ class EndingPolicy:
     def agent_listening(self, now: float) -> None:
         """Arm the existing thirty-second idle close window."""
         if not self._user_speaking and self._deadline_kind is None:
-            self._deadline_kind = "idle"
-            self._armed_at = now
+            self._arm("idle", IDLE_S, now)
 
     def agent_busy(self) -> None:
         """Cancel idle closure while the assistant is working."""
@@ -104,13 +129,12 @@ class EndingPolicy:
             self._clear_deadline()
 
     def elapsed(self, now: float) -> str | None:
-        """Return ``close`` once the active silence window has elapsed."""
+        """Return ``close`` once the active window has elapsed."""
         if self._agent_speaking:
             return None
-        if self._deadline_kind is None or self._armed_at is None:
+        if self._window is None or self._armed_at is None:
             return None
-        window = CLOSE_QUIET_S if self._deadline_kind == "tool" else IDLE_S
-        if now - self._armed_at < window:
+        if now - self._armed_at < self._window:
             return None
         self._clear_deadline()
         return "close"

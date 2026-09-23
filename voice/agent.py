@@ -44,7 +44,7 @@ from stream import CommentaryChunker, ToolResult, TurnDone, TurnError, TurnFailu
 logger = logging.getLogger("mentat.voice")
 
 DEFAULT_MENTAT_URL = "http://127.0.0.1:8484"
-GPT_LIVE_VOICE = "marin"
+GPT_LIVE_VOICE = "meridian"
 TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_read=600)
 HERE = Path(__file__).parent
 PERSONA_PATH = HERE / "persona.md"
@@ -91,6 +91,9 @@ class FrontAgent(Agent):
 
     def _on_delegation_created(self, delegation: GPTLiveDelegation) -> None:
         """A plugin read-loop callback that must hand work to an asyncio task."""
+        logger.info(
+            "delegation %s created: %r", delegation.id, delegation.pending_transcript[:200]
+        )
         self._ending_policy.delegation_started()
         self._ending_changed()
         self._background.play(AudioConfig(str(EARCON_PATH)))
@@ -145,6 +148,12 @@ class FrontAgent(Agent):
                                     delegation_id=delegation.id,
                                 )
                         elif isinstance(item, ToolResult):
+                            logger.info(
+                                "delegation %s: tool %s%s",
+                                delegation.id,
+                                item.name,
+                                " failed" if item.is_error else "",
+                            )
                             if item.name == END_CONVERSATION_TOOL and not item.is_error:
                                 end_tool_succeeded = True
                             self._ending_policy.tool_result_seen(item.name, item.is_error)
@@ -167,6 +176,13 @@ class FrontAgent(Agent):
         if not saw_text and not end_tool_succeeded:
             raise TurnError("turn produced no commentary")
         self._ending_policy.turn_done(time.monotonic())
+        logger.info(
+            "delegation %s done: text=%s end_tool=%s; %s",
+            delegation.id,
+            saw_text,
+            end_tool_succeeded,
+            self._ending_policy.describe(),
+        )
         self._ending_changed()
 
 
@@ -218,15 +234,20 @@ async def entrypoint(ctx: JobContext) -> None:
         except asyncio.CancelledError:
             return
         if ending_policy.elapsed(time.monotonic()) == "close":
+            logger.info("closing: window elapsed")
             session.shutdown()
+        else:
+            logger.info("window elapsed without close; %s", ending_policy.describe())
 
     def _rearm_timer() -> None:
         nonlocal timer_task
         if timer_task is not None:
             timer_task.cancel()
             timer_task = None
-        if ending_policy.deadline is not None:
-            timer_task = asyncio.create_task(_wait_for_deadline(ending_policy.deadline))
+        remaining = ending_policy.remaining(time.monotonic())
+        if remaining is not None:
+            logger.info("close window armed: %.1f s left", remaining)
+            timer_task = asyncio.create_task(_wait_for_deadline(remaining))
 
     cleanup_task: asyncio.Task[None] | None = None
 
@@ -271,6 +292,7 @@ async def entrypoint(ctx: JobContext) -> None:
             ending_policy.agent_speaking()
         elif old_state == "speaking" and new_state != "speaking":
             ending_policy.agent_quiet(time.monotonic())
+        logger.info("agent %s -> %s; %s", old_state, new_state, ending_policy.describe())
         _rearm_timer()
 
     agent = FrontAgent(
@@ -289,6 +311,12 @@ async def entrypoint(ctx: JobContext) -> None:
             ending_policy.user_spoke()
         elif event.new_state in {"listening", "away"}:
             ending_policy.user_quiet()
+        logger.info(
+            "user %s -> %s; %s",
+            getattr(event, "old_state", None),
+            event.new_state,
+            ending_policy.describe(),
+        )
         _rearm_timer()
 
     await session.start(

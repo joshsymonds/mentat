@@ -8,7 +8,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from request import (
-    CLOSE_QUIET_S,
+    CLOSE_TAIL_S,
+    CLOSE_UNSPOKEN_S,
     CONSULT_FRAMING,
     CONSULT_TURN_CHARS,
     IDLE_S,
@@ -202,16 +203,42 @@ class DelegationRunnerTest(unittest.IsolatedAsyncioTestCase):
 
 
 class EndingPolicyTest(unittest.TestCase):
-    def test_successful_end_tool_waits_for_speech_to_finish_before_closing(self):
+    def test_end_tool_closes_a_second_after_the_goodbye_finishes(self):
         policy = EndingPolicy()
         policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
         policy.agent_speaking()
         policy.turn_done(103.0)
-        self.assertEqual(policy.deadline, CLOSE_QUIET_S)
+        self.assertEqual(policy.deadline, CLOSE_TAIL_S)
         self.assertIsNone(policy.elapsed(120.0))
         policy.agent_quiet(121.0)
-        self.assertIsNone(policy.elapsed(126.9))
-        self.assertEqual(policy.elapsed(127.0), "close")
+        self.assertEqual(policy.deadline, CLOSE_TAIL_S)
+        self.assertIsNone(policy.elapsed(121.9))
+        self.assertEqual(policy.elapsed(122.0), "close")
+
+    def test_end_tool_waits_briefly_for_a_goodbye_that_has_not_started(self):
+        policy = EndingPolicy()
+        policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
+        policy.turn_done(100.0)
+        self.assertEqual(policy.deadline, CLOSE_UNSPOKEN_S)
+        policy.agent_speaking()
+        self.assertIsNone(policy.elapsed(110.0))
+        policy.agent_quiet(110.0)
+        self.assertIsNone(policy.elapsed(110.9))
+        self.assertEqual(policy.elapsed(111.0), "close")
+
+    def test_end_tool_with_no_goodbye_still_closes(self):
+        policy = EndingPolicy()
+        policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
+        policy.turn_done(100.0)
+        self.assertIsNone(policy.elapsed(100.0 + CLOSE_UNSPOKEN_S - 0.1))
+        self.assertEqual(policy.elapsed(100.0 + CLOSE_UNSPOKEN_S), "close")
+
+    def test_remaining_counts_down_from_when_the_window_was_armed(self):
+        policy = EndingPolicy()
+        self.assertIsNone(policy.remaining(100.0))
+        policy.agent_listening(100.0)
+        self.assertEqual(policy.remaining(110.0), IDLE_S - 10.0)
+        self.assertEqual(policy.remaining(200.0), 0.0)
 
     def test_failed_end_tool_does_not_arm(self):
         policy = EndingPolicy()
@@ -229,20 +256,29 @@ class EndingPolicyTest(unittest.TestCase):
         policy = EndingPolicy()
         policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
         policy.turn_done(100.0)
-        self.assertEqual(policy.deadline, CLOSE_QUIET_S)
+        self.assertEqual(policy.deadline, CLOSE_UNSPOKEN_S)
         policy.delegation_started()
         self.assertIsNone(policy.deadline)
         self.assertIsNone(policy.elapsed(200.0))
         policy.turn_done(300.0)
         self.assertIsNone(policy.deadline)
 
-    def test_user_speech_revokes_armed_close(self):
+    def test_caller_saying_bye_does_not_revoke_the_ending(self):
         policy = EndingPolicy()
         policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
+        policy.agent_speaking()
         policy.turn_done(100.0)
         policy.user_spoke()
-        self.assertIsNone(policy.deadline)
-        self.assertIsNone(policy.elapsed(200.0))
+        policy.agent_quiet(102.0)
+        policy.user_quiet()
+        self.assertEqual(policy.elapsed(102.0 + CLOSE_TAIL_S), "close")
+
+    def test_caller_speaking_as_the_turn_finishes_still_arms(self):
+        policy = EndingPolicy()
+        policy.user_spoke()
+        policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
+        policy.turn_done(200.0)
+        self.assertEqual(policy.deadline, CLOSE_UNSPOKEN_S)
 
     def test_idle_listening_still_closes_after_thirty_seconds(self):
         policy = EndingPolicy()
@@ -251,6 +287,13 @@ class EndingPolicyTest(unittest.TestCase):
         self.assertIsNone(policy.elapsed(129.9))
         self.assertEqual(policy.elapsed(130.0), "close")
 
+    def test_user_speech_cancels_idle(self):
+        policy = EndingPolicy()
+        policy.agent_listening(100.0)
+        policy.user_spoke()
+        self.assertIsNone(policy.deadline)
+        self.assertIsNone(policy.elapsed(200.0))
+
     def test_busy_cancels_idle_and_user_speech_does_not_cancel_runner(self):
         policy = EndingPolicy()
         policy.agent_listening(100.0)
@@ -258,16 +301,6 @@ class EndingPolicyTest(unittest.TestCase):
         self.assertIsNone(policy.deadline)
         policy.user_spoke()
         self.assertIsNone(policy.deadline)
-
-    def test_user_quiet_then_new_successful_turn_rearms(self):
-        policy = EndingPolicy()
-        policy.user_spoke()
-        policy.user_quiet()
-        policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)
-        policy.turn_done(200.0)
-        self.assertEqual(policy.deadline, CLOSE_QUIET_S)
-        self.assertIsNone(policy.elapsed(205.9))
-        self.assertEqual(policy.elapsed(206.0), "close")
 
 
 class CloseSequenceTest(unittest.IsolatedAsyncioTestCase):
