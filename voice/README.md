@@ -129,15 +129,16 @@ start relative to the caller's speech end. These four calls exercise current
 lookup, price/source freshness, stable knowledge, and stale-summary caution:
 
 ```sh
-ssh ultraviolet sudo env DEV_DIR="$DEV_DIR" DEV_ROOM="$DEV_ROOM" DEV_PY="$DEV_PY" \
-  bash -c 'set -euo pipefail
-    set -a; . /run/agenix/mentat-voice-env; set +a
-    export LIVEKIT_URL=ws://127.0.0.1:7880
-    exec timeout 240 "$DEV_PY" "$DEV_DIR/caller.py" "$DEV_ROOM" "$@"' caller \
+ssh ultraviolet sudo env DEV_DIR="$DEV_DIR" DEV_ROOM="$DEV_ROOM" DEV_PY="$DEV_PY" bash -s <<'REMOTE'
+set -euo pipefail
+set -a; . /run/agenix/mentat-voice-env; set +a
+export LIVEKIT_URL=ws://127.0.0.1:7880
+exec timeout 240 "$DEV_PY" "$DEV_DIR/caller.py" "$DEV_ROOM" \
   'What is the latest released version of livekit-agents on PyPI?@1::[0-9]+\.[0-9]+\.[0-9]+' \
   'What is the current Bitcoin price in USD according to CoinGecko?@1::(?i)(?:\$|USD\s*)[0-9,]+(?:\.[0-9]+)?|[0-9,]+(?:\.[0-9]+)?\s*USD' \
   'Who wrote Pride and Prejudice?@1::(?i)Jane\s+Austen' \
   'What was the latest Formula 1 Grand Prix, and who won it?@1::(?i)\b(?:won|winner|unsure|uncertain)\b'
+REMOTE
 ```
 
 Compare A with PyPI, B with CoinGecko (record its currency and fetch time), C
