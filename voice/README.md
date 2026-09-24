@@ -28,11 +28,31 @@ environment in step 2.
 ## Testing branch code in a live room
 
 Audio changes need a real room. Run branch code against the production SFU and
-mentatd in a throwaway room without redeploying the worker.
+mentatd in a throwaway room without redeploying the worker. For this web-search
+change, run calls A-D below and compare each printed latency with the eight
+second target; the worker log records whether A, B and D used `web_search`.
 
-Stop the production worker first so it does not join the development room.
+Use one shell session for the procedure. Install the cleanup trap before
+stopping production voice; it removes the dev process/files and starts
+`mentat-voice` on normal exit, failure, Ctrl-C or termination:
 
 ```sh
+DEV_DIR=
+cleanup() {
+  if [[ -n "$DEV_DIR" ]]; then
+    ssh ultraviolet sudo env DEV_DIR="$DEV_DIR" sh -s <<'REMOTE_CLEANUP' || true
+set -eu
+if [ -f "$DEV_DIR/agent.pid" ]; then
+  kill "$(cat "$DEV_DIR/agent.pid")" 2>/dev/null || true
+fi
+rm -rf -- "$DEV_DIR"
+REMOTE_CLEANUP
+  fi
+  ssh ultraviolet sudo systemctl start mentat-voice
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 ssh ultraviolet sudo systemctl stop mentat-voice
 ```
 
@@ -44,21 +64,24 @@ writable home for plugin caches. Use `mktemp -d` rather than a predictable
 path.
 
 ```sh
-dev=$(ssh ultraviolet 'mktemp -d /tmp/mentat-voice-dev.XXXXXX')
-ssh ultraviolet "mkdir -p $dev/assets $dev/home/cache"
-scp voice/agent.py voice/persona.md voice/request.py voice/stream.py ultraviolet:$dev/
-scp voice/assets/earcon.wav ultraviolet:$dev/assets/
+DEV_DIR=$(ssh ultraviolet 'mktemp -d /tmp/mentat-voice-dev.XXXXXX')
+ssh ultraviolet "mkdir -p $DEV_DIR/assets $DEV_DIR/home/cache"
+scp voice/agent.py voice/persona.md voice/request.py voice/stream.py voice/caller.py ultraviolet:$DEV_DIR/
+scp voice/assets/earcon.wav ultraviolet:$DEV_DIR/assets/
 ```
 
 ### 2. Launch the agent pinned to a dev room
 
 Load the production secrets, including `OPENAI_API_KEY`, from the environment
 file. Use loopback URLs, a distinct health port, a writable home, and a
-bounded timeout around the process. Keep credentials out of command arguments.
+bounded timeout around the process. Set `DEV_PY` to the Python executable used
+by the production unit. Keep credentials out of command arguments.
 
 ```sh
-ssh ultraviolet sudo env DEV_DIR=$dev DEV_ROOM=dev-myfeature-<rev> \
-  DEV_PY=<python-from-unit> \
+DEV_ROOM=dev-myfeature-REV
+DEV_PY=/path/to/unit-python
+ssh ultraviolet sudo env DEV_DIR="$DEV_DIR" DEV_ROOM="$DEV_ROOM" \
+  DEV_PY="$DEV_PY" \
   bash -c 'set -euo pipefail
     set -a; . /run/agenix/mentat-voice-env; set +a
     export LIVEKIT_URL=ws://127.0.0.1:7880 MENTAT_URL=http://127.0.0.1:8484 \
@@ -73,7 +96,7 @@ ssh ultraviolet sudo env DEV_DIR=$dev DEV_ROOM=dev-myfeature-<rev> \
     printf "%s\n" "$!" >"$DEV_DIR/agent.pid"'
 ```
 
-Confirm startup with `sudo grep -E 'starting worker|job-' $dev/agent.log`.
+Confirm startup with `ssh ultraviolet sudo grep -E 'starting worker|job-' $DEV_DIR/agent.log`.
 The LiveKit Agents 1.8.1 `connect --room <name>` mode still exists, behind a
 deprecation warning. Use a unique room name for every test.
 
@@ -84,11 +107,11 @@ Mint a short-lived token, open the printed browser URL on the tailnet, allow
 the microphone, and talk.
 
 ```sh
-ssh ultraviolet sudo bash -c 'set -euo pipefail
+ssh ultraviolet sudo env DEV_ROOM="$DEV_ROOM" bash -c 'set -euo pipefail
   keyfile=/run/agenix/livekit-keys
   export LIVEKIT_API_KEY=$(sed -n "s/^\([^:[:space:]]\+\)[[:space:]]*:.*$/\1/p" "$keyfile" | head -n1)
   export LIVEKIT_API_SECRET=$(sed -n "s/^[^:]\+:[[:space:]]*\(.\+\)$/\1/p" "$keyfile" | head -n1)
-  token=$(lk token create --join --room dev-myfeature-<rev> \
+  token=$(lk token create --join --room "$DEV_ROOM" \
           --identity acceptance --valid-for 45m --token-only)
   printf "https://meet.livekit.io/custom?liveKitUrl=wss%%3A%%2F%%2Fultraviolet.tail82223.ts.net%%3A7443&token=%s\n" "$token"'
 ```
@@ -97,6 +120,30 @@ The connect job stops after the room has no human participant for several
 minutes or when the last human leaves. The SFU remains authoritative about
 participants, and the worker log shows delegation, stream, and disconnect
 events.
+
+### 4. Run calls A-D
+
+Use `LINE@DELAY_SECONDS::ANSWER_REGEX` for each scripted prompt. Regexes are
+matched against timestamped Whisper segments; output reports the first match's
+start relative to the caller's speech end. These four calls exercise current
+lookup, price/source freshness, stable knowledge, and stale-summary caution:
+
+```sh
+ssh ultraviolet sudo env DEV_DIR="$DEV_DIR" DEV_ROOM="$DEV_ROOM" DEV_PY="$DEV_PY" \
+  bash -c 'set -euo pipefail
+    set -a; . /run/agenix/mentat-voice-env; set +a
+    export LIVEKIT_URL=ws://127.0.0.1:7880
+    exec timeout 240 "$DEV_PY" "$DEV_DIR/caller.py" "$DEV_ROOM" "$@"' caller \
+  'What is the latest released version of livekit-agents on PyPI?@1::[0-9]+\.[0-9]+\.[0-9]+' \
+  'What is the current Bitcoin price in USD according to CoinGecko?@1::(?i)(?:\$|USD\s*)[0-9,]+(?:\.[0-9]+)?|[0-9,]+(?:\.[0-9]+)?\s*USD' \
+  'Who wrote Pride and Prejudice?@1::(?i)Jane\s+Austen' \
+  'What was the latest Formula 1 Grand Prix, and who won it?@1::(?i)\b(?:won|winner|unsure|uncertain)\b'
+```
+
+Compare A with PyPI, B with CoinGecko (record its currency and fetch time), C
+with Jane Austen and no delegation, and D with a live F1 results page or an
+explicit statement of uncertainty. Check `agent.log` for `web_search` on A, B,
+and D and for no delegation on C.
 
 ### Gotchas
 
@@ -108,17 +155,10 @@ events.
   agent; participant tiles only show humans. The SFU is the authority:
   `lk room participants list <room>` (same env vars as token minting, plus
   `LIVEKIT_URL=ws://127.0.0.1:7880`).
-- **Watch the log during the test.** `sudo tail -F $dev/agent.log` filtered
+- **Watch the log during the test.** `sudo tail -F $DEV_DIR/agent.log` filtered
   for `session duration|delegation failed|voice session closing|ERROR|Traceback|disconnected` shows every turn
   land in real time. rtc_session errors during teardown are normal.
 
-
-### 4. Clean up
-
-```sh
-ssh ultraviolet "sudo sh -c 'kill \$(cat $dev/agent.pid) 2>/dev/null; rm -rf $dev'"
-ssh ultraviolet sudo systemctl start mentat-voice
-```
 
 ## Phone control
 
