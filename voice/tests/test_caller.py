@@ -152,18 +152,19 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PublisherFilteringTests(unittest.TestCase):
-    def test_mixed_audio_publishers_selects_only_agent_audio(self):
+    def test_agent_audio_selects_only_microphone_source(self):
         publishers = [
-            ("agent", "audio", "answer audio"),
-            ("standard", "audio", "browser microphone"),
-            ("agent", "video", "agent video"),
+            ("agent", "audio", 0, "background audio"),
+            ("agent", "audio", 2, "spoken answer"),
+            ("standard", "audio", 2, "browser microphone"),
+            ("agent", "video", 2, "agent video"),
         ]
         selected = [
             track
-            for publisher_kind, track_kind, track in publishers
-            if is_agent_audio_track(publisher_kind, track_kind, "agent", "audio")
+            for publisher_kind, track_kind, source, track in publishers
+            if is_agent_audio_track(publisher_kind, track_kind, source, "agent", "audio", 2)
         ]
-        self.assertEqual(selected, ["answer audio"])
+        self.assertEqual(selected, ["spoken answer"])
 
 
 class CleanupDocumentationTests(unittest.TestCase):

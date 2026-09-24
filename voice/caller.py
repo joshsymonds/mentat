@@ -42,9 +42,20 @@ def parse_step(value: str) -> tuple[float, str, str]:
     return delay, line, pattern
 
 
-def is_agent_audio_track(participant_kind: Any, track_kind: Any, agent_kind: Any, audio_kind: Any) -> bool:
-    """Select only audio tracks published by LiveKit agent participants."""
-    return participant_kind == agent_kind and track_kind == audio_kind
+def is_agent_audio_track(
+    participant_kind: Any,
+    track_kind: Any,
+    publication_source: Any,
+    agent_kind: Any,
+    audio_kind: Any,
+    microphone_source: Any,
+) -> bool:
+    """Select only microphone audio tracks published by LiveKit agent participants."""
+    return (
+        participant_kind == agent_kind
+        and track_kind == audio_kind
+        and publication_source == microphone_source
+    )
 
 
 def first_matching_latency(
@@ -154,8 +165,10 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
             if is_agent_audio_track(
                 participant.kind,
                 track.kind,
+                publication.source,
                 rtc.ParticipantKind.PARTICIPANT_KIND_AGENT,
                 rtc.TrackKind.KIND_AUDIO,
+                rtc.TrackSource.SOURCE_MICROPHONE,
             ):
                 answer_tracks.put_nowait(track)
 
