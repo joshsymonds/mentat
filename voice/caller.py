@@ -6,13 +6,11 @@ import re
 import sys
 import time
 import wave
-from array import array
 from dataclasses import dataclass
 from typing import Any
 
 RATE = 24000
 FRAME_SAMPLES = RATE // 100
-SILENCE_SECONDS = 1.25
 MAX_ANSWER_SECONDS = 30
 
 
@@ -74,42 +72,27 @@ def _format_segments(segments: list[dict[str, Any]]) -> str:
     )
 
 
-def _frame_is_silent(frame: Any) -> bool:
-    samples = array("h")
-    samples.frombytes(bytes(frame.data))
-    return not samples or max(abs(sample) for sample in samples) < 250
-
-
 async def _capture_answer(track_queue: asyncio.Queue[Any]) -> tuple[bytes, int, int, float]:
     from livekit import rtc
 
-    capture_started = time.monotonic()
     track = await asyncio.wait_for(track_queue.get(), timeout=15)
+    capture_started: float | None = None
     audio_stream = rtc.AudioStream(track)
     frames: list[bytes] = []
-    quiet_samples = 0
-    heard_audio = False
-    started = time.monotonic()
     try:
         async for event in audio_stream:
             frame = event.frame
+            if capture_started is None:
+                capture_started = time.monotonic()
             raw = bytes(frame.data)
             frames.append(raw)
-            sample_count = frame.samples_per_channel
-            if _frame_is_silent(frame):
-                quiet_samples += sample_count
-            else:
-                heard_audio = True
-                quiet_samples = 0
-            elapsed = time.monotonic() - started
-            if heard_audio and quiet_samples / frame.sample_rate >= SILENCE_SECONDS:
-                break
+            elapsed = time.monotonic() - capture_started
             if elapsed >= MAX_ANSWER_SECONDS:
                 break
     finally:
         await audio_stream.aclose()
         track_queue.put_nowait(track)
-    if not frames:
+    if not frames or capture_started is None:
         raise RuntimeError("agent audio track produced no frames")
     return b"".join(frames), frame.sample_rate, frame.num_channels, capture_started
 

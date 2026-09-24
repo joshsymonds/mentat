@@ -1,13 +1,17 @@
+import asyncio
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from caller import first_matching_latency, is_agent_audio_track, parse_step
+import caller
+from caller import _capture_answer, first_matching_latency, is_agent_audio_track, parse_step
 
 
 class ParseStepTests(unittest.TestCase):
@@ -53,6 +57,98 @@ class MatchingLatencyTests(unittest.TestCase):
     def test_rejects_invalid_regex(self):
         with self.assertRaises(ValueError):
             first_matching_latency([], "[", 0.0, 0.0)
+
+
+class CaptureTests(unittest.IsolatedAsyncioTestCase):
+    def fake_rtc(self, frames, before_first_frame=None):
+        class AudioStream:
+            def __init__(self, track):
+                self.frames = iter(frames)
+                self.first_frame = True
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    frame = next(self.frames)
+                    if self.first_frame and before_first_frame is not None:
+                        before_first_frame()
+                    self.first_frame = False
+                    return SimpleNamespace(frame=frame)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+            async def aclose(self):
+                return None
+
+        return SimpleNamespace(AudioStream=AudioStream)
+
+    @staticmethod
+    def frame(silent):
+        sample = b"\0\0" if silent else b"\0\1"
+        return SimpleNamespace(
+            data=sample * 100,
+            samples_per_channel=100,
+            sample_rate=1000,
+            num_channels=1,
+        )
+
+    async def test_capture_keeps_search_answer_after_acknowledgment_pause(self):
+        answer = self.frame(False)
+        answer.data = b"\x01\0" * 100
+        frames = [self.frame(False), *[self.frame(True) for _ in range(13)], answer]
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=self.fake_rtc(frames))}):
+            pcm, _, _, _ = await _capture_answer(queue)
+        self.assertEqual(len(pcm), len(frames) * 200)
+        self.assertTrue(pcm.endswith(answer.data))
+
+    async def test_latency_origin_includes_wait_for_first_audio_frame(self):
+        class Clock:
+            now = 100.0
+
+            def monotonic(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        clock = Clock()
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        with patch.object(caller, "time", clock):
+            with patch.dict(
+                sys.modules,
+                {"livekit": SimpleNamespace(rtc=self.fake_rtc([self.frame(False)], lambda: clock.advance(8.1)))},
+            ):
+                _, _, _, capture_started = await _capture_answer(queue)
+        self.assertEqual(capture_started, 108.1)
+        self.assertAlmostEqual(
+            first_matching_latency([{"start": 0.0, "text": "Answer"}], "Answer", 100.0, capture_started),
+            8.1,
+        )
+
+    async def test_latency_origin_is_after_delayed_track_subscription(self):
+        frames = [self.frame(False)]
+
+        class DelayedQueue(asyncio.Queue):
+            async def get(self):
+                await asyncio.sleep(0)
+                caller.time.monotonic()
+                return object()
+
+        queue = DelayedQueue()
+        clock = Mock(side_effect=[100.0, 108.1, 108.2])
+        with patch.object(caller, "time", SimpleNamespace(monotonic=clock)):
+            with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=self.fake_rtc(frames))}):
+                _, _, _, capture_started = await _capture_answer(queue)
+        self.assertEqual(capture_started, 108.1)
+        self.assertAlmostEqual(
+            first_matching_latency([{"start": 0.0, "text": "Answer"}], "Answer", 100.0, capture_started),
+            8.1,
+        )
 
 
 class PublisherFilteringTests(unittest.TestCase):
