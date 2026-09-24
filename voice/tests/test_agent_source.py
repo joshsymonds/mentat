@@ -49,6 +49,28 @@ class AgentSourceContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
+    def test_each_delegation_logs_exactly_at_first_commentary_append(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        run_delegation = source.split("    async def _run_delegation(", 1)[1].split(
+            "    async def _stream_backend(", 1
+        )[0]
+        stream_backend = source.split("    async def _stream_backend(", 1)[1].split(
+            "\n\ndef log_turn_metrics", 1
+        )[0]
+
+        log_line = 'logger.info("delegation %s first commentary", delegation.id)'
+        guarded_log = run_delegation.index(log_line)
+        first_check = run_delegation.index("if not commentary_logged")
+        mark_logged = run_delegation.index("commentary_logged = True")
+        append = run_delegation.index("self.duplex_session.append_commentary(")
+        self.assertEqual(run_delegation.count(log_line), 1)
+        self.assertLess(first_check, guarded_log)
+        self.assertLess(guarded_log, mark_logged)
+        self.assertLess(mark_logged, append)
+        self.assertIn("append_commentary=append_commentary", run_delegation)
+        self.assertEqual(stream_backend.count("append_commentary(chunk)"), 2)
+        self.assertNotIn("duplex_session.append_commentary(", stream_backend)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -108,18 +108,29 @@ class FrontAgent(Agent):
         )
 
     async def _run_delegation(self, delegation: GPTLiveDelegation) -> None:
+        commentary_logged = False
+
+        def append_commentary(text: str) -> None:
+            nonlocal commentary_logged
+            if not commentary_logged:
+                logger.info("delegation %s first commentary", delegation.id)
+                commentary_logged = True
+            self.duplex_session.append_commentary(text, delegation_id=delegation.id)
+
         try:
-            await self._stream_backend(delegation)
+            await self._stream_backend(delegation, append_commentary=append_commentary)
         except asyncio.CancelledError:
             raise
         except (TurnError, aiohttp.ClientError, TimeoutError) as error:
             logger.warning("delegation failed: %s", error)
-            self.duplex_session.append_commentary(
-                CONSULT_FAILED,
-                delegation_id=delegation.id,
-            )
+            append_commentary(CONSULT_FAILED)
 
-    async def _stream_backend(self, delegation: GPTLiveDelegation) -> None:
+    async def _stream_backend(
+        self,
+        delegation: GPTLiveDelegation,
+        *,
+        append_commentary: Callable[[str], None],
+    ) -> None:
         envelope = consult_envelope(
             self._voice_card,
             summary="",
@@ -143,10 +154,7 @@ class FrontAgent(Agent):
                         if isinstance(item, str):
                             saw_text = True
                             for chunk in chunker.feed(item):
-                                self.duplex_session.append_commentary(
-                                    chunk,
-                                    delegation_id=delegation.id,
-                                )
+                                append_commentary(chunk)
                         elif isinstance(item, ToolResult):
                             logger.info(
                                 "delegation %s: tool %s%s",
@@ -163,10 +171,7 @@ class FrontAgent(Agent):
                         elif isinstance(item, TurnDone):
                             for chunk in chunker.flush():
                                 saw_text = True
-                                self.duplex_session.append_commentary(
-                                    chunk,
-                                    delegation_id=delegation.id,
-                                )
+                                append_commentary(chunk)
                             done_seen = True
                             break
                     if done_seen:
