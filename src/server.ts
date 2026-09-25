@@ -15,7 +15,7 @@ import {
 } from './backend.ts';
 import type { Logger } from './log.ts';
 import { handleMcp, type McpDependencies } from './mcp.ts';
-import type { TokenIssuer } from './voicetoken.ts';
+import { parseCallContext, type TokenIssuer } from './voicetoken.ts';
 import { errorLine, toWireLine } from './wire.ts';
 
 /** An utterance is tiny; this only stops unbounded request bodies. */
@@ -80,14 +80,12 @@ export function createHandler(
 ): RequestListener {
   return (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/voice/token' && issuer !== undefined) {
-      try {
-        const body = JSON.stringify(issuer.issue()) + '\n';
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(body);
-      } catch (error) {
-        logger.error('voice token issuance failed', { error: String(error) });
-        fail(res, 500, 'internal');
-      }
+      handleVoiceToken(issuer, logger, req, res).catch((error: unknown) => {
+        logger.error('voice token handler failed', { error: String(error) });
+        if (!res.destroyed) {
+          res.destroy();
+        }
+      });
       return;
     }
     if (req.method === 'POST' && req.url === '/v1/conversation') {
@@ -277,6 +275,46 @@ async function readTurnRequest(
     ...(effort !== undefined && { effort: effort as Effort }),
     ...(model !== undefined && { model }),
   };
+}
+
+// The call context in the body only colours the greeting, so a body that is
+// empty or does not parse still gets a token — never a failed call.
+async function handleVoiceToken(
+  issuer: TokenIssuer,
+  logger: Logger,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    for await (const chunk of req) {
+      const buffer = chunk as Buffer;
+      size += buffer.length;
+      if (size > MAX_REQUEST_BYTES) {
+        fail(res, 413, 'request body too large');
+        return;
+      }
+      chunks.push(buffer);
+    }
+  } catch {
+    res.destroy();
+    return;
+  }
+  let body: unknown;
+  try {
+    body = size > 0 ? (JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown) : undefined;
+  } catch {
+    logger.warn('voice token body is not JSON; issuing without call context');
+  }
+  try {
+    const grant = JSON.stringify(issuer.issue(parseCallContext(body))) + '\n';
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(grant);
+  } catch (error) {
+    logger.error('voice token issuance failed', { error: String(error) });
+    fail(res, 500, 'internal');
+  }
 }
 
 async function readJsonBody(

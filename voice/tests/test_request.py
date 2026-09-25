@@ -1,13 +1,19 @@
 """Offline tests for voice request construction and ending policy."""
 
 import asyncio
+import json
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from request import (
+    ATTR_DRIVING,
+    ATTR_LOCATION,
+    ATTR_TIME_ZONE,
+    CALL_OPENED,
     CLOSE_TAIL_S,
     CLOSE_UNSPOKEN_S,
     CONSULT_FRAMING,
@@ -19,7 +25,9 @@ from request import (
     VOICE_CARD_MARKER,
     DelegationRunner,
     EndingPolicy,
+    Place,
     PrivateContext,
+    call_context,
     consult_envelope,
     load_private_context,
     parse_private_context,
@@ -59,6 +67,22 @@ class RequestTest(unittest.TestCase):
             ),
             [("assistant", "reply"), ("user", "new")],
         )
+
+    def test_recent_turns_drops_the_opening_cue(self):
+        self.assertEqual(
+            recent_turns(
+                [Message("user", CALL_OPENED), Message("assistant", "Hey, what's up?")]
+            ),
+            [("assistant", "Hey, what's up?")],
+        )
+
+    def test_consult_envelope_ends_the_call_once_intent_is_complete(self):
+        envelope = " ".join(consult_envelope("card", "", [], "Set a timer").lower().split())
+        self.assertIn("end the call as soon as josh's intent is complete", envelope)
+        self.assertIn("no offer of more help", envelope)
+        self.assertIn("end_conversation with reason done in the same turn", envelope)
+        self.assertIn("end_conversation with reason signoff", envelope)
+        self.assertIn("keep the call open only when you asked josh something", envelope)
 
     def test_consult_envelope_has_backend_rules_and_question(self):
         envelope = consult_envelope(
@@ -103,6 +127,22 @@ class RequestTest(unittest.TestCase):
             parse_private_context('keyterms = ["Mentat"]')
         with self.assertRaises(ValueError):
             parse_private_context('unknown = "x"')
+
+    def test_private_context_places_parse_strictly(self):
+        parsed = parse_private_context(
+            "[places.home]\nlat = 47.6\nlng = -122.3\nradius_m = 150\n"
+        )
+        self.assertEqual(parsed.places, {"home": Place(47.6, -122.3, 150.0)})
+        for bad in (
+            "places = 3",
+            "[places.home]\nlat = 47.6\nlng = -122.3\n",
+            '[places.home]\nlat = "47.6"\nlng = -122.3\nradius_m = 150\n',
+            "[places.home]\nlat = 91\nlng = -122.3\nradius_m = 150\n",
+            "[places.home]\nlat = 47.6\nlng = -122.3\nradius_m = 0\n",
+            "[places.home]\nlat = 47.6\nlng = -122.3\nradius_m = 150\nname = 'x'\n",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_private_context(bad)
 
     def test_turn_constants_are_pinned(self):
         self.assertEqual(TURN_META, {"surface": "voice", "user": "josh"})
@@ -321,6 +361,72 @@ class CloseSequenceTest(unittest.IsolatedAsyncioTestCase):
         await run_close_sequence(close_player, delete_room, shutdown_job, logs.append)
         self.assertEqual(order, ["close_player", "delete_room", "shutdown_job"])
         self.assertIn("room already gone", logs[0])
+
+
+PACIFIC = timezone(timedelta(hours=-7))
+# Thursday 2026-09-24 19:40 Pacific
+THURSDAY_EVENING = datetime(2026, 9, 24, 19, 40, tzinfo=PACIFIC)
+PLACES = {"home": Place(47.6062, -122.3321, 150.0), "the gym": Place(47.62, -122.35, 80.0)}
+
+
+def located(lat, lng, accuracy=10.0):
+    return {ATTR_LOCATION: json.dumps({"lat": lat, "lng": lng, "accuracy_m": accuracy, "age_s": 4})}
+
+
+class CallContextTest(unittest.TestCase):
+    def test_time_of_day_without_attributes_uses_worker_time(self):
+        self.assertEqual(
+            call_context({}, PLACES, THURSDAY_EVENING),
+            "Call context at the start of this call: It's Thursday evening, 7:40 pm.",
+        )
+
+    def test_parts_of_day(self):
+        for hour, part in ((6, "morning"), (13, "afternoon"), (22, "night"), (2, "the middle of the night")):
+            with self.subTest(hour=hour):
+                self.assertIn(part, call_context({}, {}, THURSDAY_EVENING.replace(hour=hour)))
+
+    def test_place_driving_and_home_zone(self):
+        attributes = {
+            ATTR_TIME_ZONE: "America/Los_Angeles",
+            ATTR_DRIVING: "true",
+            **located(47.6065, -122.3325),
+        }
+        self.assertEqual(
+            call_context(attributes, PLACES, THURSDAY_EVENING),
+            "Call context at the start of this call: It's Thursday evening, 7:40 pm. "
+            "Josh is at home. Josh is driving.",
+        )
+
+    def test_away_zone_is_local_time_and_flags_travel(self):
+        context = call_context({ATTR_TIME_ZONE: "America/New_York"}, PLACES, THURSDAY_EVENING)
+        self.assertIn("It's Thursday night, 10:40 pm.", context)
+        self.assertIn("Josh's phone is on New York time, not home time, so he's probably traveling.", context)
+
+    def test_unknown_zone_falls_back_to_worker_time(self):
+        context = call_context({ATTR_TIME_ZONE: "Mars/Olympus"}, PLACES, THURSDAY_EVENING)
+        self.assertIn("7:40 pm", context)
+        self.assertNotIn("traveling", context)
+
+    def test_far_fuzzy_or_malformed_locations_name_no_place(self):
+        for attributes in (
+            located(40.0, -100.0),
+            located(47.6100, -122.3321, accuracy=5000.0),
+            {ATTR_LOCATION: "not json"},
+            {ATTR_LOCATION: json.dumps({"lat": "x"})},
+        ):
+            with self.subTest(attributes=attributes):
+                self.assertNotIn("Josh is at", call_context(attributes, PLACES, THURSDAY_EVENING))
+
+    def test_fuzzy_fix_counts_within_its_accuracy(self):
+        # ~250 m north of home, 150 m radius, 120 m accuracy
+        context = call_context(located(47.6085, -122.3321, 120.0), PLACES, THURSDAY_EVENING)
+        self.assertIn("Josh is at home.", context)
+
+    def test_nearest_matching_place_wins_and_needs_an_aware_now(self):
+        places = {"the office": Place(47.6062, -122.3321, 500.0), "home": Place(47.6063, -122.3321, 50.0)}
+        self.assertIn("Josh is at home.", call_context(located(47.6063, -122.3321), places, THURSDAY_EVENING))
+        with self.assertRaises(ValueError):
+            call_context({}, {}, THURSDAY_EVENING.replace(tzinfo=None))
 
 
 if __name__ == "__main__":

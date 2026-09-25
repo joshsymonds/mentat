@@ -60,6 +60,33 @@ class PhoneLocationTest {
     }
 
     @Test
+    fun recentReturnsAFreshLastKnownFixWithoutWaitingOnACurrentOne() {
+        val source = FakeLocationSource(
+            currentThrows = AssertionError("waited on a current fix"),
+            lastKnownLocation = location(47.6, -122.3, 15f, ageSeconds = 120),
+        )
+        val phoneLocation = PhoneLocation(ApplicationProvider.getApplicationContext(), source)
+        grantLocation()
+
+        val response = requireNotNull(phoneLocation.recent())
+
+        assertEquals(47.6, response.getDouble("lat"), 0.00001)
+        assertEquals(120L, response.getLong("age_s"))
+        assertFalse(source.currentCalled)
+    }
+
+    @Test
+    fun recentRejectsStaleFixesAndMissingPermission() {
+        val stale = FakeLocationSource(lastKnownLocation = location(47.6, -122.3, 15f, ageSeconds = 900))
+        grantLocation()
+        assertEquals(null, PhoneLocation(ApplicationProvider.getApplicationContext(), stale).recent())
+
+        val denied = FakeLocationSource(lastKnownLocation = location(47.6, -122.3, 15f, ageSeconds = 1))
+        assertEquals(null, PhoneLocation(denied, permissionGranted = { false }).recent())
+        assertFalse(denied.lastKnownCalled)
+    }
+
+    @Test
     fun missingPermissionRejectsWithoutTouchingSource() {
         val source = FakeLocationSource(currentThrows = AssertionError("source touched"))
         val phoneLocation = PhoneLocation(ApplicationProvider.getApplicationContext(), source)

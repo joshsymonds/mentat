@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.json.JSONObject
 import org.junit.Test
 
 class TokenEndpointTest {
@@ -47,6 +48,24 @@ class TokenEndpointTest {
 
         assertEquals("POST", method.get())
         assertEquals(0, bodySize.get())
+    }
+
+    @Test
+    fun fetchPostsTheCallContextAsJson() {
+        val body = AtomicReference<String>()
+        val response = """
+            {"token": "t", "room": "r", "url": "wss://voice.example.com", "expires_at": "2026-08-19T16:00:00.000Z"}
+        """.trimIndent()
+        val location = JSONObject().put("lat", 47.6).put("lng", -122.3).put("accuracy_m", 12.0).put("age_s", 30)
+
+        withServer(response = response, onRequest = { _, requestBody -> body.set(String(requestBody)) }) { baseUrl ->
+            HttpTokenEndpoint(baseUrl).fetch(CallContext("America/Los_Angeles", location, driving = false))
+        }
+
+        val context = JSONObject(body.get()).getJSONObject("context")
+        assertEquals("America/Los_Angeles", context.getString("time_zone"))
+        assertEquals(false, context.getBoolean("driving"))
+        assertEquals(47.6, context.getJSONObject("location").getDouble("lat"), 0.00001)
     }
 
     @Test

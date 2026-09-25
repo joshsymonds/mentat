@@ -333,7 +333,8 @@ export async function handleMcp(
   server.registerTool(
     'end_conversation',
     {
-      description: 'End the current voice conversation after a sign-off or after completing the request.',
+      description:
+        'End the current voice conversation: after a sign-off, or as soon as the request is complete and nothing is left open.',
       inputSchema: { reason: z.enum(['signoff', 'done']) },
     },
     () => textResult('Conversation ended.'),

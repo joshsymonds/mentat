@@ -16,7 +16,7 @@ data class TokenGrant(
 )
 
 interface TokenEndpoint {
-    fun fetch(): TokenGrant
+    fun fetch(context: CallContext? = null): TokenGrant
 }
 
 class TokenFetchException(
@@ -32,16 +32,20 @@ class HttpTokenEndpoint(
 ) : TokenEndpoint {
     private val endpointUrl = "${baseUrl.trimEnd('/')}/v1/voice/token"
 
-    override fun fetch(): TokenGrant {
+    override fun fetch(context: CallContext?): TokenGrant {
         var connection: HttpURLConnection? = null
+        val body = context?.toRequestBody()?.toByteArray(Charsets.UTF_8) ?: ByteArray(0)
         try {
             connection = URL(endpointUrl).openConnection() as HttpURLConnection
             connection.connectTimeout = connectTimeoutMillis
             connection.readTimeout = readTimeoutMillis
             connection.requestMethod = "POST"
             connection.doOutput = true
-            connection.setFixedLengthStreamingMode(0)
-            connection.outputStream.use { }
+            if (body.isNotEmpty()) {
+                connection.setRequestProperty("Content-Type", "application/json")
+            }
+            connection.setFixedLengthStreamingMode(body.size)
+            connection.outputStream.use { it.write(body) }
 
             val status = connection.responseCode
             if (status != HttpURLConnection.HTTP_OK) {

@@ -2,6 +2,7 @@ package gg.savecraft.mentat.session
 
 import android.content.Intent
 import android.os.Looper
+import gg.savecraft.mentat.core.CallContext
 import gg.savecraft.mentat.core.SessionState
 import gg.savecraft.mentat.core.TokenEndpoint
 import gg.savecraft.mentat.core.TokenFetchException
@@ -246,19 +247,51 @@ class VoiceSessionServiceTest {
         assertTrue(liveKit.microphoneEnabled.value)
     }
 
+    @Test
+    fun callContextRidesWithTheTokenRequest() = runBlocking {
+        val context = CallContext(timeZone = "America/Los_Angeles", location = null, driving = true)
+        val endpoint = RecordingTokenEndpoint()
+
+        controller(FakeLiveKitSession(), endpoint, callContext = { context }).start()
+
+        assertEquals(listOf<CallContext?>(context), endpoint.contexts)
+    }
+
+    @Test
+    fun unreadableCallContextStillFetchesATokenWithoutOne() = runBlocking {
+        val endpoint = RecordingTokenEndpoint()
+        val liveKit = FakeLiveKitSession()
+
+        controller(liveKit, endpoint, callContext = { throw SecurityException("no location") }).start()
+
+        assertEquals(listOf<CallContext?>(null), endpoint.contexts)
+        assertEquals("wss://voice.example.com" to "token", liveKit.connection)
+    }
+
     private fun controller(
         liveKitSession: FakeLiveKitSession,
         tokenEndpoint: TokenEndpoint = FakeTokenEndpoint,
         stopService: () -> Unit = {},
+        callContext: () -> CallContext? = { null },
     ) = VoiceSessionController(
         tokenEndpoint = tokenEndpoint,
         liveKitSession = liveKitSession,
         stopService = stopService,
         scope = scope,
+        callContext = callContext,
     )
 
+    private class RecordingTokenEndpoint : TokenEndpoint {
+        val contexts = mutableListOf<CallContext?>()
+
+        override fun fetch(context: CallContext?): TokenGrant {
+            contexts += context
+            return FakeTokenEndpoint.fetch(context)
+        }
+    }
+
     private object FakeTokenEndpoint : TokenEndpoint {
-        override fun fetch() = TokenGrant(
+        override fun fetch(context: CallContext?) = TokenGrant(
             token = "token",
             room = "room",
             url = "wss://voice.example.com",
@@ -267,7 +300,7 @@ class VoiceSessionServiceTest {
     }
 
     private object FailingTokenEndpoint : TokenEndpoint {
-        override fun fetch(): TokenGrant = throw TokenFetchException("Token request failed")
+        override fun fetch(context: CallContext?): TokenGrant = throw TokenFetchException("Token request failed")
     }
 
     class FakeLiveKitSession(

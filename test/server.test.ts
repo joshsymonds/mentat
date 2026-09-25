@@ -301,8 +301,9 @@ describe('POST /v1/voice/token', () => {
   };
   const issuer: TokenIssuer = { issue: () => grant };
 
-  it('returns the issued grant as single-line JSON when configured and ignores the body', async () => {
-    const base = await serve(new FakeBackend(() => []), new SessionTracker(), issuer);
+  it('returns the issued grant as single-line JSON and issues without context for a non-JSON body', async () => {
+    const issue = vi.fn<TokenIssuer['issue']>(() => grant);
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), { issue });
 
     const res = await fetch(`${base}/v1/voice/token`, {
       method: 'POST',
@@ -312,6 +313,20 @@ describe('POST /v1/voice/token', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('application/json');
     expect(await res.text()).toBe(`${JSON.stringify(grant)}\n`);
+    expect(issue).toHaveBeenCalledWith(undefined);
+  });
+
+  it('passes the call context in the body to the issuer', async () => {
+    const issue = vi.fn<TokenIssuer['issue']>(() => grant);
+    const base = await serve(new FakeBackend(() => []), new SessionTracker(), { issue });
+
+    const res = await fetch(`${base}/v1/voice/token`, {
+      method: 'POST',
+      body: JSON.stringify({ context: { time_zone: 'America/Chicago', driving: true } }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(issue).toHaveBeenCalledWith({ timeZone: 'America/Chicago', driving: true });
   });
 
   it('returns 500 when issuance throws and continues serving requests', async () => {

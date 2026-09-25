@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import tomllib
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SESSION_PREFIX = "voice-"
 TURN_META = {"surface": "voice", "user": "josh"}
@@ -23,8 +27,13 @@ CONSULT_SMS_RULE = (
     "in a later turn. A yes authorizes exactly that message once; then call send_sms with send=true."
 )
 CONSULT_ENDING_RULE = (
-    "To end the call, say the closing words, then call end_conversation with a reason, "
-    "and say nothing after."
+    "End the call as soon as Josh's intent is complete. When an action is confirmed or a "
+    "question is answered and nothing is left open, confirm it in a few words, with no "
+    "offer of more help, then call end_conversation with reason done in the same turn. "
+    "When Josh signs off, say a short goodbye, then call end_conversation with reason "
+    "signoff. Keep the call open only when you asked Josh something you need answered. "
+    "Load end_conversation in the same tool search as any other tool the turn needs. "
+    "To end the call, say the closing words, then call end_conversation, and say nothing after."
 )
 CONSULT_WINDOW_TURNS = 2
 CONSULT_TURN_CHARS = 500
@@ -34,6 +43,8 @@ CLOSE_TAIL_S = 1.0
 CLOSE_UNSPOKEN_S = 4.0
 IDLE_S = 30.0
 END_CONVERSATION_TOOL = "mcp__mentat__end_conversation"
+# the startup user item that, with the persona's opening policy, makes the voice speak first
+CALL_OPENED = "(Josh just opened the call.)"
 
 
 class EndingPolicy:
@@ -206,17 +217,27 @@ async def run_close_sequence(
 
 
 @dataclass(frozen=True)
+class Place:
+    """A named spot Josh is at when his phone is within ``radius_m`` of it."""
+
+    lat: float
+    lng: float
+    radius_m: float
+
+
+@dataclass(frozen=True)
 class PrivateContext:
     """Private deployment context kept outside the public repository."""
 
     about: str = ""
     pronunciations: Mapping[str, str] = field(default_factory=dict)
+    places: Mapping[str, Place] = field(default_factory=dict)
 
 
 def parse_private_context(text: str) -> PrivateContext:
     """Parse the strict private-context TOML document."""
     data = tomllib.loads(text)
-    unknown = set(data) - {"about", "pronunciations"}
+    unknown = set(data) - {"about", "pronunciations", "places"}
     if unknown:
         raise ValueError(f"private context has unknown keys: {sorted(unknown)}")
     about = data.get("about", "")
@@ -230,7 +251,25 @@ def parse_private_context(text: str) -> PrivateContext:
     return PrivateContext(
         about=about.strip(),
         pronunciations=dict(pronunciations),
+        places=_parse_places(data.get("places", {})),
     )
+
+
+def _parse_places(raw: Any) -> dict[str, Place]:
+    if not isinstance(raw, dict):
+        raise ValueError("private context: places must be a table of places")
+    places: dict[str, Place] = {}
+    for name, spec in raw.items():
+        if not isinstance(spec, dict) or set(spec) != {"lat", "lng", "radius_m"}:
+            raise ValueError(f"private context: place {name!r} needs exactly lat, lng, radius_m")
+        values = [spec["lat"], spec["lng"], spec["radius_m"]]
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+            raise ValueError(f"private context: place {name!r} coordinates must be numbers")
+        lat, lng, radius = (float(v) for v in values)
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180 and radius > 0):
+            raise ValueError(f"private context: place {name!r} is out of range")
+        places[name] = Place(lat=lat, lng=lng, radius_m=radius)
+    return places
 
 
 def load_private_context(path: str | None) -> PrivateContext:
@@ -257,12 +296,13 @@ def with_private_context(instructions: str, private: PrivateContext) -> str:
 def recent_turns(
     items: Iterable[Any], count: int = CONSULT_WINDOW_TURNS
 ) -> list[tuple[str, str]]:
-    """Return the latest text-bearing message turns, oldest first."""
+    """Return the latest text-bearing message turns, oldest first, without the opening cue."""
     turns = [
         (str(item.role), str(item.text_content))
         for item in items
         if getattr(item, "type", None) == "message"
         and getattr(item, "text_content", None)
+        and item.text_content != CALL_OPENED
     ]
     return turns[-count:]
 
@@ -317,3 +357,86 @@ def _capped(text: str) -> str:
     if len(text) <= CONSULT_TURN_CHARS:
         return text
     return text[:CONSULT_TURN_CHARS] + "…"
+
+
+# participant attributes mentatd stamps on the phone's token from its call context
+ATTR_TIME_ZONE = "mentat.time_zone"
+ATTR_LOCATION = "mentat.location"
+ATTR_DRIVING = "mentat.driving"
+EARTH_RADIUS_M = 6_371_000.0
+
+
+def _part_of_day(hour: int) -> str:
+    if 5 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 17:
+        return "afternoon"
+    if 17 <= hour < 21:
+        return "evening"
+    if 0 <= hour < 5:
+        return "the middle of the night"
+    return "night"
+
+
+def _distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = phi2 - phi1
+    dlmb = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def nearest_place(attributes: Mapping[str, str], places: Mapping[str, Place]) -> str | None:
+    """The named place the phone's reported location falls inside, nearest first."""
+    try:
+        location = json.loads(attributes[ATTR_LOCATION])
+        lat, lng = float(location["lat"]), float(location["lng"])
+        accuracy = max(0.0, float(location.get("accuracy_m", 0.0)))
+    except (KeyError, TypeError, ValueError):
+        return None
+    best: tuple[float, str] | None = None
+    for name, place in places.items():
+        distance = _distance_m(lat, lng, place.lat, place.lng)
+        # a fuzzy fix may still count, but never by more than the place's own radius
+        if distance - min(accuracy, place.radius_m) <= place.radius_m:
+            if best is None or distance < best[0]:
+                best = (distance, name)
+    return best[1] if best else None
+
+
+def call_timezone(attributes: Mapping[str, str], home: tzinfo) -> tzinfo:
+    """The phone's zone when it reported a real one, else the worker's own."""
+    name = attributes.get(ATTR_TIME_ZONE)
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return home
+
+
+def call_context(
+    attributes: Mapping[str, str],
+    places: Mapping[str, Place],
+    now: datetime,
+) -> str:
+    """One instruction paragraph describing Josh's situation as the call opens.
+
+    ``now`` is aware and in the worker's zone, which stands in for home time.
+    """
+    home = now.tzinfo
+    if home is None:
+        raise ValueError("call_context needs an aware datetime")
+    zone = call_timezone(attributes, home)
+    local = now.astimezone(zone)
+    clock = local.strftime("%I:%M %p").lstrip("0").lower()
+    lines = [f"It's {local.strftime('%A')} {_part_of_day(local.hour)}, {clock}."]
+    if local.utcoffset() != now.astimezone(home).utcoffset():
+        city = str(zone).rsplit("/", 1)[-1].replace("_", " ")
+        lines.append(f"Josh's phone is on {city} time, not home time, so he's probably traveling.")
+    if (place := nearest_place(attributes, places)) is not None:
+        lines.append(f"Josh is at {place}.")
+    if attributes.get(ATTR_DRIVING) == "true":
+        lines.append("Josh is driving.")
+    return "Call context at the start of this call: " + " ".join(lines)
+

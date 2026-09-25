@@ -72,6 +72,16 @@ class PhoneLocation private constructor(
         return null
     }
 
+    /** The last-known fix if it is recent, without waiting on a new one. */
+    fun recent(): JSONObject? {
+        if (!permissionChecker()) {
+            return null
+        }
+        val lastKnown = runCatching { source.lastKnown() }.getOrNull() ?: return null
+        val ageNanos = ageNanos(lastKnown)
+        return if (ageNanos <= MAX_LAST_KNOWN_AGE_NANOS) encode(lastKnown, ageNanos / NANOS_PER_SECOND) else null
+    }
+
     private fun encode(location: Location, ageSeconds: Long = ageSeconds(location)): JSONObject =
         JSONObject()
             .put("lat", location.latitude)

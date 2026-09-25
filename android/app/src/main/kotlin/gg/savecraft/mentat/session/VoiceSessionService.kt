@@ -4,18 +4,23 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.app.UiModeManager
 import android.content.Intent
+import android.content.res.Configuration
 import android.os.Binder
 import android.os.IBinder
 import android.util.Log
 import gg.savecraft.mentat.R
+import gg.savecraft.mentat.core.CallContext
 import gg.savecraft.mentat.core.HttpTokenEndpoint
+import gg.savecraft.mentat.core.PhoneLocation
 import gg.savecraft.mentat.core.SessionEvent
 import gg.savecraft.mentat.core.SessionState
 import gg.savecraft.mentat.core.SessionStateMachine
 import gg.savecraft.mentat.core.TokenEndpoint
 import gg.savecraft.mentat.core.Transcript
 import gg.savecraft.mentat.core.TranscriptSegment
+import java.time.ZoneId
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -48,6 +53,7 @@ open class VoiceSessionService : Service() {
             liveKitSession = liveKitSession(),
             stopService = ::stopVoiceService,
             scope = serviceScope,
+            callContext = ::callContext,
         )
     }
 
@@ -104,6 +110,14 @@ open class VoiceSessionService : Service() {
 
     protected open fun liveKitSession(): LiveKitSession = AndroidLiveKitSession(this)
 
+    /** Time zone, a recent fix, and Android Auto's car mode, read without waiting on anything. */
+    protected open fun callContext(): CallContext = CallContext(
+        timeZone = ZoneId.systemDefault().id,
+        location = PhoneLocation(this).recent(),
+        driving = getSystemService(UiModeManager::class.java)?.currentModeType ==
+            Configuration.UI_MODE_TYPE_CAR,
+    )
+
 
     protected open fun stopVoiceService() {
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -143,6 +157,7 @@ internal class VoiceSessionController(
     private val liveKitSession: LiveKitSession,
     private val stopService: () -> Unit,
     private val scope: CoroutineScope,
+    private val callContext: () -> CallContext? = { null },
 ) {
     private val machine = SessionStateMachine()
     private val transcriptStore = Transcript()
@@ -169,7 +184,16 @@ internal class VoiceSessionController(
         }
         transition(SessionEvent.AssistInvoked)
         val grant = try {
-            withContext(Dispatchers.IO) { tokenEndpoint.fetch() }
+            withContext(Dispatchers.IO) {
+                // the context only colours the greeting; failing to read it never blocks a call
+                val context = try {
+                    callContext()
+                } catch (exception: Exception) {
+                    Log.w("MentatAssist", "Unable to read call context", exception)
+                    null
+                }
+                tokenEndpoint.fetch(context)
+            }
         } catch (exception: Exception) {
             transition(SessionEvent.TokenFailed(exception.message ?: "Unable to fetch voice token"))
             return

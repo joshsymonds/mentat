@@ -60,6 +60,18 @@ VOICE_STABLE = (
     "than delegating."
 )
 
+OPENING_POLICY = (
+    "When the call opens, speak first. Greet Josh in a few words and ask what's up, "
+    "then listen. Let the call context shape the greeting: the time of day, the day "
+    "of the week, where he is, or that he's driving or traveling. Lead with the most "
+    "specific thing you know: driving, traveling, or a named place beats the time of "
+    "day. Vary the wording from call to call."
+)
+COMPLETION_POLICY = (
+    'When Mentat confirms an action or answers Josh\'s request, relay it briefly and '
+    'stop. Do not add "anything else?" or offer more help;'
+)
+
 
 class InstructionPolicyTest(unittest.TestCase):
     @classmethod
@@ -95,6 +107,10 @@ class InstructionPolicyTest(unittest.TestCase):
     def test_voice_delegates_uncertain_facts_but_answers_stable_knowledge_directly(self):
         self.assert_policy_present(self.instructions, VOICE_DELEGATION)
         self.assert_policy_present(self.instructions, VOICE_STABLE)
+
+    def test_voice_greets_first_and_does_not_prolong_a_finished_request(self):
+        self.assert_policy_present(self.instructions, OPENING_POLICY)
+        self.assert_policy_present(self.instructions, COMPLETION_POLICY)
 
     def test_policy_assertions_reject_negation_or_removal(self):
         mutations = (

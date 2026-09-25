@@ -18,7 +18,18 @@ Who he is: ...one paragraph, folded into the worker instructions.
 """
 [pronunciations]
 Symonds = "Sigh-monds"
+
+# each key finishes the sentence "Josh is at ..."; radius_m is how close counts
+[places.home]
+lat = 47.6
+lng = -122.3
+radius_m = 150
 ```
+
+Places shape the opening greeting. The phone sends its time zone, last-known
+location, and whether Android Auto has it in car mode with the token request;
+mentatd stamps them on the token as participant attributes, and the worker
+turns them into a one-paragraph call context in that call's instructions.
 
 Unset means a development room has no private context. A set but unreadable
 path fails the worker at startup. To run a dev room with it, add

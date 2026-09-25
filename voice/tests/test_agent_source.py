@@ -16,6 +16,21 @@ class AgentSourceContractTest(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
+    def test_agent_opens_with_the_call_opened_cue_as_startup_history(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        self.assertIn('opening.add_message(role="user", content=CALL_OPENED)', source)
+        self.assertIn("chat_ctx=opening", source)
+
+    def test_agent_reads_call_context_before_the_session_starts(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        entry = source.split("async def entrypoint(", 1)[1]
+        wait = entry.index("await ctx.wait_for_participant()")
+        context = entry.index("call_context(caller.attributes, private.places")
+        folded = entry.index('instructions += "\\n\\n" + context')
+        start = entry.index("await session.start(")
+        self.assertLess(wait, context)
+        self.assertLess(context, folded)
+        self.assertLess(folded, start)
 
     def test_agent_handles_turn_done_and_turn_failure(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
