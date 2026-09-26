@@ -1,5 +1,6 @@
 """Source contract for the runtime-only LiveKit glue."""
 
+import ast
 import unittest
 from pathlib import Path
 
@@ -65,21 +66,84 @@ class AgentSourceContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
-    def test_microphone_subscription_starts_after_room_io_and_connect_disables_auto_subscribe(self):
+    def test_room_io_starts_before_connect_with_default_subscription(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         entry = source.split("async def entrypoint(", 1)[1]
-        connect = entry.index("await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)")
+        io_start = entry.index("await voice_room_io.start()")
+        connect = entry.index("await ctx.connect()")
+        wait = entry.index("await ctx.wait_for_participant()")
+        context = entry.index("call_context(caller.attributes, private.places")
+        folded = entry.index('instructions += "\\n\\n" + context')
         session_start = entry.index("await session.start(")
-        io_started = entry.index("room_io_started = True")
-        subscribe_existing = entry.index("for publication in caller.track_publications.values()")
-        self.assertLess(connect, session_start)
-        self.assertLess(session_start, io_started)
-        self.assertLess(io_started, subscribe_existing)
-        self.assertIn("publication.set_subscribed(True)", entry)
-        self.assertIn("publication.source == rtc.TrackSource.SOURCE_MICROPHONE", entry)
-        self.assertIn('ctx.room.on("track_published"', entry)
-        self.assertIn("participant.identity == caller_identity", entry)
-        self.assertIn("for publication in caller.track_publications.values()", entry)
+
+        self.assertLess(io_start, connect)
+        self.assertLess(connect, wait)
+        self.assertLess(wait, context)
+        self.assertLess(context, folded)
+        self.assertLess(folded, session_start)
+        self.assertNotIn("room=ctx.room", entry[session_start:])
+        self.assertIn("room_io.RoomIO(", entry)
+        self.assertNotIn("auto_subscribe=", entry)
+        self.assertNotIn("AutoSubscribe.SUBSCRIBE_NONE", entry)
+
+    def test_room_io_is_closed_with_the_session(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        entry = source.split("async def entrypoint(", 1)[1]
+        close_sequence = entry.split("run_close_sequence(", 1)[1].split("\n                )", 1)[0]
+        self.assertIn("_close_audio", close_sequence)
+        close_audio = entry.split("async def _close_audio()", 1)[1].split(
+            '@session.on("close")', 1
+        )[0]
+        self.assertIn("await _close_voice_room_io()", close_audio)
+
+    def test_close_sequence_call_matches_helper_signature(self):
+        voice_dir = Path(__file__).resolve().parents[1]
+        agent_tree = ast.parse((voice_dir / "agent.py").read_text())
+        request_tree = ast.parse((voice_dir / "request.py").read_text())
+        close_call = next(
+            node
+            for node in ast.walk(agent_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run_close_sequence"
+        )
+        close_definition = next(
+            node
+            for node in ast.walk(request_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "run_close_sequence"
+        )
+        positional_parameters = (
+            close_definition.args.posonlyargs + close_definition.args.args
+        )
+        required_parameters = len(positional_parameters) - len(close_definition.args.defaults)
+
+        self.assertGreaterEqual(len(close_call.args), required_parameters)
+        self.assertLessEqual(len(close_call.args), len(positional_parameters))
+        self.assertFalse(close_call.keywords)
+
+    def test_room_io_shutdown_cleanup_is_registered_before_connect(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        entry = source.split("async def entrypoint(", 1)[1]
+        register = entry.index("ctx.add_shutdown_callback(_close_voice_room_io)")
+        connect = entry.index("await ctx.connect()")
+        close_helper = entry.split("async def _close_voice_room_io()", 1)[1].split(
+            "ctx.add_shutdown_callback(_close_voice_room_io)", 1
+        )[0]
+        self.assertLess(register, connect)
+        self.assertIn("await voice_room_io.aclose()", close_helper)
+
+    def test_explicit_microphone_subscription_helpers_are_absent(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        for superseded in (
+            "caller_identity",
+            "_subscribe_microphone",
+            "_on_track_published",
+            "set_subscribed(True)",
+            'ctx.room.on("track_published"',
+            "caller.track_publications.values()",
+        ):
+            self.assertNotIn(superseded, source)
 
     def test_each_delegation_logs_exactly_at_first_commentary_append(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()

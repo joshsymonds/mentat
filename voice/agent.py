@@ -12,12 +12,11 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-from livekit import agents, rtc
+from livekit import agents
 from livekit.agents import (
     Agent,
     AgentSession,
     AudioConfig,
-    AutoSubscribe,
     BackgroundAudioPlayer,
     JobContext,
     WorkerOptions,
@@ -220,42 +219,45 @@ def prewarm(proc: agents.JobProcess) -> None:
 
 async def entrypoint(ctx: JobContext) -> None:
     """Serve one room until GPT-Live or the close policy ends it."""
-    caller_identity: str | None = None
-    room_io_started = False
+    session = AgentSession(
+        vad=ctx.proc.userdata["vad"],
+        llm=GPTLiveModel(voice=GPT_LIVE_VOICE, delegation="client"),
+    )
+    voice_room_io = room_io.RoomIO(
+        agent_session=session,
+        room=ctx.room,
+        options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=dtln.noise_suppression(),
+            ),
+        ),
+    )
+    voice_room_io_closed = False
 
-    def _subscribe_microphone(publication: rtc.RemoteTrackPublication) -> None:
-        if publication.source == rtc.TrackSource.SOURCE_MICROPHONE:
-            publication.set_subscribed(True)
+    async def _close_voice_room_io() -> None:
+        nonlocal voice_room_io_closed
+        if not voice_room_io_closed:
+            try:
+                await voice_room_io.aclose()
+            except Exception:
+                logger.exception("voice RoomIO cleanup failed")
+            else:
+                voice_room_io_closed = True
 
-    def _on_track_published(
-        publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
-    ) -> None:
-        if (
-            room_io_started
-            and caller_identity is not None
-            and participant.identity == caller_identity
-            and publication.source == rtc.TrackSource.SOURCE_MICROPHONE
-        ):
-            _subscribe_microphone(publication)
-
-    ctx.room.on("track_published", _on_track_published)
-    await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
+    ctx.add_shutdown_callback(_close_voice_room_io)
+    await voice_room_io.start()
+    await ctx.connect()
     instructions, voice_card = load_persona()
     private: PrivateContext = ctx.proc.userdata["private"]
     instructions = with_private_context(instructions, private)
     # The caller's token carries call context, which must be folded into the
     # instructions before the GPT-Live session begins.
     caller = await ctx.wait_for_participant()
-    caller_identity = caller.identity
     context = call_context(caller.attributes, private.places, datetime.now().astimezone())
     logger.info("%s (attributes: %s)", context, sorted(caller.attributes))
     instructions += "\n\n" + context
     ending_policy = EndingPolicy()
 
-    session = AgentSession(
-        vad=ctx.proc.userdata["vad"],
-        llm=GPTLiveModel(voice=GPT_LIVE_VOICE, delegation="client"),
-    )
     log_turn_metrics(session)
 
     background = BackgroundAudioPlayer()
@@ -292,6 +294,10 @@ async def entrypoint(ctx: JobContext) -> None:
     async def _shutdown_job() -> None:
         get_job_context().shutdown()
 
+    async def _close_audio() -> None:
+        await _close_voice_room_io()
+        await background.aclose()
+
     @session.on("close")
     def _on_close(_: Any) -> None:
         nonlocal cleanup_task, timer_task
@@ -302,7 +308,7 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.info("voice session closing")
             cleanup_task = asyncio.create_task(
                 run_close_sequence(
-                    background.aclose,
+                    _close_audio,
                     _delete_room,
                     _shutdown_job,
                     logger.error,
@@ -354,18 +360,7 @@ async def entrypoint(ctx: JobContext) -> None:
         )
         _rearm_timer()
 
-    await session.start(
-        agent=agent,
-        room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=dtln.noise_suppression(),
-            ),
-        ),
-    )
-    room_io_started = True
-    for publication in caller.track_publications.values():
-        _subscribe_microphone(publication)
+    await session.start(agent=agent)
 
 
 if __name__ == "__main__":
