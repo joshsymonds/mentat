@@ -65,6 +65,22 @@ class AgentSourceContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
+    def test_microphone_subscription_starts_after_room_io_and_connect_disables_auto_subscribe(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        entry = source.split("async def entrypoint(", 1)[1]
+        connect = entry.index("await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)")
+        session_start = entry.index("await session.start(")
+        io_started = entry.index("room_io_started = True")
+        subscribe_existing = entry.index("for publication in caller.track_publications.values()")
+        self.assertLess(connect, session_start)
+        self.assertLess(session_start, io_started)
+        self.assertLess(io_started, subscribe_existing)
+        self.assertIn("publication.set_subscribed(True)", entry)
+        self.assertIn("publication.source == rtc.TrackSource.SOURCE_MICROPHONE", entry)
+        self.assertIn('ctx.room.on("track_published"', entry)
+        self.assertIn("participant.identity == caller_identity", entry)
+        self.assertIn("for publication in caller.track_publications.values()", entry)
+
     def test_each_delegation_logs_exactly_at_first_commentary_append(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         run_delegation = source.split("    async def _run_delegation(", 1)[1].split(
