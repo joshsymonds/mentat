@@ -18,7 +18,6 @@ from livekit.agents import (
     AgentSession,
     AudioConfig,
     BackgroundAudioPlayer,
-    ChatContext,
     JobContext,
     WorkerOptions,
     get_job_context,
@@ -28,7 +27,6 @@ from livekit.plugins import dtln, silero
 from livekit.plugins.openai.realtime import GPTLiveDelegation, GPTLiveModel
 
 from request import (
-    CALL_OPENED,
     END_CONVERSATION_TOOL,
     PRIVATE_CONTEXT_ENV,
     DelegationRunner,
@@ -78,10 +76,7 @@ class FrontAgent(Agent):
         ending_policy: EndingPolicy,
         ending_changed: Callable[[], None],
     ) -> None:
-        # startup history goes out in session.start; with the opening policy it greets Josh
-        opening = ChatContext.empty()
-        opening.add_message(role="user", content=CALL_OPENED)
-        super().__init__(instructions=instructions, chat_ctx=opening)
+        super().__init__(instructions=instructions)
         self._voice_card = voice_card
         self._room_name = room_name
         self._mentat_url = mentat_url
@@ -228,8 +223,8 @@ async def entrypoint(ctx: JobContext) -> None:
     instructions, voice_card = load_persona()
     private: PrivateContext = ctx.proc.userdata["private"]
     instructions = with_private_context(instructions, private)
-    # the caller's token carries the phone's call context, and session.start fixes the
-    # instructions, so the greeting's context is read before the session begins
+    # The caller's token carries call context, which must be folded into the
+    # instructions before the GPT-Live session begins.
     caller = await ctx.wait_for_participant()
     context = call_context(caller.attributes, private.places, datetime.now().astimezone())
     logger.info("%s (attributes: %s)", context, sorted(caller.attributes))

@@ -13,7 +13,6 @@ from request import (
     ATTR_DRIVING,
     ATTR_LOCATION,
     ATTR_TIME_ZONE,
-    CALL_OPENED,
     CLOSE_TAIL_S,
     CLOSE_UNSPOKEN_S,
     CONSULT_FRAMING,
@@ -68,12 +67,11 @@ class RequestTest(unittest.TestCase):
             [("assistant", "reply"), ("user", "new")],
         )
 
-    def test_recent_turns_drops_the_opening_cue(self):
+    def test_recent_turns_does_not_filter_former_opening_cue_text(self):
+        former_cue = "(Josh just opened the call.)"
         self.assertEqual(
-            recent_turns(
-                [Message("user", CALL_OPENED), Message("assistant", "Hey, what's up?")]
-            ),
-            [("assistant", "Hey, what's up?")],
+            recent_turns([Message("user", former_cue), Message("assistant", "Reply")]),
+            [("user", former_cue), ("assistant", "Reply")],
         )
 
     def test_consult_envelope_ends_the_call_once_intent_is_complete(self):

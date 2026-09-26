@@ -43,9 +43,6 @@ CLOSE_TAIL_S = 1.0
 CLOSE_UNSPOKEN_S = 4.0
 IDLE_S = 30.0
 END_CONVERSATION_TOOL = "mcp__mentat__end_conversation"
-# the startup user item that, with the persona's opening policy, makes the voice speak first
-CALL_OPENED = "(Josh just opened the call.)"
-
 
 class EndingPolicy:
     """Close state machine for idle and backend-requested call endings.
@@ -296,13 +293,12 @@ def with_private_context(instructions: str, private: PrivateContext) -> str:
 def recent_turns(
     items: Iterable[Any], count: int = CONSULT_WINDOW_TURNS
 ) -> list[tuple[str, str]]:
-    """Return the latest text-bearing message turns, oldest first, without the opening cue."""
+    """Return the latest text-bearing message turns, oldest first."""
     turns = [
         (str(item.role), str(item.text_content))
         for item in items
         if getattr(item, "type", None) == "message"
         and getattr(item, "text_content", None)
-        and item.text_content != CALL_OPENED
     ]
     return turns[-count:]
 

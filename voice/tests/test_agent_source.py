@@ -16,10 +16,11 @@ class AgentSourceContractTest(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
-    def test_agent_opens_with_the_call_opened_cue_as_startup_history(self):
+    def test_agent_has_no_startup_greeting_history(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
-        self.assertIn('opening.add_message(role="user", content=CALL_OPENED)', source)
-        self.assertIn("chat_ctx=opening", source)
+        self.assertNotIn("CALL_OPENED", source)
+        self.assertNotIn("chat_ctx=", source)
+        self.assertNotIn("opening.add_message", source)
 
     def test_agent_reads_call_context_before_the_session_starts(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
