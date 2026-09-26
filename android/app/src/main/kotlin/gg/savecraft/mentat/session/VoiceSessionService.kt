@@ -183,28 +183,40 @@ internal class VoiceSessionController(
             }
         }
         transition(SessionEvent.AssistInvoked)
-        val grant = try {
-            withContext(Dispatchers.IO) {
-                // the context only colours the greeting; failing to read it never blocks a call
-                val context = try {
-                    callContext()
+        try {
+            liveKitSession.withPreconnectAudio {
+                liveKitSession.playListeningChime()
+                val grant = try {
+                    withContext(Dispatchers.IO) {
+                        // the context only colours the greeting; failing to read it never blocks a call
+                        val context = try {
+                            callContext()
+                        } catch (exception: Exception) {
+                            Log.w("MentatAssist", "Unable to read call context", exception)
+                            null
+                        }
+                        tokenEndpoint.fetch(context)
+                    }
                 } catch (exception: Exception) {
-                    Log.w("MentatAssist", "Unable to read call context", exception)
-                    null
+                    transition(SessionEvent.TokenFailed(exception.message ?: "Unable to fetch voice token"))
+                    return@withPreconnectAudio
                 }
-                tokenEndpoint.fetch(context)
+                transition(SessionEvent.TokenReceived(grant))
+                try {
+                    liveKitSession.connect(grant.url, grant.token)
+                    liveKitSession.setMicEnabled(true)
+                    mutableMicEnabled.value = true
+                } catch (exception: Exception) {
+                    transition(SessionEvent.ConnectFailed(exception.message ?: "Unable to connect to voice session"))
+                }
             }
         } catch (exception: Exception) {
-            transition(SessionEvent.TokenFailed(exception.message ?: "Unable to fetch voice token"))
-            return
-        }
-        transition(SessionEvent.TokenReceived(grant))
-        try {
-            liveKitSession.connect(grant.url, grant.token)
-            liveKitSession.setMicEnabled(true)
-            mutableMicEnabled.value = true
-        } catch (exception: Exception) {
-            transition(SessionEvent.ConnectFailed(exception.message ?: "Unable to connect to voice session"))
+            val reason = exception.message ?: "Unable to start audio capture"
+            when (state.value) {
+                SessionState.FetchingToken -> transition(SessionEvent.TokenFailed(reason))
+                is SessionState.Failed -> Unit
+                else -> transition(SessionEvent.ConnectFailed(reason))
+            }
         }
     }
 

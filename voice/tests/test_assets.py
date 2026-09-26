@@ -23,6 +23,11 @@ import generate
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 EARCON = ASSETS / "earcon.wav"
+LISTENING = (
+    Path(__file__).resolve().parents[2]
+    / "android/app/src/main/res/raw"
+    / generate.LISTENING_NAME
+)
 
 FULL_SCALE = 32767
 
@@ -84,6 +89,35 @@ class EarconTest(unittest.TestCase):
         self.assertLess(generate.EARCON_TONES[0][1], generate.EARCON_TONES[1][1])
 
 
+class PhoneListeningTest(unittest.TestCase):
+    """The phone's listening chime is a separate, lower three-note rise."""
+
+    def test_listening_tones_are_a_lower_three_note_rise(self):
+        tones = generate.LISTENING_TONES
+        self.assertEqual(len(tones), 3)
+        self.assertTrue(
+            all(tones[index][0] < tones[index + 1][0] for index in range(2))
+        )
+        self.assertTrue(
+            all(tones[index][1] < tones[index + 1][1] for index in range(2))
+        )
+        self.assertLess(
+            max(frequency for frequency, _ in tones),
+            min(frequency for frequency, _ in generate.EARCON_TONES),
+        )
+
+    def test_listening_asset_matches_regeneration(self):
+        self.assertTrue(LISTENING.is_file(), f"{LISTENING} not generated")
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = Path(tmp) / LISTENING.name
+            generate.generate_listening(fresh)
+            self.assertEqual(
+                fresh.read_bytes(),
+                LISTENING.read_bytes(),
+                f"{LISTENING.name} does not match generate.py output",
+            )
+
+
 class SoundWiringContractTest(unittest.TestCase):
     """Generation, deployment, and runtime wiring retain only the earcon."""
 
@@ -120,18 +154,29 @@ class DeterminismTest(unittest.TestCase):
 
     def test_regeneration_reproduces_the_committed_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
+            fresh_earcon = Path(tmp) / EARCON.name
+            fresh_listening = Path(tmp) / generate.LISTENING_NAME
             result = subprocess.run(
-                [sys.executable, str(ASSETS / "generate.py"), tmp],
+                [
+                    sys.executable,
+                    str(ASSETS / "generate.py"),
+                    tmp,
+                    str(fresh_listening),
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            fresh = Path(tmp) / EARCON.name
             self.assertEqual(
-                fresh.read_bytes(),
+                fresh_earcon.read_bytes(),
                 EARCON.read_bytes(),
                 f"{EARCON.name} does not match generate.py output",
+            )
+            self.assertEqual(
+                fresh_listening.read_bytes(),
+                LISTENING.read_bytes(),
+                f"{LISTENING.name} does not match generate.py output",
             )
 
 
