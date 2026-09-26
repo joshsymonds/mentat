@@ -626,6 +626,12 @@ class AssistActivityTest {
         var disconnectCalls = 0
         var closeCalls = 0
 
+        override suspend fun withPreconnectAudio(operation: suspend () -> Unit) {
+            operation()
+        }
+
+        override fun playListeningChime() {}
+
         override suspend fun connect(url: String, token: String) {}
 
 

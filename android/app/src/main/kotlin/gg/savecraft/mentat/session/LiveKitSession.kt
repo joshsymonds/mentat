@@ -1,11 +1,14 @@
 package gg.savecraft.mentat.session
 
 import android.content.Context
+import android.media.MediaPlayer
+import gg.savecraft.mentat.R
 import gg.savecraft.mentat.core.SessionEvent
 import gg.savecraft.mentat.core.TranscriptSegment
 import io.livekit.android.LiveKit
 import io.livekit.android.events.DisconnectReason
 import io.livekit.android.events.RoomEvent
+import io.livekit.android.audio.withPreconnectAudio
 import io.livekit.android.events.collect
 import io.livekit.android.room.Room
 import kotlinx.coroutines.CoroutineScope
@@ -28,8 +31,11 @@ interface LiveKitSession {
     val events: Flow<LiveKitEvent>
     val transcripts: Flow<TranscriptSegment>
 
-    suspend fun connect(url: String, token: String)
+    suspend fun withPreconnectAudio(operation: suspend () -> Unit)
 
+    fun playListeningChime()
+
+    suspend fun connect(url: String, token: String)
 
     suspend fun setMicEnabled(enabled: Boolean)
 
@@ -68,8 +74,9 @@ interface LiveKitSession {
 }
 
 class AndroidLiveKitSession(context: Context) : LiveKitSession {
+    private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val room: Room = LiveKit.create(context.applicationContext)
+    private val room: Room = LiveKit.create(appContext)
     private val mutableEvents = MutableSharedFlow<LiveKitEvent>(extraBufferCapacity = 8)
     private val mutableTranscripts = MutableSharedFlow<TranscriptSegment>(extraBufferCapacity = 8)
     private var disconnected = false
@@ -99,6 +106,23 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
         }
     }
 
+
+    override suspend fun withPreconnectAudio(operation: suspend () -> Unit) {
+        room.withPreconnectAudio(operation = operation)
+    }
+
+    override fun playListeningChime() {
+        val player = checkNotNull(MediaPlayer.create(appContext, R.raw.listening)) {
+            "Unable to load listening chime"
+        }
+        player.setOnCompletionListener { it.release() }
+        try {
+            player.start()
+        } catch (exception: Exception) {
+            player.release()
+            throw exception
+        }
+    }
 
     override suspend fun connect(url: String, token: String) {
         room.connect(url, token)

@@ -43,9 +43,42 @@ class VoiceSessionServiceTest {
 
         assertEquals(SessionState.Live, service.state.value)
         assertEquals("wss://voice.example.com" to "token", liveKit.connection)
-        assertEquals(listOf("connect", "mic"), liveKit.callOrder)
+        assertEquals(
+            listOf("buffer-start", "chime", "connect", "mic", "buffer-end"),
+            liveKit.callOrder,
+        )
         assertTrue(liveKit.microphoneEnabled.value)
         assertTrue(service.micEnabled.value)
+    }
+
+    @Test
+    fun listeningChimeAndPreconnectCaptureStartBeforeTokenFetch() = runBlocking {
+        val callOrder = mutableListOf<String>()
+        val liveKit = FakeLiveKitSession(callOrder = callOrder)
+        val endpoint = RecordingTokenEndpoint(callOrder)
+
+        controller(liveKit, endpoint).start()
+
+        assertEquals(
+            listOf("buffer-start", "chime", "fetch", "connect", "mic", "buffer-end"),
+            callOrder,
+        )
+    }
+
+    @Test
+    fun listeningChimeFailureFailsBeforeTokenFetch() = runBlocking {
+        val callOrder = mutableListOf<String>()
+        val liveKit = FakeLiveKitSession(
+            callOrder = callOrder,
+            chimeFailure = IllegalStateException("chime unavailable"),
+        )
+        val endpoint = RecordingTokenEndpoint(callOrder)
+
+        val service = controller(liveKit, endpoint)
+        service.start()
+
+        assertEquals(SessionState.Failed("chime unavailable"), service.state.value)
+        assertEquals(listOf("buffer-start", "chime", "buffer-end"), callOrder)
     }
 
     @Test
@@ -65,7 +98,10 @@ class VoiceSessionServiceTest {
         service.start()
 
         assertEquals(SessionState.Failed("connection refused"), service.state.value)
-        assertEquals(listOf("connect"), liveKit.callOrder)
+        assertEquals(
+            listOf("buffer-start", "chime", "connect", "buffer-end"),
+            liveKit.callOrder,
+        )
     }
 
     @Test
@@ -281,10 +317,13 @@ class VoiceSessionServiceTest {
         callContext = callContext,
     )
 
-    private class RecordingTokenEndpoint : TokenEndpoint {
+    private class RecordingTokenEndpoint(
+        private val callOrder: MutableList<String> = mutableListOf(),
+    ) : TokenEndpoint {
         val contexts = mutableListOf<CallContext?>()
 
         override fun fetch(context: CallContext?): TokenGrant {
+            callOrder += "fetch"
             contexts += context
             return FakeTokenEndpoint.fetch(context)
         }
@@ -309,6 +348,8 @@ class VoiceSessionServiceTest {
         var setMicFailure: Exception? = null,
         var disconnectFailure: Exception? = null,
         var closeFailure: Exception? = null,
+        val callOrder: MutableList<String> = mutableListOf(),
+        private val chimeFailure: Exception? = null,
     ) : LiveKitSession {
         override val events = MutableSharedFlow<LiveKitEvent>()
         override val transcripts = MutableSharedFlow<TranscriptSegment>()
@@ -317,7 +358,19 @@ class VoiceSessionServiceTest {
         var disconnected = false
         var closed = false
 
-        val callOrder = mutableListOf<String>()
+        override suspend fun withPreconnectAudio(operation: suspend () -> Unit) {
+            callOrder += "buffer-start"
+            try {
+                operation()
+            } finally {
+                callOrder += "buffer-end"
+            }
+        }
+
+        override fun playListeningChime() {
+            callOrder += "chime"
+            chimeFailure?.let { throw it }
+        }
 
         override suspend fun connect(url: String, token: String) {
             callOrder += "connect"
