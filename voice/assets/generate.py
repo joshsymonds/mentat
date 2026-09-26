@@ -1,11 +1,11 @@
 """Generate the voice surface's sound asset.
 
-The .wav file next to this script is checked in, but it is authored here
-rather than in an editor: a reviewer cannot diff a binary, and the sound asset
-that arrives as opaque bytes can never be audited. Generation is therefore
-deterministic — pure arithmetic, no randomness, no timestamps — so re-running
-this script reproduces the committed bytes exactly, and the code below is the
-real source of truth for what the assistant sounds like.
+The voice earcon and Android listening chime are checked in as .wav files,
+but authored here rather than in an editor: a reviewer cannot diff a binary,
+and an opaque sound asset can never be audited. Generation is deterministic —
+pure arithmetic, no randomness, no timestamps — so re-running this script
+reproduces the committed bytes exactly, and the code below is the real source
+of truth for what the assistant sounds like.
 
 The clip feeds LiveKit's BackgroundAudioPlayer:
 
@@ -13,7 +13,8 @@ The clip feeds LiveKit's BackgroundAudioPlayer:
                thinking state after the user stops talking — roughly a second
                ahead of first speech, so the silence never reads as a failure.
 
-Usage: generate.py [output-dir]   (defaults to this script's own directory)
+Usage: generate.py [output-dir [listening-output]]
+       With no arguments, regenerates the voice earcon and Android chime.
 """
 
 from __future__ import annotations
@@ -42,6 +43,13 @@ EARCON_DECAY_S = 0.045  # exponential decay constant, giving a struck-bell tail
 EARCON_PEAK_DBFS = -12.0
 
 EARCON_NAME = "earcon.wav"
+
+# --- phone listening chime --------------------------------------------------
+# Three notes below the delegation earcon's A5, with a clear upward contour.
+# This is the phone's listening cue, not a change to the delegation earcon.
+LISTENING_TONES = ((440.0, 0.0), (554.37, 0.10), (659.25, 0.20))
+LISTENING_TONE_S = 0.13
+LISTENING_NAME = "listening.wav"
 
 
 def _amplitude(dbfs: float) -> float:
@@ -87,6 +95,19 @@ def earcon_signal() -> list[float]:
     return _normalize(signal, EARCON_PEAK_DBFS)
 
 
+def listening_signal() -> list[float]:
+    """The phone's distinct, lower three-note listening rise."""
+    tone_len = round(LISTENING_TONE_S * SAMPLE_RATE)
+    total = max(round(onset * SAMPLE_RATE) for _, onset in LISTENING_TONES) + tone_len
+    signal = [0.0] * total
+    for frequency, onset in LISTENING_TONES:
+        start = round(onset * SAMPLE_RATE)
+        step = math.tau * frequency / SAMPLE_RATE
+        for i in range(tone_len):
+            signal[start + i] += math.sin(step * i) * _chime_envelope(i, tone_len)
+    return _normalize(signal, EARCON_PEAK_DBFS)
+
+
 def to_pcm16(signal: list[float]) -> array[int]:
     """Quantize floats in -1..1 to signed 16-bit samples."""
     return array("h", [round(value * FULL_SCALE) for value in signal])
@@ -106,6 +127,12 @@ def write_wav(path: Path, samples: array[int]) -> None:
         out.writeframes(samples.tobytes())
 
 
+def generate_listening(path: Path) -> None:
+    """Write the phone listening chime to its Android raw-resource path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_wav(path, to_pcm16(listening_signal()))
+
+
 def generate(out_dir: Path) -> None:
     """Write the earcon into out_dir."""
     write_wav(out_dir / EARCON_NAME, to_pcm16(earcon_signal()))
@@ -114,6 +141,18 @@ def generate(out_dir: Path) -> None:
 def main(argv: list[str]) -> None:
     out_dir = Path(argv[1]) if len(argv) > 1 else Path(__file__).resolve().parent
     generate(out_dir)
+    if len(argv) > 2:
+        listening_path = Path(argv[2])
+    elif len(argv) == 1:
+        listening_path = (
+            Path(__file__).resolve().parents[2]
+            / "android/app/src/main/res/raw"
+            / LISTENING_NAME
+        )
+    else:
+        listening_path = None
+    if listening_path is not None:
+        generate_listening(listening_path)
 
 
 if __name__ == "__main__":
