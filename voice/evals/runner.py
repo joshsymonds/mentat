@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote, urlsplit
+from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -24,6 +29,26 @@ ANSWER_CAPTURE_DEADLINE_SECONDS = 45.0
 ROOM_DELETE_DEADLINE_SECONDS = 60.0
 REMOTE_OPERATION_DEADLINE_SECONDS = 30.0
 ROOM_POLL_INTERVAL_SECONDS = 0.25
+TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
+FAKE_PHONE_LOG = "evals/phone.jsonl"
+SMS_CONFIRMATION_PATTERN = re.compile(
+    r"\b(?:should i|would you like|do you want|shall i|want me to|say yes)\b",
+    re.IGNORECASE,
+)
+PHONE_TOOL_KINDS = {
+    "send_sms": "sms",
+    "open_on_phone": "open",
+    "list_conversations": "conversations",
+    "read_conversation": "messages",
+    "search_messages": "search",
+    "find_places": "location",
+    "navigate_to": "navigate",
+    "dial": "dial",
+    "set_alarm": "alarm",
+    "set_timer": "timer",
+    "get_location": "location",
+    "get_current_location": "location",
+}
 
 
 @dataclass(frozen=True)
@@ -72,12 +97,14 @@ def _finite_timestamp(value: Any, label: str) -> float:
 def _segment_start(segments: list[dict[str, Any]]) -> float:
     starts = []
     for segment in segments:
-        value = segment.get("start")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise RuntimeError("transcription segment has no valid start timestamp")
-        start = float(value)
-        if not math.isfinite(start) or start < 0:
-            raise RuntimeError("transcription segment has no valid start timestamp")
+        if not isinstance(segment, dict):
+            raise RuntimeError("transcription segment is not an object")
+        start = _finite_timestamp(segment.get("start"), "transcription segment start")
+        end = _finite_timestamp(segment.get("end"), "transcription segment end")
+        if start < 0 or end < start:
+            raise RuntimeError("transcription segment has invalid timestamp bounds")
+        if not isinstance(segment.get("text"), str):
+            raise RuntimeError("transcription segment has no text")
         starts.append(start)
     if not starts:
         raise RuntimeError("transcription returned no segments")
@@ -312,7 +339,9 @@ async def capture_script(
                 "line": step.line,
                 "transcript": transcript,
                 "speech_end": speech_end,
+                "capture_started": capture_started,
                 "first_audio": first_audio,
+                "segments": segments,
                 "room_deleted": None,
             }
             traces.append(trace)
@@ -354,6 +383,360 @@ async def capture_script(
                 )
 
 
+def _json_lines(text: str, label: str) -> list[dict[str, Any]]:
+    if not isinstance(text, str):
+        raise RuntimeError(f"{label} log is missing or invalid")
+    if not text.strip():
+        if label == "fake phone":
+            return []
+        raise RuntimeError(f"{label} log is missing or empty")
+    records = []
+    for index, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            raise RuntimeError(f"{label} log contains an empty line at {index}")
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"{label} log contains malformed JSON at line {index}") from error
+        if not isinstance(value, dict):
+            raise RuntimeError(f"{label} log line {index} is not an object")
+        records.append(value)
+    return records
+
+
+def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    turns: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for message in messages:
+        current.append(message)
+        if message.get("type") != "result":
+            continue
+        calls = []
+        tools = []
+        for raw in current:
+            if raw.get("type") == "stream_event":
+                event = raw.get("event")
+                if isinstance(event, dict) and event.get("type") == "message_start":
+                    started = event.get("message")
+                    if not isinstance(started, dict):
+                        raise RuntimeError("recorded message_start has no message object")
+                    model = started.get("model")
+                    message_id = started.get("id")
+                    if not isinstance(model, str) or not model or not isinstance(message_id, str) or not message_id:
+                        raise RuntimeError("recorded message_start has no finite model-call evidence")
+                    calls.append({"id": message_id, "model": model})
+            if raw.get("type") == "assistant":
+                assistant_message = raw.get("message")
+                blocks = assistant_message.get("content") if isinstance(assistant_message, dict) else None
+                if not isinstance(blocks, list):
+                    raise RuntimeError("recorded assistant message has no content blocks")
+                for block in blocks:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    name = block.get("name")
+                    arguments = block.get("input")
+                    if not isinstance(name, str) or not isinstance(arguments, dict):
+                        raise RuntimeError("recorded tool use has invalid name or arguments")
+                    tool_kind = PHONE_TOOL_KINDS.get(name.rsplit("__", 1)[-1])
+                    if tool_kind is not None:
+                        tools.append({"turn": len(turns) + 1, "name": name, "kind": tool_kind, "input": arguments})
+        if not calls:
+            raise RuntimeError("recorded assistant result has no message_start model-call evidence")
+        turns.append({"model_calls": calls, "phone_tools": tools})
+        current = []
+    if any(
+        item.get("type") in ("assistant", "user")
+        or (item.get("type") == "stream_event" and isinstance(item.get("event"), dict)
+            and item["event"].get("type") == "message_start")
+        for item in current
+    ):
+        raise RuntimeError("recorded SDK turn is missing its top-level result boundary")
+    if not turns:
+        raise RuntimeError("SDK recording contains no completed turns")
+    return turns
+
+
+def _phone_commands(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    commands: list[dict[str, Any]] = []
+    results: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        event = entry.get("event")
+        payload = entry.get("command") if event == "command" else entry.get("result")
+        if event not in ("command", "result") or not isinstance(payload, dict):
+            raise RuntimeError("fake phone log contains an invalid event")
+        command_id = payload.get("id")
+        if not isinstance(command_id, str) or not command_id:
+            raise RuntimeError("fake phone log event has no command id")
+        if event == "command":
+            if command_id in results or any(command.get("id") == command_id for command in commands):
+                raise RuntimeError("fake phone log repeats a command id")
+            if not isinstance(payload.get("kind"), str):
+                raise RuntimeError("fake phone command has no kind")
+            commands.append(dict(payload))
+        else:
+            if command_id in results:
+                raise RuntimeError("fake phone log repeats a command result")
+            results[command_id] = dict(payload)
+    command_ids = {command["id"] for command in commands}
+    if command_ids != set(results):
+        raise RuntimeError("fake phone log has a missing or unmatched command result")
+    if any(result.get("status") != "ok" for result in results.values()):
+        raise RuntimeError("fake phone reported a failed command")
+    return commands
+
+
+def _match_phone_tools(
+    commands: list[dict[str, Any]], recorded_turns: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    tools = [tool for turn in recorded_turns for tool in turn["phone_tools"]]
+    if len(commands) != len(tools):
+        raise RuntimeError(
+            f"fake phone observed {len(commands)} commands but SDK recording has {len(tools)} phone tool uses"
+        )
+    matched = []
+    for index, (command, tool) in enumerate(zip(commands, tools, strict=True), 1):
+        if command["kind"] != tool["kind"]:
+            raise RuntimeError(f"fake phone command {index} does not match its recorded phone tool")
+        arguments = tool["input"]
+        for key, value in command.items():
+            if key in ("id", "kind", "expires_at"):
+                continue
+            if arguments.get(key) != value:
+                raise RuntimeError(f"fake phone command {index} does not match its recorded phone tool arguments")
+        matched.append({**command, "turn": tool["turn"]})
+    return matched
+
+
+def _scenario_steps(scenario: Any) -> list[str]:
+    caller_lines = getattr(scenario, "caller_lines", None)
+    expectations = getattr(scenario, "turns", None)
+    if not isinstance(caller_lines, tuple) or not isinstance(expectations, tuple) or len(caller_lines) != len(expectations):
+        raise RuntimeError("scenario scripts and turn expectations are missing or mismatched")
+    raw_steps = []
+    for line, expectation in zip(caller_lines, expectations, strict=True):
+        patterns = getattr(expectation, "answer_patterns", None)
+        if not isinstance(line, str) or not line or not isinstance(patterns, tuple) or not patterns:
+            raise RuntimeError("scenario has a missing caller line or answer pattern")
+        safe_patterns = (
+            pattern.replace("(?::", r"(?:\x3a").replace("::", r"\x3a\x3a")
+            for pattern in patterns
+        )
+        combined = "".join(f"(?=.*(?:{pattern}))" for pattern in safe_patterns) + ".*"
+        raw_step = f"{line}@0::{combined}"
+        try:
+            caller.parse_step(raw_step)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"scenario caller line cannot be scripted: {line!r}") from error
+        raw_steps.append(raw_step)
+    return raw_steps
+
+
+def _confirmation_time(trace: dict[str, Any]) -> float:
+    segments = trace.get("segments")
+    capture_started = _finite_timestamp(trace.get("capture_started"), "capture start")
+    if not isinstance(segments, list) or not segments:
+        raise RuntimeError("SMS confirmation has no transcript segment timestamps")
+    transcript_parts = []
+    ranges = []
+    cursor = 0
+    for segment in segments:
+        if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+            raise RuntimeError("SMS confirmation has an invalid transcript segment")
+        if cursor:
+            transcript_parts.append(" ")
+            cursor += 1
+        start = cursor
+        transcript_parts.append(segment["text"])
+        cursor += len(segment["text"])
+        end = _finite_timestamp(segment.get("end"), "transcription segment end")
+        ranges.append((start, cursor, end))
+    match = SMS_CONFIRMATION_PATTERN.search("".join(transcript_parts))
+    if match is None:
+        raise RuntimeError("SMS say-back transcript has no confirmation prompt")
+    for start, end, segment_end in ranges:
+        if start < match.end() <= end:
+            return capture_started + segment_end
+    raise RuntimeError("SMS confirmation prompt has no matching transcript segment timestamp")
+
+
+def _completed_stdout(result: Any, label: str) -> str:
+    if getattr(result, "returncode", None) != 0:
+        raise RuntimeError(f"{label} failed: {getattr(result, 'stderr', '')}")
+    stdout = getattr(result, "stdout", None)
+    if not isinstance(stdout, str):
+        raise RuntimeError(f"{label} returned no output")
+    return stdout
+
+
+def _voice_token(base_url: str) -> dict[str, Any]:
+    parsed = urlsplit(base_url)
+    try:
+        is_loopback = parsed.hostname is not None and ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        is_loopback = False
+    if (
+        parsed.scheme != "http"
+        or not is_loopback
+        or parsed.username
+        or parsed.password
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("dev voice-token endpoint must be an HTTP loopback origin")
+    request = Request(
+        f"{base_url.rstrip('/')}/v1/voice/token",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=TOKEN_REQUEST_DEADLINE_SECONDS) as response:
+            if response.status != 200:
+                raise RuntimeError(f"voice-token endpoint returned HTTP {response.status}")
+            grant = json.loads(response.read())
+    except (OSError, TimeoutError, json.JSONDecodeError) as error:
+        raise RuntimeError("dev voice-token request failed") from error
+    if not isinstance(grant, dict):
+        raise RuntimeError("voice-token response is not an object")
+    token = grant.get("token")
+    room = grant.get("room")
+    url = grant.get("url")
+    expires_at = grant.get("expires_at")
+    token_parts = token.split(".") if isinstance(token, str) else []
+    if (
+        len(token_parts) != 3
+        or any(not part for part in token_parts)
+        or not isinstance(room, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", room) is None
+    ):
+        raise RuntimeError("voice-token response is missing a valid token or room")
+    if not isinstance(url, str):
+        raise RuntimeError("voice-token response is missing a valid LiveKit URL")
+    try:
+        livekit_url = urlsplit(url)
+    except ValueError as error:
+        raise RuntimeError("voice-token response has an invalid LiveKit URL") from error
+    if livekit_url.scheme not in ("ws", "wss") or livekit_url.hostname is None:
+        raise RuntimeError("voice-token response is missing a valid LiveKit URL")
+    if not isinstance(expires_at, str):
+        raise RuntimeError("voice-token response is missing token expiry")
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RuntimeError("voice-token response has an invalid expiry") from error
+    if expiry.tzinfo is None:
+        raise RuntimeError("voice-token response expiry has no timezone")
+    return grant
+
+
+def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
+    """Run and strictly evaluate one scenario against the isolated DevStack."""
+    raw_steps = _scenario_steps(scenario)
+    close_after = getattr(scenario, "room_close_after", None)
+    if close_after is not None and (
+        isinstance(close_after, bool)
+        or not isinstance(close_after, int)
+        or not 1 <= close_after <= len(raw_steps)
+    ):
+        raise RuntimeError("scenario has an invalid room-close turn")
+    base_url = getattr(stack, "base_url", None)
+    if not isinstance(base_url, str) or not base_url:
+        raise RuntimeError("dev stack has no base URL")
+    grant = _voice_token(base_url)
+    room = grant["room"]
+    stack.start_worker(room)
+    close_arg = "none" if close_after is None else str(close_after)
+    capture = stack.run_voice(
+        ["evals/runner.py", "--fake-phone", "--room-close-after", close_arg, room, *raw_steps]
+    )
+    capture_text = _completed_stdout(capture, "remote scripted capture")
+    try:
+        capture_data = json.loads(capture_text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("remote scripted capture returned malformed JSON") from error
+    traces = capture_data.get("turns") if isinstance(capture_data, dict) else None
+    if not isinstance(traces, list) or len(traces) != len(scenario.turns):
+        raise RuntimeError("remote scripted capture returned missing or incomplete turns")
+
+    phone_text = _completed_stdout(stack.run_remote(["sudo", "cat", FAKE_PHONE_LOG]), "fake phone log read")
+    phone_commands = _phone_commands(_json_lines(phone_text, "fake phone"))
+    session_id = "voice-" + room
+    record_path = "records/" + quote(session_id, safe="") + ".jsonl"
+    record_text = _completed_stdout(
+        stack.run_remote(["sudo", "cat", record_path]), "daemon SDK recording read"
+    )
+    recorded_turns = _recorded_turns(_json_lines(record_text, "SDK recording"))
+    if len(recorded_turns) != len(traces):
+        raise RuntimeError("SDK recording turn boundaries do not match captured transcript turns")
+    phone_commands = _match_phone_tools(phone_commands, recorded_turns)
+
+    room_deleted_turns = []
+    for index, (trace, expected, recorded) in enumerate(
+        zip(traces, scenario.turns, recorded_turns, strict=True), 1
+    ):
+        if not isinstance(trace, dict) or trace.get("turn") != index or trace.get("room") != room:
+            raise RuntimeError(f"captured turn {index} has invalid turn or room identity")
+        if not isinstance(trace.get("transcript"), str) or not trace["transcript"].strip():
+            raise RuntimeError(f"captured turn {index} has no complete transcript")
+        for field in ("speech_end", "first_audio", "capture_started"):
+            _finite_timestamp(trace.get(field), field)
+        segments = trace.get("segments")
+        if not isinstance(segments, list) or not segments:
+            raise RuntimeError(f"captured turn {index} has no transcript segment evidence")
+        for segment in segments:
+            _segment_start([segment])
+        trace["model_calls"] = recorded["model_calls"]
+        trace["expect_confirmation"] = getattr(expected, "sms_recipient", None) is not None
+        trace["expect_hangup"] = close_after == index
+        trace["confirmation"] = (
+            _confirmation_time(trace) if trace["expect_confirmation"] else None
+        )
+        if trace.get("room_deleted") is not None:
+            _finite_timestamp(trace["room_deleted"], "room deletion")
+            room_deleted_turns.append(index)
+    if len(room_deleted_turns) > 1:
+        raise RuntimeError("capture observed room deletion more than once")
+    room_closed_after = room_deleted_turns[0] if room_deleted_turns else None
+    from evals.scenarios import evaluate_scenario
+
+    evaluate_scenario(scenario, [trace["transcript"] for trace in traces], phone_commands, room_closed_after)
+    return {"room": room, "turns": traces, "phone_commands": phone_commands, "room_closed_after": room_closed_after}
+
+
+async def _run_remote_capture_with_fake_phone(
+    room_name: str, raw_steps: list[str], *, room_close_after: int | None
+) -> list[dict[str, Any]]:
+    base_url = os.environ.get("MENTAT_URL", "")
+    log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
+    log_path.unlink(missing_ok=True)
+    phone_script = (
+        "import asyncio, sys; from phone import run_fake_phone; "
+        "asyncio.run(run_fake_phone(sys.argv[1], sys.argv[2], 'success'))"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", phone_script, base_url, str(log_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        await asyncio.sleep(0.2)
+        if process.poll() is not None:
+            raise RuntimeError("fake phone process exited before scripted capture")
+        return await run_remote_capture(room_name, raw_steps, room_close_after=room_close_after)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                await asyncio.to_thread(process.wait, 5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                await asyncio.to_thread(process.wait)
+
+
 async def run_remote_capture(
     room_name: str, raw_steps: list[str], *, room_close_after: int | None = None
 ) -> list[dict[str, Any]]:
@@ -374,6 +757,7 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
     parser = argparse.ArgumentParser(
         description="Capture scripted caller turns from a remote voice room"
     )
+    parser.add_argument("--fake-phone", action="store_true", help="run the loopback-only fake phone during capture")
     parser.add_argument("room")
     parser.add_argument(
         "--room-close-after",
@@ -396,10 +780,10 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    room, steps, room_close_after = _parse_arguments(sys.argv[1:] if argv is None else argv)
-    traces = asyncio.run(
-        run_remote_capture(room, steps, room_close_after=room_close_after)
-    )
+    arguments = sys.argv[1:] if argv is None else argv
+    room, steps, room_close_after = _parse_arguments(arguments)
+    capture = _run_remote_capture_with_fake_phone if "--fake-phone" in arguments else run_remote_capture
+    traces = asyncio.run(capture(room, steps, room_close_after=room_close_after))
     print(json.dumps({"turns": traces}, separators=(",", ":")), flush=True)
     return 0
 
