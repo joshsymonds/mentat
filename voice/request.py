@@ -27,11 +27,14 @@ CONSULT_SMS_RULE = (
     "in a later turn. A yes authorizes exactly that message once; then call send_sms with send=true."
 )
 CONSULT_ENDING_RULE = (
-    "End the call as soon as Josh's intent is complete. When an action is confirmed or a "
-    "question is answered and nothing is left open, confirm it in a few words, with no "
-    "offer of more help, then call end_conversation with reason done in the same turn. "
-    "When Josh signs off, say a short goodbye, then call end_conversation with reason "
-    "signoff. Keep the call open only when you asked Josh something you need answered. "
+    "Has the intent been fulfilled of the conversation? If so, hang up. If plausibly not, stay. "
+    "After a successful action that fulfills Josh's intent, such as setting a timer or alarm, "
+    "confirm it briefly and call "
+    "end_conversation with reason done in the same response. Keep the call open when the "
+    "conversation plausibly continues, including a follow-up like 'Who was she?' after "
+    "answering 'Who was Alice Keck?'; do not treat every answered question as the end. "
+    "Do not offer anything else or more help. When Josh signs off, say a short goodbye, "
+    "then call end_conversation with reason signoff. "
     "Load end_conversation in the same tool search as any other tool the turn needs. "
     "To end the call, say the closing words, then call end_conversation, and say nothing after."
 )

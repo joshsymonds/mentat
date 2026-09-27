@@ -74,13 +74,23 @@ class RequestTest(unittest.TestCase):
             [("user", former_cue), ("assistant", "Reply")],
         )
 
-    def test_consult_envelope_ends_the_call_once_intent_is_complete(self):
+    def test_consult_envelope_ends_after_a_fulfilled_action_and_confirmation(self):
         envelope = " ".join(consult_envelope("card", "", [], "Set a timer").lower().split())
-        self.assertIn("end the call as soon as josh's intent is complete", envelope)
-        self.assertIn("no offer of more help", envelope)
-        self.assertIn("end_conversation with reason done in the same turn", envelope)
+        self.assertIn("has the intent been fulfilled of the conversation? if so, hang up. if plausibly not, stay.", envelope)
+        self.assertIn("after a successful action that fulfills josh's intent, such as setting a timer or alarm, confirm it briefly and call end_conversation with reason done in the same response", envelope)
+        self.assertIn("do not offer anything else or more help", envelope)
         self.assertIn("end_conversation with reason signoff", envelope)
-        self.assertIn("keep the call open only when you asked josh something", envelope)
+
+    def test_consult_envelope_keeps_plausible_followups_open(self):
+        envelope = " ".join(consult_envelope("card", "", [], "Who was Alice Keck?").lower().split())
+        self.assertIn("keep the call open when the conversation plausibly continues", envelope)
+        self.assertIn("who was she", envelope)
+        self.assertIn("do not offer anything else or more help", envelope)
+
+    def test_consult_envelope_preserves_sms_confirmation_wording(self):
+        envelope = " ".join(consult_envelope("card", "", [], "Text Alice").lower().split())
+        self.assertIn("a yes authorizes exactly that message once", envelope)
+        self.assertIn("then call send_sms with send=true", envelope)
 
     def test_consult_envelope_has_backend_rules_and_question(self):
         envelope = consult_envelope(
