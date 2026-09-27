@@ -29,6 +29,7 @@ class Scenario:
     room_close_after: int | None
     place_query: str | None = None
     selected_place_pattern: str | None = None
+    spoken_place_pattern: str | None = None
 
 
 SCENARIOS = (
@@ -69,7 +70,7 @@ SCENARIOS = (
             "Navigate to Alice Keck Park Memorial Garden.",
         ),
         turns=(
-            TurnExpectation((r"Alice Keck Park", r"Santa Barbara")),
+            TurnExpectation((r"\b(?:Alice Keck Park Memorial Garden|Halis Keck Park Memorial Gardens)\b", r"Santa Barbara")),
             TurnExpectation((r"Alice Keck Park", r"(?:navigat|directions|route|taking you)")),
         ),
         commands=(
@@ -78,7 +79,8 @@ SCENARIOS = (
         ),
         room_close_after=2,
         place_query="Alice Keck Park Memorial Garden",
-        selected_place_pattern=r"(?i)Alice Keck Park(?: Memorial)? Garden",
+        selected_place_pattern=r"(?i)^Alice Keck Park Memorial Garden$",
+        spoken_place_pattern=r"(?i)\b(?:Alice Keck Park Memorial Garden|Halis Keck Park Memorial Gardens)\b",
     ),
     Scenario(
         name="sms-say-back-yes",
@@ -346,7 +348,13 @@ def _scenario_failures(
                 f"{scenario.name}: navigation selected an unexpected place name {name!r}",
             )
             require(
-                bool(turns) and isinstance(name, str) and name in turns[0],
+                bool(turns)
+                and isinstance(name, str)
+                and re.search(
+                    scenario.spoken_place_pattern or re.escape(name),
+                    turns[0],
+                    re.IGNORECASE,
+                ) is not None,
                 command_turn,
                 f"{scenario.name}: navigation target {name!r} was not among the spoken search results",
             )

@@ -436,6 +436,127 @@ class ScenarioCorpusTests(unittest.TestCase):
                 room_closed_after=2,
             )
 
+    def test_accepts_observed_halis_keck_asr_variation_in_complete_and_prefix_paths(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+        search_result = "Halis Keck Park Memorial Gardens. Right there in Santa Barbara."
+        navigate = {
+            "turn": 2,
+            "kind": "navigate",
+            "name": "Alice Keck Park Memorial Garden",
+            "address": "1 Garden Road",
+            "place_id": "alice-keck-place-id",
+            "lat": 34.42,
+            "lng": -119.70,
+        }
+        evaluate_scenario(
+            scenario,
+            turns=[search_result, "Navigating to Alice Keck Park Memorial Garden now."],
+            phone_commands=[{"turn": 1, "kind": "location"}, navigate],
+            room_closed_after=2,
+        )
+        self.assertEqual(
+            evaluate_scenario_prefix(
+                scenario,
+                turns=[search_result],
+                phone_commands=[{"turn": 1, "kind": "location"}, navigate],
+                room_closed_after=None,
+                failed_turn=2,
+            ),
+            [],
+        )
+
+    def test_rejects_absent_or_unobserved_keck_name_and_wrong_navigation_target(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+        commands = [
+            {"turn": 1, "kind": "location"},
+            {
+                "turn": 2,
+                "kind": "navigate",
+                "name": "Alice Keck Park Memorial Garden",
+                "address": "1 Garden Road",
+                "place_id": "alice-keck-place-id",
+                "lat": 34.42,
+                "lng": -119.70,
+            },
+        ]
+        invalid_search_results = (
+            "Santa Barbara Street is the result.",
+            "Alice Park Memorial Garden. Right there in Santa Barbara.",
+            "Halis Keck Park by Santa Barbara.",
+        )
+        for search_result in invalid_search_results:
+            with self.subTest(search_result=search_result), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    scenario,
+                    turns=[search_result, "Navigating to Alice Keck Park Memorial Garden now."],
+                    phone_commands=commands,
+                    room_closed_after=2,
+                )
+            self.assertTrue(
+                evaluate_scenario_prefix(
+                    scenario,
+                    turns=[search_result],
+                    phone_commands=[commands[0]],
+                    room_closed_after=None,
+                    failed_turn=2,
+                ),
+                search_result,
+            )
+
+        wrong_target = [
+            commands[0],
+            {**commands[1], "name": "Another Santa Barbara Garden"},
+        ]
+        with self.assertRaisesRegex(AssertionError, "unexpected place name"):
+            evaluate_scenario(
+                scenario,
+                turns=[
+                    "Alice Keck Park Memorial Garden is right there in Santa Barbara.",
+                    "Navigating to Alice Keck Park Memorial Garden now.",
+                ],
+                phone_commands=wrong_target,
+                room_closed_after=2,
+            )
+
+    def test_keck_asr_tolerance_keeps_navigation_evidence_and_room_close_strict(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+        turns = [
+            "Halis Keck Park Memorial Gardens. Right there in Santa Barbara.",
+            "Navigating to Alice Keck Park Memorial Garden now.",
+        ]
+        navigate = {
+            "turn": 2,
+            "kind": "navigate",
+            "name": "Alice Keck Park Memorial Garden",
+            "address": "1 Garden Road",
+            "place_id": "alice-keck-place-id",
+            "lat": 34.42,
+            "lng": -119.70,
+        }
+        invalid_commands = (
+            ({**navigate, "name": "Alice Keck Park Garden"}, "unexpected place name"),
+            ({**navigate, "address": " "}, "no result address"),
+            ({**navigate, "place_id": ""}, "no returned place id"),
+            ({**navigate, "lat": float("nan")}, "invalid coordinates"),
+            ({**navigate, "lng": True}, "invalid coordinates"),
+        )
+        for invalid_navigate, failure in invalid_commands:
+            with self.subTest(command=invalid_navigate), self.assertRaisesRegex(AssertionError, failure):
+                evaluate_scenario(
+                    scenario,
+                    turns=turns,
+                    phone_commands=[{"turn": 1, "kind": "location"}, invalid_navigate],
+                    room_closed_after=2,
+                )
+
+        with self.assertRaisesRegex(AssertionError, "expected room close after turn 2"):
+            evaluate_scenario(
+                scenario,
+                turns=turns,
+                phone_commands=[{"turn": 1, "kind": "location"}, navigate],
+                room_closed_after=1,
+            )
+
     def test_rejects_wrong_navigation_without_other_mismatches(self):
         scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
         with self.assertRaisesRegex(AssertionError, "navigation selected an unexpected place name"):
