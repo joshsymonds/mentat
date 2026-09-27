@@ -268,7 +268,9 @@ def _sms_value_matches(field: str, actual: Any, expected: Any) -> bool:
             else ""
         )
         return actual_digits == expected_digits or (
-            bool(national_number) and actual_digits == national_number
+            bool(national_number)
+            and actual_digits == national_number
+            and not actual.lstrip().startswith("+")
         )
     if field == "body":
         return (

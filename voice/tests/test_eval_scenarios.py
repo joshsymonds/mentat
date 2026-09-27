@@ -1202,6 +1202,52 @@ class ScenarioCorpusTests(unittest.TestCase):
                 room_closed_after=2,
             )
 
+    def test_accepts_only_valid_us_sms_payload_number_forms(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        turns = [
+            "I can text +1-202-555-0142: I will be there at six. Should I send it?",
+            "Sent that message.",
+        ]
+
+        with self.subTest(recipient="+2025550142"):
+            with self.assertRaisesRegex(AssertionError, "expected to"):
+                evaluate_scenario(
+                    scenario,
+                    turns=turns,
+                    phone_commands=[
+                        {"turn": 2, "kind": "sms", "to": "+2025550142", "body": "I will be there at six."}
+                    ],
+                    room_closed_after=2,
+                )
+
+        for recipient in (
+            "2025550142",
+            "(202) 555-0142",
+            "12025550142",
+            "+1-202-555-0142",
+        ):
+            with self.subTest(recipient=recipient):
+                evaluate_scenario(
+                    scenario,
+                    turns=turns,
+                    phone_commands=[
+                        {"turn": 2, "kind": "sms", "to": recipient, "body": "I will be there at six."}
+                    ],
+                    room_closed_after=2,
+                )
+
+        for command in (
+            {"turn": 2, "kind": "sms", "to": "+1-202-555-0199", "body": "I will be there at six."},
+            {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at seven."},
+        ):
+            with self.subTest(command=command), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    scenario,
+                    turns=turns,
+                    phone_commands=[command],
+                    room_closed_after=2,
+                )
+
     def test_accepts_national_sms_payload_number_only_for_matching_readback(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
         turns = [
