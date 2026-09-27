@@ -109,6 +109,39 @@ class DevStackTest(unittest.TestCase):
         self.assertIn('"$ROOM"', worker_script)
         self.assertIn("systemctl stop mentat-voice", worker_script)
 
+    @patch("voice.evals.dev_stack.subprocess.Popen")
+    def test_successive_token_rooms_replace_worker_and_retain_private_environment(self, popen):
+        popen.return_value = unittest.mock.Mock(poll=lambda: None)
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.repeat\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+            stack.start_worker("first-token-room")
+            stack.start_worker("second-token-room")
+
+        worker_calls = [
+            (args, kwargs)
+            for args, kwargs in calls
+            if args[:2] == ["ssh", "ultraviolet"] and "--room" in kwargs.get("input", "")
+        ]
+        self.assertEqual(len(worker_calls), 2)
+        self.assertIn("first-token-room", worker_calls[0][0])
+        self.assertIn("second-token-room", worker_calls[1][0])
+        self.assertIn('"$ROOM"', worker_calls[0][1]["input"])
+        self.assertIn('"$ROOM"', worker_calls[1][1]["input"])
+        replacement = worker_calls[1][1]["input"]
+        self.assertIn('if [ -f "$DEV_DIR/voice.pid" ]', replacement)
+        self.assertLess(replacement.index('kill -TERM -- "-$previous_pid"'), replacement.index('python3 - "$DEV_DIR"'))
+        self.assertIn('if kill -0 "$previous_pid" 2>/dev/null; then', replacement)
+        self.assertNotIn('(dev_dir / "voice.env.json").unlink()', _START_WORKER_SCRIPT)
+
     def test_staging_directories_remain_writable_for_unprivileged_scp(self):
         calls = []
 

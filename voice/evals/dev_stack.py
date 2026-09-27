@@ -170,6 +170,18 @@ HEALTH_PORT=$3
 ROOM=$4
 trap 'systemctl start mentat-voice' EXIT
 systemctl stop mentat-voice
+if [ -f "$DEV_DIR/voice.pid" ]; then
+  previous_pid=$(cat "$DEV_DIR/voice.pid")
+  kill -TERM -- "-$previous_pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    kill -0 "$previous_pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$previous_pid" 2>/dev/null; then
+    kill -KILL -- "-$previous_pid" 2>/dev/null || true
+  fi
+  rm -f -- "$DEV_DIR/voice.pid"
+fi
 python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" "$ROOM" <<'PY'
 import json
 import subprocess
@@ -197,7 +209,6 @@ voice = subprocess.Popen(
 )
 (dev_dir / "voice.pid").write_text(f"{voice.pid}\n")
 voice_log.close()
-(dev_dir / "voice.env.json").unlink()
 PY
 trap - EXIT
 '''
@@ -239,7 +250,6 @@ class DevStack:
         self._tunnel: subprocess.Popen[bytes] | None = None
         self._signal_handlers: dict[int, signal.Handlers] = {}
         self._entered = False
-        self._worker_started = False
 
     @property
     def url(self) -> str:
@@ -254,7 +264,6 @@ class DevStack:
     def __enter__(self) -> DevStack:
         if not self.opt_in:
             raise RuntimeError("DevStack requires explicit opt-in for a live run")
-        self._worker_started = False
         self._install_signal_handlers()
         try:
             self._start()
@@ -294,8 +303,6 @@ class DevStack:
         """Join the room minted by the dev daemon's voice-token endpoint."""
         if not self._entered:
             raise RuntimeError("dev stack is not running")
-        if self._worker_started:
-            raise RuntimeError("voice worker has already been started")
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", room) is None:
             raise ValueError("room must be a safe LiveKit room name")
         self._remote(
@@ -305,7 +312,6 @@ class DevStack:
             str(self.health_port),
             room,
         )
-        self._worker_started = True
 
     def _start(self) -> None:
         built = self._run(
@@ -445,7 +451,6 @@ systemctl start mentat-voice
             finally:
                 self._remote_dir = None
                 self._local_port = None
-                self._worker_started = False
 
     def _install_signal_handlers(self) -> None:
         if threading.current_thread() is not threading.main_thread():
