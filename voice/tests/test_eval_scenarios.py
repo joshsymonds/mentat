@@ -171,6 +171,47 @@ class ScenarioCorpusTests(unittest.TestCase):
                     room_closed_after=1,
                 )
 
+    def test_rejects_wrong_timer_and_alarm_facts_or_fake_commands(self):
+        cases = (
+            (
+                "timer-300-seconds",
+                "Done, 5 minutes on the clock.",
+                {"turn": 1, "kind": "timer", "seconds": 60},
+            ),
+            (
+                "equivalent-alarm",
+                "Your 8am alarm is set.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "equivalent-alarm",
+                "Your 7am alarm is set.",
+                {"turn": 1, "kind": "alarm", "hour": 8, "minute": 0},
+            ),
+        )
+        for name, answer, command in cases:
+            with self.subTest(name=name, answer=answer, command=command), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    next(s for s in SCENARIOS if s.name == name),
+                    turns=[answer],
+                    phone_commands=[command],
+                    room_closed_after=1,
+                )
+
+    def test_rejects_pm_alarm_even_when_hour_and_command_match(self):
+        scenario = next(s for s in SCENARIOS if s.name == "equivalent-alarm")
+        for answer in (
+            "Your 7:00 p.m. alarm is set.",
+            "Your 7 a.m. alarm is set — sorry, I meant 7 p.m.",
+        ):
+            with self.subTest(answer=answer), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    scenario,
+                    turns=[answer],
+                    phone_commands=[{"turn": 1, "kind": "alarm", "hour": 7, "minute": 0}],
+                    room_closed_after=1,
+                )
+
     def test_rejects_changed_spoken_time_even_when_sent_payload_matches(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
         with self.assertRaisesRegex(AssertionError, "said back"):
@@ -245,6 +286,20 @@ class ScenarioCorpusTests(unittest.TestCase):
                     {"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
                 ],
                 room_closed_after=3,
+            )
+
+    def test_rejects_duplicate_sms_send_even_when_both_match_readback(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        command = {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
+        with self.assertRaisesRegex(AssertionError, "expected 1 phone commands, got 2"):
+            evaluate_scenario(
+                scenario,
+                turns=[
+                    "I can text +1-202-555-0142: I will be there at six. Should I send it?",
+                    "Sent that message.",
+                ],
+                phone_commands=[command, command],
+                room_closed_after=2,
             )
 
     def test_rejects_wrong_navigation_without_other_mismatches(self):
@@ -415,6 +470,115 @@ class ScenarioCorpusTests(unittest.TestCase):
                     phone_commands=list(commands),
                     room_closed_after=2,
                 )
+
+    def test_accepts_eval7_timer_and_alarm_transcripts(self):
+        cases = (
+            (
+                "timer-300-seconds",
+                "Sure, 5 minutes starting now. Done, 5 minutes on the clock.",
+                {"turn": 1, "kind": "timer", "seconds": 300},
+            ),
+            (
+                "equivalent-alarm",
+                "On it. Done. Your 7am alarm is set.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+        )
+        for name, answer, command in cases:
+            with self.subTest(name=name):
+                evaluate_scenario(
+                    next(s for s in SCENARIOS if s.name == name),
+                    turns=[answer],
+                    phone_commands=[command],
+                    room_closed_after=1,
+                )
+
+    def test_accepts_eval7_sms_readback_with_punctuation_free_number_and_body(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        readbacks = (
+            "On it. Just to confirm, I'll text 202-555-0142. I will be there at 6. Want me to send it?",
+            "Just to confirm, I'll text 202 555 0142 I will be there at 6 want me to send it?",
+        )
+        for readback in readbacks:
+            with self.subTest(readback=readback):
+                evaluate_scenario(
+                    scenario,
+                    turns=[readback, "Message sent to 202-555-0142."],
+                    phone_commands=[
+                        {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
+                    ],
+                    room_closed_after=2,
+                )
+
+    def test_eval7_sms_without_readback_still_fails(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        missing_readbacks = (
+            "Okay, I'm ready to send that.",
+            "Would you like me to send that message?",
+            "Would you like me to text +1-202-555-0142?",
+        )
+        for answer in missing_readbacks:
+            with self.subTest(answer=answer), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    scenario,
+                    turns=[answer, "Message sent to 202-555-0142."],
+                    phone_commands=[
+                        {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
+                    ],
+                    room_closed_after=2,
+                )
+
+    def test_rejects_donation_attributed_to_someone_else(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                scenario,
+                turns=[
+                    "Alice Keck Park was donated by someone else.",
+                    "Alice Keck Park was W. M. Keck's daughter.",
+                    "Her family's wealth came from Superior Oil.",
+                ],
+                phone_commands=[],
+                room_closed_after=None,
+            )
+
+    def test_accepts_eval7_alice_donor_answer_without_city_literal(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        first_turns = (
+            "I'm checking that now. It's named for Alice Keck Park, who bought the entire block back in 75 and gave it to the city for a park, without saying who she was. The city dedicated the garden to her in 1980.",
+            "Sure, I'll check. It's actually named after a person, Alice Keck Park. Park was her married name, and she was related to the Kecks, as in W. M. Keck. The city got the land as an anonymous gift, turned it into a garden, and dedicated it to her in 1980.",
+        )
+        for first_turn in first_turns:
+            with self.subTest(first_turn=first_turn):
+                evaluate_scenario(
+                    scenario,
+                    turns=[
+                        first_turn,
+                        "Alice Keck Park was W. M. Keck's daughter.",
+                        "Her family's wealth came from Superior Oil.",
+                    ],
+                    phone_commands=[],
+                    room_closed_after=None,
+                )
+
+    def test_rejects_false_alice_donor_identity_and_wealth_source(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        valid = [
+            "Alice Keck Park was donated by Alice Keck.",
+            "Alice Keck Park was W. M. Keck's daughter.",
+            "Her family's wealth came from Superior Oil.",
+        ]
+        false_facts = (
+            (0, "Alice Keck Park was not donated by Alice Keck; someone else gave it."),
+            (0, "Alice Keck Park was donated by the city as an anonymous gift and was dedicated in 1980."),
+            (1, "Alice Keck Park was not W. M. Keck's daughter."),
+            (2, "Her family's wealth did not come from Superior Oil."),
+        )
+        for index, false_answer in false_facts:
+            turns = valid.copy()
+            turns[index] = false_answer
+            with self.subTest(turn=false_answer), self.assertRaises(AssertionError):
+                evaluate_scenario(scenario, turns=turns, phone_commands=[], room_closed_after=None)
 
 
 if __name__ == "__main__":

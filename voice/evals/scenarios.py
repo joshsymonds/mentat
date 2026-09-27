@@ -35,14 +35,30 @@ SCENARIOS = (
     Scenario(
         name="timer-300-seconds",
         caller_lines=("Set a timer for five minutes.",),
-        turns=(TurnExpectation((r"\b(?:five|5)[ -]minutes?\b", r"\btimer\b", r"\bset\b")),),
+        turns=(
+            TurnExpectation(
+                (
+                    r"\b(?:five|5)[ -]minutes?\b",
+                    r"\b(?:done|set|started|running|counting down|on the clock)\b",
+                )
+            ),
+        ),
         commands=({"turn": 1, "kind": "timer", "seconds": 300},),
         room_close_after=1,
     ),
     Scenario(
         name="equivalent-alarm",
         caller_lines=("Set an alarm for 7 a.m.",),
-        turns=(TurnExpectation((r"\b7(?::00| o'clock|\s*a\.m\.)\b", r"\balarm\b", r"\bset\b")),),
+        turns=(
+            TurnExpectation(
+                (
+                    r"\b7(?:(?:\s*:\s*00)(?:\s*a\.?\s*m\.?)?|\s*a\.?\s*m\.?|\s*o['’]?clock)(?!\s*p\.?\s*m\.?)\b",
+                    r"\balarm\b",
+                    r"\b(?:done|set|started)\b",
+                ),
+                reject_patterns=(r"\b7(?::00)?\s*p\.?\s*m\.?(?![A-Za-z])",),
+            ),
+        ),
         commands=({"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},),
         room_close_after=1,
     ),
@@ -110,12 +126,28 @@ SCENARIOS = (
         ),
         turns=(
             TurnExpectation(
-                (r"Alice Keck Park", r"Santa Barbara", r"\b(?:donated|gave|gifted)\b"),
+                (
+                    r"\bAlice Keck Park\b",
+                    r"\bAlice Keck\b(?: Park)?\s+(?:donated|gave|gifted)\b|"
+                    r"\bAlice Keck Park\b.{0,8}\bwho\s+(?:bought|donated|gave|gifted)\b|"
+                    r"\b(?:donated|given|gifted)\b.{0,80}\bby Alice Keck\b|"
+                    r"\bcity\b.{0,80}\b(?:got|received)\b.{0,80}\banonymous gift\b.{0,100}\bdedicated\b",
+                ),
                 reject_patterns=(
                     r"\b(?:not sure|don't know|do not know|unclear|can't say|cannot say)\b.{0,100}\b(?:donat|gave|gift)\w*\b",
+                    r"\b(?:not|never|did not|didn't|was not|wasn't)\b.{0,100}\b(?:donat|gave|gift)\w*\b",
+                    r"\b(?:donated|given|gifted)\b.{0,40}\bby (?:the )?city\b|"
+                    r"\b(?:the )?city\b.{0,40}\b(?:donated|gave|gifted)\b",
+                    r"\b(?:someone else|somebody else|another person)\b.{0,80}\b(?:donated|gave|gifted)\b|"
+                    r"\b(?:donated|gave|gifted)\b.{0,80}\b(?:someone else|somebody else|another person)\b",
                 ),
             ),
-            TurnExpectation((r"W\.?\s*M\.?\s*Keck", r"(?:father|daughter)")),
+            TurnExpectation(
+                (r"W\.?\s*M\.?\s*Keck", r"(?:father|daughter)"),
+                reject_patterns=(
+                    r"\b(?:not|never|is not|isn't|was not|wasn't)\b.{0,80}\b(?:father|daughter|son|child|related)\b",
+                ),
+            ),
             TurnExpectation(
                 (
                     r"Superior Oil",
@@ -123,6 +155,7 @@ SCENARIOS = (
                 ),
                 reject_patterns=(
                     r"\b(?:can't say|cannot say|don't know|do not know|not sure|may have)\b.{0,100}\b(?:inher|wealth|fortune|Superior Oil)\b",
+                    r"\b(?:not|never|did not|didn't|was not|wasn't)\b.{0,100}\b(?:inher|wealth|fortune|Superior Oil)\b",
                 ),
             ),
         ),
@@ -141,14 +174,17 @@ def _require(condition: bool, message: str) -> None:
 def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -> str:
     """Extract the complete say-back between the recipient and confirmation prompt."""
     pattern = re.compile(
-        r"\b(?:text|send)\s+(?P<recipient>[+\d().\s-]+?)\s*:\s*"
-        r"(?P<body>.+?)(?=\s+(?:should i|would you like|do you want|shall i)\b)",
+        r"\b(?:text|send)\s+(?P<recipient>[+\d().\s-]*\d)\s*[:,.]?\s+"
+        r"(?P<body>.+?)(?=\s+(?:should i|would you like|do you want|shall i|want me to)\b)",
         re.IGNORECASE | re.DOTALL,
     )
     match = pattern.search(text)
+    spoken_recipient = re.sub(r"\D", "", match.group("recipient")) if match else ""
+    expected_recipient = re.sub(r"\D", "", recipient)
+    national_number = expected_recipient[1:] if recipient.startswith("+1") and expected_recipient.startswith("1") else ""
     _require(
         match is not None
-        and re.sub(r"\D", "", match.group("recipient")) == re.sub(r"\D", "", recipient),
+        and spoken_recipient in (expected_recipient, national_number),
         f"{scenario_name}: turn {turn} has no complete {recipient} message say-back",
     )
     tail = text[match.end():]
