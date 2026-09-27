@@ -58,6 +58,9 @@ def _score_turn(
     label = f"{name} run {run_index + 1} turn {turn_index + 1}"
     if not isinstance(turn, dict):
         raise ValueError(f"{label}: turn observation must be an object")
+    kind = turn.get("kind")
+    if kind not in ("action", "search"):
+        raise ValueError(f"missing kind or invalid turn kind {kind!r}")
     speech_end = _timestamp(turn, "speech_end")
     first_audio = _timestamp(turn, "first_audio")
     if "expect_confirmation" not in turn:
@@ -107,6 +110,8 @@ def _score_turn(
     report = {
         "run": run_index + 1,
         "turn": turn_index + 1,
+        "kind": kind,
+        "expect_hangup": expect_hangup,
         "latency_seconds": {
             "first_audio": first_audio_latency,
             "confirmation": (
@@ -152,14 +157,11 @@ def score_observations(
         if not isinstance(name, str) or not name.strip():
             name = f"case {case_index + 1}"
             failures.append(f"{name}: missing scenario name")
-        kind = scenario.get("kind")
-        if kind not in ("action", "search"):
-            failures.append(f"{name}: kind must be action or search")
         runs = scenario.get("runs")
         if not isinstance(runs, list):
             message = f"{name}: missing or invalid runs"
             failures.append(message)
-            reports.append({"name": name, "kind": kind, "turns": [], "gates": [], "failures": [message]})
+            reports.append({"name": name, "turns": [], "gates": [], "failures": [message]})
             continue
         case_failures: list[str] = []
         if len(runs) != required_runs:
@@ -177,15 +179,22 @@ def score_observations(
                 except ValueError as error:
                     case_failures.append(f"{name} run {run_index + 1} turn {turn_index + 1}: {error}")
 
-        by_turn: dict[int, list[float]] = {}
+        by_turn: dict[int, list[dict[str, Any]]] = {}
         for turn in turns:
-            by_turn.setdefault(turn["turn"], []).append(turn["latency_seconds"]["first_audio"])
+            by_turn.setdefault(turn["turn"], []).append(turn)
         gates: list[dict[str, Any]] = []
-        for turn_index, latencies in sorted(by_turn.items()):
+        for turn_index, turn_reports in sorted(by_turn.items()):
+            kinds = {turn["kind"] for turn in turn_reports}
+            if len(kinds) != 1:
+                case_failures.append(f"{name} turn {turn_index}: kind differs across runs")
+                continue
+            kind = next(iter(kinds))
+            latencies = [turn["latency_seconds"]["first_audio"] for turn in turn_reports]
             p50 = nearest_rank(latencies, 0.50)
             p95 = nearest_rank(latencies, 0.95)
             gate = {
                 "turn": turn_index,
+                "kind": kind,
                 "run_count": len(latencies),
                 "first_audio_p50_seconds": p50,
                 "first_audio_p95_seconds": p95,
@@ -202,7 +211,7 @@ def score_observations(
                         f"{name} turn {turn_index}: first-audio p95 {p95:g}s "
                         f"exceeds {ACTION_P95_LIMIT_SECONDS:g}s"
                     )
-            elif kind == "search" and p50 > SEARCH_P50_LIMIT_SECONDS:
+            elif p50 > SEARCH_P50_LIMIT_SECONDS:
                 case_failures.append(
                     f"{name} turn {turn_index}: first-audio p50 {p50:g}s "
                     f"exceeds {SEARCH_P50_LIMIT_SECONDS:g}s"
@@ -215,7 +224,6 @@ def score_observations(
 
         report = {
             "name": name,
-            "kind": kind,
             "run_count": len(runs),
             "turns": turns,
             "gates": gates,

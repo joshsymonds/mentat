@@ -379,6 +379,20 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ScenarioObservationTests(unittest.TestCase):
+    def test_turn_kinds_cover_search_action_and_search_only_scenarios(self):
+        self.assertEqual(
+            [runner._turn_kind(SCENARIOS[2], index) for index in (1, 2)],
+            ["search", "action"],
+        )
+        self.assertEqual(
+            [runner._turn_kind(SCENARIOS[5], index) for index in (1, 2, 3)],
+            ["search", "search", "search"],
+        )
+        self.assertEqual(
+            [runner._turn_kind(SCENARIOS[0], 1), runner._turn_kind(SCENARIOS[3], 1)],
+            ["action", "action"],
+        )
+
     def test_every_scenario_script_fits_the_single_room_capture_format(self):
         for scenario in SCENARIOS:
             with self.subTest(scenario=scenario.name):
@@ -567,6 +581,128 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertEqual(observation["phone_commands"][0]["turn"], 2)
         self.assertEqual(observation["phone_commands"][0]["id"], "phone-id-independent-of-tool-id")
         self.assertEqual(observation["room_closed_after"], 2)
+
+
+class LocalEvalCliTests(unittest.TestCase):
+    def test_list_prints_all_scenarios_without_starting_dev_stack(self):
+        output = []
+        with patch.object(runner, "DevStack", create=True) as dev_stack, patch(
+            "builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])
+        ):
+            result = runner.main(["eval", "--list"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output, [scenario.name for scenario in SCENARIOS])
+        dev_stack.assert_not_called()
+
+    def test_live_eval_repeats_every_scenario_and_prints_strict_report(self):
+        from contextlib import contextmanager
+        import json
+
+        lifecycle = []
+        calls = []
+
+        @contextmanager
+        def dev_stack(**kwargs):
+            lifecycle.append(("enter", kwargs["opt_in"]))
+            try:
+                yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+            finally:
+                lifecycle.append(("exit",))
+
+        def observe(scenario, _stack):
+            calls.append(scenario.name)
+            turns = []
+            for index, expectation in enumerate(scenario.turns, 1):
+                turns.append({
+                    "kind": "search" if not scenario.commands or (scenario.place_query and index == 1) else "action",
+                    "speech_end": 10.0,
+                    "first_audio": 11.0,
+                    "expect_confirmation": expectation.sms_recipient is not None,
+                    "confirmation": 12.0 if expectation.sms_recipient is not None else None,
+                    "expect_hangup": scenario.room_close_after == index,
+                    "room_deleted": 13.0 if scenario.room_close_after == index else None,
+                    "model_calls": [],
+                })
+            return {"turns": turns}
+
+        output = []
+        with patch.object(runner, "DevStack", side_effect=dev_stack, create=True), patch.object(
+            runner, "observe_scenario", side_effect=observe
+        ), patch("builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])):
+            result = runner.main(["eval", "--live", "--runs", "2"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [scenario.name for scenario in SCENARIOS for _ in range(2)])
+        self.assertEqual(lifecycle, [("enter", True), ("exit",)])
+        report = json.loads(output[0])
+        self.assertTrue(report["passed"])
+        self.assertEqual(
+            [turn["kind"] for turn in report["cases"][2]["turns"][:2]],
+            ["search", "action"],
+        )
+        self.assertEqual(
+            [turn["kind"] for turn in report["cases"][5]["turns"][:3]],
+            ["search", "search", "search"],
+        )
+        self.assertTrue(all(case["run_count"] == 2 for case in report["cases"]))
+        self.assertTrue(all(gate["run_count"] == 2 for case in report["cases"] for gate in case["gates"]))
+        self.assertIn("latency_seconds", report["cases"][0]["turns"][0])
+        self.assertIn("model_call_count", report["cases"][0]["turns"][0])
+        self.assertEqual(report["cases"][0]["turns"][0]["latency_seconds"]["room_deleted"], 3.0)
+
+    def test_live_eval_requires_opt_in_and_continues_after_case_failure(self):
+        from contextlib import contextmanager
+        import json
+
+        calls = []
+        lifecycle = []
+
+        @contextmanager
+        def dev_stack(**kwargs):
+            lifecycle.append(("enter", kwargs["opt_in"]))
+            try:
+                yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+            finally:
+                lifecycle.append(("exit",))
+
+        output = []
+        with patch.object(runner, "DevStack", side_effect=AssertionError("stack started"), create=True), patch(
+            "builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])
+        ):
+            result = runner.main(["eval", "--runs", "1"])
+        self.assertNotEqual(result, 0)
+        self.assertEqual(output, ["eval requires --live; no DevStack was started"])
+
+        def observe(scenario, _stack):
+            calls.append(scenario.name)
+            if scenario is SCENARIOS[0]:
+                raise RuntimeError("deliberate scenario failure")
+            return {"turns": [
+                {
+                    "kind": "search" if not scenario.commands or (scenario.place_query and index == 1) else "action",
+                    "speech_end": 10.0,
+                    "first_audio": 11.0,
+                    "expect_confirmation": expectation.sms_recipient is not None,
+                    "confirmation": 12.0 if expectation.sms_recipient is not None else None,
+                    "expect_hangup": scenario.room_close_after == index,
+                    "room_deleted": 13.0 if scenario.room_close_after == index else None,
+                    "model_calls": [],
+                }
+                for index, expectation in enumerate(scenario.turns, 1)
+            ]}
+
+        output.clear()
+        with patch.object(runner, "DevStack", side_effect=dev_stack, create=True), patch.object(
+            runner, "observe_scenario", side_effect=observe
+        ), patch("builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])):
+            result = runner.main(["eval", "--live", "--runs", "1"])
+        self.assertEqual(result, 1)
+        self.assertEqual(calls, [scenario.name for scenario in SCENARIOS])
+        self.assertEqual(lifecycle, [("enter", True), ("exit",)])
+        report = json.loads(output[0])
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("deliberate scenario failure" in failure for failure in report["failures"]))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,9 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import caller
+from evals.dev_stack import DevStack
+from evals.report import score_observations
+from evals.scenarios import SCENARIOS
 
 RATE = caller.RATE
 FRAME_SAMPLES = caller.FRAME_SAMPLES
@@ -531,6 +534,14 @@ def _scenario_steps(scenario: Any) -> list[str]:
     return raw_steps
 
 
+def _turn_kind(scenario: Any, turn_index: int) -> str:
+    if not getattr(scenario, "commands", ()):
+        return "search"
+    if getattr(scenario, "place_query", None) is not None and turn_index == 1:
+        return "search"
+    return "action"
+
+
 def _confirmation_time(trace: dict[str, Any]) -> float:
     segments = trace.get("segments")
     capture_started = _finite_timestamp(trace.get("capture_started"), "capture start")
@@ -686,6 +697,7 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
             raise RuntimeError(f"captured turn {index} has no transcript segment evidence")
         for segment in segments:
             _segment_start([segment])
+        trace["kind"] = _turn_kind(scenario, index)
         trace["model_calls"] = recorded["model_calls"]
         trace["expect_confirmation"] = getattr(expected, "sms_recipient", None) is not None
         trace["expect_hangup"] = close_after == index
@@ -779,8 +791,63 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
     return arguments.room, arguments.steps, room_close_after
 
 
+def _run_local_eval(argv: list[str]) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python3 -m voice.evals.runner eval",
+        description="Run repeated voice evaluations against one isolated DevStack",
+    )
+    parser.add_argument("--live", action="store_true", help="explicitly opt in to the live isolated stack")
+    parser.add_argument("--runs", type=int, default=10, help="observations per scenario (default: 10)")
+    parser.add_argument("--list", action="store_true", help="list the contracted scenarios without running them")
+    arguments = parser.parse_args(argv)
+    if arguments.list:
+        if arguments.live or arguments.runs != 10:
+            print("eval --list cannot be combined with --live or --runs", file=sys.stderr)
+            return 2
+        for scenario in SCENARIOS:
+            print(scenario.name)
+        return 0
+    if not arguments.live:
+        print("eval requires --live; no DevStack was started", file=sys.stderr)
+        return 2
+    if arguments.runs <= 0:
+        print("eval --runs must be a positive integer", file=sys.stderr)
+        return 2
+
+    observations: dict[str, Any] = {"cases": []}
+    capture_failures: list[tuple[int, int, str]] = []
+    checkout = Path(__file__).resolve().parents[2]
+    with DevStack(checkout=checkout, opt_in=True) as stack:
+        for scenario_index, scenario in enumerate(SCENARIOS):
+            runs = []
+            for run_index in range(arguments.runs):
+                try:
+                    runs.append(observe_scenario(scenario, stack))
+                except Exception as error:
+                    message = f"{scenario.name} run {run_index + 1}: {error}"
+                    capture_failures.append((scenario_index, run_index, message))
+                    runs.append({"failure": str(error)})
+            observations["cases"].append({
+                "name": scenario.name,
+                "runs": runs,
+            })
+
+    report = score_observations(observations, required_runs=arguments.runs)
+    for scenario_index, _run_index, message in capture_failures:
+        report["failures"].append(message)
+        case = report["cases"][scenario_index]
+        case["failures"].append(message)
+    report["passed"] = not report["failures"]
+    print(json.dumps(report, indent=2, sort_keys=True), flush=True)
+    return 0 if report["passed"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == "eval":
+        return _run_local_eval(arguments[1:])
     room, steps, room_close_after = _parse_arguments(arguments)
     capture = _run_remote_capture_with_fake_phone if "--fake-phone" in arguments else run_remote_capture
     traces = asyncio.run(capture(room, steps, room_close_after=room_close_after))

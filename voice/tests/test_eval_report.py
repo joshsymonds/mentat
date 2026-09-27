@@ -13,8 +13,9 @@ from evals.report import nearest_rank, score_observations
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def turn(start=0.0, first_audio=2.0, confirmation=2.5, room_deleted=5.0, calls=None):
+def turn(start=0.0, first_audio=2.0, confirmation=2.5, room_deleted=5.0, calls=None, kind="action"):
     return {
+        "kind": kind,
         "speech_end": start,
         "first_audio": first_audio,
         "confirmation": confirmation,
@@ -28,9 +29,8 @@ def turn(start=0.0, first_audio=2.0, confirmation=2.5, room_deleted=5.0, calls=N
 def case(name="send message", kind="action", latency=2.0):
     return {
         "name": name,
-        "kind": kind,
         "runs": [
-            {"turns": [turn(first_audio=latency, confirmation=latency + 0.5)]}
+            {"turns": [turn(first_audio=latency, confirmation=latency + 0.5, kind=kind)]}
             for _ in range(10)
         ],
     }
@@ -107,6 +107,45 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(report["gates"][0]["turn"], 1)
         self.assertEqual(report["gates"][0]["first_audio_p50_seconds"], 2.0)
         self.assertEqual(report["gates"][0]["first_audio_p95_seconds"], 2.0)
+
+    def test_mixed_case_applies_search_and_action_gates_to_each_turn(self):
+        observation = {
+            "cases": [{
+                "name": "place search and navigation",
+                "runs": [{
+                    "turns": [
+                        turn(first_audio=9.0, kind="search"),
+                        turn(first_audio=6.0, kind="action"),
+                    ]
+                } for _ in range(10)],
+            }]
+        }
+
+        result = score_observations(observation)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(
+            [turn["kind"] for turn in result["cases"][0]["turns"][:2]],
+            ["search", "action"],
+        )
+        gates = result["cases"][0]["gates"]
+        self.assertEqual([gate["kind"] for gate in gates], ["search", "action"])
+        self.assertEqual(gates[0]["first_audio_p50_seconds"], 9.0)
+        self.assertEqual(gates[1]["first_audio_p50_seconds"], 6.0)
+        self.assertEqual(gates[1]["first_audio_p95_seconds"], 6.0)
+        failures = " ".join(result["failures"])
+        self.assertIn("turn 2", failures)
+        self.assertIn("p95", failures)
+        self.assertNotIn("turn 1", failures)
+
+    def test_missing_per_turn_kind_fails_closed(self):
+        observation = {"cases": [case()]}
+        del observation["cases"][0]["runs"][0]["turns"][0]["kind"]
+
+        result = score_observations(observation)
+
+        self.assertFalse(result["passed"])
+        self.assertIn("missing kind", " ".join(result["failures"]))
 
     def test_action_gate_fails_and_names_the_case(self):
         result = score_observations({"cases": [case(latency=5.1)]})
@@ -186,8 +225,12 @@ class ScoringTests(unittest.TestCase):
         observation = {
             "cases": [{
                 "name": "Alice Keck chain",
-                "kind": "search",
-                "runs": [{"turns": [dict(turn_without_end), dict(turn_without_end)]} for _ in range(10)],
+                "runs": [{
+                    "turns": [
+                        {**turn_without_end, "kind": "search"},
+                        {**turn_without_end, "kind": "search"},
+                    ]
+                } for _ in range(10)],
             }]
         }
 
