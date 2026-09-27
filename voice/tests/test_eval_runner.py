@@ -2064,6 +2064,69 @@ class ScenarioObservationTests(unittest.TestCase):
                     10.8,
                 )
 
+    def test_run17_confirmation_timing_recognizes_live_prompt_forms_from_shared_pattern(self):
+        from evals import scenarios
+
+        self.assertIs(runner.SMS_CONFIRMATION_PATTERN, scenarios.SMS_CONFIRMATION_PATTERN)
+        prompts = (
+            "Just say when and I'll send it.",
+            "Say when and I'll send it.",
+            "Sound good?",
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(
+                    runner._confirmation_time({
+                        "capture_started": 10.0,
+                        "segments": [
+                            {"start": 0.0, "end": 0.3, "text": "Texting 202-555-0142, I will be there at six."},
+                            {"start": 0.4, "end": 0.8, "text": prompt},
+                        ],
+                    }),
+                    10.8,
+                )
+
+    def test_run17_answer_timing_requires_live_sms_readback_and_confirmation(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        cases = (
+            [
+                "Texting 202-555-0142, I will be there at six.",
+                "Just say when and I'll send it.",
+            ],
+            [
+                "Texting plus 1, 2, 0, 2, 5, 5, 5, 0, 1, 4, 2, I will be there at six.",
+                "Say when and I'll send it.",
+            ],
+            [
+                "Texting plus 1202.",
+                "5-5-5.",
+                "0142. I will be there at six.",
+                "Sound good?",
+            ],
+        )
+        for texts in cases:
+            with self.subTest(texts=texts):
+                self.assertEqual(
+                    runner._answer_time(
+                        {
+                            "capture_started": 10.0,
+                            "speech_end": 10.0,
+                            "segments": [
+                                {
+                                    "start": index * 0.2,
+                                    "end": index * 0.2 + 0.1,
+                                    "text": text,
+                                }
+                                for index, text in enumerate(texts)
+                            ],
+                        },
+                        scenario.turns[0],
+                        scenario_name=scenario.name,
+                        turn_index=1,
+                    ),
+                    10.0 + (len(texts) - 1) * 0.2,
+                )
+
     def test_confirmation_timestamp_recognizes_all_approved_prompt_literals(self):
         prompts = (
             "Should I send it?",

@@ -33,16 +33,18 @@ class Scenario:
 
 
 _ALICE_DONOR_CLAIM = (
-    r"\bAlice Keck(?: Park)?\s+(?:bought|purchased|donated|gave|gifted)\b|"
-    r"\bAlice Keck(?: Park)?\b.{0,100}\bshe\s+(?:bought|purchased|donated|gave|gifted)\b|"
-    r"\bAlice Keck Park\b.{0,8}\bwho\s+(?:bought|purchased|donated|gave|gifted)\b|"
-    r"\bAlice Keck Park,\s+a local philanthropist[,.]\s*who\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice (?:Bertha )?Keck(?: Park)?\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice (?:Bertha )?Keck(?: Park)?\b.{0,100}\bshe\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice (?:Bertha )?Keck Park\b.{0,8}\bwho\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice (?:Bertha )?Keck Park,\s+a (?:local|Santa Barbara) philanthropist[,.]?\s*who\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice (?:Bertha )?Keck Park\s+was\s+a Santa Barbara philanthropist\s+who\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\b(?:bought|purchased|donated|gave|gifted|given)\b.{0,80}\b(?:by|from)\s+Alice Keck\b|"
     r"\b(?:gift|donation)\b.{0,80}\b(?:by|from)\s+Alice Keck\b"
 )
 SMS_CONFIRMATION_PATTERN = re.compile(
     r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|"
-    r"say the word|confirm,\s+and i'll send it|sound right|good to send)\b",
+    r"say the word|(?:just\s+)?say when(?:\s+and i'll send it)?|"
+    r"confirm,\s+and i'll send it|sound right|sound good|good to send)\b",
     re.IGNORECASE,
 )
 _UNCERTAIN_DONOR_CLAIM = (
@@ -51,12 +53,12 @@ _UNCERTAIN_DONOR_CLAIM = (
 )
 _TRANSFER_ACTION = r"(?:bought|purchased|paid(?:\s+for)?|donat\w*|gave|gift\w*|given)"
 _PARK_LAND_OBJECT = (
-    r"(?:Alice Keck Park|(?:(?:the|that|this|her|his|their)\s+)?"
+    r"(?:Alice (?:Bertha )?Keck Park|(?:(?:the|that|this|her|his|their)\s+)?"
     r"(?:land|property|park|garden|site)|it)"
 )
 _OTHER_ROLE = r"(?:the\s+)?(?:her\s+)?(?:husband|wife|father|mother|daughter|son|family|city|someone else|somebody else|another person)"
 _NAMED_OTHER_ACTOR = (
-    r"(?-i:(?!(?:Alice|Halis)\s+Keck\b)(?!Keck\s+Park\b)"
+    r"(?-i:(?!(?:Alice|Halis)\s+(?:Bertha\s+)?Keck\b)(?!Keck\s+Park\b)"
     r"(?:[A-Z][A-Za-z'’-]+|[A-Z]\.)(?:\s+(?:[A-Z][A-Za-z'’-]+|[A-Z]\.|de|van|von|da)){1,5})"
 )
 _OTHER_ACTOR = rf"(?:{_OTHER_ROLE}|{_NAMED_OTHER_ACTOR})"
@@ -64,6 +66,7 @@ _ACTION_ACKNOWLEDGMENT = (
     r"\b(?:done|set|start(?:\s+it)?|started|starting|setting|running|sent|sending|texted|cent|scent|"
     r"navigat\w*|directions|route|taking you|sending you there|on the clock)\b"
 )
+_SMS_SENT_ACKNOWLEDGMENT = r"\b(?:done|sent|sense|sending|texted|cent|scent)\b"
 _DIGIT_WORDS = {
     "zero": "0",
     "oh": "0",
@@ -80,7 +83,7 @@ _DIGIT_WORDS = {
 _DIGIT_WORD_PATTERN = "|".join(_DIGIT_WORDS)
 _SPOKEN_SMS_RECIPIENT = re.compile(
     rf"(?P<recipient>(?:\+|plus(?:[\s-]+))?"
-    rf"(?:(?:{_DIGIT_WORD_PATTERN}|\d)[\s().,-]*){{10,15}})"
+    rf"(?:(?:{_DIGIT_WORD_PATTERN}|\d)[\s().,/\-]*){{10,15}})"
     r"\s*[:,.]?\s+",
     re.IGNORECASE,
 )
@@ -164,11 +167,11 @@ SCENARIOS = (
         caller_lines=("Text +1-202-555-0142: I will be there at six.", "Yes."),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
+                (r"\b(?:text|texting|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
-            TurnExpectation((_ACTION_ACKNOWLEDGMENT,)),
+            TurnExpectation((_SMS_SENT_ACKNOWLEDGMENT,)),
         ),
         commands=({"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."},),
         room_close_after=2,
@@ -182,16 +185,16 @@ SCENARIOS = (
         ),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
+                (r"\b(?:text|texting|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
             TurnExpectation(
-                (r"\b(?:text|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
+                (r"\b(?:text|texting|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at seven.",
             ),
-            TurnExpectation((_ACTION_ACKNOWLEDGMENT,)),
+            TurnExpectation((_SMS_SENT_ACKNOWLEDGMENT,)),
         ),
         commands=({"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at seven."},),
         room_close_after=3,
@@ -206,7 +209,7 @@ SCENARIOS = (
         turns=(
             TurnExpectation(
                 (
-                    r"\bAlice Keck(?: Park)?\b",
+                    r"\bAlice (?:Bertha )?Keck(?: Park)?\b",
                     _ALICE_DONOR_CLAIM,
                 ),
                 reject_patterns=(

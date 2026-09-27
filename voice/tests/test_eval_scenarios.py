@@ -1538,6 +1538,67 @@ class ScenarioCorpusTests(unittest.TestCase):
             room_closed_after=3,
         )
 
+    def test_run17_live_sms_readback_forms_and_sense_acknowledgment(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        correct_send = {
+            "turn": 2,
+            "kind": "sms",
+            "to": "+1-202-555-0142",
+            "body": "I will be there at six.",
+        }
+        readbacks = (
+            "Texting 202-555-0142, I will be there at six. Just say when and I'll send it.",
+            "Texting plus 1, 2, 0, 2, 5, 5, 5, 0, 1, 4, 2, I will be there at six. "
+            "Say when and I'll send it.",
+            "Texting plus 1202. / 5-5-5. / 0142. I will be there at six. Sound good?",
+        )
+        for readback in readbacks:
+            with self.subTest(readback=readback):
+                evaluate_scenario(
+                    scenario,
+                    [readback, "Sense."],
+                    [correct_send],
+                    room_closed_after=2,
+                )
+
+    def test_run17_sense_asr_variant_is_specific_to_sms_send_acknowledgment(self):
+        timer = next(s for s in SCENARIOS if s.name == "timer-300-seconds")
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                timer,
+                ["Sense."],
+                [{"turn": 1, "kind": "timer", "seconds": 300}],
+                room_closed_after=1,
+            )
+
+    def test_run17_alice_middle_name_and_santa_barbara_philanthropist_attribution(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        followups = [
+            "Alice Keck Park was W. M. Keck's daughter.",
+            "Her family's wealth came from Superior Oil.",
+        ]
+        evaluate_scenario(
+            scenario,
+            [
+                "Alice Bertha Keck Park was a Santa Barbara philanthropist who bought the land "
+                "and gave it to the city.",
+                *followups,
+            ],
+            [],
+            room_closed_after=None,
+        )
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                scenario,
+                [
+                    "Alice Bertha Keck Park was named for her husband, who bought the land "
+                    "and gave it to the city.",
+                    *followups,
+                ],
+                [],
+                room_closed_after=None,
+            )
+
     def test_run15_alice_philanthropist_appositive_attributes_donor_only_to_alice(self):
         scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
         followups = [
