@@ -95,6 +95,7 @@ class CaptureDependencies:
     transcribe: Callable[..., Any]
     capture_factory: Callable[..., Any]
     monotonic: Callable[[], float] = time.monotonic
+    wall_time: Callable[[], float] = time.time
     sleep: Callable[[float], Any] = asyncio.sleep
 
 
@@ -261,10 +262,8 @@ def _voiced_segments(
     _segment_start(segments)
     eligible = []
     for segment in segments:
-        start = float(segment["start"])
-        end = float(segment["end"])
-        if end > pcm_duration:
-            raise RuntimeError("transcription segment has invalid timestamp bounds")
+        start = min(_finite_timestamp(segment["start"], "transcription segment start"), pcm_duration)
+        end = min(_finite_timestamp(segment["end"], "transcription segment end"), pcm_duration)
         active_run = 0
         has_sustained_speech = False
         for index, rms in enumerate(rms_values):
@@ -496,6 +495,16 @@ async def capture_script(
                 ),
                 "speech_end",
             )
+            paired_monotonic = _finite_timestamp(
+                dependencies.monotonic(), "paired monotonic speech end"
+            )
+            paired_wall_time = _finite_timestamp(
+                dependencies.wall_time(), "paired wall speech end"
+            )
+            speech_end_wall = _finite_timestamp(
+                paired_wall_time + speech_end - paired_monotonic,
+                "speech_end_wall",
+            )
             if room_close_after == index + 1:
                 deletion_task = asyncio.create_task(
                     _wait_for_room_deletion(
@@ -554,6 +563,7 @@ async def capture_script(
                 "transcript": transcript,
                 "speech_started_at": speech_started_at,
                 "speech_end": speech_end,
+                "speech_end_wall": speech_end_wall,
                 "capture_started": capture_started,
                 "first_audio": first_audio,
                 "overlap": overlap,
@@ -1201,7 +1211,7 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     else:
         recorded_turns = []
     phone_commands = _match_phone_tools(phone_commands, recorded_turns)
-    # speech_end and phone received_at both use ultraviolet's wall clock.
+    # Phone receipt and paired speech-end timestamps use the same epoch clock.
     command_receipts: dict[int, float] = {}
     for command in phone_commands:
         turn = command["turn"]
@@ -1216,7 +1226,13 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
             raise RuntimeError(f"captured turn {index} has invalid turn or room identity")
         if not isinstance(trace.get("transcript"), str) or not trace["transcript"].strip():
             raise RuntimeError(f"captured turn {index} has no complete transcript")
-        for field in ("speech_started_at", "speech_end", "first_audio", "capture_started"):
+        for field in (
+            "speech_started_at",
+            "speech_end",
+            "speech_end_wall",
+            "first_audio",
+            "capture_started",
+        ):
             _finite_timestamp(trace.get(field), field)
         if not isinstance(trace.get("overlap"), bool):
             raise RuntimeError(f"captured turn {index} has no valid overlap observation")

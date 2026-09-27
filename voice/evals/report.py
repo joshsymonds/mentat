@@ -95,6 +95,7 @@ def _score_turn(
         except ValueError:
             problems.append(f"{label}: missing or invalid answer_at timestamp")
     command_received_at = None
+    command_speech_end = None
     if "command_received_at" not in turn:
         problems.append(f"{label}: missing command receipt timestamp declaration")
     elif turn["command_received_at"] is None:
@@ -105,6 +106,11 @@ def _score_turn(
             command_received_at = _timestamp(turn, "command_received_at")
         except ValueError:
             problems.append(f"{label}: missing or invalid command receipt timestamp")
+    if kind == "action" or command_received_at is not None:
+        try:
+            command_speech_end = _timestamp(turn, "speech_end_wall")
+        except ValueError:
+            problems.append(f"{label}: missing or invalid speech_end_wall timestamp")
     if "overlap" not in turn or not isinstance(turn["overlap"], bool):
         raise ValueError(f"{label}: missing or invalid overlap observation")
     overlap = turn["overlap"]
@@ -149,10 +155,10 @@ def _score_turn(
         if answer_latency < 0:
             problems.append(f"{label}: answer precedes speech_end")
     command_latency = None
-    if command_received_at is not None:
-        command_latency = command_received_at - speech_end
+    if command_received_at is not None and command_speech_end is not None:
+        command_latency = command_received_at - command_speech_end
         if command_latency < 0:
-            problems.append(f"{label}: command receipt precedes speech_end")
+            problems.append(f"{label}: command receipt precedes speech_end_wall")
     first_audio_latency = first_audio - speech_end
     report = {
         "run": run_index + 1,

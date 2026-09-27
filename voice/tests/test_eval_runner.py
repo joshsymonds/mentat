@@ -35,9 +35,13 @@ def pcm_windows(*levels, sample_rate=24000, channels=1):
 class Clock:
     def __init__(self):
         self.now = 10.0
+        self.epoch = 1_700_000_000.0
 
     def monotonic(self):
         return self.now
+
+    def wall_time(self):
+        return self.epoch + (self.now - 10.0)
 
     async def sleep(self, seconds):
         self.now += seconds
@@ -161,6 +165,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             transcribe=transcribe,
             capture_factory=ContinuousCapture,
             monotonic=clock.monotonic,
+            wall_time=clock.wall_time,
             sleep=clock.sleep,
         )
 
@@ -183,6 +188,11 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(traces), 2)
         self.assertEqual([item["transcript"] for item in traces], ["answer", "answer"])
+        for item in traces:
+            self.assertAlmostEqual(
+                item["speech_end_wall"],
+                clock.epoch + (item["speech_end"] - 10.0),
+            )
         self.assertTrue(all(item["speech_end"] < item["first_audio"] for item in traces))
         self.assertIsNone(traces[0]["room_deleted"])
         self.assertGreaterEqual(traces[1]["room_deleted"], traces[1]["speech_end"])
@@ -350,13 +360,24 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 1,
                 [{"start": 0.0, "end": 0.02, "text": "invalid PCM"}],
             )
-        with self.assertRaisesRegex(RuntimeError, "invalid timestamp bounds"):
-            runner._voiced_segments(
-                pcm_windows(600, 600),
-                24000,
-                1,
-                [{"start": 0.0, "end": 0.2, "text": "past capture end"}],
-            )
+        overrun = [{"start": 0.0, "end": 0.2, "text": "past capture end"}]
+        self.assertEqual(
+            runner._voiced_segments(pcm_windows(600, 600), 24000, 1, overrun),
+            overrun,
+        )
+
+    def test_segment_end_rounding_overrun_is_clamped_only_for_voiced_filtering(self):
+        raw_segments = [{"start": 0.0, "end": 0.0400001, "text": "voiced"}]
+        eligible = runner._voiced_segments(pcm_windows(600, 600), 24000, 1, raw_segments)
+
+        self.assertEqual(eligible, raw_segments)
+        self.assertEqual(raw_segments[0]["end"], 0.0400001)
+        for invalid in (
+            {"start": 0.02, "end": 0.01, "text": "reversed"},
+            {"start": 0.0, "end": float("nan"), "text": "nonfinite"},
+        ):
+            with self.subTest(segment=invalid), self.assertRaises(RuntimeError):
+                runner._voiced_segments(pcm_windows(600, 600), 24000, 1, [invalid])
 
     def test_pcm_onset_ignores_a_partial_trailing_window(self):
         trailing_half_window = struct.pack("<240h", *([0] * 240))
@@ -398,7 +419,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         async def transcribe(*_args):
             return [
                 {"start": 0.2, "end": 0.4, "text": "Okay, I heard you."},
-                {"start": 1.2, "end": 1.24, "text": "The timer is set for five minutes."},
+                {"start": 1.2, "end": 1.26, "text": "The timer is set for five minutes."},
             ]
 
         dependencies = CaptureDependencies(
@@ -430,7 +451,29 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trace["raw_segments"][0]["start"], 0.2)
         self.assertEqual(trace["first_audio"], 100.2)
         self.assertEqual(trace["speech_end"], 100.0)
+        self.assertEqual(trace["raw_segments"][1]["end"], 1.26)
         self.assertTrue(trace["overlap"])
+        from evals.report import score_observations
+
+        scored = score_observations({"cases": [{
+            "name": "rounded whisper end",
+            "runs": [{"turns": [{
+                "kind": "search",
+                "speech_end": trace["speech_end"],
+                "first_audio": trace["first_audio"],
+                "answer_at": trace["first_audio"],
+                "command_received_at": None,
+                "overlap": trace["overlap"],
+                "expect_confirmation": False,
+                "confirmation": None,
+                "expect_hangup": False,
+                "room_deleted": None,
+                "model_calls": [],
+                "raw_segments": trace["raw_segments"],
+            }]}],
+        }]}, required_runs=1)
+        self.assertEqual(len(scored["cases"][0]["turns"]), 1)
+        self.assertEqual(scored["cases"][0]["turns"][0]["segments"][1]["end"], 1.26)
 
     async def test_silent_transcript_segments_are_excluded_from_truth_and_timing(self):
         dependencies = self.dependencies_for_failure("other")
@@ -931,6 +974,7 @@ class LocalEvalTests(unittest.TestCase):
                 "turn": 1,
                 "kind": "action",
                 "speech_end": 101.0,
+                "speech_end_wall": 1_700_000_001.0,
                 "first_audio": 102.0,
                 "overlap": False,
                 "confirmation": None,
@@ -1084,6 +1128,7 @@ class ScenarioObservationTests(unittest.TestCase):
             "transcript": "Wrong park.",
             "speech_started_at": 100.0,
             "speech_end": 101.0,
+            "speech_end_wall": 1_700_000_001.0,
             "first_audio": 102.0,
             "overlap": False,
             "capture_started": 101.5,
@@ -1151,6 +1196,7 @@ class ScenarioObservationTests(unittest.TestCase):
                     "transcript": transcript,
                     "speech_started_at": started,
                     "speech_end": started + 1.0,
+                    "speech_end_wall": started + 1.0,
                     "first_audio": started + 2.0,
                     "overlap": False,
                     "capture_started": started + 1.5,
@@ -1279,6 +1325,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 "transcript": "Your timer is set for five minutes.",
                 "speech_started_at": 100.0,
                 "speech_end": 101.0,
+                "speech_end_wall": 1_700_000_001.0,
                 "first_audio": 101.8,
                 "capture_started": 101.4,
                 "overlap": False,
@@ -1291,7 +1338,7 @@ class ScenarioObservationTests(unittest.TestCase):
             },
         }
         phone_log = "".join(json.dumps(entry) + "\n" for entry in (
-            {"event": "command", "received_at": 101.5, "command": {
+            {"event": "command", "received_at": 1_700_000_001.5, "command": {
                 "id": "fake-timer-command",
                 "kind": "timer",
                 "seconds": 300,
@@ -1347,7 +1394,7 @@ class ScenarioObservationTests(unittest.TestCase):
             "kind": "timer",
             "seconds": 300,
             "expires_at": "2026-09-26T21:00:00Z",
-            "received_at": 101.5,
+            "received_at": 1_700_000_001.5,
             "turn": 1,
         }])
         self.assertEqual(observation["product_failures"], [])
@@ -1847,6 +1894,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 "transcript": "Text +1-202-555-0142: I will be there at six. Should I send it?",
                 "speech_started_at": 99.0,
                 "speech_end": 99.5,
+                "speech_end_wall": 1_700_000_000.5,
                 "first_audio": 100.2,
                 "overlap": False,
                 "capture_started": 100.0,
@@ -1863,6 +1911,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 "transcript": "Message sent to +1-202-555-0142.",
                 "speech_started_at": 200.0,
                 "speech_end": 201.0,
+                "speech_end_wall": 1_700_000_001.0,
                 "first_audio": 201.2,
                 "overlap": False,
                 "capture_started": 201.0,
@@ -1875,7 +1924,7 @@ class ScenarioObservationTests(unittest.TestCase):
             for entry in (
                 {
                     "event": "command",
-                    "received_at": 202.0,
+                    "received_at": 1_700_000_002.0,
                     "command": {
                         "id": "phone-id-independent-of-tool-id",
                         "kind": "sms",
@@ -1971,7 +2020,7 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertIsNone(observation["turns"][0]["command_received_at"])
         self.assertEqual(observation["turns"][0]["answer_at"], 100.6)
         self.assertEqual(observation["turns"][1]["kind"], "action")
-        self.assertEqual(observation["turns"][1]["command_received_at"], 202.0)
+        self.assertEqual(observation["turns"][1]["command_received_at"], 1_700_000_002.0)
         self.assertEqual(observation["turns"][1]["answer_at"], 201.2)
         self.assertEqual([len(turn["model_calls"]) for turn in observation["turns"]], [1, 2])
         self.assertEqual(observation["phone_commands"][0]["turn"], 2)
@@ -2013,6 +2062,7 @@ class LocalEvalCliTests(unittest.TestCase):
                 turns.append({
                     "kind": runner._turn_kind(scenario, index),
                     "speech_end": 10.0,
+                    "speech_end_wall": 10.0,
                     "first_audio": 11.0,
                     "command_received_at": 11.0 if runner._turn_kind(scenario, index) == "action" else None,
                     "answer_at": 11.0,
@@ -2081,6 +2131,7 @@ class LocalEvalCliTests(unittest.TestCase):
                 {
                     "kind": runner._turn_kind(scenario, index),
                     "speech_end": 10.0,
+                    "speech_end_wall": 10.0,
                     "first_audio": 11.0,
                     "command_received_at": 11.0 if runner._turn_kind(scenario, index) == "action" else None,
                     "answer_at": 11.0,
@@ -2117,6 +2168,7 @@ class LocalEvalCliTests(unittest.TestCase):
                     "turn": 1,
                     "kind": "search",
                     "speech_end": 10.0,
+                    "speech_end_wall": 10.0,
                     "first_audio": 11.0,
                     "command_received_at": None,
                     "answer_at": 11.0,
@@ -2131,6 +2183,7 @@ class LocalEvalCliTests(unittest.TestCase):
                     "turn": 2,
                     "kind": "action",
                     "speech_end": 20.0,
+                    "speech_end_wall": 20.0,
                     "first_audio": 21.5,
                     "command_received_at": 21.5,
                     "answer_at": 21.5,
@@ -2186,6 +2239,7 @@ class LocalEvalCliTests(unittest.TestCase):
                 turns.append({
                     "kind": runner._turn_kind(scenario, index),
                     "speech_end": 10.0,
+                    "speech_end_wall": 10.0,
                     "first_audio": 11.0,
                     "command_received_at": 11.0 if runner._turn_kind(scenario, index) == "action" else None,
                     "answer_at": 11.0,
@@ -2258,6 +2312,7 @@ class LocalEvalCliTests(unittest.TestCase):
                 "transcript": "Timer set for five minutes.",
                 "speech_started_at": 100.0,
                 "speech_end": 101.0,
+                "speech_end_wall": 1_700_000_001.0,
                 "first_audio": 102.0,
                 "capture_started": 101.5,
                 "overlap": False,
@@ -2270,7 +2325,7 @@ class LocalEvalCliTests(unittest.TestCase):
             },
         }
         phone_log = "".join(json.dumps(entry) + "\n" for entry in (
-            {"event": "command", "received_at": 101.5, "command": {
+            {"event": "command", "received_at": 1_700_000_001.5, "command": {
                 "id": "timer-command", "kind": "timer", "seconds": 300,
             }},
             {"event": "result", "result": {"id": "timer-command", "status": "ok"}},

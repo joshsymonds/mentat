@@ -18,6 +18,7 @@ def turn(start=0.0, first_audio=2.0, confirmation=2.5, room_deleted=5.0, calls=N
     return {
         "kind": kind,
         "speech_end": start,
+        "speech_end_wall": start,
         "first_audio": first_audio,
         "command_received_at": first_audio,
         "answer_at": first_audio,
@@ -133,9 +134,65 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("command-receipt p50 12s", " ".join(actions["failures"]))
         self.assertIn("answer p50 12s", " ".join(searches["failures"]))
 
+    def test_action_receipt_uses_wall_speech_end_and_gates_without_matching_answer(self):
+        timely = turn(first_audio=12.0, confirmation=None, room_deleted=None)
+        timely.update({
+            "turn": 1,
+            "speech_end": 10.0,
+            "speech_end_wall": 1_700_000_000.0,
+            "command_received_at": 1_700_000_002.0,
+            "answer_at": None,
+            "expect_confirmation": False,
+            "expect_hangup": False,
+        })
+        slow = dict(timely)
+        slow["command_received_at"] = 1_700_000_006.0
+        observation = {"cases": [
+            {"name": "timely receipt", "runs": [{"turns": [dict(timely)]} for _ in range(10)]},
+            {"name": "slow receipt", "runs": [{"turns": [dict(slow)]} for _ in range(10)]},
+        ]}
+
+        result = score_observations(observation)
+
+        self.assertFalse(result["passed"])
+        timely_report, slow_report = result["cases"]
+        self.assertEqual(timely_report["gates"][0]["command_receipt_p50_seconds"], 2.0)
+        self.assertEqual(slow_report["gates"][0]["command_receipt_p50_seconds"], 6.0)
+        self.assertIn("missing answer_at timestamp", " ".join(timely_report["failures"]))
+        self.assertFalse(any("command-receipt" in failure for failure in timely_report["failures"]))
+        self.assertTrue(any("command-receipt p50 6s" in failure for failure in slow_report["failures"]))
+
+    def test_search_command_receipt_uses_wall_clock_without_changing_answer_gate(self):
+        with_command = turn(start=100.0, first_audio=102.0, confirmation=None, room_deleted=None, kind="search")
+        with_command.update({
+            "speech_end_wall": 1_700_000_000.0,
+            "command_received_at": 1_700_000_002.0,
+            "answer_at": 112.0,
+            "expect_confirmation": False,
+            "expect_hangup": False,
+        })
+        without_command = dict(with_command)
+        without_command.update({
+            "command_received_at": None,
+            "answer_at": 109.0,
+        })
+        result = score_observations({"cases": [
+            {"name": "search with location command", "runs": [{"turns": [with_command]}]},
+            {"name": "search without command", "runs": [{"turns": [without_command]}]},
+        ]}, required_runs=1)
+
+        commanded, uncommanded = result["cases"]
+        self.assertEqual(commanded["turns"][0]["latency_seconds"]["command_receipt"], 2.0)
+        self.assertEqual(commanded["gates"][0]["answer_p50_seconds"], 12.0)
+        self.assertTrue(any("answer p50 12s" in failure for failure in commanded["failures"]))
+        self.assertIsNone(uncommanded["turns"][0]["latency_seconds"]["command_receipt"])
+        self.assertEqual(uncommanded["gates"][0]["answer_p50_seconds"], 9.0)
+        self.assertEqual(uncommanded["failures"], [])
+
     def test_missing_or_malformed_command_receipt_and_answer_timestamps_fail_closed(self):
         for field, value in (("command_received_at", None), ("command_received_at", float("nan")),
-                             ("answer_at", None), ("answer_at", float("inf"))):
+                             ("answer_at", None), ("answer_at", float("inf")),
+                             ("speech_end_wall", None)):
             with self.subTest(field=field, value=value):
                 observation_turn = turn()
                 observation_turn.update({
@@ -148,7 +205,13 @@ class ScoringTests(unittest.TestCase):
                     "name": "strict timing", "runs": [{"turns": [observation_turn]}],
                 }]}, required_runs=1)
                 self.assertFalse(result["passed"])
-                expected_name = "command receipt" if field == "command_received_at" else "answer_at"
+                expected_name = (
+                    "command receipt"
+                    if field == "command_received_at"
+                    else "speech_end_wall"
+                    if field == "speech_end_wall"
+                    else "answer_at"
+                )
                 self.assertIn(expected_name, " ".join(result["failures"]))
 
     def test_reports_per_turn_latencies_and_backend_call_counts(self):
