@@ -733,7 +733,7 @@ def _json_lines(text: str, label: str) -> list[dict[str, Any]]:
     if not isinstance(text, str):
         raise RuntimeError(f"{label} log is missing or invalid")
     if not text.strip():
-        if label == "fake phone":
+        if label in {"fake phone", "delegation marker"}:
             return []
         raise RuntimeError(f"{label} log is missing or empty")
     records = []
@@ -772,8 +772,6 @@ def _eval_delegations(marker_log: str, room_name: str) -> list[dict[str, Any]]:
             raise RuntimeError("delegation marker timestamps are ambiguous or out of order")
         seen_ids.add(delegation_id)
         delegations.append({"id": delegation_id, "created_at": created_at})
-    if not delegations:
-        raise RuntimeError("delegation marker file has no records for the current room")
     return delegations
 
 
@@ -1098,11 +1096,30 @@ def _confirmation_time(trace: dict[str, Any]) -> float | None:
 
 def _completed_stdout(result: Any, label: str) -> str:
     if getattr(result, "returncode", None) != 0:
-        raise RuntimeError(f"{label} failed: {getattr(result, 'stderr', '')}")
+        stderr = _redact_diagnostics(getattr(result, "stderr", ""))
+        raise RuntimeError(f"{label} failed: {stderr}")
     stdout = getattr(result, "stdout", None)
     if not isinstance(stdout, str):
         raise RuntimeError(f"{label} returned no output")
     return stdout
+
+
+def _remote_artifact_text(
+    stack: Any, path: str, label: str, *, allow_missing: bool = False
+) -> str | None:
+    try:
+        result = stack.run_remote(["sudo", "cat", path])
+    except subprocess.CalledProcessError as error:
+        stderr = _redact_diagnostics(error.stderr).strip()
+        if (
+            allow_missing
+            and error.returncode == 1
+            and stderr == f"cat: {path}: No such file or directory"
+        ):
+            return None
+        detail = stderr or f"remote command exited with status {error.returncode}"
+        raise RuntimeError(f"{label} at {path} read failed: {detail}") from error
+    return _completed_stdout(result, f"{label} at {path} read")
 
 
 def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -1328,22 +1345,28 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
         )
 
     phone_log_path = "voice/" + FAKE_PHONE_LOG
-    phone_text = _completed_stdout(stack.run_remote(["sudo", "cat", phone_log_path]), "fake phone log read")
+    phone_text = _remote_artifact_text(stack, phone_log_path, "fake phone log")
+    if phone_text is None:
+        raise RuntimeError(f"fake phone log at {phone_log_path} is missing")
     phone_commands = _phone_commands(_json_lines(phone_text, "fake phone"))
     sdk_recording_applicable = not _is_preflight_tts_capture_failure(
         traces, capture_failure
     )
     if sdk_recording_applicable:
-        marker_log = _completed_stdout(
-            stack.run_remote(["sudo", "cat", "voice/evals/delegations.jsonl"]),
-            "delegation marker log read",
-        )
+        marker_path = "voice/evals/delegations.jsonl"
+        marker_log = _remote_artifact_text(stack, marker_path, "delegation marker log")
+        if marker_log is None:
+            raise RuntimeError(f"delegation marker log at {marker_path} is missing")
         session_id = "voice-" + room
         record_path = "records/" + quote(session_id, safe="") + ".jsonl"
-        record_text = _completed_stdout(
-            stack.run_remote(["sudo", "cat", record_path]), "daemon SDK recording read"
+        record_text = _remote_artifact_text(
+            stack, record_path, "daemon SDK recording", allow_missing=True
         )
-        recorded_turns = _recorded_turns(_json_lines(record_text, "SDK recording"))
+        recorded_turns = (
+            []
+            if record_text is None
+            else _recorded_turns(_json_lines(record_text, "SDK recording"))
+        )
         traces = _attribute_model_calls(
             traces,
             marker_log,

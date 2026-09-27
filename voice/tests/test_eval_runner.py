@@ -1432,6 +1432,162 @@ class LocalEvalTests(unittest.TestCase):
 
 
 class ScenarioObservationTests(unittest.TestCase):
+    def test_direct_turn_accepts_missing_optional_sdk_record(self):
+        import json
+        import subprocess
+        from subprocess import CompletedProcess
+
+        expectation = type(SCENARIOS[0].turns[0])(("forty-two",))
+        scenario = type(SCENARIOS[0])(
+            name="direct-answer",
+            caller_lines=("What is the answer?",),
+            turns=(expectation,),
+            commands=(),
+            room_close_after=None,
+        )
+        room = "direct-answer-room"
+        trace = {
+            "turn": 1,
+            "room": room,
+            "line": scenario.caller_lines[0],
+            "transcript": "The answer is forty-two.",
+            "speech_started_at": 100.0,
+            "speech_end": 101.0,
+            "speech_end_wall": 1_700_000_001.0,
+            "first_audio": 102.0,
+            "overlap": False,
+            "capture_started": 101.5,
+            "segments": [{"start": 0.2, "end": 0.8, "text": "The answer is forty-two."}],
+            "room_deleted": None,
+        }
+        record_path = f"records/voice-{room}.jsonl"
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, json.dumps({"turns": [trace]}), "")
+
+            def run_remote(self, command):
+                path = command[-1]
+                if path == "voice/evals/phone.jsonl":
+                    return CompletedProcess(command, 0, "", "")
+                if path == "voice/evals/delegations.jsonl":
+                    return CompletedProcess(command, 0, "", "")
+                if path == record_path:
+                    raise subprocess.CalledProcessError(
+                        1,
+                        ["ssh", "ultraviolet", "bash", "-s"],
+                        output="",
+                        stderr=f"cat: {record_path}: No such file or directory\n",
+                    )
+                raise AssertionError(f"unexpected remote command {command!r}")
+
+        with patch.object(
+            runner,
+            "_voice_token",
+            return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"},
+        ):
+            observation = runner.observe_scenario(scenario, Stack())
+
+        self.assertEqual(observation["turns"][0]["transcript"], "The answer is forty-two.")
+        self.assertEqual(observation["turns"][0]["model_calls"], [])
+        self.assertEqual(observation["phone_commands"], [])
+
+    def test_remote_artifact_failures_name_path_and_scrub_stderr(self):
+        import json
+        import subprocess
+        from subprocess import CompletedProcess
+
+        expectation = type(SCENARIOS[0].turns[0])(("forty-two",))
+        scenario = type(SCENARIOS[0])(
+            name="direct-answer",
+            caller_lines=("What is the answer?",),
+            turns=(expectation,),
+            commands=(),
+            room_close_after=None,
+        )
+        room = "artifact-error-room"
+        trace = {
+            "turn": 1,
+            "room": room,
+            "line": scenario.caller_lines[0],
+            "transcript": "The answer is forty-two.",
+            "speech_started_at": 100.0,
+            "speech_end": 101.0,
+            "speech_end_wall": 1_700_000_001.0,
+            "first_audio": 102.0,
+            "overlap": False,
+            "capture_started": 101.5,
+            "segments": [{"start": 0.2, "end": 0.8, "text": "The answer is forty-two."}],
+            "room_deleted": None,
+        }
+        paths = (
+            "voice/evals/phone.jsonl",
+            "voice/evals/delegations.jsonl",
+            f"records/voice-{room}.jsonl",
+        )
+        for failed_path in paths:
+            class Stack:
+                base_url = "http://127.0.0.1:8485"
+
+                def start_worker(self, _room):
+                    pass
+
+                def run_voice(self, command, *, token, livekit_url):
+                    return CompletedProcess(command, 0, json.dumps({"turns": [trace]}), "")
+
+                def run_remote(self, command):
+                    path = command[-1]
+                    if path == failed_path:
+                        raise subprocess.CalledProcessError(
+                            255,
+                            ["ssh", "ultraviolet", "bash", "-s"],
+                            output="",
+                            stderr="Permission denied; Authorization: Bearer secret-value\\n",
+                        )
+                    if path == "voice/evals/phone.jsonl":
+                        return CompletedProcess(command, 0, "", "")
+                    if path == "voice/evals/delegations.jsonl":
+                        return CompletedProcess(command, 0, "", "")
+                    if path == f"records/voice-{room}.jsonl":
+                        return CompletedProcess(command, 0, "", "")
+                    raise AssertionError(f"unexpected remote command {command!r}")
+
+            with patch.object(
+                runner,
+                "_voice_token",
+                return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"},
+            ), self.subTest(path=failed_path):
+                with self.assertRaises(RuntimeError) as raised:
+                    runner.observe_scenario(scenario, Stack())
+            self.assertIn(failed_path, str(raised.exception))
+            self.assertNotIsInstance(raised.exception, subprocess.CalledProcessError)
+            self.assertNotIn("secret-value", str(raised.exception))
+
+    def test_missing_phone_and_marker_artifacts_fail_closed(self):
+        import subprocess
+
+        for path, label in (
+            ("voice/evals/phone.jsonl", "fake phone log"),
+            ("voice/evals/delegations.jsonl", "delegation marker log"),
+        ):
+            class Stack:
+                def run_remote(self, command):
+                    raise subprocess.CalledProcessError(
+                        1,
+                        ["ssh", "ultraviolet", "bash", "-s"],
+                        output="",
+                        stderr=f"cat: {path}: No such file or directory\\n",
+                    )
+
+            with self.subTest(path=path), self.assertRaises(RuntimeError) as raised:
+                runner._remote_artifact_text(Stack(), path, label)
+            self.assertIn(path, str(raised.exception))
+
     def test_turn_kinds_cover_search_action_and_search_only_scenarios(self):
         self.assertEqual(
             [runner._turn_kind(SCENARIOS[2], index) for index in (1, 2)],
@@ -2310,6 +2466,20 @@ class ScenarioObservationTests(unittest.TestCase):
         ]
         call = {"model_calls": [{"id": "model-call-1", "model": "claude-opus-5"}]}
 
+        with self.assertRaisesRegex(RuntimeError, "delegation and SDK result counts differ"):
+            runner._attribute_model_calls(
+                traces[:1],
+                "",
+                "room-a",
+                [call],
+            )
+        with self.assertRaisesRegex(RuntimeError, "delegation and SDK result counts differ"):
+            runner._attribute_model_calls(
+                traces[:1],
+                '{"room":"room-a","id":"d1","created_at":100.5}\n',
+                "room-a",
+                [],
+            )
         with self.assertRaisesRegex(RuntimeError, "delegation and SDK result counts differ"):
             runner._attribute_model_calls(
                 traces,
