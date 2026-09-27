@@ -22,7 +22,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import caller
-from evals.dev_stack import DevStack, _redact_diagnostics
+from evals.dev_stack import DevStack, RemoteCommandError, _redact_diagnostics
 from evals.report import NO_ANSWER_FAILURE, score_observations
 from evals.scenarios import (
     SCENARIOS,
@@ -35,13 +35,17 @@ RATE = caller.RATE
 FRAME_SAMPLES = caller.FRAME_SAMPLES
 PARTICIPANT_DEADLINE_SECONDS = 30.0
 ANSWER_CAPTURE_DEADLINE_SECONDS = 45.0
+ANSWER_TRANSCRIPTION_DEADLINE_SECONDS = 30.0
 ROOM_DELETE_DEADLINE_SECONDS = 60.0
 REMOTE_OPERATION_DEADLINE_SECONDS = 30.0
 ROOM_POLL_INTERVAL_SECONDS = 0.25
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
+SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
+    r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
+)
 SMS_CONFIRMATION_PATTERN = re.compile(
-    r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word)\b",
+    r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word|confirm,\s+and i'll send it)\b",
     re.IGNORECASE,
 )
 PHONE_TOOL_KINDS = {
@@ -62,6 +66,17 @@ PHONE_TOOL_KINDS = {
 
 class DeadlineExceeded(RuntimeError):
     """A bounded capture operation did not complete before its deadline."""
+
+
+def _scripted_tts_timeout_line(message: Any) -> int | None:
+    if not isinstance(message, str):
+        return None
+    match = SCRIPTED_TTS_TIMEOUT_PATTERN.fullmatch(message)
+    return int(match.group(1)) if match is not None else None
+
+
+def _is_scripted_tts_timeout(message: Any) -> bool:
+    return _scripted_tts_timeout_line(message) is not None
 
 
 class PartialCaptureFailure(RuntimeError):
@@ -382,6 +397,34 @@ async def capture_script(
     parsed_livekit_url = urlsplit(livekit_url)
     if parsed_livekit_url.scheme not in ("ws", "wss") or parsed_livekit_url.hostname is None:
         raise RuntimeError("endpoint-issued LiveKit URL is missing or invalid")
+
+    synthesized: list[bytes] = []
+    for index, step in enumerate(steps):
+        try:
+            pcm = await _with_deadline(
+                dependencies.tts(dependencies.http, step.line),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "scripted speech synthesis",
+            )
+        except DeadlineExceeded as error:
+            if str(error) != "scripted speech synthesis exceeded its deadline":
+                raise
+            try:
+                pcm = await _with_deadline(
+                    dependencies.tts(dependencies.http, step.line),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "scripted speech synthesis",
+                )
+            except DeadlineExceeded as retry_error:
+                if str(retry_error) != "scripted speech synthesis exceeded its deadline":
+                    raise
+                raise PartialCaptureFailure(
+                    [],
+                    1,
+                    f"scripted speech synthesis for line {index + 1} exceeded its deadline",
+                ) from retry_error
+        synthesized.append(pcm)
+
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
     capture_end: asyncio.Event | None = None
@@ -483,18 +526,8 @@ async def capture_script(
                     "silence timing",
                 )
 
-        for index, step in enumerate(steps):
+        for index, (step, pcm) in enumerate(zip(steps, synthesized, strict=True)):
             await quiet(step.delay)
-            try:
-                pcm = await _with_deadline(
-                    dependencies.tts(dependencies.http, step.line),
-                    REMOTE_OPERATION_DEADLINE_SECONDS,
-                    "scripted speech synthesis",
-                )
-            except DeadlineExceeded as error:
-                if str(error) == "scripted speech synthesis exceeded its deadline":
-                    raise PartialCaptureFailure(traces, index + 1, str(error)) from error
-                raise
             capture_end = asyncio.Event()
             capture = dependencies.capture_factory(answer_tracks, capture_end)
             await _with_deadline(
@@ -557,20 +590,41 @@ async def capture_script(
             utterances = _pcm_utterances(answer_pcm, sample_rate, channels)
             raw_segments = []
             segments = []
+            if (
+                not math.isfinite(ANSWER_TRANSCRIPTION_DEADLINE_SECONDS)
+                or ANSWER_TRANSCRIPTION_DEADLINE_SECONDS <= 0
+            ):
+                raise RuntimeError("answer transcription deadline must be finite and positive")
             transcription_deadline = (
-                dependencies.monotonic() + REMOTE_OPERATION_DEADLINE_SECONDS
+                dependencies.monotonic() + ANSWER_TRANSCRIPTION_DEADLINE_SECONDS
             )
-            for utterance_start, utterance_end, utterance_pcm in utterances:
-                remaining = transcription_deadline - dependencies.monotonic()
-                if remaining <= 0:
-                    raise DeadlineExceeded("answer transcription exceeded its deadline")
-                utterance_segments = await _with_deadline(
+            transcription_tasks = [
+                asyncio.create_task(
                     dependencies.transcribe(
                         dependencies.http, utterance_pcm, sample_rate, channels
-                    ),
-                    remaining,
-                    "answer transcription",
+                    )
                 )
+                for _utterance_start, _utterance_end, utterance_pcm in utterances
+            ]
+            remaining = transcription_deadline - dependencies.monotonic()
+            if remaining > 0:
+                done, pending = await asyncio.wait(
+                    transcription_tasks,
+                    timeout=remaining,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+            else:
+                done, pending = set(), set(transcription_tasks)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            for utterance, task in zip(utterances, transcription_tasks, strict=True):
+                if task not in done:
+                    break
+                utterance_start, utterance_end, _utterance_pcm = utterance
+                utterance_segments = task.result()
                 if not isinstance(utterance_segments, list):
                     raise RuntimeError("transcription returned invalid segments")
                 raw_segments.extend(utterance_segments)
@@ -588,6 +642,14 @@ async def capture_script(
                         "end": utterance_end,
                         "text": text,
                     })
+            if pending:
+                raise PartialCaptureFailure(
+                    traces,
+                    index + 1,
+                    "answer transcription exceeded its deadline",
+                    speech_started_at=speech_started_at,
+                    segments=raw_segments or None,
+                )
             if not segments:
                 raise PartialCaptureFailure(
                     traces,
@@ -1066,6 +1128,12 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         {"turn", "message", "speech_started_at"},
         {"turn", "message", "speech_started_at", "segments"},
     )
+    preflight_tts_line = _scripted_tts_timeout_line(
+        failure.get("message") if isinstance(failure, dict) else None
+    )
+    preflight_tts_failure = (
+        preflight_tts_line is not None and preflight_tts_line <= expected_turns
+    )
     same_turn_hangup_timeout = (
         isinstance(failure, dict)
         and failure.get("message") == "room deletion was not observed before deadline"
@@ -1086,18 +1154,30 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
             same_turn_hangup_timeout
             or (
                 failure.get("message") != "room deletion was not observed before deadline"
-                and failure["turn"] == len(traces) + 1
+                and (
+                    (preflight_tts_failure and not traces and failure["turn"] == 1)
+                    or (
+                        not preflight_tts_failure
+                        and failure["turn"] == len(traces) + 1
+                    )
+                )
             )
         )
         or failure["turn"] > expected_turns
-        or failure.get("message") not in {
-            "scripted speech synthesis exceeded its deadline",
-            NO_ANSWER_FAILURE,
-            "room was deleted before all scripted lines were captured",
-            "room deletion was not observed before deadline",
-        }
+        or not (
+            preflight_tts_failure
+            or failure.get("message") in {
+                "answer transcription exceeded its deadline",
+                NO_ANSWER_FAILURE,
+                "room was deleted before all scripted lines were captured",
+                "room deletion was not observed before deadline",
+            }
+        )
         or (
-            failure.get("message") == NO_ANSWER_FAILURE
+            failure.get("message") in {
+                NO_ANSWER_FAILURE,
+                "answer transcription exceeded its deadline",
+            }
         ) != ("speech_started_at" in failure)
         or (
             failure.get("message") == "room was deleted before all scripted lines were captured"
@@ -1106,7 +1186,10 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
     ):
         raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
     if "segments" in failure and (
-        failure.get("message") != NO_ANSWER_FAILURE
+        failure.get("message") not in {
+            NO_ANSWER_FAILURE,
+            "answer transcription exceeded its deadline",
+        }
         or not isinstance(failure["segments"], list)
     ):
         raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
@@ -1121,6 +1204,18 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         ):
             raise RuntimeError("partial failure speech start is ambiguous or out of order")
     return traces, failure
+
+
+def _is_preflight_tts_capture_failure(
+    traces: list[dict[str, Any]], failure: dict[str, Any] | None
+) -> bool:
+    return (
+        not traces
+        and isinstance(failure, dict)
+        and failure.get("turn") == 1
+        and _is_scripted_tts_timeout(failure.get("message"))
+        and "speech_started_at" not in failure
+    )
 
 
 def _voice_token(base_url: str) -> dict[str, Any]:
@@ -1202,22 +1297,44 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     room = grant["room"]
     stack.start_worker(room)
     close_arg = "none" if close_after is None else str(close_after)
-    capture = stack.run_voice(
-        ["evals/runner.py", "--fake-phone", "--room-close-after", close_arg, room, *raw_steps],
-        token=grant["token"],
-        livekit_url=grant["url"],
-    )
-    capture_text = _completed_stdout(capture, "remote scripted capture")
-    traces, capture_failure = _capture_envelope(capture_text, len(scenario.turns))
+    command = [
+        "evals/runner.py", "--fake-phone", "--room-close-after", close_arg, room, *raw_steps
+    ]
+    try:
+        capture = stack.run_voice(
+            command,
+            token=grant["token"],
+            livekit_url=grant["url"],
+        )
+    except RemoteCommandError as error:
+        if error.returncode != 1 or not isinstance(error.output, str):
+            raise
+        try:
+            traces, capture_failure = _capture_envelope(error.output, len(scenario.turns))
+        except RuntimeError:
+            raise error
+        if not _is_preflight_tts_capture_failure(traces, capture_failure):
+            raise
+        capture_returncode = error.returncode
+    else:
+        capture_text = getattr(capture, "stdout", None)
+        if not isinstance(capture_text, str):
+            raise RuntimeError("remote scripted capture returned no output")
+        traces, capture_failure = _capture_envelope(capture_text, len(scenario.turns))
+        capture_returncode = getattr(capture, "returncode", None)
+
+    if capture_returncode != 0 and not _is_preflight_tts_capture_failure(
+        traces, capture_failure
+    ):
+        raise RuntimeError(
+            f"remote scripted capture failed: {getattr(capture, 'stderr', '')}"
+        )
 
     phone_log_path = "voice/" + FAKE_PHONE_LOG
     phone_text = _completed_stdout(stack.run_remote(["sudo", "cat", phone_log_path]), "fake phone log read")
     phone_commands = _phone_commands(_json_lines(phone_text, "fake phone"))
-    sdk_recording_applicable = not (
-        not traces
-        and capture_failure is not None
-        and capture_failure["message"] == "scripted speech synthesis exceeded its deadline"
-        and "speech_started_at" not in capture_failure
+    sdk_recording_applicable = not _is_preflight_tts_capture_failure(
+        traces, capture_failure
     )
     if sdk_recording_applicable:
         marker_log = _completed_stdout(
@@ -1510,7 +1627,11 @@ def main(argv: list[str] | None = None) -> int:
     except PartialCaptureFailure as error:
         envelope = {"turns": error.turns, "failure": error.failure}
         print(json.dumps(envelope, separators=(",", ":")), flush=True)
-        return 0
+        return int(
+            not error.turns
+            and error.failure.get("turn") == 1
+            and _is_scripted_tts_timeout(error.failure.get("message"))
+        )
     print(json.dumps({"turns": traces}, separators=(",", ":")), flush=True)
     return 0
 

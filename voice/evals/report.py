@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,10 +19,20 @@ NO_ANSWER_FAILURE = (
     "no-answer: captured PCM is silent, malformed, or has no qualifying post-playout onset"
 )
 PARTIAL_CAPTURE_MESSAGES = {
-    "scripted speech synthesis exceeded its deadline",
+    "answer transcription exceeded its deadline",
     NO_ANSWER_FAILURE,
     "room deletion was not observed before deadline",
 }
+SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
+    r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
+)
+
+
+def _is_scripted_tts_timeout(message: Any) -> bool:
+    return (
+        isinstance(message, str)
+        and SCRIPTED_TTS_TIMEOUT_PATTERN.fullmatch(message) is not None
+    )
 
 
 def nearest_rank(values: list[float], percentile: float) -> float:
@@ -233,6 +244,10 @@ def score_observations(
             valid_failure = False
             if "failure" in run:
                 failure = run["failure"]
+                preflight_tts_failure = (
+                    isinstance(failure, dict)
+                    and _is_scripted_tts_timeout(failure.get("message"))
+                )
                 failure_fields = (
                     {"turn", "message"},
                     {"turn", "message", "speech_started_at"},
@@ -258,16 +273,31 @@ def score_observations(
                             or (
                                 failure.get("message")
                                 != "room deletion was not observed before deadline"
-                                and failure["turn"] == len(run["turns"]) + 1
+                                and (
+                                    (preflight_tts_failure and not run["turns"] and failure["turn"] == 1)
+                                    or (
+                                        not preflight_tts_failure
+                                        and failure["turn"] == len(run["turns"]) + 1
+                                    )
+                                )
                             )
                         )
-                        and failure.get("message") in PARTIAL_CAPTURE_MESSAGES
                         and (
-                            failure.get("message") == NO_ANSWER_FAILURE
+                            preflight_tts_failure
+                            or failure.get("message") in PARTIAL_CAPTURE_MESSAGES
+                        )
+                        and (
+                            failure.get("message") in {
+                                NO_ANSWER_FAILURE,
+                                "answer transcription exceeded its deadline",
+                            }
                         ) == ("speech_started_at" in failure)
                         and (
                             "segments" not in failure
-                            or failure.get("message") == NO_ANSWER_FAILURE
+                            or failure.get("message") in {
+                                NO_ANSWER_FAILURE,
+                                "answer transcription exceeded its deadline",
+                            }
                         )
                     )
                     if valid_failure and "segments" in failure:

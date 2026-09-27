@@ -360,15 +360,55 @@ class ScoringTests(unittest.TestCase):
         for segment in raw_segments:
             self.assertIn(segment, result["cases"][0]["capture_failures"][0]["segments"])
 
-    def test_partial_capture_scores_completed_turns_and_names_failed_turn(self):
+    def test_asr_deadline_failure_keeps_completed_turn_and_partial_transcript_evidence(self):
+        completed = turn()
+        completed["speech_started_at"] = 1_700_000_000.0
+        partial_segments = [{"start": 0.0, "end": 0.2, "text": "finished phrase"}]
         observation = {
             "cases": [{
                 "name": "send message",
                 "runs": [{
-                    "turns": [turn()],
+                    "turns": [completed],
                     "failure": {
                         "turn": 2,
-                        "message": "scripted speech synthesis exceeded its deadline",
+                        "message": "answer transcription exceeded its deadline",
+                        "speech_started_at": 1_700_000_010.0,
+                        "segments": partial_segments,
+                    },
+                    "product_failures": [{"turn": 1, "message": "completed product evidence"}],
+                    "phone_commands": [{"id": "sms-1", "turn": 1, "kind": "sms"}],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        report = result["cases"][0]
+        self.assertEqual(len(report["turns"]), 1)
+        self.assertEqual(report["capture_failures"], [{
+            "run": 1,
+            "turn": 2,
+            "message": "answer transcription exceeded its deadline",
+            "segments": partial_segments,
+        }])
+        failures = " ".join(report["failures"])
+        self.assertIn("completed product evidence", failures)
+        self.assertIn("answer transcription exceeded its deadline", failures)
+
+    def test_partial_capture_scores_completed_turns_and_names_failed_turn(self):
+        completed = turn()
+        completed["speech_started_at"] = 1_700_000_000.0
+        observation = {
+            "cases": [{
+                "name": "send message",
+                "runs": [{
+                    "turns": [completed],
+                    "failure": {
+                        "turn": 2,
+                        "message": "answer transcription exceeded its deadline",
+                        "speech_started_at": 1_700_000_001.0,
+                        "segments": [{"start": 0.0, "end": 0.2, "text": "partial"}],
                     },
                     "product_failures": [
                         {"turn": 1, "message": "turn 1 missing answer pattern 'Alice Keck Park'"}
@@ -387,7 +427,7 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(report["gates"][0]["run_count"], 1)
         failures = " ".join(result["failures"])
         self.assertIn("send message run 1 turn 2", failures)
-        self.assertIn("scripted speech synthesis exceeded its deadline", failures)
+        self.assertIn("answer transcription exceeded its deadline", failures)
         self.assertIn("send message run 1 turn 1", failures)
         self.assertIn("missing answer pattern 'Alice Keck Park'", failures)
         self.assertEqual(report["turns"][0]["model_call_count"], 1)
@@ -433,6 +473,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_valid_completed_prefix_reports_only_the_later_capture_failure(self):
         trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
+        trace["speech_started_at"] = 1_700_000_000.0
         trace["expect_confirmation"] = False
         trace["expect_hangup"] = False
         observation = {
@@ -442,7 +483,9 @@ class ScoringTests(unittest.TestCase):
                     "turns": [trace],
                     "failure": {
                         "turn": 2,
-                        "message": "scripted speech synthesis exceeded its deadline",
+                        "message": "answer transcription exceeded its deadline",
+                        "speech_started_at": 1_700_000_001.0,
+                        "segments": [{"start": 0.0, "end": 0.2, "text": "partial"}],
                     },
                     "product_failures": [],
                     "phone_commands": [{
@@ -464,6 +507,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_partial_failure_turn_product_error_requires_observed_phone_command(self):
         trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
+        trace["speech_started_at"] = 1_700_000_000.0
         trace["expect_confirmation"] = False
         trace["expect_hangup"] = False
         observation = {
@@ -473,7 +517,9 @@ class ScoringTests(unittest.TestCase):
                     "turns": [trace],
                     "failure": {
                         "turn": 2,
-                        "message": "scripted speech synthesis exceeded its deadline",
+                        "message": "answer transcription exceeded its deadline",
+                        "speech_started_at": 1_700_000_001.0,
+                        "segments": [{"start": 0.0, "end": 0.2, "text": "partial"}],
                     },
                     "product_failures": [{
                         "turn": 2,
@@ -499,6 +545,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_failed_turn_product_error_without_real_phone_evidence_fails_closed(self):
         trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
+        trace["speech_started_at"] = 1_700_000_000.0
         trace["expect_confirmation"] = False
         trace["expect_hangup"] = False
         observation = {
@@ -508,7 +555,9 @@ class ScoringTests(unittest.TestCase):
                     "turns": [trace],
                     "failure": {
                         "turn": 2,
-                        "message": "scripted speech synthesis exceeded its deadline",
+                        "message": "answer transcription exceeded its deadline",
+                        "speech_started_at": 1_700_000_001.0,
+                        "segments": [{"start": 0.0, "end": 0.2, "text": "partial"}],
                     },
                     "product_failures": [{"turn": 2, "message": "forged"}],
                     "phone_commands": [],
@@ -582,7 +631,7 @@ class ScoringTests(unittest.TestCase):
             {"turn": 2, "message": "room deletion was not observed before deadline"},
             {
                 "turn": 2,
-                "message": "scripted speech synthesis exceeded its deadline",
+                "message": "scripted speech synthesis for line 2 exceeded its deadline",
                 "speech_started_at": 100.0,
             },
         )
