@@ -821,11 +821,18 @@ class DevStackTest(unittest.TestCase):
             staging.mkdir()
             source = Path(temporary) / "credential"
             source.write_text("private test context")
+            identity_lookups = []
             namespace = {
                 "Path": Path,
                 "os": os,
-                "pwd": SimpleNamespace(getpwnam=lambda _: SimpleNamespace(pw_uid=os.getuid())),
-                "grp": SimpleNamespace(getgrnam=lambda _: SimpleNamespace(gr_gid=os.getgid())),
+                "pwd": SimpleNamespace(
+                    getpwnam=lambda name: identity_lookups.append(("user", name))
+                    or SimpleNamespace(pw_uid=os.getuid())
+                ),
+                "grp": SimpleNamespace(
+                    getgrnam=lambda name: identity_lookups.append(("group", name))
+                    or SimpleNamespace(gr_gid=os.getgid())
+                ),
             }
             exec(_PRIVATE_CREDENTIAL_SOURCE, namespace)
             values = {"MENTAT_VOICE_PRIVATE": str(source)}
@@ -838,6 +845,118 @@ class DevStackTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o400)
             self.assertEqual(staged.stat().st_uid, os.getuid())
             self.assertEqual(staged.stat().st_gid, os.getgid())
+            self.assertEqual(identity_lookups, [("user", "nobody"), ("group", "nogroup")])
+
+    def test_setup_captures_gateway_url_and_staged_key_for_candidate(self):
+        setup_header = 'python3 - "$DEV_DIR" "$MENTAT_PID" "$VOICE_PID" <<\'PY\''
+        setup_script = _SETUP_SCRIPT.replace(
+            "__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE
+        )
+        setup_body = setup_script.split(setup_header, 1)[1].split("\nPY\n", 1)[0]
+        setup_body = setup_body.replace(
+            'Path(f"/proc/{pid}/environ")', 'Path(environ_dir / pid)'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = root / "stage"
+            staging.mkdir()
+            environ_dir = root / "environ"
+            environ_dir.mkdir()
+            source = root / "production-key"
+            source.write_bytes(b"synthetic-setup-gateway-key")
+            gateway_url = "https://gateway.example.test/v1"
+            (environ_dir / "123").write_bytes(
+                f"MENTAT_LISTEN=127.0.0.1:8484\0MENTAT_VOICE_GATEWAY_URL={gateway_url}\0"
+                f"MENTAT_VOICE_GATEWAY_KEY_FILE={source}\0".encode()
+            )
+            (environ_dir / "456").write_bytes(b"")
+            namespace = {
+                "environ_dir": environ_dir,
+                "pwd": SimpleNamespace(getpwnam=lambda _: SimpleNamespace(pw_uid=os.getuid())),
+                "grp": SimpleNamespace(getgrnam=lambda _: SimpleNamespace(gr_gid=os.getgid())),
+            }
+            with patch("sys.argv", ["setup.py", str(staging), "123", "456"]):
+                with patch("pwd.getpwnam", return_value=SimpleNamespace(pw_uid=os.getuid())):
+                    with patch("grp.getgrnam", return_value=SimpleNamespace(gr_gid=os.getgid())):
+                        exec(setup_body, namespace)
+
+            candidate_env = json.loads((staging / "mentat.env.json").read_text())
+            self.assertEqual(candidate_env["MENTAT_VOICE_GATEWAY_URL"], gateway_url)
+            staged = Path(candidate_env["MENTAT_VOICE_GATEWAY_KEY_FILE"])
+            self.assertEqual(staged, staging / "voice-gateway-key")
+            self.assertEqual(staged.read_bytes(), b"synthetic-setup-gateway-key")
+            self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o400)
+            self.assertEqual(staged.stat().st_uid, os.getuid())
+            self.assertEqual(staged.stat().st_gid, os.getgid())
+
+    def test_gateway_credential_is_staged_for_dev_mentatd(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = root / "stage"
+            staging.mkdir()
+            source = root / "production-gateway-key"
+            key = b"synthetic-gateway-key-only"
+            source.write_bytes(key)
+            values = {
+                "MENTAT_VOICE_GATEWAY_URL": "https://gateway.example.test/v1",
+                "MENTAT_VOICE_GATEWAY_KEY_FILE": str(source),
+            }
+            calls = []
+            def get_user(name):
+                calls.append(("user", name))
+                return SimpleNamespace(pw_uid=os.getuid())
+
+            def get_group(name):
+                calls.append(("group", name))
+                return SimpleNamespace(gr_gid=os.getgid())
+
+            namespace = {
+                "Path": Path,
+                "os": os,
+                "pwd": SimpleNamespace(getpwnam=get_user),
+                "grp": SimpleNamespace(getgrnam=get_group),
+            }
+            exec(_PRIVATE_CREDENTIAL_SOURCE, namespace)
+
+            namespace["stage_gateway_key"](values, staging)
+
+            staged = Path(values["MENTAT_VOICE_GATEWAY_KEY_FILE"])
+            self.assertEqual(staged.read_bytes(), key)
+            self.assertNotEqual(staged, source)
+            self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o400)
+            self.assertEqual(staged.stat().st_uid, os.getuid())
+            self.assertEqual(staged.stat().st_gid, os.getgid())
+            self.assertEqual(values["MENTAT_VOICE_GATEWAY_URL"], "https://gateway.example.test/v1")
+            self.assertEqual(calls, [("user", "mentat"), ("group", "mentat")])
+
+    def test_gateway_credential_is_optional_but_missing_named_file_fails_safely(self):
+        namespace = {
+            "Path": Path,
+            "os": os,
+            "pwd": SimpleNamespace(getpwnam=lambda _: SimpleNamespace(pw_uid=os.getuid())),
+            "grp": SimpleNamespace(getgrnam=lambda _: SimpleNamespace(gr_gid=os.getgid())),
+        }
+        exec(_PRIVATE_CREDENTIAL_SOURCE, namespace)
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = Path(temporary)
+            unconfigured = {"MENTAT_VOICE_PRIVATE": "/synthetic/voice-private"}
+            namespace["stage_gateway_key"](unconfigured, staging)
+            self.assertNotIn("MENTAT_VOICE_GATEWAY_URL", unconfigured)
+            self.assertNotIn("MENTAT_VOICE_GATEWAY_KEY_FILE", unconfigured)
+
+            missing = staging / "private" / "missing-key"
+            configured = {
+                "MENTAT_VOICE_GATEWAY_URL": "https://gateway.example.test/v1",
+                "MENTAT_VOICE_GATEWAY_KEY_FILE": str(missing),
+            }
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+                with self.assertRaisesRegex(RuntimeError, "gateway credential") as raised:
+                    namespace["stage_gateway_key"](configured, staging)
+            diagnostic = str(raised.exception)
+            self.assertNotIn(str(missing), diagnostic)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "")
 
     def test_mcp_rewrite_changes_only_loopback_production_port(self):
         namespace = {"json": json, "urlsplit": urlsplit, "urlunsplit": urlunsplit}

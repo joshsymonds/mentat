@@ -140,6 +140,20 @@ _PRIVATE_CREDENTIAL_SOURCE = '''def stage_voice_private(values, dev_dir):
     os.chown(destination, pwd.getpwnam("nobody").pw_uid, grp.getgrnam("nogroup").gr_gid)
     os.chmod(destination, 0o400)
     values["MENTAT_VOICE_PRIVATE"] = str(destination)
+
+
+def stage_gateway_key(values, dev_dir):
+    key_path = values.get("MENTAT_VOICE_GATEWAY_KEY_FILE")
+    if not key_path:
+        return
+    source = Path(key_path)
+    if not source.is_file():
+        raise RuntimeError("production voice gateway credential is unavailable")
+    destination = dev_dir / "voice-gateway-key"
+    destination.write_bytes(source.read_bytes())
+    os.chown(destination, pwd.getpwnam("mentat").pw_uid, grp.getgrnam("mentat").gr_gid)
+    os.chmod(destination, 0o400)
+    values["MENTAT_VOICE_GATEWAY_KEY_FILE"] = str(destination)
 '''
 
 
@@ -210,6 +224,8 @@ for name, pid in (("mentat", sys.argv[2]), ("voice", sys.argv[3])):
             values[key.decode()] = value.decode()
     if name == "voice":
         stage_voice_private(values, dev_dir)
+    elif name == "mentat":
+        stage_gateway_key(values, dev_dir)
     (dev_dir / f"{name}.env.json").write_text(json.dumps(values))
     os.chmod(dev_dir / f"{name}.env.json", 0o600)
 PY
