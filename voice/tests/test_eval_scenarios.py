@@ -311,7 +311,7 @@ class ScenarioCorpusTests(unittest.TestCase):
             (
                 "phone-offline",
                 "The phone is offline, so I couldn't set the timer.",
-                [{"turn": 1, "kind": "timer", "seconds": 300, "outcome": "error"}],
+                [],
             ),
             (
                 "unknown-outcome",
@@ -327,6 +327,16 @@ class ScenarioCorpusTests(unittest.TestCase):
                     phone_commands=command,
                     room_closed_after=scenario.room_close_after,
                 )
+
+    def test_phone_offline_rejects_fake_success_command(self):
+        scenario = next(s for s in SCENARIOS if s.name == "phone-offline")
+        with self.assertRaisesRegex(AssertionError, "expected 0 phone commands, got 1"):
+            evaluate_scenario(
+                scenario,
+                turns=["The phone is offline, so I couldn't set the timer."],
+                phone_commands=[{"turn": 1, "kind": "timer", "seconds": 300}],
+                room_closed_after=scenario.room_close_after,
+            )
 
     def test_negative_scenarios_reject_success_claims_without_required_evidence(self):
         for name in ("unusable-selection", "phone-offline", "unknown-outcome"):

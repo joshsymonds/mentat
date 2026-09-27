@@ -146,7 +146,7 @@ SCENARIOS = (
                 (r"(?:phone|timer).*(?:offline|unavailable|couldn't|could not|failed)|(?:offline|unavailable).*(?:phone|timer)",)
             ),
         ),
-        commands=({"turn": 1, "kind": "timer", "seconds": 300, "outcome": "error"},),
+        commands=(),
         room_close_after=1,
     ),
     Scenario(
