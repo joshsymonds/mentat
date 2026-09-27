@@ -442,9 +442,11 @@ class DevStack:
         )
         self._run(
             [
-                "scp",
-                str(self.checkout / "voice" / "evals" / "runner.py"),
-                f"{self.remote}:{self._remote_dir}/voice/evals/runner.py",
+                "scp", "-r",
+                *(str(self.checkout / "voice" / "evals" / name) for name in (
+                    "runner.py", "dev_stack.py", "report.py", "scenarios.py",
+                )),
+                f"{self.remote}:{self._remote_dir}/voice/evals/",
             ],
             check=True,
             capture_output=True,

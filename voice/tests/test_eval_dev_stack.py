@@ -3,8 +3,10 @@
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,7 +61,8 @@ class DevStackTest(unittest.TestCase):
         transfers = [call[0] for call in calls if call[0][0] == "scp"]
         self.assertTrue(any("voice/evals/phone.py" in " ".join(args) for args in transfers))
         self.assertTrue(any(
-            any(arg.startswith("ultraviolet:") and arg.endswith("/voice/evals/runner.py") for arg in args)
+            any(arg.startswith("ultraviolet:") and arg.endswith("/voice/evals/") for arg in args)
+            and any(arg.endswith("/voice/evals/runner.py") for arg in args)
             for args in transfers
         ))
         self.assertTrue(any("src" in " ".join(args) and "node_modules" in " ".join(args) for args in transfers))
@@ -425,6 +428,63 @@ class DevStackTest(unittest.TestCase):
         )
         self.assertIn("systemctl start mentat-voice", cleanup)
         self.assertIn("trap 'systemctl start mentat-voice' EXIT", cleanup)
+
+    def test_staged_remote_runner_imports_from_the_uploaded_voice_files(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.imports\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
+            popen.return_value = unittest.mock.Mock(poll=lambda: None)
+            with DevStack(checkout=CHECKOUT, opt_in=True, run=run):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            remote = Path(temporary)
+            voice_root = remote / "voice"
+            for args, _ in calls:
+                if not args or args[0] != "scp":
+                    continue
+                remote_target = args[-1].split(":", 1)[1]
+                target_is_directory = remote_target.endswith("/")
+                target = remote / Path(remote_target).relative_to("/tmp/mentat-eval.imports")
+                for source in args[1:-1]:
+                    candidate = Path(source)
+                    if not candidate.is_relative_to(CHECKOUT / "voice"):
+                        continue
+                    destination = target / candidate.name if target_is_directory else target
+                    if candidate.is_dir():
+                        shutil.copytree(candidate, destination)
+                    elif candidate.is_file():
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_bytes(candidate.read_bytes())
+
+            runner = voice_root / "evals" / "runner.py"
+            self.assertTrue(runner.is_file(), "runner.py must be in the staged voice tree")
+            result = subprocess.run(
+                [
+                    os.fspath(sys.executable),
+                    "-I",
+                    "-c",
+                    "import sys; sys.path.insert(0, sys.argv[1]); import evals.runner",
+                    os.fspath(voice_root),
+                ],
+                cwd=remote,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"staged runner import failed\nstdout: {result.stdout}\nstderr: {result.stderr}",
+            )
 
 
 if __name__ == "__main__":
