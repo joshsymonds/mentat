@@ -98,6 +98,67 @@ class DevStackTest(unittest.TestCase):
         self.assertIn("agent.pid", setup)
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
+    def test_controlmaster_handoff_does_not_abort_a_live_forward(self, popen):
+        calls = []
+        tunnel_processes = []
+        forward = {"available": False}
+        refusals = [
+            urllib.error.URLError("connection refused"),
+            urllib.error.URLError("connection refused"),
+        ]
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = b'{"status":"ok"}\n'
+        health_calls = []
+
+        def start_ssh(args, **kwargs):
+            calls.append(args)
+            dedicated = ["-o", "ControlMaster=no"] in [args[i:i + 2] for i in range(len(args) - 1)]
+            dedicated = dedicated and ["-o", "ControlPath=none"] in [
+                args[i:i + 2] for i in range(len(args) - 1)
+            ]
+            dedicated = dedicated and ["-o", "ExitOnForwardFailure=yes"] in [
+                args[i:i + 2] for i in range(len(args) - 1)
+            ]
+            forward["available"] = True
+            tunnel = unittest.mock.Mock(poll=lambda: None if dedicated else 0)
+            tunnel_processes.append(tunnel)
+            return tunnel
+
+        def urlopen(url, *, timeout):
+            health_calls.append((url, timeout))
+            self.assertTrue(forward["available"], "the persistent ControlMaster keeps the forward open")
+            if refusals:
+                raise refusals.pop(0)
+            return response
+
+        def run(args, **kwargs):
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.controlmaster\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        popen.side_effect = start_ssh
+        with patch("urllib.request.urlopen", side_effect=urlopen), patch("time.sleep") as sleep:
+            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+                self.assertEqual(len(health_calls), 3)
+                self.assertEqual(health_calls[-1][0], f"{stack.url}/healthz")
+                sleep.assert_called()
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn(["-o", "ControlMaster=no"], [
+            calls[0][i:i + 2] for i in range(len(calls[0]) - 1)
+        ])
+        self.assertIn(["-o", "ControlPath=none"], [
+            calls[0][i:i + 2] for i in range(len(calls[0]) - 1)
+        ])
+        self.assertIn(["-o", "ExitOnForwardFailure=yes"], [
+            calls[0][i:i + 2] for i in range(len(calls[0]) - 1)
+        ])
+        tunnel_processes[0].terminate.assert_called_once()
+
+    @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_enter_waits_for_tunneled_health_endpoint_before_returning(self, popen):
         tunnel = unittest.mock.Mock(poll=lambda: None)
         popen.return_value = tunnel

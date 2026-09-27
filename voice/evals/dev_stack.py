@@ -569,7 +569,11 @@ class DevStack:
         )
         self._tunnel = subprocess.Popen(
             [
-                "ssh", "-N", "-L",
+                "ssh",
+                "-o", "ControlMaster=no",
+                "-o", "ControlPath=none",
+                "-o", "ExitOnForwardFailure=yes",
+                "-N", "-L",
                 f"127.0.0.1:{self._local_port}:127.0.0.1:{self.dev_port}",
                 self.remote,
             ],
