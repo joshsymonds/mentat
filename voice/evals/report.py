@@ -1,0 +1,234 @@
+"""Offline scoring for scripted voice-evaluation observations."""
+
+from __future__ import annotations
+
+import json
+import math
+import sys
+from pathlib import Path
+from typing import Any
+
+ACTION_P50_LIMIT_SECONDS = 3.5
+ACTION_P95_LIMIT_SECONDS = 5.0
+SEARCH_P50_LIMIT_SECONDS = 10.0
+ANSWER_DEADLINE_SECONDS = 30.0
+CONFIRMATION_DEADLINE_SECONDS = 30.0
+HANGUP_DEADLINE_SECONDS = 60.0
+RUNS_REQUIRED = 10
+
+
+def nearest_rank(values: list[float], percentile: float) -> float:
+    """Return the nearest-rank percentile, with rank ceil(p * n)."""
+    if not values:
+        raise ValueError("nearest-rank requires at least one value")
+    if not isinstance(percentile, (int, float)) or isinstance(percentile, bool):
+        raise ValueError("percentile must be a number in (0, 1]")
+    if any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in values):
+        raise ValueError("values must be finite numbers")
+    try:
+        percentile = float(percentile)
+        ordered = [float(value) for value in values]
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError("percentile and values must be finite numbers") from error
+    if not math.isfinite(percentile) or not 0 < percentile <= 1:
+        raise ValueError("percentile must be a number in (0, 1]")
+    if any(not math.isfinite(value) for value in ordered):
+        raise ValueError("values must be finite numbers")
+    ordered.sort()
+    rank = math.ceil(percentile * len(ordered))
+    return ordered[rank - 1]
+
+
+def _timestamp(turn: dict[str, Any], field: str) -> float:
+    value = turn.get(field)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"missing or invalid {field} timestamp")
+    try:
+        timestamp = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ValueError(f"missing or invalid {field} timestamp") from error
+    if not math.isfinite(timestamp):
+        raise ValueError(f"missing or invalid {field} timestamp")
+    return timestamp
+
+
+def _score_turn(
+    turn: Any, name: str, run_index: int, turn_index: int
+) -> tuple[dict[str, Any], list[str]]:
+    label = f"{name} run {run_index + 1} turn {turn_index + 1}"
+    if not isinstance(turn, dict):
+        raise ValueError(f"{label}: turn observation must be an object")
+    speech_end = _timestamp(turn, "speech_end")
+    first_audio = _timestamp(turn, "first_audio")
+    if "expect_confirmation" not in turn:
+        raise ValueError(f"{label}: missing expect_confirmation declaration")
+    if "expect_hangup" not in turn:
+        raise ValueError(f"{label}: missing expect_hangup declaration")
+    expect_confirmation = turn["expect_confirmation"]
+    expect_hangup = turn["expect_hangup"]
+    if not isinstance(expect_confirmation, bool):
+        raise ValueError(f"{label}: expect_confirmation must be a boolean")
+    if not isinstance(expect_hangup, bool):
+        raise ValueError(f"{label}: expect_hangup must be a boolean")
+
+    calls = turn.get("model_calls")
+    if not isinstance(calls, list):
+        raise ValueError(f"{label}: missing or invalid model_calls observations")
+
+    event_times: dict[str, float | None] = {}
+    problems: list[str] = []
+    for field, expected, deadline in (
+        ("confirmation", expect_confirmation, CONFIRMATION_DEADLINE_SECONDS),
+        ("room_deleted", expect_hangup, HANGUP_DEADLINE_SECONDS),
+    ):
+        if field not in turn or turn[field] is None:
+            event_times[field] = None
+            if expected:
+                problems.append(f"{label}: expected {field} observation is missing")
+            continue
+        event_time = _timestamp(turn, field)
+        if event_time < speech_end:
+            problems.append(f"{label}: {field} precedes speech_end")
+        latency = event_time - speech_end
+        event_times[field] = event_time
+        if expected and latency > deadline:
+            problems.append(f"{label}: {field} latency {latency:g}s exceeds {deadline:g}s deadline")
+        if field == "room_deleted" and not expected:
+            problems.append(f"{label}: room deleted when hang-up was not expected")
+
+    first_audio_latency = first_audio - speech_end
+    if first_audio_latency < 0:
+        problems.append(f"{label}: first_audio precedes speech_end")
+    if first_audio_latency > ANSWER_DEADLINE_SECONDS:
+        problems.append(
+            f"{label}: first_audio latency {first_audio_latency:g}s exceeds "
+            f"{ANSWER_DEADLINE_SECONDS:g}s deadline"
+        )
+    report = {
+        "run": run_index + 1,
+        "turn": turn_index + 1,
+        "latency_seconds": {
+            "first_audio": first_audio_latency,
+            "confirmation": (
+                None if event_times["confirmation"] is None
+                else event_times["confirmation"] - speech_end
+            ),
+            "room_deleted": (
+                None if event_times["room_deleted"] is None
+                else event_times["room_deleted"] - speech_end
+            ),
+        },
+        "model_call_count": len(calls),
+    }
+    return report, problems
+
+
+def score_observations(observations: Any) -> dict[str, Any]:
+    """Score scenario cases and fail closed for every missing or invalid datum."""
+    failures: list[str] = []
+    reports: list[dict[str, Any]] = []
+    if not isinstance(observations, dict) or not isinstance(observations.get("cases"), list):
+        return {"passed": False, "failures": ["input: expected an object containing a cases list"], "cases": []}
+    if not observations["cases"]:
+        return {"passed": False, "failures": ["input: cases list must not be empty"], "cases": []}
+
+    for case_index, scenario in enumerate(observations["cases"]):
+        if not isinstance(scenario, dict):
+            failures.append(f"case {case_index + 1}: scenario must be an object")
+            continue
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = f"case {case_index + 1}"
+            failures.append(f"{name}: missing scenario name")
+        kind = scenario.get("kind")
+        if kind not in ("action", "search"):
+            failures.append(f"{name}: kind must be action or search")
+        runs = scenario.get("runs")
+        if not isinstance(runs, list):
+            message = f"{name}: missing or invalid runs"
+            failures.append(message)
+            reports.append({"name": name, "kind": kind, "turns": [], "gates": [], "failures": [message]})
+            continue
+        case_failures: list[str] = []
+        if len(runs) != RUNS_REQUIRED:
+            case_failures.append(f"{name}: expected {RUNS_REQUIRED} runs, found {len(runs)}")
+        turns: list[dict[str, Any]] = []
+        for run_index, run in enumerate(runs):
+            if not isinstance(run, dict) or not isinstance(run.get("turns"), list) or not run["turns"]:
+                case_failures.append(f"{name} run {run_index + 1}: missing turn observations")
+                continue
+            for turn_index, raw_turn in enumerate(run["turns"]):
+                try:
+                    report, problems = _score_turn(raw_turn, name, run_index, turn_index)
+                    turns.append(report)
+                    case_failures.extend(problems)
+                except ValueError as error:
+                    case_failures.append(f"{name} run {run_index + 1} turn {turn_index + 1}: {error}")
+
+        by_turn: dict[int, list[float]] = {}
+        for turn in turns:
+            by_turn.setdefault(turn["turn"], []).append(turn["latency_seconds"]["first_audio"])
+        gates: list[dict[str, Any]] = []
+        for turn_index, latencies in sorted(by_turn.items()):
+            p50 = nearest_rank(latencies, 0.50)
+            p95 = nearest_rank(latencies, 0.95)
+            gate = {
+                "turn": turn_index,
+                "run_count": len(latencies),
+                "first_audio_p50_seconds": p50,
+                "first_audio_p95_seconds": p95,
+            }
+            gates.append(gate)
+            if kind == "action":
+                if p50 > ACTION_P50_LIMIT_SECONDS:
+                    case_failures.append(
+                        f"{name} turn {turn_index}: first-audio p50 {p50:g}s "
+                        f"exceeds {ACTION_P50_LIMIT_SECONDS:g}s"
+                    )
+                if p95 > ACTION_P95_LIMIT_SECONDS:
+                    case_failures.append(
+                        f"{name} turn {turn_index}: first-audio p95 {p95:g}s "
+                        f"exceeds {ACTION_P95_LIMIT_SECONDS:g}s"
+                    )
+            elif kind == "search" and p50 > SEARCH_P50_LIMIT_SECONDS:
+                case_failures.append(
+                    f"{name} turn {turn_index}: first-audio p50 {p50:g}s "
+                    f"exceeds {SEARCH_P50_LIMIT_SECONDS:g}s"
+                )
+            if len(latencies) != RUNS_REQUIRED:
+                case_failures.append(
+                    f"{name} turn {turn_index}: expected {RUNS_REQUIRED} latency observations, "
+                    f"found {len(latencies)}"
+                )
+
+        report = {
+            "name": name,
+            "kind": kind,
+            "run_count": len(runs),
+            "turns": turns,
+            "gates": gates,
+            "failures": case_failures,
+        }
+        reports.append(report)
+        failures.extend(case_failures)
+
+    return {"passed": not failures, "failures": failures, "cases": reports}
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if len(arguments) != 1:
+        print("usage: report.py OBSERVATIONS.json", file=sys.stderr)
+        return 2
+    try:
+        observations = json.loads(Path(arguments[0]).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(json.dumps({"passed": False, "failures": [f"input: {error}"], "cases": []}))
+        return 2
+    report = score_observations(observations)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
