@@ -111,7 +111,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             async def result(self):
                 events.append("capture-result")
                 clock.now += 0.05
-                return pcm_windows(0, 0, 0, 0, 0, 600, 600), 24000, 1, clock.monotonic() + 0.1
+                return pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18)), 24000, 1, clock.monotonic() + 0.1
 
         class AudioSource(Source):
             def __init__(self, *_args):
@@ -150,7 +150,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return b"\x00\x00"
 
         async def transcribe(_http, pcm, _rate, _channels):
-            self.assertEqual(pcm, pcm_windows(0, 0, 0, 0, 0, 600, 600))
+            self.assertEqual(pcm, pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18)))
             return [{"start": 0.1, "end": 0.4, "text": "answer"}]
 
         dependencies = CaptureDependencies(
@@ -328,6 +328,36 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             (10.06, True),
         )
 
+    def test_speech_segment_filter_requires_adjacent_windows_and_valid_bounds(self):
+        exactly_threshold = [{"start": 0.0, "end": 0.04, "text": "eligible"}]
+        self.assertEqual(
+            runner._voiced_segments(pcm_windows(200, 200), 24000, 1, exactly_threshold),
+            exactly_threshold,
+        )
+        self.assertEqual(
+            runner._voiced_segments(
+                pcm_windows(600, 0, 600),
+                24000,
+                1,
+                [{"start": 0.0, "end": 0.06, "text": "separate bursts"}],
+            ),
+            [],
+        )
+        with self.assertRaisesRegex(RuntimeError, "no-answer"):
+            runner._voiced_segments(
+                bytes([0]),
+                24000,
+                1,
+                [{"start": 0.0, "end": 0.02, "text": "invalid PCM"}],
+            )
+        with self.assertRaisesRegex(RuntimeError, "invalid timestamp bounds"):
+            runner._voiced_segments(
+                pcm_windows(600, 600),
+                24000,
+                1,
+                [{"start": 0.0, "end": 0.2, "text": "past capture end"}],
+            )
+
     def test_pcm_onset_ignores_a_partial_trailing_window(self):
         trailing_half_window = struct.pack("<240h", *([0] * 240))
         pcm = pcm_windows(0, 0, 600, 600) + trailing_half_window
@@ -368,7 +398,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         async def transcribe(*_args):
             return [
                 {"start": 0.2, "end": 0.4, "text": "Okay, I heard you."},
-                {"start": 1.2, "end": 1.6, "text": "The timer is set for five minutes."},
+                {"start": 1.2, "end": 1.24, "text": "The timer is set for five minutes."},
             ]
 
         dependencies = CaptureDependencies(
@@ -395,11 +425,80 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(traces), 1)
         trace = traces[0]
-        self.assertEqual(trace["transcript"], "Okay, I heard you. The timer is set for five minutes.")
-        self.assertEqual(trace["segments"][0]["start"], 0.2)
+        self.assertEqual(trace["transcript"], "The timer is set for five minutes.")
+        self.assertEqual(trace["segments"][0]["start"], 1.2)
+        self.assertEqual(trace["raw_segments"][0]["start"], 0.2)
         self.assertEqual(trace["first_audio"], 100.2)
         self.assertEqual(trace["speech_end"], 100.0)
         self.assertTrue(trace["overlap"])
+
+    async def test_silent_transcript_segments_are_excluded_from_truth_and_timing(self):
+        dependencies = self.dependencies_for_failure("other")
+        raw_segments = [
+            {"start": 0.0, "end": 0.1, "text": "Okay, Bye. Five minutes, timer set. Should I send it?"},
+            {"start": 0.1, "end": 0.14, "text": "I am still listening."},
+        ]
+
+        async def transcribe(*_args):
+            return raw_segments
+
+        dependencies = CaptureDependencies(
+            **{**dependencies.__dict__, "transcribe": transcribe}
+        )
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            traces = await capture_script(
+                "android-selected-room",
+                ["Question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+
+        trace = traces[0]
+        self.assertEqual(trace["transcript"], "I am still listening.")
+        self.assertEqual(trace["segments"], [raw_segments[1]])
+        self.assertEqual(trace["raw_segments"], raw_segments)
+        self.assertIsNone(
+            runner._answer_time(
+                trace,
+                SimpleNamespace(answer_patterns=(r"Should I send it",)),
+            )
+        )
+        self.assertIsNone(runner._confirmation_time(trace))
+        from evals.scenarios import evaluate_scenario_failures
+
+        failures = evaluate_scenario_failures(
+            SCENARIOS[0],
+            [trace["transcript"]],
+            [{"turn": 1, "kind": "timer", "seconds": 300}],
+            1,
+        )
+        self.assertTrue(any("missing answer pattern" in failure.message for failure in failures))
+
+    async def test_all_silent_transcript_segments_keep_named_no_answer_and_raw_evidence(self):
+        dependencies = self.dependencies_for_failure("other")
+        raw_segments = [
+            {"start": 0.0, "end": 0.08, "text": "Five minutes, timer set."},
+        ]
+
+        async def transcribe(*_args):
+            return raw_segments
+
+        dependencies = CaptureDependencies(
+            **{**dependencies.__dict__, "transcribe": transcribe}
+        )
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            self.assertRaises(runner.PartialCaptureFailure) as caught,
+        ):
+            await capture_script(
+                "android-selected-room",
+                ["Question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+
+        self.assertEqual(caught.exception.failure["message"], runner.NO_ANSWER_FAILURE)
+        self.assertEqual(caught.exception.failure["segments"], raw_segments)
 
     async def test_capture_silence_and_malformed_pcm_emit_named_no_answer_failures(self):
         for pcm, sample_rate in (
@@ -530,7 +629,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                             pass
 
                         async def result(self):
-                            return pcm_windows(0, 0, 0, 0, 0, 600, 600), 24000, 1, next(self.starts)
+                            return pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18)), 24000, 1, next(self.starts)
 
                     dependencies = CaptureDependencies(
                         **{
@@ -594,7 +693,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
             async def result(self):
-                return pcm_windows(0, 0, 0, 0, 0, 600, 600), 24000, 1, time.monotonic() + 0.1
+                return pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18)), 24000, 1, time.monotonic() + 0.1
 
         async def future_speech_end(_source):
             return time.monotonic() + 1000.0
@@ -777,7 +876,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     raise RuntimeError("agent audio track produced no frames")
                 if failure == "capture":
                     await asyncio.sleep(1)
-                return pcm_windows(0, 0, 0, 0, 0, 600, 600), 24000, 1, time.monotonic() + 0.1
+                return pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18)), 24000, 1, time.monotonic() + 0.1
 
         alice_responses = iter((
             "Alice Keck Park in Santa Barbara was donated by Alice Keck.",

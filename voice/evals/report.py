@@ -59,6 +59,21 @@ def _timestamp(turn: dict[str, Any], field: str) -> float:
     return timestamp
 
 
+def _transcript_segments(segments: Any) -> list[dict[str, Any]]:
+    if not isinstance(segments, list) or not segments:
+        raise ValueError("missing or invalid transcript segment evidence")
+    evidence = []
+    for segment in segments:
+        if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+            raise ValueError("invalid transcript segment evidence")
+        start = _timestamp(segment, "start")
+        end = _timestamp(segment, "end")
+        if end < start:
+            raise ValueError("invalid transcript segment bounds")
+        evidence.append({"start": start, "end": end, "text": segment["text"]})
+    return evidence
+
+
 def _score_turn(
     turn: Any, name: str, run_index: int, turn_index: int
 ) -> tuple[dict[str, Any], list[str]]:
@@ -160,6 +175,8 @@ def _score_turn(
         },
         "model_call_count": len(calls),
     }
+    if "raw_segments" in turn:
+        report["segments"] = _transcript_segments(turn["raw_segments"])
     return report, problems
 
 
@@ -202,6 +219,7 @@ def score_observations(
         if len(runs) != required_runs:
             case_failures.append(f"{name}: expected {required_runs} runs, found {len(runs)}")
         turns: list[dict[str, Any]] = []
+        capture_failures: list[dict[str, Any]] = []
         for run_index, run in enumerate(runs):
             if not isinstance(run, dict) or not isinstance(run.get("turns"), list):
                 case_failures.append(f"{name} run {run_index + 1}: missing turn observations")
@@ -212,6 +230,7 @@ def score_observations(
                 failure_fields = (
                     {"turn", "message"},
                     {"turn", "message", "speech_started_at"},
+                    {"turn", "message", "speech_started_at", "segments"},
                 )
                 try:
                     valid_failure = (
@@ -240,7 +259,13 @@ def score_observations(
                         and (
                             failure.get("message") == NO_ANSWER_FAILURE
                         ) == ("speech_started_at" in failure)
+                        and (
+                            "segments" not in failure
+                            or failure.get("message") == NO_ANSWER_FAILURE
+                        )
                     )
+                    if valid_failure and "segments" in failure:
+                        _transcript_segments(failure["segments"])
                     if valid_failure and "speech_started_at" in failure:
                         failure_start = _timestamp(failure, "speech_started_at")
                         if run["turns"]:
@@ -262,6 +287,14 @@ def score_observations(
                     f"{name} run {run_index + 1} turn {failure['turn']}: "
                     f"capture failed: {failure['message']}"
                 )
+                capture_failure = {
+                    "run": run_index + 1,
+                    "turn": failure["turn"],
+                    "message": failure["message"],
+                }
+                if "segments" in failure:
+                    capture_failure["segments"] = _transcript_segments(failure["segments"])
+                capture_failures.append(capture_failure)
                 product_failures = run.get("product_failures")
                 if not isinstance(product_failures, list):
                     case_failures.append(
@@ -412,6 +445,7 @@ def score_observations(
             "run_count": len(runs),
             "turns": turns,
             "gates": gates,
+            "capture_failures": capture_failures,
             "failures": case_failures,
         }
         reports.append(report)

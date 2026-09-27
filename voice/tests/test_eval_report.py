@@ -243,6 +243,60 @@ class ScoringTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("invalid complete product failure metadata", " ".join(result["failures"]))
 
+    def test_product_failure_report_preserves_raw_transcript_segments(self):
+        raw_segments = [
+            {"start": 0.0, "end": 0.1, "text": "Okay."},
+            {"start": 0.1, "end": 0.3, "text": "The timer is set."},
+        ]
+        failed_turn = turn()
+        failed_turn["turn"] = 1
+        failed_turn["raw_segments"] = raw_segments
+        observation = {
+            "cases": [{
+                "name": "timer",
+                "runs": [{
+                    "turns": [failed_turn],
+                    "product_failures": [{"turn": 1, "message": "missing answer"}],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["cases"][0]["turns"][0]["segments"], raw_segments)
+
+    def test_partial_capture_report_preserves_raw_failed_turn_segments(self):
+        raw_segments = [
+            {"start": 0.0, "end": 0.1, "text": "Okay."},
+            {"start": 0.1, "end": 0.3, "text": "The timer is set."},
+        ]
+        observation = {
+            "cases": [{
+                "name": "timer",
+                "runs": [{
+                    "turns": [],
+                    "failure": {
+                        "turn": 1,
+                        "message": NO_ANSWER_FAILURE,
+                        "speech_started_at": 1_700_000_000.0,
+                        "segments": raw_segments,
+                    },
+                    "product_failures": [],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(
+            result["cases"][0]["capture_failures"],
+            [{"run": 1, "turn": 1, "message": NO_ANSWER_FAILURE, "segments": raw_segments}],
+        )
+        for segment in raw_segments:
+            self.assertIn(segment, result["cases"][0]["capture_failures"][0]["segments"])
+
     def test_partial_capture_scores_completed_turns_and_names_failed_turn(self):
         observation = {
             "cases": [{

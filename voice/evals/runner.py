@@ -73,12 +73,15 @@ class PartialCaptureFailure(RuntimeError):
         turn: int,
         message: str,
         speech_started_at: float | None = None,
+        segments: list[dict[str, Any]] | None = None,
     ):
         super().__init__(message)
         self.turns = turns
         self.failure = {"turn": turn, "message": message}
         if speech_started_at is not None:
             self.failure["speech_started_at"] = speech_started_at
+        if segments is not None:
+            self.failure["segments"] = segments
 
 
 @dataclass(frozen=True)
@@ -220,6 +223,63 @@ def _first_audio_after(
     if first_audio is None:
         raise RuntimeError(NO_ANSWER_FAILURE)
     return first_audio, overlap
+
+
+def _voiced_segments(
+    answer_pcm: bytes,
+    sample_rate: int,
+    channels: int,
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep transcript segments containing two adjacent speech-level PCM windows."""
+    if (
+        not isinstance(segments, list)
+        or not segments
+        or not isinstance(answer_pcm, bytes)
+        or isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, int)
+        or sample_rate < 50
+        or sample_rate % 50 != 0
+        or isinstance(channels, bool)
+        or not isinstance(channels, int)
+        or channels < 1
+        or not answer_pcm
+        or len(answer_pcm) % (channels * 2) != 0
+    ):
+        raise RuntimeError(NO_ANSWER_FAILURE)
+
+    window_frames = sample_rate // 50
+    window_values = window_frames * channels
+    window_bytes = window_values * 2
+    frame_bytes = channels * 2
+    pcm_duration = len(answer_pcm) // frame_bytes / sample_rate
+    rms_values = []
+    for offset in range(0, len(answer_pcm) - window_bytes + 1, window_bytes):
+        values = struct.unpack(f"<{window_values}h", answer_pcm[offset : offset + window_bytes])
+        rms_values.append(math.sqrt(sum(value * value for value in values) / len(values)))
+
+    _segment_start(segments)
+    eligible = []
+    for segment in segments:
+        start = float(segment["start"])
+        end = float(segment["end"])
+        if end > pcm_duration:
+            raise RuntimeError("transcription segment has invalid timestamp bounds")
+        active_run = 0
+        has_sustained_speech = False
+        for index, rms in enumerate(rms_values):
+            window_start = index * PCM_WINDOW_SECONDS
+            window_end = window_start + PCM_WINDOW_SECONDS
+            if window_start >= start and window_end <= end and rms >= PCM_RMS_THRESHOLD:
+                active_run += 1
+                if active_run >= 2:
+                    has_sustained_speech = True
+                    break
+            else:
+                active_run = 0
+        if has_sustained_speech:
+            eligible.append(segment)
+    return eligible
 
 
 def _trace_text(segments: list[dict[str, Any]]) -> str:
@@ -468,11 +528,22 @@ async def capture_script(
                         speech_started_at=speech_started_at,
                     ) from error
                 raise
-            segments = await _with_deadline(
+            raw_segments = await _with_deadline(
                 dependencies.transcribe(dependencies.http, answer_pcm, sample_rate, channels),
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "answer transcription",
             )
+            if not isinstance(raw_segments, list) or not raw_segments:
+                raise RuntimeError("transcription returned an empty transcript")
+            segments = _voiced_segments(answer_pcm, sample_rate, channels, raw_segments)
+            if not segments:
+                raise PartialCaptureFailure(
+                    traces,
+                    index + 1,
+                    NO_ANSWER_FAILURE,
+                    speech_started_at=speech_started_at,
+                    segments=raw_segments,
+                )
             transcript = _trace_text(segments)
             if not transcript:
                 raise RuntimeError("transcription returned an empty transcript")
@@ -487,6 +558,7 @@ async def capture_script(
                 "first_audio": first_audio,
                 "overlap": overlap,
                 "segments": segments,
+                "raw_segments": raw_segments,
                 "room_deleted": None,
             }
             traces.append(trace)
@@ -940,6 +1012,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
     allowed_failure_fields = (
         {"turn", "message"},
         {"turn", "message", "speech_started_at"},
+        {"turn", "message", "speech_started_at", "segments"},
     )
     same_turn_hangup_timeout = (
         isinstance(failure, dict)
@@ -980,6 +1053,18 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         )
     ):
         raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
+    if "segments" in failure:
+        if (
+            failure.get("message") != NO_ANSWER_FAILURE
+            or not isinstance(failure["segments"], list)
+        ):
+            raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
+        try:
+            _segment_start(failure["segments"])
+        except RuntimeError as error:
+            raise RuntimeError(
+                "remote scripted capture returned invalid partial failure segment evidence"
+            ) from error
     if "speech_started_at" in failure:
         failure_started_at = _finite_timestamp(
             failure["speech_started_at"], "failed caller speech start"
@@ -1140,6 +1225,12 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
             raise RuntimeError(f"captured turn {index} has no transcript segment evidence")
         for segment in segments:
             _segment_start([segment])
+        raw_segments = trace.get("raw_segments")
+        if raw_segments is not None:
+            if not isinstance(raw_segments, list) or not raw_segments:
+                raise RuntimeError(f"captured turn {index} has invalid raw transcript segment evidence")
+            for segment in raw_segments:
+                _segment_start([segment])
         trace["kind"] = _turn_kind(scenario, index)
         trace["command_received_at"] = command_receipts.get(index)
         trace["answer_at"] = _answer_time(
