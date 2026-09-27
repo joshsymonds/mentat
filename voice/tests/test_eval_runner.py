@@ -303,12 +303,116 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(traces), 1)
 
+    async def test_capture_records_early_audio_overlap_and_full_trace(self):
+        dependencies = self.dependencies_for_failure("other")
+
+        class EarlyCapture:
+            def __init__(self, _queue, _ended=None):
+                pass
+
+            async def start(self):
+                pass
+
+            async def result(self):
+                return b"audio", 24000, 1, 99.0
+
+        async def transcribe(*_args):
+            return [
+                {"start": 0.2, "end": 0.4, "text": "Okay, I heard you."},
+                {"start": 1.2, "end": 1.6, "text": "The timer is set for five minutes."},
+            ]
+
+        dependencies = CaptureDependencies(
+            **{
+                **dependencies.__dict__,
+                "capture_factory": EarlyCapture,
+                "transcribe": transcribe,
+            }
+        )
+
+        async def speech_end(_source):
+            return 100.0
+
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+        ):
+            traces = await capture_script(
+                "android-selected-room",
+                [r"Set a timer@0::timer is set"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self.assertEqual(trace["transcript"], "Okay, I heard you. The timer is set for five minutes.")
+        self.assertEqual(trace["segments"][0]["start"], 0.2)
+        self.assertEqual(trace["first_audio"], 100.2)
+        self.assertEqual(trace["speech_end"], 100.0)
+        self.assertTrue(trace["overlap"])
+
+    async def test_capture_fails_when_no_agent_audio_follows_speech_end(self):
+        dependencies = self.dependencies_for_failure("other")
+
+        class EarlyOnlyCapture:
+            def __init__(self, _queue, _ended=None):
+                pass
+
+            async def start(self):
+                pass
+
+            async def result(self):
+                return b"audio", 24000, 1, 99.0
+
+        async def transcribe(*_args):
+            return [{"start": 0.2, "end": 0.4, "text": "Okay, I heard you."}]
+
+        dependencies = CaptureDependencies(
+            **{
+                **dependencies.__dict__,
+                "capture_factory": EarlyOnlyCapture,
+                "transcribe": transcribe,
+            }
+        )
+
+        async def speech_end(_source):
+            return 100.0
+
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+            self.assertRaisesRegex(RuntimeError, "no agent audio after speech end"),
+        ):
+            await capture_script(
+                "android-selected-room",
+                [r"Question@0::.*"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+
+    async def test_wrong_answer_is_rejected_only_after_complete_capture(self):
+        from evals.scenarios import evaluate_scenario
+
+        dependencies = self.dependencies_for_failure("answer")
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            traces = await capture_script(
+                "android-selected-room",
+                [r"Set a timer@0::five minutes"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+
+        self.assertEqual(traces[0]["transcript"], "wrong response")
+        self.assertEqual(len(traces[0]["segments"]), 1)
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(SCENARIOS[0], [traces[0]["transcript"]], [], None)
+
     async def test_missing_audio_transcript_and_room_deletion_fail_closed(self):
         for failure, expected in (
             ("audio", "no frames"),
             ("capture", "exceeded its deadline"),
             ("transcript", "empty transcript"),
-            ("answer", "did not match expected answer"),
             ("room", "room deletion was not observed"),
         ):
             with self.subTest(failure=failure):
@@ -326,6 +430,15 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                             poll_interval=0.01,
                             room_close_after=1,
                         )
+
+    def test_missing_or_invalid_segment_timestamps_fail_closed(self):
+        for segments in (
+            [{"start": 0.1, "text": "answer"}],
+            [{"start": float("nan"), "end": 0.2, "text": "answer"}],
+            [{"start": 0.2, "end": 0.1, "text": "answer"}],
+        ):
+            with self.subTest(segments=segments), self.assertRaises(RuntimeError):
+                runner._segment_start(segments)
 
     @staticmethod
     def dependencies_for_failure(failure):
@@ -682,6 +795,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 "speech_started_at": 99.0,
                 "speech_end": 99.5,
                 "first_audio": 100.2,
+                "overlap": False,
                 "capture_started": 100.0,
                 "segments": [
                     {"start": 0.2, "end": 0.5, "text": "Text +1-202-555-0142: I will be there at six."},
@@ -697,6 +811,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 "speech_started_at": 200.0,
                 "speech_end": 201.0,
                 "first_audio": 201.2,
+                "overlap": False,
                 "capture_started": 201.0,
                 "segments": [{"start": 0.2, "end": 0.6, "text": "Message sent to +1-202-555-0142."}],
                 "room_deleted": 203.0,
@@ -839,6 +954,7 @@ class LocalEvalCliTests(unittest.TestCase):
                     "kind": "search" if not scenario.commands or (scenario.place_query and index == 1) else "action",
                     "speech_end": 10.0,
                     "first_audio": 11.0,
+                    "overlap": False,
                     "expect_confirmation": expectation.sms_recipient is not None,
                     "confirmation": 12.0 if expectation.sms_recipient is not None else None,
                     "expect_hangup": scenario.room_close_after == index,
@@ -904,6 +1020,7 @@ class LocalEvalCliTests(unittest.TestCase):
                     "kind": "search" if not scenario.commands or (scenario.place_query and index == 1) else "action",
                     "speech_end": 10.0,
                     "first_audio": 11.0,
+                    "overlap": False,
                     "expect_confirmation": expectation.sms_recipient is not None,
                     "confirmation": 12.0 if expectation.sms_recipient is not None else None,
                     "expect_hangup": scenario.room_close_after == index,

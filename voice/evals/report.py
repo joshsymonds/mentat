@@ -47,7 +47,7 @@ def _timestamp(turn: dict[str, Any], field: str) -> float:
         timestamp = float(value)
     except (OverflowError, ValueError) as error:
         raise ValueError(f"missing or invalid {field} timestamp") from error
-    if not math.isfinite(timestamp):
+    if not math.isfinite(timestamp) or timestamp < 0:
         raise ValueError(f"missing or invalid {field} timestamp")
     return timestamp
 
@@ -63,6 +63,9 @@ def _score_turn(
         raise ValueError(f"missing kind or invalid turn kind {kind!r}")
     speech_end = _timestamp(turn, "speech_end")
     first_audio = _timestamp(turn, "first_audio")
+    if "overlap" not in turn or not isinstance(turn["overlap"], bool):
+        raise ValueError(f"{label}: missing or invalid overlap observation")
+    overlap = turn["overlap"]
     if "expect_confirmation" not in turn:
         raise ValueError(f"{label}: missing expect_confirmation declaration")
     if "expect_hangup" not in turn:
@@ -112,6 +115,7 @@ def _score_turn(
         "turn": turn_index + 1,
         "kind": kind,
         "expect_hangup": expect_hangup,
+        "overlap": overlap,
         "latency_seconds": {
             "first_audio": first_audio_latency,
             "confirmation": (

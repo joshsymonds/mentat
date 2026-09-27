@@ -18,6 +18,7 @@ def turn(start=0.0, first_audio=2.0, confirmation=2.5, room_deleted=5.0, calls=N
         "kind": kind,
         "speech_end": start,
         "first_audio": first_audio,
+        "overlap": False,
         "confirmation": confirmation,
         "room_deleted": room_deleted,
         "expect_confirmation": True,
@@ -218,6 +219,7 @@ class ScoringTests(unittest.TestCase):
         turn_without_end = {
             "speech_end": 0.0,
             "first_audio": 2.0,
+            "overlap": False,
             "model_calls": [],
             "expect_confirmation": False,
             "expect_hangup": False,
@@ -239,12 +241,45 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(result["passed"], result["failures"])
         self.assertEqual(len(result["cases"][0]["turns"]), 20)
 
-    def test_invalid_timestamps_fail_closed(self):
+    def test_early_audio_is_reported_as_overlap_and_latency_uses_post_playout_audio(self):
         observation = {"cases": [case()]}
-        observation["cases"][0]["runs"][0]["turns"][0]["first_audio"] = -1
+        for run in observation["cases"][0]["runs"]:
+            run["turns"][0]["speech_end"] = 2.0
+            run["turns"][0]["first_audio"] = 2.2
+            run["turns"][0]["overlap"] = True
+
         result = score_observations(observation)
+
+        self.assertTrue(result["passed"], result["failures"])
+        first_turn = result["cases"][0]["turns"][0]
+        self.assertAlmostEqual(first_turn["latency_seconds"]["first_audio"], 0.2)
+        self.assertTrue(first_turn["overlap"])
+        self.assertAlmostEqual(
+            result["cases"][0]["gates"][0]["first_audio_p50_seconds"], 0.2
+        )
+
+    def test_first_audio_before_speech_end_is_not_a_valid_latency(self):
+        observation = {"cases": [case()]}
+        observation["cases"][0]["runs"][0]["turns"][0]["speech_end"] = 2.0
+        observation["cases"][0]["runs"][0]["turns"][0]["first_audio"] = 1.5
+        observation["cases"][0]["runs"][0]["turns"][0]["overlap"] = True
+
+        result = score_observations(observation)
+
         self.assertFalse(result["passed"])
-        self.assertIn("send message", " ".join(result["failures"]))
+        self.assertIn("first_audio precedes speech_end", " ".join(result["failures"]))
+
+    def test_missing_or_invalid_timestamps_fail_closed(self):
+        for invalid in (None, float("nan"), -1):
+            with self.subTest(invalid=invalid):
+                observation = {"cases": [case()]}
+                if invalid is None:
+                    del observation["cases"][0]["runs"][0]["turns"][0]["first_audio"]
+                else:
+                    observation["cases"][0]["runs"][0]["turns"][0]["first_audio"] = invalid
+                result = score_observations(observation)
+                self.assertFalse(result["passed"])
+                self.assertIn("first_audio", " ".join(result["failures"]))
 
     def test_cli_emits_report_and_nonzero_for_failed_case(self):
         observation = {"cases": [case(latency=5.1)]}
