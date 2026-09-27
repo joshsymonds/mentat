@@ -16,6 +16,14 @@ from evals.runner import CaptureDependencies, capture_script
 from evals.scenarios import SCENARIOS
 
 
+TEST_VOICE_ENV = {
+    "LIVEKIT_API_KEY": "key",
+    "LIVEKIT_API_SECRET": "secret",
+    "MENTAT_VOICE_TOKEN": "test-issued.header.signature",
+    "LIVEKIT_URL": "wss://test-livekit.invalid",
+}
+
+
 class Clock:
     def __init__(self):
         self.now = 10.0
@@ -153,7 +161,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return clock.monotonic()
 
         with (
-            patch.dict(os.environ, {"LIVEKIT_API_KEY": "key", "LIVEKIT_API_SECRET": "secret"}),
+            patch.dict(os.environ, TEST_VOICE_ENV),
             patch.object(runner.caller, "_speech_end_after_playout", speech_end),
         ):
             traces = await capture_script(
@@ -175,6 +183,41 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(events.index("playout"), events.index("capture-result"))
         self.assertEqual(events[-1], "disconnect")
 
+    async def test_injected_endpoint_token_and_url_reach_room_connect_without_local_mint(self):
+        dependencies = self.dependencies_for_failure("other")
+        token = "endpoint-issued.header.signature"
+        livekit_url = "wss://issued-livekit.invalid"
+        connections = []
+
+        async def connect(room, url, issued_token):
+            connections.append((url, issued_token))
+
+        with (
+            patch.object(dependencies.rtc.Room, "connect", connect),
+            patch.object(
+                dependencies.api,
+                "AccessToken",
+                side_effect=AssertionError("caller must not mint a replacement token"),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "LIVEKIT_API_KEY": "key",
+                    "LIVEKIT_API_SECRET": "secret",
+                    "MENTAT_VOICE_TOKEN": token,
+                    "LIVEKIT_URL": livekit_url,
+                },
+            ),
+        ):
+            await capture_script(
+                "android-selected-room",
+                ["Question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+
+        self.assertEqual(connections, [(livekit_url, token)])
+
     async def test_three_turn_chain_keeps_open_room_without_deletion_wait(self):
         dependencies = self.dependencies_for_failure("alice")
         steps = [
@@ -182,7 +225,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             r"Okay, who was she?@0::W\. M\. Keck",
             r"Okay, what was the source of her wealth?@0::Superior Oil",
         ]
-        with patch.dict(os.environ, {"LIVEKIT_API_KEY": "key", "LIVEKIT_API_SECRET": "secret"}):
+        with patch.dict(os.environ, TEST_VOICE_ENV):
             traces = await capture_script(
                 "android-selected-room",
                 steps,
@@ -223,7 +266,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return time.monotonic()
 
         with (
-            patch.dict(os.environ, {"LIVEKIT_API_KEY": "key", "LIVEKIT_API_SECRET": "secret"}),
+            patch.dict(os.environ, TEST_VOICE_ENV),
             patch.object(runner, "REMOTE_OPERATION_DEADLINE_SECONDS", 0.01),
             patch.object(runner.caller, "_speech_end_after_playout", stuck_playout),
             self.assertRaisesRegex(RuntimeError, "speech playout completion exceeded its deadline"),
@@ -237,7 +280,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         dependencies = self.dependencies_for_failure("room-list")
         with (
-            patch.dict(os.environ, {"LIVEKIT_API_KEY": "key", "LIVEKIT_API_SECRET": "secret"}),
+            patch.dict(os.environ, TEST_VOICE_ENV),
             patch.object(runner, "REMOTE_OPERATION_DEADLINE_SECONDS", 0.01),
             self.assertRaisesRegex(RuntimeError, "LiveKit room listing exceeded its deadline"),
         ):
@@ -261,7 +304,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 dependencies = self.dependencies_for_failure(failure)
                 with self.assertRaisesRegex(RuntimeError, expected):
                     with (
-                        patch.dict(os.environ, {"LIVEKIT_API_KEY": "key", "LIVEKIT_API_SECRET": "secret"}),
+                        patch.dict(os.environ, TEST_VOICE_ENV),
                         patch.object(runner, "ANSWER_CAPTURE_DEADLINE_SECONDS", 0.01),
                     ):
                         await capture_script(
@@ -411,6 +454,62 @@ class LocalEvalTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn(diagnostic, " ".join(report["failures"]))
         self.assertIn(diagnostic, " ".join(report["cases"][0]["failures"]))
+
+    def test_eval_json_scrubs_assignment_json_and_header_credentials(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        secrets = (
+            "bare-assignment-secret",
+            "double-quoted-secret",
+            "single-quoted-secret",
+            "json-secret",
+            "single-json-secret",
+            "colon-secret",
+            "export-secret",
+            "patchbay-header-secret",
+            "authorization-header-secret",
+            "api-header-secret",
+        )
+        diagnostic = "DISTINCTIVE-CAUSE\n" + "\n".join((
+            f"API_KEY={secrets[0]}",
+            f'LIVEKIT_API_SECRET="{secrets[1]}"',
+            f"LIVEKIT_AUTH_TOKEN='{secrets[2]}'",
+            f'{{"LIVEKIT_API_SECRET": "{secrets[3]}"}}',
+            f"{{'LIVEKIT_API_KEY': '{secrets[4]}'}}",
+            f"VOICE_TOKEN: {secrets[5]}",
+            f"export DEVICE_PASSWORD={secrets[6]}",
+            f"X-Patchbay-Key: {secrets[7]}",
+            f"Authorization: Bearer {secrets[8]}",
+            f"x-api-key: {secrets[9]}",
+        ))
+
+        class Stack:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "DevStack", Stack),
+            patch.object(runner, "observe_scenario", side_effect=RuntimeError(diagnostic)),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        serialized = output.getvalue()
+        report = json.loads(serialized)
+        self.assertEqual(result, 1)
+        self.assertIn("DISTINCTIVE-CAUSE", serialized)
+        self.assertFalse(report["passed"])
+        for secret in secrets:
+            self.assertNotIn(secret, serialized)
 
 
 class ScenarioObservationTests(unittest.TestCase):
@@ -639,13 +738,15 @@ class ScenarioObservationTests(unittest.TestCase):
             def __init__(self):
                 self.worker_rooms = []
                 self.voice_commands = []
+                self.voice_grants = []
                 self.remote_commands = []
 
             def start_worker(self, room):
                 self.worker_rooms.append(room)
 
-            def run_voice(self, command):
+            def run_voice(self, command, *, token, livekit_url):
                 self.voice_commands.append(command)
+                self.voice_grants.append((token, livekit_url))
                 if command[0] == "evals/runner.py":
                     return CompletedProcess(command, 0, json.dumps({"turns": assistant_turns}), "")
                 raise AssertionError(f"unexpected remote voice command {command!r}")
@@ -670,6 +771,8 @@ class ScenarioObservationTests(unittest.TestCase):
 
         self.assertEqual(token_requests, [("POST", "/v1/voice/token", b"{}")])
         self.assertEqual(stack.worker_rooms, [grant["room"]])
+        self.assertEqual(stack.voice_grants, [(grant["token"], grant["url"])])
+        self.assertNotIn(grant["token"], repr(observation))
         self.assertEqual(stack.voice_commands[0][0], "evals/runner.py")
         self.assertIn(grant["room"], stack.voice_commands[0])
         self.assertIn("--fake-phone", stack.voice_commands[0])

@@ -151,37 +151,103 @@ class DevStackTest(unittest.TestCase):
         self.assertIn('if kill -0 "$previous_pid" 2>/dev/null; then', replacement)
         self.assertNotIn('(dev_dir / "voice.env.json").unlink()', _START_WORKER_SCRIPT)
 
-    def test_run_voice_uses_staged_python_and_private_remote_environment(self):
+    def test_run_voice_transfers_grant_over_stdin_and_redacts_captured_output(self):
         calls = []
-        secret = "remote-openai-secret"
+        token = "issued-token.secret.signature"
+        livekit_url = "wss://issued-livekit.invalid"
 
         def run(args, **kwargs):
             calls.append((args, kwargs))
-            return subprocess.CompletedProcess(args, 0, "caller output", "caller warning")
+            return subprocess.CompletedProcess(
+                args, 0, f"caller output {token}", f"caller warning {token}"
+            )
 
         stack = DevStack(checkout=CHECKOUT, run=run)
         stack._entered = True
         stack._remote_dir = "/tmp/mentat-eval.test"
-        result = stack.run_voice(["evals/runner.py", "--room", "token-room"])
+        result = stack.run_voice(
+            ["evals/runner.py", "--room", "token-room"],
+            token=token,
+            livekit_url=livekit_url,
+        )
 
-        self.assertEqual(result.stdout, "caller output")
-        self.assertEqual(result.stderr, "caller warning")
+        self.assertEqual(result.stdout, "caller output [REDACTED]")
+        self.assertEqual(result.stderr, "caller warning [REDACTED]")
         self.assertEqual(len(calls), 1)
         args, kwargs = calls[0]
-        self.assertEqual(
-            args,
-            ["ssh", "ultraviolet", "sudo", "bash", "-s", "--", "/tmp/mentat-eval.test", "8485", "8486"],
-        )
-        self.assertTrue(kwargs["check"])
+        self.assertEqual(args[:2], ["ssh", "ultraviolet"])
+        self.assertNotIn(token, " ".join(args))
         self.assertTrue(kwargs["capture_output"])
         self.assertTrue(kwargs["text"])
-        self.assertIn('voice.env.json', kwargs["input"])
-        self.assertIn('voice-python.path', kwargs["input"])
-        self.assertIn('"--reuid=nobody"', kwargs["input"])
-        self.assertIn("'evals/runner.py', '--room', 'token-room'", kwargs["input"])
-        self.assertIn('"LIVEKIT_URL": "ws://127.0.0.1:7880"', kwargs["input"])
-        self.assertIn('"MENTAT_URL": f"http://127.0.0.1:{DEV_PORT}"', kwargs["input"])
-        self.assertNotIn(secret, " ".join(args) + kwargs["input"])
+        self.assertTrue(kwargs["check"])
+        self.assertIn('"command": ["evals/runner.py", "--room", "token-room"]', kwargs["input"])
+        self.assertIn(f'"token": "{token}"', kwargs["input"])
+        self.assertIn(f'"livekit_url": "{livekit_url}"', kwargs["input"])
+        self.assertIn('"MENTAT_VOICE_TOKEN": token', kwargs["input"])
+        self.assertIn('"LIVEKIT_URL": livekit_url', kwargs["input"])
+        self.assertIn('"voice.env.json"', kwargs["input"])
+        self.assertNotIn("ws://127.0.0.1:7880", kwargs["input"])
+
+    def test_remote_and_run_voice_scrub_credential_forms_and_retain_cause(self):
+        token = "issued-token.header.signature"
+        secret_values = (
+            "bare-assignment-secret",
+            "double-quoted-secret",
+            "single-quoted-secret",
+            "json-secret",
+            "single-json-secret",
+            "colon-secret",
+            "export-secret",
+            "patchbay-header-secret",
+            "authorization-header-secret",
+            "api-header-secret",
+        )
+        diagnostics = "DISTINCTIVE-CAUSE\n" + "\n".join((
+            f"API_KEY={secret_values[0]}",
+            f'LIVEKIT_API_SECRET="{secret_values[1]}"',
+            f"LIVEKIT_AUTH_TOKEN='{secret_values[2]}'",
+            f'{{"LIVEKIT_API_SECRET": "{secret_values[3]}"}}',
+            f"{{'LIVEKIT_API_KEY': '{secret_values[4]}'}}",
+            f"VOICE_TOKEN: {secret_values[5]}",
+            f"export DEVICE_PASSWORD={secret_values[6]}",
+            f"X-Patchbay-Key: {secret_values[7]}",
+            f"Authorization: Bearer {secret_values[8]}",
+            f"x-api-key: {secret_values[9]}",
+        )) + f"\n{token}"
+
+        for path in ("_remote", "run_voice"):
+            with self.subTest(path=path):
+                failure = subprocess.CalledProcessError(
+                    7,
+                    ["ssh", "ultraviolet"],
+                    output=diagnostics,
+                    stderr=diagnostics,
+                )
+
+                def run(_args, **kwargs):
+                    self.assertTrue(kwargs["check"])
+                    raise failure
+
+                stack = DevStack(checkout=CHECKOUT, run=run)
+                stack._entered = True
+                stack._remote_dir = "/tmp/mentat-eval.test"
+                with self.assertRaises(subprocess.CalledProcessError) as raised:
+                    if path == "_remote":
+                        stack._remote("remote command", redact=(token,))
+                    else:
+                        stack.run_voice(
+                            ["evals/runner.py"],
+                            token=token,
+                            livekit_url="wss://issued.invalid",
+                        )
+
+                error = raised.exception
+                self.assertIn("DISTINCTIVE-CAUSE", str(error))
+                self.assertIs(error.__cause__, failure)
+                for secret in (*secret_values, token):
+                    self.assertNotIn(secret, str(error))
+                    self.assertNotIn(secret, error.stderr)
+                    self.assertNotIn(secret, error.output)
 
     def test_setpriv_is_resolved_outside_service_path_for_all_launches(self):
         def python_block(script, header):
@@ -192,12 +258,20 @@ class DevStackTest(unittest.TestCase):
             dev_dir = root / "stage"
             (dev_dir / "mentat").mkdir(parents=True)
             (dev_dir / "voice").mkdir()
+            (dev_dir / "voice/evals").mkdir()
+            shutil.copy2(
+                Path(__file__).resolve().parents[1] / "evals/dev_stack.py",
+                dev_dir / "voice/evals/dev_stack.py",
+            )
             service_path = str(root / "service-bin")
             (dev_dir / "mentat.env.json").write_text(json.dumps({
                 "PATH": service_path,
                 "MENTAT_LISTEN": "127.0.0.1:8484",
             }))
-            (dev_dir / "voice.env.json").write_text(json.dumps({"PATH": service_path}))
+            (dev_dir / "voice.env.json").write_text(json.dumps({
+                "PATH": service_path,
+                "LIVEKIT_API_SECRET": "private-env-secret",
+            }))
             (dev_dir / "voice-python.path").write_text("/nix/store/python/bin/python3")
 
             setup_bin = root / "setup-bin"
@@ -233,22 +307,39 @@ class DevStackTest(unittest.TestCase):
             self.assertEqual(worker_argv[0], resolved_setpriv)
             self.assertEqual(popen.call_args.kwargs["env"]["PATH"], service_path)
 
-            caller_body = python_block(
-                _RUN_VOICE_SCRIPT.replace(
-                    "__COMMAND__", repr(["evals/runner.py", "--room", "caller-room"])
-                ),
-                'python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" <<\'PY\'',
+            token = "issued-token.header.signature"
+            caller_payload = json.dumps({
+                "command": ["evals/runner.py", "--room", "caller-room"],
+                "token": token,
+                "livekit_url": "wss://issued-livekit.invalid",
+            })
+            result = SimpleNamespace(
+                stdout="DISTINCTIVE-CAUSE private-env-secret " + token,
+                stderr="private-env-secret " + token,
+                returncode=0,
             )
-            result = SimpleNamespace(stdout="", stderr="", returncode=0)
-            with patch("sys.argv", ["caller.py", str(dev_dir), "8485", "8486"]):
-                with patch("sys.stdout", io.StringIO()), patch("sys.stderr", io.StringIO()):
-                    with patch("subprocess.run", return_value=result) as run:
-                        with patch("sys.exit") as exit_process:
-                            exec(caller_body, {})
+            caller_stdout = io.StringIO()
+            caller_stderr = io.StringIO()
+            with patch("sys.argv", ["-c", "--", str(dev_dir), "8485", "8486"]):
+                with patch("sys.stdin", io.StringIO(caller_payload)):
+                    with patch("sys.stdout", caller_stdout), patch("sys.stderr", caller_stderr):
+                        with patch("subprocess.run", return_value=result) as run:
+                            with patch("sys.exit") as exit_process:
+                                exec(_RUN_VOICE_SCRIPT, {})
             exit_process.assert_called_once_with(0)
+            self.assertIn("DISTINCTIVE-CAUSE", caller_stdout.getvalue())
+            self.assertNotIn("private-env-secret", caller_stdout.getvalue())
+            self.assertNotIn(token, caller_stdout.getvalue())
+            self.assertNotIn("private-env-secret", caller_stderr.getvalue())
+            self.assertNotIn(token, caller_stderr.getvalue())
             caller_argv = run.call_args.args[0]
             self.assertEqual(caller_argv[0], resolved_setpriv)
             self.assertEqual(run.call_args.kwargs["env"]["PATH"], service_path)
+            self.assertEqual(run.call_args.kwargs["env"]["MENTAT_VOICE_TOKEN"], token)
+            self.assertEqual(
+                run.call_args.kwargs["env"]["LIVEKIT_URL"],
+                "wss://issued-livekit.invalid",
+            )
 
     def test_setup_fails_if_setpriv_cannot_be_resolved(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -271,8 +362,9 @@ class DevStackTest(unittest.TestCase):
         run = unittest.mock.Mock()
         stack = DevStack(checkout=CHECKOUT, run=run)
 
+        grant = {"token": "issued-token.header.signature", "livekit_url": "wss://issued.invalid"}
         with self.assertRaisesRegex(RuntimeError, "dev stack is not running"):
-            stack.run_voice(["voice/evals/caller.py"])
+            stack.run_voice(["voice/evals/caller.py"], **grant)
         run.assert_not_called()
 
         failure = subprocess.CalledProcessError(
@@ -282,7 +374,7 @@ class DevStackTest(unittest.TestCase):
         stack._entered = True
         stack._remote_dir = "/tmp/mentat-eval.test"
         with self.assertRaises(subprocess.CalledProcessError) as raised:
-            stack.run_voice(["voice/evals/caller.py"])
+            stack.run_voice(["voice/evals/caller.py"], **grant)
         self.assertIsInstance(raised.exception, subprocess.CalledProcessError)
         self.assertIs(raised.exception.__cause__, failure)
         self.assertIn("caller failed", str(raised.exception))

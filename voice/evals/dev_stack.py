@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import signal
@@ -22,6 +23,45 @@ class RemoteCommandError(subprocess.CalledProcessError):
         message = super().__str__()
         stderr = self.stderr.strip() if isinstance(self.stderr, str) else ""
         return f"{message}: {stderr}" if stderr else message
+
+
+_SECRET_NAME = re.compile(r"(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)", re.IGNORECASE)
+_SECRET_ASSIGNMENT = re.compile(
+    r"""(?ix)
+    (?P<prefix>
+        (?:\bexport\s+)?
+        [\"']?
+        [A-Z0-9_.-]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[A-Z0-9_.-]*
+        [\"']?
+        \s*(?:=|:)\s*(?:Bearer\s+)?
+    )
+    (?:\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'|[^\s,;}\]]+)
+    """
+)
+_AUTHORIZATION_BEARER = re.compile(
+    r"(?i)(\bAuthorization\s*:\s*Bearer\s+)[^\s,;}\]]+"
+)
+_BEARER_VALUE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+")
+
+
+def _secret_environment_values(values: dict[str, object]) -> list[str]:
+    return [
+        value
+        for name, value in values.items()
+        if _SECRET_NAME.search(name) and isinstance(value, str) and value
+    ]
+
+
+def _redact_diagnostics(value: str | bytes | None, secrets: Sequence[str] = ()) -> str:
+    if isinstance(value, bytes):
+        text = value.decode(errors="replace")
+    else:
+        text = value if isinstance(value, str) else ""
+    for secret in sorted((secret for secret in secrets if secret), key=len, reverse=True):
+        text = text.replace(secret, "[REDACTED]")
+    text = _SECRET_ASSIGNMENT.sub(lambda match: match.group("prefix") + "[REDACTED]", text)
+    text = _AUTHORIZATION_BEARER.sub(r"\1[REDACTED]", text)
+    return _BEARER_VALUE.sub(r"\1[REDACTED]", text)
 
 
 _MCP_REWRITE_SOURCE = '''def rewrite_mcp_config(raw, production_port, dev_port):
@@ -232,30 +272,45 @@ trap - EXIT
 '''
 
 
-_RUN_VOICE_SCRIPT = r'''set -euo pipefail
-DEV_DIR=$1
-DEV_PORT=$2
-HEALTH_PORT=$3
-python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" <<'PY'
-import json
+_RUN_VOICE_SCRIPT = r'''import json
 import subprocess
 import sys
 from pathlib import Path
 
-DEV_DIR = Path(sys.argv[1])
-DEV_PORT = sys.argv[2]
-HEALTH_PORT = sys.argv[3]
-command = __COMMAND__
+if len(sys.argv) != 5 or sys.argv[1] != "--":
+    raise RuntimeError("remote caller received invalid staging arguments")
+DEV_DIR = Path(sys.argv[2])
+DEV_PORT = sys.argv[3]
+HEALTH_PORT = sys.argv[4]
+sys.path.insert(0, str(DEV_DIR / "voice"))
+from evals.dev_stack import _redact_diagnostics, _secret_environment_values
+
+payload = json.load(sys.stdin)
+command = payload.get("command")
+token = payload.get("token")
+livekit_url = payload.get("livekit_url")
+if (
+    not isinstance(command, list)
+    or not command
+    or any(not isinstance(arg, str) or "\x00" in arg for arg in command)
+    or not isinstance(token, str)
+    or not token
+    or not isinstance(livekit_url, str)
+    or not livekit_url
+):
+    raise RuntimeError("remote caller received an incomplete voice grant")
 voice_python = (DEV_DIR / "voice-python.path").read_text().strip()
 setpriv_path = (DEV_DIR / "setpriv.path").read_text().strip()
 voice_env = json.loads((DEV_DIR / "voice.env.json").read_text())
 voice_env.update({
-    "LIVEKIT_URL": "ws://127.0.0.1:7880",
+    "LIVEKIT_URL": livekit_url,
+    "MENTAT_VOICE_TOKEN": token,
     "MENTAT_URL": f"http://127.0.0.1:{DEV_PORT}",
     "HOME": str(DEV_DIR / "home/voice"),
     "XDG_CACHE_HOME": str(DEV_DIR / "home/voice/cache"),
     "MENTAT_VOICE_HTTP_PORT": HEALTH_PORT,
 })
+secret_values = _secret_environment_values(voice_env) + [token]
 result = subprocess.run(
     [
         setpriv_path, "--reuid=nobody", "--regid=nogroup", "--clear-groups",
@@ -266,10 +321,9 @@ result = subprocess.run(
     stdin=subprocess.DEVNULL,
     capture_output=True, text=True, check=False,
 )
-sys.stdout.write(result.stdout)
-sys.stderr.write(result.stderr)
+sys.stdout.write(_redact_diagnostics(result.stdout, secret_values))
+sys.stderr.write(_redact_diagnostics(result.stderr, secret_values))
 sys.exit(result.returncode)
-PY
 '''
 
 
@@ -358,18 +412,39 @@ class DevStack:
             text=True,
         )
 
-    def run_voice(self, command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        """Run a staged caller as the voice worker with its private environment."""
+    def run_voice(
+        self, command: Sequence[str], *, token: str, livekit_url: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a staged caller with the dev endpoint's private voice grant."""
         if not self._entered:
             raise RuntimeError("dev stack is not running")
         if not command or any(not isinstance(arg, str) or "\x00" in arg for arg in command):
             raise ValueError("voice command must contain non-empty safe arguments")
-        script = _RUN_VOICE_SCRIPT.replace("__COMMAND__", repr(list(command)))
-        return self._remote(
-            script,
-            self._remote_dir or "",
-            str(self.dev_port),
-            str(self.health_port),
+        if not isinstance(token, str) or not token:
+            raise ValueError("voice token must be non-empty")
+        if not isinstance(livekit_url, str) or not livekit_url:
+            raise ValueError("LiveKit URL must be non-empty")
+        payload = json.dumps({
+            "command": list(command),
+            "token": token,
+            "livekit_url": livekit_url,
+        })
+        python_command = shlex.join([
+            "python3", "-c", _RUN_VOICE_SCRIPT, "--",
+            self._remote_dir or "", str(self.dev_port), str(self.health_port),
+        ])
+        script = (
+            "set -euo pipefail\n"
+            f"{python_command} <<'MENTAT_VOICE_GRANT'\n"
+            f"{payload}\n"
+            "MENTAT_VOICE_GRANT\n"
+        )
+        result = self._remote(script, redact=(token,))
+        return subprocess.CompletedProcess(
+            result.args,
+            result.returncode,
+            _redact_diagnostics(result.stdout, (token,)),
+            _redact_diagnostics(result.stderr, (token,)),
         )
 
     def start_worker(self, room: str) -> None:
@@ -501,7 +576,9 @@ class DevStack:
         if self._tunnel.poll() is not None:
             raise RuntimeError("SSH port-forward exited before the dev stack became available")
 
-    def _remote(self, script: str, *args: str) -> subprocess.CompletedProcess[str]:
+    def _remote(
+        self, script: str, *args: str, redact: Sequence[str] = ()
+    ) -> subprocess.CompletedProcess[str]:
         try:
             return self._run(
                 ["ssh", self.remote, "sudo", "bash", "-s", "--", *args],
@@ -511,20 +588,11 @@ class DevStack:
                 text=True,
             )
         except subprocess.CalledProcessError as error:
-            stderr = error.stderr or ""
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode(errors="replace")
-            stderr = re.sub(
-                r"""(?i)(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[=:]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)""",
-                r"\1[REDACTED]",
-                stderr,
-            )
-            stderr = re.sub(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", stderr)
             raise RemoteCommandError(
                 error.returncode,
                 error.cmd,
-                output=error.output,
-                stderr=stderr,
+                output=_redact_diagnostics(error.output, redact),
+                stderr=_redact_diagnostics(error.stderr, redact),
             ) from error
 
     def _cleanup(self) -> None:

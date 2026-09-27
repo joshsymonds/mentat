@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import caller
-from evals.dev_stack import DevStack
+from evals.dev_stack import DevStack, _redact_diagnostics
 from evals.report import score_observations
 from evals.scenarios import SCENARIOS
 
@@ -190,12 +190,14 @@ async def capture_script(
 
     api_key = os.environ["LIVEKIT_API_KEY"]
     api_secret = os.environ["LIVEKIT_API_SECRET"]
-    token = (
-        dependencies.api.AccessToken(api_key, api_secret)
-        .with_identity("scripted-caller")
-        .with_grants(dependencies.api.VideoGrants(room_join=True, room=room_name))
-        .to_jwt()
-    )
+    token = os.environ.get("MENTAT_VOICE_TOKEN", "")
+    token_parts = token.split(".")
+    if len(token_parts) != 3 or any(not part for part in token_parts):
+        raise RuntimeError("endpoint-issued voice token is missing or invalid")
+    livekit_url = os.environ.get("LIVEKIT_URL", "")
+    parsed_livekit_url = urlsplit(livekit_url)
+    if parsed_livekit_url.scheme not in ("ws", "wss") or parsed_livekit_url.hostname is None:
+        raise RuntimeError("endpoint-issued LiveKit URL is missing or invalid")
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
 
@@ -211,7 +213,6 @@ async def capture_script(
         ):
             answer_tracks.put_nowait(track)
 
-    livekit_url = os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
     api_client = dependencies.api.LiveKitAPI(livekit_url, api_key, api_secret)
     traces: list[dict[str, Any]] = []
     deletion_task: asyncio.Task[float] | None = None
@@ -729,7 +730,9 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     stack.start_worker(room)
     close_arg = "none" if close_after is None else str(close_after)
     capture = stack.run_voice(
-        ["evals/runner.py", "--fake-phone", "--room-close-after", close_arg, room, *raw_steps]
+        ["evals/runner.py", "--fake-phone", "--room-close-after", close_arg, room, *raw_steps],
+        token=grant["token"],
+        livekit_url=grant["url"],
     )
     capture_text = _completed_stdout(capture, "remote scripted capture")
     try:
@@ -897,15 +900,17 @@ def _run_local_eval(argv: list[str]) -> int:
                     try:
                         runs.append(observe_scenario(scenario, stack))
                     except Exception as error:
-                        message = f"{scenario.name} run {run_index + 1}: {error}"
+                        message = _redact_diagnostics(
+                            f"{scenario.name} run {run_index + 1}: {error}"
+                        )
                         capture_failures.append((scenario_index, run_index, message))
-                        runs.append({"failure": str(error)})
+                        runs.append({"failure": _redact_diagnostics(str(error))})
                 observations["cases"].append({
                     "name": scenario.name,
                     "runs": runs,
                 })
     except Exception as error:
-        message = f"DevStack setup failed: {error}"
+        message = _redact_diagnostics(f"DevStack setup failed: {error}")
         observations["cases"] = [
             {"name": scenario.name, "runs": []}
             for scenario in SCENARIOS
