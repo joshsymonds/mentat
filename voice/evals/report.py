@@ -15,9 +15,12 @@ ANSWER_DEADLINE_SECONDS = 30.0
 CONFIRMATION_DEADLINE_SECONDS = 30.0
 HANGUP_DEADLINE_SECONDS = 60.0
 RUNS_REQUIRED = 10
+NO_ANSWER_FAILURE = (
+    "no-answer: captured PCM is silent, malformed, or has no qualifying post-playout onset"
+)
 PARTIAL_CAPTURE_MESSAGES = {
     "scripted speech synthesis exceeded its deadline",
-    "transcription returned no agent audio after speech end",
+    NO_ANSWER_FAILURE,
     "room was deleted before all scripted lines were captured",
     "room deletion was not observed before deadline",
 }
@@ -213,8 +216,7 @@ def score_observations(
                         )
                         and failure.get("message") in PARTIAL_CAPTURE_MESSAGES
                         and (
-                            failure.get("message")
-                            == "transcription returned no agent audio after speech end"
+                            failure.get("message") == NO_ANSWER_FAILURE
                         ) == ("speech_started_at" in failure)
                         and not (
                             failure.get("message")

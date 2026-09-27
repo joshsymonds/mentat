@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import caller
 from evals.dev_stack import DevStack, _redact_diagnostics
-from evals.report import score_observations
+from evals.report import NO_ANSWER_FAILURE, score_observations
 from evals.scenarios import SCENARIOS
 
 RATE = caller.RATE
@@ -135,21 +136,81 @@ def _segment_start(segments: list[dict[str, Any]]) -> float:
     return min(starts)
 
 
+PCM_WINDOW_SECONDS = 0.020
+PCM_RMS_THRESHOLD = 200
+
+
 def _first_audio_after(
-    capture_started: float, speech_end: float, segments: list[dict[str, Any]]
+    answer_pcm: bytes,
+    sample_rate: int,
+    channels: int,
+    capture_started: float,
+    speech_end: float,
 ) -> tuple[float, bool]:
-    _segment_start(segments)
+    """Find sustained agent speech from signed 16-bit little-endian PCM."""
+    capture_started = _finite_timestamp(capture_started, "capture start")
+    speech_end = _finite_timestamp(speech_end, "speech_end")
+    if (
+        not isinstance(answer_pcm, bytes)
+        or isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, int)
+        or sample_rate < 50
+        or sample_rate % 50 != 0
+        or isinstance(channels, bool)
+        or not isinstance(channels, int)
+        or channels < 1
+    ):
+        raise RuntimeError(NO_ANSWER_FAILURE)
+
+    window_frames = sample_rate // 50
+    window_values = window_frames * channels
+    window_bytes = window_values * 2
+    sample_frame_bytes = channels * 2
+    if (
+        window_frames < 1
+        or not answer_pcm
+        or len(answer_pcm) % sample_frame_bytes != 0
+    ):
+        raise RuntimeError(NO_ANSWER_FAILURE)
+
+    rms_values = []
+    window_count = len(answer_pcm) // window_bytes
+    for window_index in range(window_count):
+        offset = window_index * window_bytes
+        window = answer_pcm[offset : offset + window_bytes]
+        values = struct.unpack(f"<{window_values}h", window)
+        rms_values.append(math.sqrt(sum(value * value for value in values) / len(values)))
+
     first_audio = None
     overlap = False
-    for segment in segments:
-        start = capture_started + segment["start"]
-        end = capture_started + segment["end"]
-        overlap = overlap or start < speech_end
-        if end > speech_end:
-            candidate = max(start, speech_end)
-            first_audio = candidate if first_audio is None else min(first_audio, candidate)
+    run_start = None
+    for index, rms in enumerate(rms_values):
+        if rms >= PCM_RMS_THRESHOLD:
+            if run_start is None:
+                run_start = index
+            continue
+        if run_start is not None and index - run_start >= 2:
+            run_end = index
+            run_start_time = capture_started + run_start * PCM_WINDOW_SECONDS
+            overlap = overlap or run_start_time < speech_end
+            for qualifying_index in range(run_start, run_end):
+                window_start = capture_started + qualifying_index * PCM_WINDOW_SECONDS
+                if window_start >= speech_end:
+                    first_audio = window_start if first_audio is None else min(first_audio, window_start)
+            run_start = None
+        else:
+            run_start = None
+    if run_start is not None and len(rms_values) - run_start >= 2:
+        run_end = len(rms_values)
+        run_start_time = capture_started + run_start * PCM_WINDOW_SECONDS
+        overlap = overlap or run_start_time < speech_end
+        for qualifying_index in range(run_start, run_end):
+            window_start = capture_started + qualifying_index * PCM_WINDOW_SECONDS
+            if window_start >= speech_end:
+                first_audio = window_start if first_audio is None else min(first_audio, window_start)
+
     if first_audio is None:
-        raise RuntimeError("transcription returned no agent audio after speech end")
+        raise RuntimeError(NO_ANSWER_FAILURE)
     return first_audio, overlap
 
 
@@ -385,21 +446,13 @@ async def capture_script(
                 )
             except TimeoutError as error:
                 raise RuntimeError("agent audio capture exceeded its deadline") from error
-            if not answer_pcm:
-                raise RuntimeError("agent audio capture returned no frames")
-            segments = await _with_deadline(
-                dependencies.transcribe(dependencies.http, answer_pcm, sample_rate, channels),
-                REMOTE_OPERATION_DEADLINE_SECONDS,
-                "answer transcription",
-            )
             capture_started = _finite_timestamp(capture_started, "capture start")
-            transcript = _trace_text(segments)
-            if not transcript:
-                raise RuntimeError("transcription returned an empty transcript")
             try:
-                first_audio, overlap = _first_audio_after(capture_started, speech_end, segments)
+                first_audio, overlap = _first_audio_after(
+                    answer_pcm, sample_rate, channels, capture_started, speech_end
+                )
             except RuntimeError as error:
-                if str(error) == "transcription returned no agent audio after speech end":
+                if str(error) == NO_ANSWER_FAILURE:
                     raise PartialCaptureFailure(
                         traces,
                         index + 1,
@@ -407,6 +460,14 @@ async def capture_script(
                         speech_started_at=speech_started_at,
                     ) from error
                 raise
+            segments = await _with_deadline(
+                dependencies.transcribe(dependencies.http, answer_pcm, sample_rate, channels),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "answer transcription",
+            )
+            transcript = _trace_text(segments)
+            if not transcript:
+                raise RuntimeError("transcription returned an empty transcript")
             trace = {
                 "turn": index + 1,
                 "room": room_name,
@@ -827,12 +888,12 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         or failure["turn"] > expected_turns
         or failure.get("message") not in {
             "scripted speech synthesis exceeded its deadline",
-            "transcription returned no agent audio after speech end",
+            NO_ANSWER_FAILURE,
             "room was deleted before all scripted lines were captured",
             "room deletion was not observed before deadline",
         }
         or (
-            failure.get("message") == "transcription returned no agent audio after speech end"
+            failure.get("message") == NO_ANSWER_FAILURE
         ) != ("speech_started_at" in failure)
         or (
             failure.get("message") == "room was deleted before all scripted lines were captured"

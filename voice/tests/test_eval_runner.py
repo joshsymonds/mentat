@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import struct
 import sys
 import time
 import unittest
@@ -22,6 +23,13 @@ TEST_VOICE_ENV = {
     "MENTAT_VOICE_TOKEN": "test-issued.header.signature",
     "LIVEKIT_URL": "wss://test-livekit.invalid",
 }
+
+
+def pcm_windows(*levels, sample_rate=24000, channels=1):
+    """Encode PCM levels as 20 ms signed Int16 windows."""
+    samples_per_window = sample_rate // 50 * channels
+    values = [level for level in levels for _ in range(samples_per_window)]
+    return struct.pack(f"<{len(values)}h", *values)
 
 
 class Clock:
@@ -103,7 +111,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             async def result(self):
                 events.append("capture-result")
                 clock.now += 0.05
-                return b"audio", 24000, 1, clock.monotonic() + 0.1
+                return pcm_windows(0, 0, 0, 0, 0, 600, 600), 24000, 1, clock.monotonic() + 0.1
 
         class AudioSource(Source):
             def __init__(self, *_args):
@@ -142,7 +150,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return b"\x00\x00"
 
         async def transcribe(_http, pcm, _rate, _channels):
-            self.assertEqual(pcm, b"audio")
+            self.assertEqual(pcm, pcm_windows(0, 0, 0, 0, 0, 600, 600))
             return [{"start": 0.1, "end": 0.4, "text": "answer"}]
 
         dependencies = CaptureDependencies(
@@ -303,6 +311,47 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(traces), 1)
 
+    def test_pcm_onset_uses_sustained_post_playout_windows_and_preserves_overlap(self):
+        post_playout = pcm_windows(0, 0, 600, 600, 600, 600)
+        self.assertEqual(
+            runner._first_audio_after(post_playout, 24000, 1, 10.0, 10.04),
+            (10.04, False),
+        )
+        self.assertEqual(
+            runner._first_audio_after(pcm_windows(0, 0, 200, 200), 24000, 1, 10.0, 10.04),
+            (10.04, False),
+        )
+
+        overlapping = pcm_windows(0, 600, 600, 600, 600, 0)
+        self.assertEqual(
+            runner._first_audio_after(overlapping, 24000, 1, 10.0, 10.06),
+            (10.06, True),
+        )
+
+    def test_pcm_onset_ignores_a_partial_trailing_window(self):
+        trailing_half_window = struct.pack("<240h", *([0] * 240))
+        pcm = pcm_windows(0, 0, 600, 600) + trailing_half_window
+        self.assertEqual(
+            runner._first_audio_after(pcm, 24000, 1, 10.0, 10.04),
+            (10.04, False),
+        )
+
+    def test_pcm_onset_rejects_short_noise_silence_and_malformed_metadata_as_no_answer(self):
+        cases = (
+            (pcm_windows(0, 0, 600, 0, 0), 24000, 1),
+            (pcm_windows(0, 0, 199, 199), 24000, 1),
+            (pcm_windows(0, 0, 0, 0), 24000, 1),
+            (bytes([0]), 24000, 1),
+            (pcm_windows(0, 600), 0, 1),
+            (pcm_windows(0, 600), 24000, 0),
+            (pcm_windows(0, 600), 24000, 2),
+            (pcm_windows(600, 600, channels=2) + bytes([0, 0]), 24000, 2),
+        )
+        for pcm, sample_rate, channels in cases:
+            with self.subTest(sample_rate=sample_rate, channels=channels, pcm=pcm[:8]):
+                with self.assertRaisesRegex(RuntimeError, "no-answer"):
+                    runner._first_audio_after(pcm, sample_rate, channels, 10.0, 10.0)
+
     async def test_capture_records_early_audio_overlap_and_full_trace(self):
         dependencies = self.dependencies_for_failure("other")
 
@@ -314,7 +363,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
             async def result(self):
-                return b"audio", 24000, 1, 99.0
+                return pcm_windows(600, 600, *([0] * 58), 600, 600), 24000, 1, 99.0
 
         async def transcribe(*_args):
             return [
@@ -352,6 +401,46 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trace["speech_end"], 100.0)
         self.assertTrue(trace["overlap"])
 
+    async def test_capture_silence_and_malformed_pcm_emit_named_no_answer_failures(self):
+        for pcm, sample_rate in (
+            (pcm_windows(0, 0, 0, 0), 24000),
+            (pcm_windows(0, 600), 0),
+        ):
+            with self.subTest(sample_rate=sample_rate):
+                dependencies = self.dependencies_for_failure("other")
+
+                class Capture:
+                    async def start(self):
+                        pass
+
+                    async def result(self):
+                        return pcm, sample_rate, 1, 99.0
+
+                dependencies = CaptureDependencies(
+                    **{
+                        **dependencies.__dict__,
+                        "capture_factory": lambda *_args: Capture(),
+                    }
+                )
+
+                async def speech_end(_source):
+                    return 100.0
+
+                with (
+                    patch.dict(os.environ, TEST_VOICE_ENV),
+                    patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+                    self.assertRaises(runner.PartialCaptureFailure) as caught,
+                ):
+                    await capture_script(
+                        "android-selected-room",
+                        ["Question@0::.*"],
+                        dependencies=dependencies,
+                        room_close_after=None,
+                    )
+                self.assertEqual(caught.exception.failure["message"], runner.NO_ANSWER_FAILURE)
+                self.assertEqual(caught.exception.failure["turn"], 1)
+                self.assertEqual(caught.exception.turns, [])
+
     async def test_capture_fails_when_no_agent_audio_follows_speech_end(self):
         dependencies = self.dependencies_for_failure("other")
 
@@ -363,7 +452,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
             async def result(self):
-                return b"audio", 24000, 1, 99.0
+                return pcm_windows(600, 600, 0, 0, 0, 0), 24000, 1, 99.0
 
         async def transcribe(*_args):
             return [{"start": 0.2, "end": 0.4, "text": "Okay, I heard you."}]
@@ -382,7 +471,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.dict(os.environ, TEST_VOICE_ENV),
             patch.object(runner.caller, "_speech_end_after_playout", speech_end),
-            self.assertRaisesRegex(RuntimeError, "no agent audio after speech end"),
+            self.assertRaisesRegex(RuntimeError, "no-answer"),
         ):
             await capture_script(
                 "android-selected-room",
@@ -441,7 +530,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                             pass
 
                         async def result(self):
-                            return b"audio", 24000, 1, next(self.starts)
+                            return pcm_windows(0, 0, 0, 0, 0, 600, 600), 24000, 1, next(self.starts)
 
                     dependencies = CaptureDependencies(
                         **{
@@ -505,7 +594,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
             async def result(self):
-                return b"audio", 24000, 1, time.monotonic() + 0.1
+                return pcm_windows(0, 0, 0, 0, 0, 600, 600), 24000, 1, time.monotonic() + 0.1
 
         async def future_speech_end(_source):
             return time.monotonic() + 1000.0
@@ -531,7 +620,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.turns, [])
         self.assertEqual(
             caught.exception.failure["message"],
-            "transcription returned no agent audio after speech end",
+            runner.NO_ANSWER_FAILURE,
         )
 
     async def assert_partial_failure(self, dependencies):
@@ -688,7 +777,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     raise RuntimeError("agent audio track produced no frames")
                 if failure == "capture":
                     await asyncio.sleep(1)
-                return b"audio", 24000, 1, time.monotonic() + 0.1
+                return pcm_windows(0, 0, 0, 0, 0, 600, 600), 24000, 1, time.monotonic() + 0.1
 
         alice_responses = iter((
             "Alice Keck Park in Santa Barbara was donated by Alice Keck.",
@@ -1177,7 +1266,7 @@ class ScenarioObservationTests(unittest.TestCase):
             "turns": [trace],
             "failure": {
                 "turn": 2,
-                "message": "transcription returned no agent audio after speech end",
+                "message": runner.NO_ANSWER_FAILURE,
                 "speech_started_at": 1_700_000_000.0,
             },
         })
@@ -1185,7 +1274,7 @@ class ScenarioObservationTests(unittest.TestCase):
             [trace],
             {
                 "turn": 2,
-                "message": "transcription returned no agent audio after speech end",
+                "message": runner.NO_ANSWER_FAILURE,
                 "speech_started_at": 1_700_000_000.0,
             },
         ))
@@ -1204,7 +1293,7 @@ class ScenarioObservationTests(unittest.TestCase):
             "turns": [],
             "failure": {
                 "turn": 1,
-                "message": "transcription returned no agent audio after speech end",
+                "message": runner.NO_ANSWER_FAILURE,
                 "speech_started_at": 1_700_000_000.0,
             },
         })
@@ -1229,7 +1318,7 @@ class ScenarioObservationTests(unittest.TestCase):
             {"turns": [trace], "failure": {"turn": True, "message": "room was deleted before all scripted lines were captured"}},
             {"turns": [trace], "failure": {"turn": 3, "message": "room was deleted before all scripted lines were captured"}},
             {"turns": [trace], "failure": {"turn": 2, "message": "unrecognized failure"}},
-            {"turns": [trace], "failure": {"turn": 2, "message": "transcription returned no agent audio after speech end"}},
+            {"turns": [trace], "failure": {"turn": 2, "message": runner.NO_ANSWER_FAILURE}},
             {"turns": [trace], "failure": {"turn": 2, "message": "scripted speech synthesis exceeded its deadline", "speech_started_at": 1_700_000_000.0}},
             {"turns": [], "failure": {"turn": 1, "message": "room was deleted before all scripted lines were captured"}},
             {"turns": [{"turn": 1, "room_deleted": 4.0}], "failure": {"turn": 1, "message": "room deletion was not observed before deadline"}},

@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evals.report import nearest_rank, score_observations
+from evals.runner import NO_ANSWER_FAILURE
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -350,7 +351,7 @@ class ScoringTests(unittest.TestCase):
                     "turns": [],
                     "failure": {
                         "turn": 1,
-                        "message": "transcription returned no agent audio after speech end",
+                        "message": NO_ANSWER_FAILURE,
                         "speech_started_at": 1_700_000_000.0,
                     },
                     "product_failures": [],
@@ -363,12 +364,43 @@ class ScoringTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         failures = " ".join(result["failures"])
         self.assertIn("timer run 1 turn 1", failures)
-        self.assertIn("transcription returned no agent audio after speech end", failures)
+        self.assertIn(NO_ANSWER_FAILURE, failures)
+
+    def test_first_turn_pcm_no_answer_failure_is_named_in_cli_report(self):
+        observation = {
+            "cases": [{
+                "name": "timer-no-answer",
+                "runs": [{
+                    "turns": [],
+                    "failure": {
+                        "turn": 1,
+                        "message": NO_ANSWER_FAILURE,
+                        "speech_started_at": 1_700_000_000.0,
+                    },
+                    "product_failures": [],
+                }],
+            }]
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "observations.json"
+            path.write_text(json.dumps(observation))
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "voice" / "evals" / "report.py"), str(path)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("timer-no-answer run 1 turn 1: capture failed", result.stdout)
+        self.assertIn(NO_ANSWER_FAILURE, result.stdout)
+        self.assertNotIn("invalid partial capture failure metadata", result.stdout)
 
     def test_malformed_partial_capture_failure_metadata_fails_closed(self):
         malformed_failures = (
             {"turn": "2", "message": "room was deleted before all scripted lines were captured"},
-            {"turn": 2, "message": "transcription returned no agent audio after speech end"},
+            {"turn": 2, "message": NO_ANSWER_FAILURE},
             {"turn": 2, "message": "room deletion was not observed before deadline"},
             {
                 "turn": 2,
