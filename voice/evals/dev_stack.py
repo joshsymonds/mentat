@@ -19,6 +19,25 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 _READINESS_TIMEOUT_SECONDS = 30.0
 _READINESS_POLL_SECONDS = 0.2
 _READINESS_REQUEST_TIMEOUT_SECONDS = 2.0
+_REMOTE_PORT_PROBE_SCRIPT = r'''# MENTAT_EVAL_PORT_PROBE
+set -euo pipefail
+python3 - <<'PY'
+import json
+import socket
+
+sockets = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(2)]
+try:
+    for sock in sockets:
+        sock.bind(("0.0.0.0", 0))
+    print(json.dumps({
+        "dev_port": sockets[0].getsockname()[1],
+        "health_port": sockets[1].getsockname()[1],
+    }))
+finally:
+    for sock in sockets:
+        sock.close()
+PY
+'''
 
 
 class RemoteCommandError(subprocess.CalledProcessError):
@@ -353,15 +372,19 @@ class DevStack:
         checkout: Path,
         opt_in: bool = False,
         remote: str = "ultraviolet",
-        dev_port: int = 8485,
-        health_port: int = 8486,
+        dev_port: int | None = None,
+        health_port: int | None = None,
         local_port: int | None = None,
         run: CommandRunner = subprocess.run,
     ) -> None:
         self.checkout = Path(checkout).resolve()
         self.opt_in = opt_in
         self.remote = remote
-        if not 1 <= dev_port <= 65535 or not 1 <= health_port <= 65535 or dev_port == health_port:
+        if (
+            (dev_port is not None and not 1 <= dev_port <= 65535)
+            or (health_port is not None and not 1 <= health_port <= 65535)
+            or (dev_port is not None and dev_port == health_port)
+        ):
             raise ValueError("dev and health ports must be distinct valid TCP ports")
         if local_port is not None and not 0 <= local_port <= 65535:
             raise ValueError("local port must be a valid TCP port")
@@ -557,6 +580,8 @@ class DevStack:
             text=True,
         )
 
+        self._select_remote_ports()
+
         local_port = self._requested_local_port
         if local_port in (None, 0):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -591,6 +616,34 @@ class DevStack:
         if self._tunnel.poll() is not None:
             raise RuntimeError("SSH port-forward exited before the dev stack became available")
         self._wait_until_ready()
+
+    def _select_remote_ports(self) -> None:
+        if self.dev_port is not None and self.health_port is not None:
+            return
+        result = self._remote(_REMOTE_PORT_PROBE_SCRIPT, self._remote_dir or "")
+        try:
+            ports = json.loads(result.stdout)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError("remote port probe returned invalid port data") from error
+        if not isinstance(ports, dict):
+            raise RuntimeError("remote port probe returned invalid port data")
+        dev_port = ports.get("dev_port")
+        health_port = ports.get("health_port")
+        if (
+            isinstance(dev_port, bool)
+            or not isinstance(dev_port, int)
+            or not 1 <= dev_port <= 65535
+            or isinstance(health_port, bool)
+            or not isinstance(health_port, int)
+            or not 1 <= health_port <= 65535
+        ):
+            raise RuntimeError("remote port probe returned invalid port data")
+        selected_dev_port = self.dev_port if self.dev_port is not None else dev_port
+        selected_health_port = self.health_port if self.health_port is not None else health_port
+        if selected_dev_port == selected_health_port:
+            raise RuntimeError("remote port probe returned invalid port data")
+        self.dev_port = selected_dev_port
+        self.health_port = selected_health_port
 
     def _wait_until_ready(self) -> None:
         deadline = time.monotonic() + _READINESS_TIMEOUT_SECONDS

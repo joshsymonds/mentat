@@ -48,6 +48,92 @@ class DevStackTest(unittest.TestCase):
         run.assert_not_called()
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
+    def test_default_live_stack_selects_and_propagates_free_remote_ports(self, popen):
+        popen.return_value = unittest.mock.Mock(poll=lambda: None)
+        calls = []
+        selected_ports = {"dev_port": 49151, "health_port": 49152}
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.ports\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                probe = kwargs["input"]
+                self.assertIn('("0.0.0.0", 0)', probe)
+                self.assertIn("for _ in range(2)", probe)
+                self.assertIn("for sock in sockets:", probe)
+                return subprocess.CompletedProcess(args, 0, json.dumps(selected_ports), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+            self.assertEqual(stack.dev_port, selected_ports["dev_port"])
+            self.assertEqual(stack.health_port, selected_ports["health_port"])
+            local_port = int(urlsplit(stack.url).port)
+            stack.start_worker("ports-test-room")
+            stack.run_voice(["python3", "caller.py"], token="issued-token", livekit_url="wss://lk.invalid")
+
+        self.assertNotIn(stack.dev_port, (8485, 8486))
+        self.assertNotIn(stack.health_port, (8485, 8486))
+        self.assertNotEqual(stack.dev_port, stack.health_port)
+        remote_calls = [
+            (args, kwargs) for args, kwargs in calls
+            if args[:2] == ["ssh", "ultraviolet"]
+        ]
+        setup_args, daemon_setup = next(
+            (args, kwargs["input"])
+            for args, kwargs in remote_calls
+            if '"MENTAT_LISTEN"' in kwargs.get("input", "")
+        )
+        self.assertEqual(
+            setup_args[-2:],
+            [str(selected_ports["dev_port"]), str(selected_ports["health_port"])],
+        )
+        self.assertIn('"MENTAT_LISTEN": f"127.0.0.1:{dev_port}"', daemon_setup)
+        worker_args, _ = next(
+            (args, kwargs) for args, kwargs in remote_calls if "--room" in kwargs.get("input", "")
+        )
+        self.assertEqual(worker_args[-3:-1], [str(selected_ports["dev_port"]), str(selected_ports["health_port"])])
+        caller_script = next(
+            kwargs["input"] for _, kwargs in remote_calls if "MENTAT_VOICE_GRANT" in kwargs.get("input", "")
+        )
+        self.assertIn(str(selected_ports["dev_port"]), caller_script)
+        self.assertIn(str(selected_ports["health_port"]), caller_script)
+        self.assertIn(
+            f"127.0.0.1:{local_port}:127.0.0.1:{selected_ports['dev_port']}",
+            popen.call_args.args[0],
+        )
+        self.assertNotIn("systemctl stop mentatd", "\n".join(kwargs.get("input", "") for _, kwargs in remote_calls))
+        self.assertIn("systemctl start mentat-voice", "\n".join(kwargs.get("input", "") for _, kwargs in remote_calls))
+
+    def test_remote_port_selection_failure_cleans_up_staging_and_restarts_voice(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.probefailure\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(args, 0, "invalid probe response", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
+        with self.assertRaisesRegex(RuntimeError, "remote port probe"):
+            stack.__enter__()
+
+        cleanup = [
+            kwargs.get("input", "") for args, kwargs in calls
+            if args[:2] == ["ssh", "ultraviolet"] and "cleanup.sh" in kwargs.get("input", "")
+        ]
+        self.assertEqual(len(cleanup), 1)
+        self.assertIn("systemctl start mentat-voice", cleanup[0])
+        self.assertIsNone(stack._remote_dir)
+        self.assertIsNone(stack._local_port)
+
+    @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_stages_candidate_and_fake_phone_on_isolated_loopback_daemon(self, popen):
         popen.return_value = unittest.mock.Mock(poll=lambda: None)
         calls = []
@@ -61,7 +147,7 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.test\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with DevStack(checkout=CHECKOUT, opt_in=True, run=run, local_port=0, dev_port=dev_port) as stack:
+        with DevStack(checkout=CHECKOUT, opt_in=True, run=run, local_port=0, dev_port=dev_port, health_port=8486) as stack:
             self.assertRegex(stack.url, r"^http://127\.0\.0\.1:\d+$")
             stack.run_remote(["test", "-f", "voice/evals/phone.py"])
             stack.start_worker("android-test-room")
@@ -142,7 +228,7 @@ class DevStackTest(unittest.TestCase):
 
         popen.side_effect = start_ssh
         with patch("urllib.request.urlopen", side_effect=urlopen), patch("time.sleep") as sleep:
-            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
                 self.assertEqual(len(health_calls), 3)
                 self.assertEqual(health_calls[-1][0], f"{stack.url}/healthz")
                 sleep.assert_called()
@@ -187,7 +273,7 @@ class DevStackTest(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, "", "")
 
         with patch("urllib.request.urlopen", side_effect=urlopen), patch("time.sleep") as sleep:
-            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
                 self.assertEqual(len(calls), 3)
                 self.assertEqual(calls[-1][0], f"{stack.url}/healthz")
                 self.assertTrue(all(timeout > 0 for _, timeout in calls))
@@ -216,7 +302,7 @@ class DevStackTest(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")) as urlopen:
             with patch("time.monotonic", side_effect=lambda: now[0]), patch("time.sleep", side_effect=sleep):
                 with patch("voice.evals.dev_stack._READINESS_TIMEOUT_SECONDS", 0.5, create=True):
-                    stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
+                    stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
                     with self.assertRaisesRegex(TimeoutError, "health endpoint"):
                         stack.__enter__()
 
@@ -247,7 +333,7 @@ class DevStackTest(unittest.TestCase):
 
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")):
             with patch("time.sleep", side_effect=KeyboardInterrupt):
-                stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
+                stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
                 with self.assertRaises(KeyboardInterrupt):
                     stack.__enter__()
 
@@ -272,7 +358,7 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.room\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+        with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
             stack.start_worker(room)
 
         scripts = [kwargs.get("input", "") for args, kwargs in calls if args[:2] == ["ssh", "ultraviolet"]]
@@ -301,7 +387,7 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.repeat\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+        with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
             stack.start_worker("first-token-room")
             stack.start_worker("second-token-room")
 
@@ -602,7 +688,7 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.permissions\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
+        stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
         with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
             with stack:
                 pass
@@ -682,7 +768,7 @@ class DevStackTest(unittest.TestCase):
                 return result
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
+        stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
         with self.assertRaises(subprocess.CalledProcessError):
             with stack:
                 self.fail("setup failure should prevent entering the context")
@@ -722,7 +808,7 @@ class DevStackTest(unittest.TestCase):
             calls.append((args, kwargs))
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
+        stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
         with patch.object(DevStack, "_start", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 stack.__enter__()
@@ -748,7 +834,7 @@ class DevStackTest(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, "", "")
 
         with self.assertRaisesRegex(ValueError, "scenario failed"):
-            with DevStack(checkout=CHECKOUT, opt_in=True, run=run):
+            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run):
                 raise ValueError("scenario failed")
 
         cleanup = "\n".join(
@@ -772,7 +858,7 @@ class DevStackTest(unittest.TestCase):
 
         with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
             popen.return_value = unittest.mock.Mock(poll=lambda: None)
-            with DevStack(checkout=CHECKOUT, opt_in=True, run=run):
+            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run):
                 pass
 
         with tempfile.TemporaryDirectory() as temporary:
