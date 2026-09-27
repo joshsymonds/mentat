@@ -1116,6 +1116,125 @@ class ScenarioCorpusTests(unittest.TestCase):
             with self.subTest(false_claim=false_claim), self.assertRaises(AssertionError):
                 evaluate_scenario(scenario, turns=turns, phone_commands=[], room_closed_after=None)
 
+    def test_accepts_live_timer_and_alarm_action_confirmations_with_strict_values(self):
+        cases = (
+            (
+                "timer-300-seconds",
+                "Alright, setting a 5 minute timer. 5 minutes on it.",
+                {"turn": 1, "kind": "timer", "seconds": 300},
+            ),
+            (
+                "timer-300-seconds",
+                "Sure, starting that now. 5 minutes on it.",
+                {"turn": 1, "kind": "timer", "seconds": 300},
+            ),
+            (
+                "equivalent-alarm",
+                "You got it, setting the alarm. Done, your 7am alarm is set.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "equivalent-alarm",
+                "Sure, starting that now. Done, your 7am alarm is set.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "equivalent-alarm",
+                "Setting the 7am alarm now.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "equivalent-alarm",
+                "Starting the 7am alarm now.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+        )
+        for name, answer, command in cases:
+            with self.subTest(name=name, answer=answer):
+                evaluate_scenario(
+                    next(s for s in SCENARIOS if s.name == name),
+                    turns=[answer],
+                    phone_commands=[command],
+                    room_closed_after=1,
+                )
+
+        timer = next(s for s in SCENARIOS if s.name == "timer-300-seconds")
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                timer,
+                turns=["Alright, setting a 10 minute timer. 10 minutes on it."],
+                phone_commands=[{"turn": 1, "kind": "timer", "seconds": 300}],
+                room_closed_after=1,
+            )
+        alarm = next(s for s in SCENARIOS if s.name == "equivalent-alarm")
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                alarm,
+                turns=["You got it, setting the alarm. Done, your 7pm alarm is set."],
+                phone_commands=[{"turn": 1, "kind": "alarm", "hour": 7, "minute": 0}],
+                room_closed_after=1,
+            )
+
+    def test_accepts_live_navigation_confirmation_only_for_exact_fake_target(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+        turns = [
+            "Alice Keck Park Memorial Garden is at 1500 Santa Barbara Street.",
+            "Got it, sending you there now.",
+        ]
+        commands = [
+            {"turn": 1, "kind": "location"},
+            {
+                "turn": 2,
+                "kind": "navigate",
+                "name": "Alice Keck Park Memorial Garden",
+                "address": "1500 Santa Barbara Street",
+                "place_id": "alice-keck-place-id",
+                "lat": 34.42,
+                "lng": -119.70,
+            },
+        ]
+        evaluate_scenario(scenario, turns, commands, room_closed_after=2)
+        with self.assertRaisesRegex(AssertionError, "unexpected place name"):
+            evaluate_scenario(
+                scenario,
+                turns,
+                [commands[0], {**commands[1], "name": "Another Santa Barbara Garden"}],
+                room_closed_after=2,
+            )
+
+    def test_accepts_national_sms_payload_number_only_for_matching_readback(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        turns = [
+            "I'll text 202-555-0142: I will be there at six. Should I send it?",
+            "Sent that message.",
+        ]
+        evaluate_scenario(
+            scenario,
+            turns=turns,
+            phone_commands=[
+                {"turn": 2, "kind": "sms", "to": "2025550142", "body": "I will be there at six."}
+            ],
+            room_closed_after=2,
+        )
+        with self.assertRaisesRegex(AssertionError, "expected to"):
+            evaluate_scenario(
+                scenario,
+                turns=turns,
+                phone_commands=[
+                    {"turn": 2, "kind": "sms", "to": "2025550199", "body": "I will be there at six."}
+                ],
+                room_closed_after=2,
+            )
+        with self.assertRaisesRegex(AssertionError, "expected body"):
+            evaluate_scenario(
+                scenario,
+                turns=turns,
+                phone_commands=[
+                    {"turn": 2, "kind": "sms", "to": "2025550142", "body": "I will be there at seven."}
+                ],
+                room_closed_after=2,
+            )
+
     def test_husband_and_father_unrelated_context_does_not_override_alice_donor(self):
         scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
         first_turns = (

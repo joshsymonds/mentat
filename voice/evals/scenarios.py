@@ -96,7 +96,7 @@ SCENARIOS = (
             TurnExpectation(
                 (
                     r"\b(?:five|5)[ -]minutes?\b",
-                    r"\b(?:done|set|started|running|counting down|on the clock)\b",
+                    r"\b(?:done|set|started|starting|setting|running|counting down|on the clock)\b",
                 )
             ),
         ),
@@ -111,7 +111,7 @@ SCENARIOS = (
                 (
                     r"\b7(?:(?:\s*:\s*00)(?:\s*a\.?\s*m\.?)?|\s*a\.?\s*m\.?|\s*o['’]?clock)(?!\s*p\.?\s*m\.?)\b",
                     r"\balarm\b",
-                    r"\b(?:done|set|started)\b",
+                    r"\b(?:done|set|started|starting|setting)\b",
                 ),
                 reject_patterns=(r"\b7(?::00)?\s*p\.?\s*m\.?(?![A-Za-z])",),
             ),
@@ -128,7 +128,7 @@ SCENARIOS = (
         turns=(
             TurnExpectation((r"\b(?:Alice|Halis) Keck Park(?: Memorial Gardens?)?\b", r"Santa Barbara")),
 
-            TurnExpectation((r"\b(?:navigat\w*|directions|route|taking you)\b",)),
+            TurnExpectation((r"\b(?:navigat\w*|directions|route|taking you|sending you there)\b",)),
         ),
         commands=(
             {"turn": 1, "kind": "location"},
@@ -258,10 +258,17 @@ def _sms_body_tokens(body: str) -> tuple[str, ...]:
 def _sms_value_matches(field: str, actual: Any, expected: Any) -> bool:
     """Compare SMS payload values without accepting a changed recipient or message."""
     if field == "to":
-        return (
-            isinstance(actual, str)
-            and isinstance(expected, str)
-            and re.sub(r"\D", "", actual) == re.sub(r"\D", "", expected)
+        if not isinstance(actual, str) or not isinstance(expected, str):
+            return False
+        actual_digits = re.sub(r"\D", "", actual)
+        expected_digits = re.sub(r"\D", "", expected)
+        national_number = (
+            expected_digits[1:]
+            if expected.startswith("+1") and expected_digits.startswith("1")
+            else ""
+        )
+        return actual_digits == expected_digits or (
+            bool(national_number) and actual_digits == national_number
         )
     if field == "body":
         return (
