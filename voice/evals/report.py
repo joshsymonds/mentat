@@ -11,7 +11,6 @@ from typing import Any
 ACTION_P50_LIMIT_SECONDS = 3.5
 ACTION_P95_LIMIT_SECONDS = 5.0
 SEARCH_P50_LIMIT_SECONDS = 10.0
-ANSWER_DEADLINE_SECONDS = 30.0
 CONFIRMATION_DEADLINE_SECONDS = 30.0
 HANGUP_DEADLINE_SECONDS = 60.0
 RUNS_REQUIRED = 10
@@ -72,6 +71,26 @@ def _score_turn(
         raise ValueError(f"missing kind or invalid turn kind {kind!r}")
     speech_end = _timestamp(turn, "speech_end")
     first_audio = _timestamp(turn, "first_audio")
+    problems: list[str] = []
+    answer_at = None
+    if "answer_at" not in turn or turn["answer_at"] is None:
+        problems.append(f"{label}: missing answer_at timestamp")
+    else:
+        try:
+            answer_at = _timestamp(turn, "answer_at")
+        except ValueError:
+            problems.append(f"{label}: missing or invalid answer_at timestamp")
+    command_received_at = None
+    if "command_received_at" not in turn:
+        problems.append(f"{label}: missing command receipt timestamp declaration")
+    elif turn["command_received_at"] is None:
+        if kind == "action":
+            problems.append(f"{label}: missing command receipt timestamp")
+    else:
+        try:
+            command_received_at = _timestamp(turn, "command_received_at")
+        except ValueError:
+            problems.append(f"{label}: missing or invalid command receipt timestamp")
     if "overlap" not in turn or not isinstance(turn["overlap"], bool):
         raise ValueError(f"{label}: missing or invalid overlap observation")
     overlap = turn["overlap"]
@@ -91,7 +110,6 @@ def _score_turn(
         raise ValueError(f"{label}: missing or invalid model_calls observations")
 
     event_times: dict[str, float | None] = {}
-    problems: list[str] = []
     for field, expected, deadline in (
         ("confirmation", expect_confirmation, CONFIRMATION_DEADLINE_SECONDS),
         ("room_deleted", expect_hangup, HANGUP_DEADLINE_SECONDS),
@@ -111,14 +129,17 @@ def _score_turn(
         if field == "room_deleted" and not expected:
             problems.append(f"{label}: room deleted when hang-up was not expected")
 
+    answer_latency = None
+    if answer_at is not None:
+        answer_latency = answer_at - speech_end
+        if answer_latency < 0:
+            problems.append(f"{label}: answer precedes speech_end")
+    command_latency = None
+    if command_received_at is not None:
+        command_latency = command_received_at - speech_end
+        if command_latency < 0:
+            problems.append(f"{label}: command receipt precedes speech_end")
     first_audio_latency = first_audio - speech_end
-    if first_audio_latency < 0:
-        problems.append(f"{label}: first_audio precedes speech_end")
-    if first_audio_latency > ANSWER_DEADLINE_SECONDS:
-        problems.append(
-            f"{label}: first_audio latency {first_audio_latency:g}s exceeds "
-            f"{ANSWER_DEADLINE_SECONDS:g}s deadline"
-        )
     report = {
         "run": run_index + 1,
         "turn": turn_index + 1,
@@ -126,6 +147,8 @@ def _score_turn(
         "expect_hangup": expect_hangup,
         "overlap": overlap,
         "latency_seconds": {
+            "command_receipt": command_latency,
+            "answer": answer_latency,
             "first_audio": first_audio_latency,
             "confirmation": (
                 None if event_times["confirmation"] is None
@@ -348,31 +371,40 @@ def score_observations(
                 case_failures.append(f"{name} turn {turn_index}: kind differs across runs")
                 continue
             kind = next(iter(kinds))
-            latencies = [turn["latency_seconds"]["first_audio"] for turn in turn_reports]
-            p50 = nearest_rank(latencies, 0.50)
-            p95 = nearest_rank(latencies, 0.95)
+            metric = "command_receipt" if kind == "action" else "answer"
+            latencies = [
+                turn["latency_seconds"][metric]
+                for turn in turn_reports
+                if isinstance(turn["latency_seconds"][metric], (int, float))
+                and not isinstance(turn["latency_seconds"][metric], bool)
+            ]
+            p50 = nearest_rank(latencies, 0.50) if latencies else None
+            p95 = nearest_rank(latencies, 0.95) if latencies else None
+            audio_latencies = [turn["latency_seconds"]["first_audio"] for turn in turn_reports]
             gate = {
                 "turn": turn_index,
                 "kind": kind,
                 "run_count": len(latencies),
-                "first_audio_p50_seconds": p50,
-                "first_audio_p95_seconds": p95,
+                f"{metric}_p50_seconds": p50,
+                f"{metric}_p95_seconds": p95,
+                "first_audio_p50_seconds": nearest_rank(audio_latencies, 0.50),
+                "first_audio_p95_seconds": nearest_rank(audio_latencies, 0.95),
             }
             gates.append(gate)
             if kind == "action":
-                if p50 > ACTION_P50_LIMIT_SECONDS:
+                if p50 is not None and p50 > ACTION_P50_LIMIT_SECONDS:
                     case_failures.append(
-                        f"{name} turn {turn_index}: first-audio p50 {p50:g}s "
+                        f"{name} turn {turn_index}: command-receipt p50 {p50:g}s "
                         f"exceeds {ACTION_P50_LIMIT_SECONDS:g}s"
                     )
-                if p95 > ACTION_P95_LIMIT_SECONDS:
+                if p95 is not None and p95 > ACTION_P95_LIMIT_SECONDS:
                     case_failures.append(
-                        f"{name} turn {turn_index}: first-audio p95 {p95:g}s "
+                        f"{name} turn {turn_index}: command-receipt p95 {p95:g}s "
                         f"exceeds {ACTION_P95_LIMIT_SECONDS:g}s"
                     )
-            elif p50 > SEARCH_P50_LIMIT_SECONDS:
+            elif p50 is not None and p50 > SEARCH_P50_LIMIT_SECONDS:
                 case_failures.append(
-                    f"{name} turn {turn_index}: first-audio p50 {p50:g}s "
+                    f"{name} turn {turn_index}: answer p50 {p50:g}s "
                     f"exceeds {SEARCH_P50_LIMIT_SECONDS:g}s"
                 )
             if len(latencies) != required_runs:

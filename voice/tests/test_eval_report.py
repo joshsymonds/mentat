@@ -19,6 +19,8 @@ def turn(start=0.0, first_audio=2.0, confirmation=2.5, room_deleted=5.0, calls=N
         "kind": kind,
         "speech_end": start,
         "first_audio": first_audio,
+        "command_received_at": first_audio,
+        "answer_at": first_audio,
         "overlap": False,
         "confirmation": confirmation,
         "room_deleted": room_deleted,
@@ -63,7 +65,7 @@ class ScoringTests(unittest.TestCase):
     def test_explicit_run_count_keeps_percentile_gate_strict(self):
         observation = {"cases": [case()]}
         observation["cases"][0]["runs"] = observation["cases"][0]["runs"][:2]
-        observation["cases"][0]["runs"][1]["turns"][0]["first_audio"] = 5.1
+        observation["cases"][0]["runs"][1]["turns"][0]["command_received_at"] = 5.1
 
         result = score_observations(observation, required_runs=2)
 
@@ -92,6 +94,63 @@ class ScoringTests(unittest.TestCase):
                 self.assertFalse(result["passed"])
                 self.assertIn("required_runs", " ".join(result["failures"]))
 
+    def test_action_and_answer_gates_use_outcome_timestamps_not_first_audio(self):
+        action = turn(first_audio=2.0, confirmation=None, room_deleted=None)
+        action.update({
+            "turn": 1,
+            "expect_confirmation": False,
+            "expect_hangup": False,
+            "command_received_at": 12.0,
+            "answer_at": 2.0,
+        })
+        search = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
+        search.update({
+            "turn": 1,
+            "expect_confirmation": False,
+            "expect_hangup": False,
+            "command_received_at": None,
+            "answer_at": 12.0,
+        })
+        observations = {"cases": [
+            {"name": "slow phone receipt", "runs": [{"turns": [dict(action)]} for _ in range(10)]},
+            {"name": "slow matching answer", "runs": [{"turns": [dict(search)]} for _ in range(10)]},
+        ]}
+
+        result = score_observations(observations)
+
+        self.assertFalse(result["passed"])
+        actions, searches = result["cases"]
+        self.assertEqual(actions["turns"][0]["latency_seconds"], {
+            "command_receipt": 12.0,
+            "answer": 2.0,
+            "first_audio": 2.0,
+            "confirmation": None,
+            "room_deleted": None,
+        })
+        self.assertEqual(actions["gates"][0]["command_receipt_p50_seconds"], 12.0)
+        self.assertEqual(searches["gates"][0]["answer_p50_seconds"], 12.0)
+        self.assertEqual(searches["gates"][0]["first_audio_p50_seconds"], 2.0)
+        self.assertIn("command-receipt p50 12s", " ".join(actions["failures"]))
+        self.assertIn("answer p50 12s", " ".join(searches["failures"]))
+
+    def test_missing_or_malformed_command_receipt_and_answer_timestamps_fail_closed(self):
+        for field, value in (("command_received_at", None), ("command_received_at", float("nan")),
+                             ("answer_at", None), ("answer_at", float("inf"))):
+            with self.subTest(field=field, value=value):
+                observation_turn = turn()
+                observation_turn.update({
+                    "turn": 1,
+                    "command_received_at": 2.5,
+                    "answer_at": 2.0,
+                })
+                observation_turn[field] = value
+                result = score_observations({"cases": [{
+                    "name": "strict timing", "runs": [{"turns": [observation_turn]}],
+                }]}, required_runs=1)
+                self.assertFalse(result["passed"])
+                expected_name = "command receipt" if field == "command_received_at" else "answer_at"
+                self.assertIn(expected_name, " ".join(result["failures"]))
+
     def test_reports_per_turn_latencies_and_backend_call_counts(self):
         observation = {"cases": [case()]}
         observation["cases"][0]["runs"][0]["turns"][0]["model_calls"] = [
@@ -101,6 +160,8 @@ class ScoringTests(unittest.TestCase):
         report = result["cases"][0]
         self.assertTrue(result["passed"])
         self.assertEqual(report["turns"][0]["latency_seconds"], {
+            "command_receipt": 2.0,
+            "answer": 2.0,
             "first_audio": 2.0,
             "confirmation": 2.5,
             "room_deleted": 5.0,
@@ -465,7 +526,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_action_p95_gate_catches_one_slow_run(self):
         observation = {"cases": [case()]}
-        observation["cases"][0]["runs"][9]["turns"][0]["first_audio"] = 5.1
+        observation["cases"][0]["runs"][9]["turns"][0]["command_received_at"] = 5.1
         result = score_observations(observation)
         self.assertFalse(result["passed"])
         self.assertIn("p95", " ".join(result["failures"]))
@@ -474,7 +535,7 @@ class ScoringTests(unittest.TestCase):
         observation = {"cases": [case()]}
         for run in observation["cases"][0]["runs"]:
             run["turns"].append(turn())
-        observation["cases"][0]["runs"][0]["turns"][0]["first_audio"] = 5.1
+        observation["cases"][0]["runs"][0]["turns"][0]["command_received_at"] = 5.1
 
         result = score_observations(observation)
 
@@ -529,6 +590,8 @@ class ScoringTests(unittest.TestCase):
         turn_without_end = {
             "speech_end": 0.0,
             "first_audio": 2.0,
+            "command_received_at": None,
+            "answer_at": 2.0,
             "overlap": False,
             "model_calls": [],
             "expect_confirmation": False,
@@ -568,16 +631,20 @@ class ScoringTests(unittest.TestCase):
             result["cases"][0]["gates"][0]["first_audio_p50_seconds"], 0.2
         )
 
-    def test_first_audio_before_speech_end_is_not_a_valid_latency(self):
+    def test_first_audio_is_diagnostic_and_does_not_gate_the_turn(self):
         observation = {"cases": [case()]}
         observation["cases"][0]["runs"][0]["turns"][0]["speech_end"] = 2.0
         observation["cases"][0]["runs"][0]["turns"][0]["first_audio"] = 1.5
+        observation["cases"][0]["runs"][0]["turns"][0]["command_received_at"] = 2.5
+        observation["cases"][0]["runs"][0]["turns"][0]["answer_at"] = 2.5
         observation["cases"][0]["runs"][0]["turns"][0]["overlap"] = True
 
         result = score_observations(observation)
 
-        self.assertFalse(result["passed"])
-        self.assertIn("first_audio precedes speech_end", " ".join(result["failures"]))
+        self.assertTrue(result["passed"], result["failures"])
+        turn_report = result["cases"][0]["turns"][0]
+        self.assertEqual(turn_report["latency_seconds"]["first_audio"], -0.5)
+        self.assertEqual(result["cases"][0]["gates"][0]["command_receipt_p50_seconds"], 2.0)
 
     def test_missing_or_invalid_timestamps_fail_closed(self):
         for invalid in (None, float("nan"), -1):

@@ -24,7 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import caller
 from evals.dev_stack import DevStack, _redact_diagnostics
 from evals.report import NO_ANSWER_FAILURE, score_observations
-from evals.scenarios import SCENARIOS
+from evals.scenarios import (
+    SCENARIOS,
+    _sms_body_tokens,
+    _spoken_sms_body,
+    _uncertain_without_alice_attribution,
+)
 
 RATE = caller.RATE
 FRAME_SAMPLES = caller.FRAME_SAMPLES
@@ -113,7 +118,10 @@ async def _with_deadline(awaitable: Any, timeout: float, label: str) -> Any:
 def _finite_timestamp(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RuntimeError(f"{label} timestamp is missing or invalid")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as error:
+        raise RuntimeError(f"{label} timestamp is missing or invalid") from error
     if not math.isfinite(result):
         raise RuntimeError(f"{label} timestamp is missing or invalid")
     return result
@@ -744,7 +752,14 @@ def _phone_commands(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 raise RuntimeError("fake phone log repeats a command id")
             if not isinstance(payload.get("kind"), str):
                 raise RuntimeError("fake phone command has no kind")
-            commands.append(dict(payload))
+            received_at = entry.get("received_at")
+            try:
+                received_at = _finite_timestamp(received_at, "fake phone command receipt")
+            except RuntimeError as error:
+                raise RuntimeError(
+                    "fake phone command receipt timestamp is missing or invalid"
+                ) from error
+            commands.append({**payload, "received_at": received_at})
         else:
             if command_id in results:
                 raise RuntimeError("fake phone log repeats a command result")
@@ -771,12 +786,73 @@ def _match_phone_tools(
             raise RuntimeError(f"fake phone command {index} does not match its recorded phone tool")
         arguments = tool["input"]
         for key, value in command.items():
-            if key in ("id", "kind", "expires_at"):
+            if key in ("id", "kind", "expires_at", "received_at"):
                 continue
             if arguments.get(key) != value:
                 raise RuntimeError(f"fake phone command {index} does not match its recorded phone tool arguments")
         matched.append({**command, "turn": tool["turn"]})
     return matched
+
+
+def _answer_time(
+    trace: dict[str, Any],
+    expectation: Any,
+    *,
+    scenario_name: str | None = None,
+    turn_index: int | None = None,
+) -> float | None:
+    capture_started = _finite_timestamp(trace.get("capture_started"), "capture start")
+    segments = trace.get("segments")
+    patterns = getattr(expectation, "answer_patterns", None)
+    reject_patterns = getattr(expectation, "reject_patterns", ())
+    if not isinstance(segments, list) or not segments:
+        raise RuntimeError("answer segment timestamp evidence is missing")
+    if not isinstance(patterns, tuple) or not patterns or not isinstance(reject_patterns, tuple):
+        raise RuntimeError("answer expectation patterns are missing or invalid")
+
+    transcript_parts = []
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+            raise RuntimeError("answer segment timestamp evidence is malformed")
+        if index:
+            transcript_parts.append(" ")
+        transcript_parts.append(segment["text"])
+        segment_end = _finite_timestamp(segment.get("end"), "answer segment timestamp")
+        segment_start = _finite_timestamp(segment.get("start"), "answer segment timestamp")
+        if segment_start < 0 or segment_end < segment_start:
+            raise RuntimeError("answer segment timestamp bounds are invalid")
+        text = "".join(transcript_parts)
+        try:
+            matches = all(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+            rejected = any(re.search(pattern, text, re.IGNORECASE) for pattern in reject_patterns)
+        except (TypeError, re.error) as error:
+            raise RuntimeError("answer expectation contains an invalid pattern") from error
+        if not matches or rejected:
+            continue
+        if (
+            scenario_name == "alice-keck-context-chain"
+            and turn_index == 1
+            and _uncertain_without_alice_attribution(text)
+        ):
+            continue
+        sms_recipient = getattr(expectation, "sms_recipient", None)
+        sms_body = getattr(expectation, "sms_body", None)
+        if sms_recipient is not None or sms_body is not None:
+            if not isinstance(sms_recipient, str) or not isinstance(sms_body, str):
+                raise RuntimeError("answer expectation has an incomplete SMS say-back")
+            try:
+                spoken_body = _spoken_sms_body(
+                    text,
+                    sms_recipient,
+                    scenario_name or "scenario",
+                    turn_index or 1,
+                )
+            except AssertionError:
+                continue
+            if _sms_body_tokens(spoken_body) != _sms_body_tokens(sms_body):
+                continue
+        return capture_started + segment_start
+    return None
 
 
 def _scenario_steps(scenario: Any) -> list[str]:
@@ -799,11 +875,14 @@ def _scenario_steps(scenario: Any) -> list[str]:
 
 
 def _turn_kind(scenario: Any, turn_index: int) -> str:
-    if not getattr(scenario, "commands", ()):
-        return "search"
     if getattr(scenario, "place_query", None) is not None and turn_index == 1:
         return "search"
-    return "action"
+    if any(
+        isinstance(command, dict) and command.get("turn") == turn_index
+        for command in getattr(scenario, "commands", ())
+    ):
+        return "action"
+    return "search"
 
 
 def _confirmation_time(trace: dict[str, Any]) -> float | None:
@@ -1037,6 +1116,12 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     else:
         recorded_turns = []
     phone_commands = _match_phone_tools(phone_commands, recorded_turns)
+    # speech_end and phone received_at both use ultraviolet's wall clock.
+    command_receipts: dict[int, float] = {}
+    for command in phone_commands:
+        turn = command["turn"]
+        received_at = command["received_at"]
+        command_receipts[turn] = min(command_receipts.get(turn, received_at), received_at)
 
     room_deleted_turns = []
     for index, (trace, expected) in enumerate(
@@ -1056,6 +1141,13 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
         for segment in segments:
             _segment_start([segment])
         trace["kind"] = _turn_kind(scenario, index)
+        trace["command_received_at"] = command_receipts.get(index)
+        trace["answer_at"] = _answer_time(
+            trace,
+            expected,
+            scenario_name=scenario.name,
+            turn_index=index,
+        )
         trace["expect_confirmation"] = getattr(expected, "sms_recipient", None) is not None
         trace["expect_hangup"] = close_after == index
         trace["confirmation"] = (

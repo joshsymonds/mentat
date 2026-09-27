@@ -965,7 +965,7 @@ class ScenarioObservationTests(unittest.TestCase):
         )
         self.assertEqual(
             [runner._turn_kind(SCENARIOS[0], 1), runner._turn_kind(SCENARIOS[3], 1)],
-            ["action", "action"],
+            ["action", "search"],
         )
 
     def test_partial_observation_keeps_completed_wrong_answer_as_product_failure(self):
@@ -1062,7 +1062,7 @@ class ScenarioObservationTests(unittest.TestCase):
             for index, payload in enumerate(phone_payloads, 1):
                 command = {"id": f"phone-{index}", **payload}
                 phone_log.extend((
-                    {"event": "command", "command": command},
+                    {"event": "command", "command": command, "received_at": float(index * 100 + 1)},
                     {"event": "result", "result": {"id": command["id"], "status": "ok", "detail": "Fake phone completed"}},
                 ))
             record = []
@@ -1101,7 +1101,9 @@ class ScenarioObservationTests(unittest.TestCase):
                         raise AssertionError(f"unexpected remote command {command!r}")
                     return CompletedProcess(command, 0, outputs[key], "")
 
-            with patch.object(runner, "_voice_token", return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"}):
+            with patch.object(
+                runner, "_voice_token", return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"}
+            ):
                 return runner.observe_scenario(scenario, Stack())
 
         place = SCENARIOS[2]
@@ -1190,7 +1192,7 @@ class ScenarioObservationTests(unittest.TestCase):
             },
         }
         phone_log = "".join(json.dumps(entry) + "\n" for entry in (
-            {"event": "command", "command": {
+            {"event": "command", "received_at": 101.5, "command": {
                 "id": "fake-timer-command",
                 "kind": "timer",
                 "seconds": 300,
@@ -1246,6 +1248,7 @@ class ScenarioObservationTests(unittest.TestCase):
             "kind": "timer",
             "seconds": 300,
             "expires_at": "2026-09-26T21:00:00Z",
+            "received_at": 101.5,
             "turn": 1,
         }])
         self.assertEqual(observation["product_failures"], [])
@@ -1380,7 +1383,7 @@ class ScenarioObservationTests(unittest.TestCase):
             runner._json_lines("{broken}\n", "SDK recording")
         with self.assertRaisesRegex(RuntimeError, "missing or unmatched command result"):
             runner._phone_commands([
-                {"event": "command", "command": {"id": "c1", "kind": "sms"}},
+                {"event": "command", "command": {"id": "c1", "kind": "sms"}, "received_at": 1.0},
             ])
         self.assertEqual(runner._recorded_turns([{"type": "system", "subtype": "init"}]), [])
         with self.assertRaisesRegex(RuntimeError, "no transcript segment timestamps"):
@@ -1495,6 +1498,113 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertEqual([len(trace["model_calls"]) for trace in attributed], [0, 1])
         self.assertEqual(traces[1]["line"], "Okay, who was she?")
         self.assertEqual(traces[1]["transcript"], "Okay who was she?")
+
+    def test_fake_phone_receipt_timestamp_is_required_finite_and_preserved(self):
+        command = {"id": "phone-1", "kind": "sms", "to": "+1-202-555-0142"}
+        log = [
+            {"event": "command", "command": command, "received_at": 12.0},
+            {"event": "result", "result": {"id": "phone-1", "status": "ok"}},
+        ]
+        parsed = runner._phone_commands(log)
+        self.assertEqual(parsed, [{**command, "received_at": 12.0}])
+        self.assertEqual(
+            runner._match_phone_tools(parsed, [{"phone_tools": [{
+                "turn": 2,
+                "kind": "sms",
+                "input": {"to": "+1-202-555-0142"},
+            }]}]),
+            [{**command, "received_at": 12.0, "turn": 2}],
+        )
+        with self.assertRaisesRegex(RuntimeError, "does not match its recorded phone tool"):
+            runner._match_phone_tools(parsed, [{"phone_tools": [{
+                "turn": 2,
+                "kind": "navigate",
+                "input": {"to": "+1-202-555-0142"},
+            }]}])
+        with self.assertRaisesRegex(RuntimeError, "receipt timestamp"):
+            runner._phone_commands([
+                {"event": "command", "command": command},
+                log[1],
+            ])
+        for invalid in (None, True, float("nan"), "12"):
+            malformed = [dict(log[0], received_at=invalid), log[1]]
+            with self.subTest(received_at=invalid), self.assertRaisesRegex(RuntimeError, "receipt timestamp"):
+                runner._phone_commands(malformed)
+
+    def test_answer_timestamp_is_first_segment_completing_all_expected_patterns(self):
+        expectation = SCENARIOS[3].turns[0]
+        trace = {
+            "capture_started": 100.0,
+            "segments": [
+                {"start": 0.1, "end": 0.4, "text": "Text +1-202-555-0142: I will be there at six."},
+                {"start": 0.5, "end": 0.9, "text": "Should I send it?"},
+                {"start": 1.0, "end": 1.4, "text": "Anything else?"},
+            ],
+        }
+        self.assertEqual(
+            runner._answer_time(
+                trace, expectation, scenario_name=SCENARIOS[3].name, turn_index=1
+            ),
+            100.5,
+        )
+        self.assertIsNone(runner._answer_time({
+            "capture_started": 100.0,
+            "segments": [{"start": 0.1, "end": 0.4, "text": "I will text that."}],
+        }, expectation, scenario_name=SCENARIOS[3].name, turn_index=1))
+        with self.assertRaisesRegex(RuntimeError, "answer segment timestamp"):
+            runner._answer_time({
+                "capture_started": 100.0,
+                "segments": [{"start": 0.1, "end": float("nan"), "text": "Text +1-202-555-0142"}],
+            }, expectation, scenario_name=SCENARIOS[3].name, turn_index=1)
+
+    def test_answer_timestamp_skips_unverified_preamble_and_sms_confirmation_filler(self):
+        alice_scenario = SCENARIOS[5]
+        alice_trace = {
+            "capture_started": 100.0,
+            "segments": [
+                {
+                    "start": 1.0,
+                    "end": 5.0,
+                    "text": "I am not sure whether Alice Keck gave the land to the city.",
+                },
+                {
+                    "start": 12.0,
+                    "end": 17.0,
+                    "text": "I checked. Alice Keck Park purchased the land and gave it to the city.",
+                },
+            ],
+        }
+        self.assertEqual(
+            runner._answer_time(
+                alice_trace,
+                alice_scenario.turns[0],
+                scenario_name=alice_scenario.name,
+                turn_index=1,
+            ),
+            112.0,
+        )
+
+        sms_scenario = SCENARIOS[3]
+        sms_trace = {
+            "capture_started": 100.0,
+            "segments": [
+                {"start": 1.0, "end": 2.0, "text": "Should I send it?"},
+                {
+                    "start": 12.0,
+                    "end": 15.0,
+                    "text": "Text +1-202-555-0142: I will be there at six. Should I send it?",
+                },
+            ],
+        }
+        self.assertEqual(
+            runner._answer_time(
+                sms_trace,
+                sms_scenario.turns[0],
+                scenario_name=sms_scenario.name,
+                turn_index=1,
+            ),
+            112.0,
+        )
 
     def test_delegation_jsonl_is_room_scoped_and_rejects_malformed_or_local_duplicates(self):
         records = (
@@ -1666,6 +1776,7 @@ class ScenarioObservationTests(unittest.TestCase):
             for entry in (
                 {
                     "event": "command",
+                    "received_at": 202.0,
                     "command": {
                         "id": "phone-id-independent-of-tool-id",
                         "kind": "sms",
@@ -1757,6 +1868,12 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertIn("--fake-phone", stack.voice_commands[0])
         self.assertEqual(observation["turns"][0]["confirmation"], 101.0)
         self.assertNotEqual(observation["turns"][0]["confirmation"], observation["turns"][0]["first_audio"])
+        self.assertEqual(observation["turns"][0]["kind"], "search")
+        self.assertIsNone(observation["turns"][0]["command_received_at"])
+        self.assertEqual(observation["turns"][0]["answer_at"], 100.6)
+        self.assertEqual(observation["turns"][1]["kind"], "action")
+        self.assertEqual(observation["turns"][1]["command_received_at"], 202.0)
+        self.assertEqual(observation["turns"][1]["answer_at"], 201.2)
         self.assertEqual([len(turn["model_calls"]) for turn in observation["turns"]], [1, 2])
         self.assertEqual(observation["phone_commands"][0]["turn"], 2)
         self.assertEqual(observation["phone_commands"][0]["id"], "phone-id-independent-of-tool-id")
@@ -1795,9 +1912,11 @@ class LocalEvalCliTests(unittest.TestCase):
             turns = []
             for index, expectation in enumerate(scenario.turns, 1):
                 turns.append({
-                    "kind": "search" if not scenario.commands or (scenario.place_query and index == 1) else "action",
+                    "kind": runner._turn_kind(scenario, index),
                     "speech_end": 10.0,
                     "first_audio": 11.0,
+                    "command_received_at": 11.0 if runner._turn_kind(scenario, index) == "action" else None,
+                    "answer_at": 11.0,
                     "overlap": False,
                     "expect_confirmation": expectation.sms_recipient is not None,
                     "confirmation": 12.0 if expectation.sms_recipient is not None else None,
@@ -1861,9 +1980,11 @@ class LocalEvalCliTests(unittest.TestCase):
                 raise RuntimeError("deliberate scenario failure")
             return {"turns": [
                 {
-                    "kind": "search" if not scenario.commands or (scenario.place_query and index == 1) else "action",
+                    "kind": runner._turn_kind(scenario, index),
                     "speech_end": 10.0,
                     "first_audio": 11.0,
+                    "command_received_at": 11.0 if runner._turn_kind(scenario, index) == "action" else None,
+                    "answer_at": 11.0,
                     "overlap": False,
                     "expect_confirmation": expectation.sms_recipient is not None,
                     "confirmation": 12.0 if expectation.sms_recipient is not None else None,
@@ -1898,6 +2019,8 @@ class LocalEvalCliTests(unittest.TestCase):
                     "kind": "search",
                     "speech_end": 10.0,
                     "first_audio": 11.0,
+                    "command_received_at": None,
+                    "answer_at": 11.0,
                     "overlap": False,
                     "expect_confirmation": False,
                     "confirmation": None,
@@ -1910,6 +2033,8 @@ class LocalEvalCliTests(unittest.TestCase):
                     "kind": "action",
                     "speech_end": 20.0,
                     "first_audio": 21.5,
+                    "command_received_at": 21.5,
+                    "answer_at": 21.5,
                     "overlap": False,
                     "expect_confirmation": False,
                     "confirmation": None,
@@ -1960,9 +2085,11 @@ class LocalEvalCliTests(unittest.TestCase):
             turns = []
             for index, expectation in enumerate(scenario.turns, 1):
                 turns.append({
-                    "kind": "search" if not scenario.commands or (scenario.place_query and index == 1) else "action",
+                    "kind": runner._turn_kind(scenario, index),
                     "speech_end": 10.0,
                     "first_audio": 11.0,
+                    "command_received_at": 11.0 if runner._turn_kind(scenario, index) == "action" else None,
+                    "answer_at": 11.0,
                     "overlap": False,
                     "expect_confirmation": expectation.sms_recipient is not None,
                     "confirmation": 12.0 if expectation.sms_recipient is not None else None,
