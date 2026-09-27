@@ -46,6 +46,50 @@ class PercentileTests(unittest.TestCase):
 
 
 class ScoringTests(unittest.TestCase):
+    def test_explicit_run_count_gates_run_and_per_turn_samples(self):
+        observation = {"cases": [case()]}
+        observation["cases"][0]["runs"] = observation["cases"][0]["runs"][:2]
+        for run in observation["cases"][0]["runs"]:
+            run["turns"].append(turn())
+
+        result = score_observations(observation, required_runs=2)
+
+        self.assertTrue(result["passed"], result["failures"])
+        self.assertEqual(result["cases"][0]["run_count"], 2)
+        self.assertEqual([gate["run_count"] for gate in result["cases"][0]["gates"]], [2, 2])
+
+    def test_explicit_run_count_keeps_percentile_gate_strict(self):
+        observation = {"cases": [case()]}
+        observation["cases"][0]["runs"] = observation["cases"][0]["runs"][:2]
+        observation["cases"][0]["runs"][1]["turns"][0]["first_audio"] = 5.1
+
+        result = score_observations(observation, required_runs=2)
+
+        self.assertFalse(result["passed"])
+        self.assertIn("p95", " ".join(result["failures"]))
+        self.assertEqual(result["cases"][0]["gates"][0]["run_count"], 2)
+
+    def test_explicit_run_count_fails_when_case_or_turn_count_differs(self):
+        observation = {"cases": [case()]}
+        observation["cases"][0]["runs"] = observation["cases"][0]["runs"][:2]
+        for run in observation["cases"][0]["runs"]:
+            run["turns"].append(turn())
+        del observation["cases"][0]["runs"][1]["turns"][1]
+
+        result = score_observations(observation, required_runs=2)
+
+        self.assertFalse(result["passed"])
+        failures = " ".join(result["failures"])
+        self.assertIn("expected 2 latency observations, found 1", failures)
+
+    def test_invalid_required_run_counts_fail_closed(self):
+        observation = {"cases": [case()]}
+        for required_runs in (0, -1, True, 1.5, "2", None):
+            with self.subTest(required_runs=required_runs):
+                result = score_observations(observation, required_runs=required_runs)
+                self.assertFalse(result["passed"])
+                self.assertIn("required_runs", " ".join(result["failures"]))
+
     def test_reports_per_turn_latencies_and_backend_call_counts(self):
         observation = {"cases": [case()]}
         observation["cases"][0]["runs"][0]["turns"][0]["model_calls"] = [

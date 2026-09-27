@@ -123,8 +123,20 @@ def _score_turn(
     return report, problems
 
 
-def score_observations(observations: Any) -> dict[str, Any]:
+def score_observations(
+    observations: Any, required_runs: int = RUNS_REQUIRED
+) -> dict[str, Any]:
     """Score scenario cases and fail closed for every missing or invalid datum."""
+    if (
+        not isinstance(required_runs, int)
+        or isinstance(required_runs, bool)
+        or required_runs <= 0
+    ):
+        return {
+            "passed": False,
+            "failures": ["input: required_runs must be a positive integer"],
+            "cases": [],
+        }
     failures: list[str] = []
     reports: list[dict[str, Any]] = []
     if not isinstance(observations, dict) or not isinstance(observations.get("cases"), list):
@@ -150,8 +162,8 @@ def score_observations(observations: Any) -> dict[str, Any]:
             reports.append({"name": name, "kind": kind, "turns": [], "gates": [], "failures": [message]})
             continue
         case_failures: list[str] = []
-        if len(runs) != RUNS_REQUIRED:
-            case_failures.append(f"{name}: expected {RUNS_REQUIRED} runs, found {len(runs)}")
+        if len(runs) != required_runs:
+            case_failures.append(f"{name}: expected {required_runs} runs, found {len(runs)}")
         turns: list[dict[str, Any]] = []
         for run_index, run in enumerate(runs):
             if not isinstance(run, dict) or not isinstance(run.get("turns"), list) or not run["turns"]:
@@ -195,9 +207,9 @@ def score_observations(observations: Any) -> dict[str, Any]:
                     f"{name} turn {turn_index}: first-audio p50 {p50:g}s "
                     f"exceeds {SEARCH_P50_LIMIT_SECONDS:g}s"
                 )
-            if len(latencies) != RUNS_REQUIRED:
+            if len(latencies) != required_runs:
                 case_failures.append(
-                    f"{name} turn {turn_index}: expected {RUNS_REQUIRED} latency observations, "
+                    f"{name} turn {turn_index}: expected {required_runs} latency observations, "
                     f"found {len(latencies)}"
                 )
 
