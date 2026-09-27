@@ -56,7 +56,10 @@ SCENARIOS = (
             TurnExpectation((r"Alice Keck Park", r"Santa Barbara")),
             TurnExpectation((r"Alice Keck Park", r"(?:navigat|directions|route|taking you)")),
         ),
-        commands=({"turn": 2, "kind": "navigate"},),
+        commands=(
+            {"turn": 1, "kind": "location"},
+            {"turn": 2, "kind": "navigate"},
+        ),
         room_close_after=2,
         place_query="Alice Keck Park Memorial Garden",
         selected_place_pattern=r"(?i)Alice Keck Park(?: Memorial)? Garden",

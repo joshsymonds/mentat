@@ -142,6 +142,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                     "Navigating to Alice Keck Park Memorial Garden in Santa Barbara now.",
                 ],
                 phone_commands=[
+                    {"turn": 1, "kind": "location"},
                     {
                         "turn": 2,
                         "kind": "navigate",
@@ -162,6 +163,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                 scenario,
                 turns=["Alice Keck Park Memorial Garden is nearby. Would you like directions?", ""],
                 phone_commands=[
+                    {"turn": 1, "kind": "location"},
                     {
                         "turn": 2,
                         "kind": "navigate",
@@ -238,6 +240,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                 "Navigating to Alice Keck Park Memorial Garden now.",
             ],
             phone_commands=[
+                {"turn": 1, "kind": "location"},
                 {
                     "turn": 2,
                     "kind": "navigate",
@@ -261,6 +264,42 @@ class ScenarioCorpusTests(unittest.TestCase):
             phone_commands=[],
             room_closed_after=None,
         )
+
+    def test_place_search_requires_location_before_navigation(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+        turns = [
+            "Alice Keck Park Memorial Garden is a nearby Santa Barbara result. Which result should I navigate to?",
+            "Navigating to Alice Keck Park Memorial Garden now.",
+        ]
+        navigate = {
+            "turn": 2,
+            "kind": "navigate",
+            "name": "Alice Keck Park Memorial Garden",
+            "address": "1 Garden Road",
+            "place_id": "live-result-id",
+            "lat": 34.42,
+            "lng": -119.70,
+        }
+        evaluate_scenario(
+            scenario,
+            turns=turns,
+            phone_commands=[{"turn": 1, "kind": "location"}, navigate],
+            room_closed_after=2,
+        )
+        invalid_sequences = (
+            (navigate,),
+            (navigate, {"turn": 1, "kind": "location"}),
+            ({"turn": 1, "kind": "location"}, {"turn": 1, "kind": "location"}, navigate),
+            ({"turn": 2, "kind": "location"}, navigate),
+        )
+        for commands in invalid_sequences:
+            with self.subTest(commands=commands), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    scenario,
+                    turns=turns,
+                    phone_commands=list(commands),
+                    room_closed_after=2,
+                )
 
     def test_accepts_candid_negative_phone_outcomes(self):
         for name, answer, command in (
