@@ -284,7 +284,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                     phone_commands=[{"turn": 1, "kind": "timer", "seconds": 300}],
                     room_closed_after=1,
                 )
-        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+        with self.assertRaises(AssertionError):
             evaluate_scenario(
                 scenario,
                 turns=["Timer set for 10 minutes."],
@@ -1300,6 +1300,263 @@ class ScenarioCorpusTests(unittest.TestCase):
                     phone_commands=[],
                     room_closed_after=None,
                 )
+
+    def test_action_acknowledgments_do_not_need_to_repeat_command_values(self):
+        cases = (
+            (
+                "timer-300-seconds",
+                "Okay, done, bye.",
+                {"turn": 1, "kind": "timer", "seconds": 300},
+            ),
+            (
+                "equivalent-alarm",
+                "Okay, done, bye.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "place-search-navigation",
+                "Okay, done, bye.",
+                {"turn": 2, "kind": "navigate", "name": "Alice Keck Park Memorial Garden", "address": "1 Garden Road", "place_id": "alice-keck-place-id", "lat": 34.42, "lng": -119.70},
+            ),
+        )
+        for name, acknowledgment, action in cases:
+            with self.subTest(name=name):
+                scenario = next(s for s in SCENARIOS if s.name == name)
+                if name == "place-search-navigation":
+                    turns = ["Alice Keck Park Memorial Garden is in Santa Barbara.", acknowledgment]
+                    commands = [{"turn": 1, "kind": "location"}, action]
+                    closed_after = 2
+                else:
+                    turns = [acknowledgment]
+                    commands = [action]
+                    closed_after = 1
+                evaluate_scenario(scenario, turns, commands, room_closed_after=closed_after)
+
+        sms = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        evaluate_scenario(
+            sms,
+            ["I can text +1-202-555-0142: I will be there at six. Should I send it?", "Okay, done, bye."],
+            [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+            room_closed_after=2,
+        )
+
+    def test_completion_only_acknowledgments_still_reject_wrong_action_values(self):
+        cases = (
+            (
+                "timer-300-seconds",
+                "Okay, done, bye.",
+                {"turn": 1, "kind": "timer", "seconds": 60},
+            ),
+            (
+                "equivalent-alarm",
+                "Okay, done, bye.",
+                {"turn": 1, "kind": "alarm", "hour": 8, "minute": 0},
+            ),
+            (
+                "timer-300-seconds",
+                "Done, I set a 10-minute timer.",
+                {"turn": 1, "kind": "timer", "seconds": 300},
+            ),
+            (
+                "equivalent-alarm",
+                "Done, I set your alarm for 8 a.m.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+        )
+        for name, acknowledgment, command in cases:
+            with self.subTest(name=name, acknowledgment=acknowledgment), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    next(s for s in SCENARIOS if s.name == name),
+                    [acknowledgment],
+                    [command],
+                    room_closed_after=1,
+                )
+
+    def test_accepts_spoken_sms_recipient_as_digit_words(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        evaluate_scenario(
+            scenario,
+            [
+                "I can text plus-one-two-zero-two-five-five-five-zero-one-four-two: I will be there at six. Should I send it?",
+                "Sent that message.",
+            ],
+            [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+            room_closed_after=2,
+        )
+
+    def test_spoken_sms_digit_words_remain_strict_for_recipient_and_body(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        cases = (
+            (
+                "I can text plus-one-two-zero-two-five-five-five-zero-one-four-three: I will be there at six. Should I send it?",
+                "no complete",
+            ),
+            (
+                "I can text: I will be there at six. Should I send it?",
+                "no complete",
+            ),
+            (
+                "I can text plus-one-two-zero-two-five-five-five-zero-one-four-two: I will be there at seven. Should I send it?",
+                "said back",
+            ),
+        )
+        for readback, failure in cases:
+            with self.subTest(readback=readback), self.assertRaisesRegex(AssertionError, failure):
+                evaluate_scenario(
+                    scenario,
+                    [readback, "Sent that message."],
+                    [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+                    room_closed_after=2,
+                )
+
+
+    def test_explicit_timer_and_alarm_values_must_match_fake_phone_payload(self):
+        cases = (
+            (
+                "timer-300-seconds",
+                "Done, I set a thirty-minute timer.",
+                {"turn": 1, "kind": "timer", "seconds": 300},
+            ),
+            (
+                "timer-300-seconds",
+                "Done, I set a one hundred minute timer.",
+                {"turn": 1, "kind": "timer", "seconds": 300},
+            ),
+            (
+                "timer-300-seconds",
+                "Done, timer set for 1000 seconds.",
+                {"turn": 1, "kind": "timer", "seconds": 300},
+            ),
+            (
+                "equivalent-alarm",
+                "Done, alarm for nine.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "equivalent-alarm",
+                "Done, nine a.m.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "equivalent-alarm",
+                "Done, 9am alarm set.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "equivalent-alarm",
+                "Done, your 8:00 alarm is set.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "equivalent-alarm",
+                "Done, your 25:00 alarm is set.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+            (
+                "equivalent-alarm",
+                "Done, alarm for 7:75.",
+                {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},
+            ),
+        )
+        for name, answer, command in cases:
+            with self.subTest(name=name, answer=answer), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    next(s for s in SCENARIOS if s.name == name),
+                    [answer],
+                    [command],
+                    room_closed_after=1,
+                )
+
+    def test_standalone_seven_am_matches_fake_alarm_payload(self):
+        scenario = next(s for s in SCENARIOS if s.name == "equivalent-alarm")
+        command = {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0}
+        for answer in ("Done, seven a.m.", "Done, your 7:00 alarm is set."):
+            with self.subTest(answer=answer):
+                evaluate_scenario(scenario, [answer], [command], room_closed_after=1)
+
+    def test_unrelated_bare_number_is_not_an_alarm_time(self):
+        evaluate_scenario(
+            next(s for s in SCENARIOS if s.name == "equivalent-alarm"),
+            ["Done, the timer for nine minutes is running and the alarm is set."],
+            [{"turn": 1, "kind": "alarm", "hour": 7, "minute": 0}],
+            room_closed_after=1,
+        )
+
+    def test_value_free_action_acknowledgment_passes_without_spoken_parameters(self):
+        for name, command in (
+            ("timer-300-seconds", {"turn": 1, "kind": "timer", "seconds": 300}),
+            ("equivalent-alarm", {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0}),
+        ):
+            with self.subTest(name=name):
+                evaluate_scenario(
+                    next(s for s in SCENARIOS if s.name == name),
+                    ["Okay, done."],
+                    [command],
+                    room_closed_after=1,
+                )
+
+    def test_live_sms_body_before_spelled_recipient_requires_yes_and_one_matching_send(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        readback = (
+            "Oh, I'll be there at 6, ready to send to "
+            "plus-one-two-zero-two-five-five-five-zero-one-four-two. Want me to send it?"
+        )
+        correct_send = {
+            "turn": 2,
+            "kind": "sms",
+            "to": "+1-202-555-0142",
+            "body": "I'll be there at 6",
+        }
+        evaluate_scenario(
+            scenario,
+            [readback, "Okay, done."],
+            [correct_send],
+            room_closed_after=2,
+        )
+
+        invalid_cases = (
+            (
+                [readback.replace("one-four-two", "one-four-three"), "Okay, done."],
+                [correct_send],
+                "wrong spoken recipient",
+            ),
+            (
+                [readback, "Okay, done."],
+                [{**correct_send, "body": "I'll be there at 7"}],
+                "wrong payload body",
+            ),
+            (
+                [readback.replace("I'll be there at 6", "I'll be there at 7"), "Okay, done."],
+                [correct_send],
+                "wrong spoken body",
+            ),
+            (
+                [
+                    "Oh, ready to send to plus-one-two-zero-two-five-five-five-zero-one-four-two. Want me to send it?",
+                    "Okay, done.",
+                ],
+                [correct_send],
+                "missing body",
+            ),
+            (
+                ["Oh, I'll be there at 6. Want me to send it?", "Okay, done."],
+                [correct_send],
+                "missing recipient",
+            ),
+            (
+                [readback, "Okay, done."],
+                [{**correct_send, "turn": 1}],
+                "pre-Yes send",
+            ),
+            (
+                [readback, "Okay, done."],
+                [correct_send, {**correct_send}],
+                "duplicate send",
+            ),
+        )
+        for turns, commands, label in invalid_cases:
+            with self.subTest(label=label), self.assertRaises(AssertionError):
+                evaluate_scenario(scenario, turns, commands, room_closed_after=2)
 
 
 if __name__ == "__main__":

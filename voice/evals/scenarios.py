@@ -54,6 +54,29 @@ _NAMED_OTHER_ACTOR = (
     r"(?:[A-Z][A-Za-z'’-]+|[A-Z]\.)(?:\s+(?:[A-Z][A-Za-z'’-]+|[A-Z]\.|de|van|von|da)){1,5})"
 )
 _OTHER_ACTOR = rf"(?:{_OTHER_ROLE}|{_NAMED_OTHER_ACTOR})"
+_ACTION_ACKNOWLEDGMENT = (
+    r"\b(?:done|set|started|starting|setting|running|sent|sending|texted|scent|"
+    r"navigat\w*|directions|route|taking you|sending you there)\b"
+)
+_DIGIT_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+}
+_DIGIT_WORD_PATTERN = "|".join(_DIGIT_WORDS)
+_SPOKEN_SMS_RECIPIENT = re.compile(
+    rf"(?P<recipient>(?:\+|plus(?:[\s-]+))?"
+    rf"(?:(?:{_DIGIT_WORD_PATTERN}|\d)[\s().-]*){{10,15}})"
+    r"\s*[:,.]?\s+",
+    re.IGNORECASE,
+)
 _NON_ALICE_PARK_DONOR = (
     r"(?:"
     rf"\b{_OTHER_ROLE}\b(?:\s+\w+){{0,4}}\s+\b{_TRANSFER_ACTION}\b"
@@ -93,12 +116,7 @@ SCENARIOS = (
         name="timer-300-seconds",
         caller_lines=("Set a timer for five minutes.",),
         turns=(
-            TurnExpectation(
-                (
-                    r"\b(?:five|5)[ -]minutes?\b",
-                    r"\b(?:done|set|started|starting|setting|running|counting down|on the clock)\b",
-                )
-            ),
+            TurnExpectation((_ACTION_ACKNOWLEDGMENT,)),
         ),
         commands=({"turn": 1, "kind": "timer", "seconds": 300},),
         room_close_after=1,
@@ -107,14 +125,7 @@ SCENARIOS = (
         name="equivalent-alarm",
         caller_lines=("Set an alarm for 7 a.m.",),
         turns=(
-            TurnExpectation(
-                (
-                    r"\b7(?:(?:\s*:\s*00)(?:\s*a\.?\s*m\.?)?|\s*a\.?\s*m\.?|\s*o['’]?clock)(?!\s*p\.?\s*m\.?)\b",
-                    r"\balarm\b",
-                    r"\b(?:done|set|started|starting|setting)\b",
-                ),
-                reject_patterns=(r"\b7(?::00)?\s*p\.?\s*m\.?(?![A-Za-z])",),
-            ),
+            TurnExpectation((_ACTION_ACKNOWLEDGMENT,)),
         ),
         commands=({"turn": 1, "kind": "alarm", "hour": 7, "minute": 0},),
         room_close_after=1,
@@ -128,7 +139,7 @@ SCENARIOS = (
         turns=(
             TurnExpectation((r"\b(?:Alice|Halis) Keck Park(?: Memorial Gardens?)?\b", r"Santa Barbara")),
 
-            TurnExpectation((r"\b(?:navigat\w*|directions|route|taking you|sending you there)\b",)),
+            TurnExpectation((_ACTION_ACKNOWLEDGMENT,)),
         ),
         commands=(
             {"turn": 1, "kind": "location"},
@@ -148,7 +159,7 @@ SCENARIOS = (
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
-            TurnExpectation((r"\b(?:sent|sending|texted|scent)\b",)),
+            TurnExpectation((_ACTION_ACKNOWLEDGMENT,)),
         ),
         commands=({"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."},),
         room_close_after=2,
@@ -171,7 +182,7 @@ SCENARIOS = (
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at seven.",
             ),
-            TurnExpectation((r"\b(?:sent|sending|texted|scent)\b",)),
+            TurnExpectation((_ACTION_ACKNOWLEDGMENT,)),
         ),
         commands=({"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at seven."},),
         room_close_after=3,
@@ -224,27 +235,60 @@ def _require(condition: bool, message: str) -> None:
 
 
 def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -> str:
-    """Extract the complete say-back between the recipient and confirmation prompt."""
-    pattern = re.compile(
-        r"\b(?:text|send)\s+(?P<recipient>[+\d().\s-]*\d)\s*[:,.]?\s+"
-        r"(?P<body>.+?)(?=\s+(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word)\b)",
-        re.IGNORECASE | re.DOTALL,
+    """Extract the complete message say-back before or after its recipient."""
+    match = _SPOKEN_SMS_RECIPIENT.search(text)
+    prompt = (
+        re.search(
+            r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word)\b",
+            text[match.end():],
+            re.IGNORECASE,
+        )
+        if match is not None
+        else None
     )
-    match = pattern.search(text)
-    spoken_recipient = re.sub(r"\D", "", match.group("recipient")) if match else ""
+    spoken_recipient = (
+        re.sub(
+            r"\b(?:" + _DIGIT_WORD_PATTERN + r")\b",
+            lambda digit: _DIGIT_WORDS[digit.group().lower()],
+            match.group("recipient").lower(),
+        )
+        if match
+        else ""
+    )
+    spoken_recipient = re.sub(r"\D", "", spoken_recipient)
     expected_recipient = re.sub(r"\D", "", recipient)
     national_number = expected_recipient[1:] if recipient.startswith("+1") and expected_recipient.startswith("1") else ""
     _require(
         match is not None
+        and prompt is not None
         and spoken_recipient in (expected_recipient, national_number),
         f"{scenario_name}: turn {turn} has no complete {recipient} message say-back",
     )
-    tail = text[match.end():]
+
+    before_recipient = text[:match.start()]
+    prompt_start = match.end() + prompt.start()
+    after_recipient = text[match.end():prompt_start]
+    if after_recipient.strip(" \t,.:;–—-\"“”"):
+        body = after_recipient
+    else:
+        body = before_recipient
+        body = re.sub(r"^\s*(?:oh|okay|ok|sure)[,:]?\s+", "", body, flags=re.IGNORECASE)
+        body = re.sub(
+            r"(?:,?\s+)(?:ready\s+)?to\s+(?:text|send)\s+to\s*$",
+            "",
+            body,
+            flags=re.IGNORECASE,
+        )
+    body = " ".join(body.split()).strip(' \t,.:;–—-"“”')
+    _require(bool(body), f"{scenario_name}: turn {turn} has no complete SMS body say-back")
+
+    prompt_end = match.end() + prompt.end()
+    tail = text[prompt_end:]
     _require(
         re.search(r"\b(?:actually|correction|instead|rather|i meant|make that)\b", tail, re.IGNORECASE) is None,
         f"{scenario_name}: turn {turn} contradicts its SMS say-back after the confirmation prompt",
     )
-    return " ".join(match.group("body").split()).strip(' "“”')
+    return body
 
 
 def _sms_body_tokens(body: str) -> tuple[str, ...]:
@@ -253,6 +297,106 @@ def _sms_body_tokens(body: str) -> tuple[str, ...]:
     normalized = re.sub(r"\bsix\b", "6", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\bseven\b", "7", normalized, flags=re.IGNORECASE)
     return tuple(re.findall(r"[a-z0-9]+", normalized.lower()))
+
+
+
+_NUMBER_WORD_VALUES = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
+    "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+    "ninety": 90,
+}
+_DURATION_UNIT_PATTERN = r"(?:hours?|hrs?|minutes?|mins?|seconds?|secs?)"
+_NUMBER_WORD_PATTERN = (
+    r"(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+    r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+    r"(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?"
+)
+
+
+def _spoken_number(value: str) -> int | None:
+    if value.isdigit():
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    parts = re.split(r"[- ]", value.lower())
+    total = 0
+    for part in parts:
+        number = _NUMBER_WORD_VALUES.get(part)
+        if number is None:
+            return None
+        total += number
+    return total
+
+
+def _spoken_durations(text: str) -> list[int]:
+    durations = []
+    pattern = re.compile(
+        rf"\b(?P<value>{_NUMBER_WORD_PATTERN})[\s-]*"
+        rf"(?P<unit>{_DURATION_UNIT_PATTERN})\b",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        value = _spoken_number(match.group("value"))
+        if value is None:
+            continue
+        unit = match.group("unit").lower()
+        multiplier = 3600 if unit.startswith(("hour", "hr")) else 60 if unit.startswith(("minute", "min")) else 1
+        durations.append(value * multiplier)
+    return durations
+
+
+def _spoken_alarm_times(text: str) -> list[tuple[int, int] | None]:
+    times = []
+    clock_time = (
+        rf"(?P<hour>{_NUMBER_WORD_PATTERN})"
+        rf"(?:\s*:\s*(?P<colon_minute>\d{{1,2}})|"
+        rf"[\s-]+(?P<word_minute>{_NUMBER_WORD_PATTERN}))?"
+        r"\s*(?P<meridiem>a\.?m\.?|p\.?m\.?|o['’]?clock)?\b"
+    )
+    patterns = (
+        re.compile(
+            rf"\balarm\s+(?:for|at)\s+{clock_time}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"\b(?P<hour>{_NUMBER_WORD_PATTERN})"
+            rf"(?:\s*:\s*(?P<colon_minute>\d{{1,2}})|"
+            rf"[\s-]+(?P<word_minute>{_NUMBER_WORD_PATTERN}))?"
+            r"\s*(?P<meridiem>a\.?m\.?|p\.?m\.?|o['’]?clock)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"\b(?P<hour>{_NUMBER_WORD_PATTERN})\s*:\s*"
+            r"(?P<colon_minute>\d{1,2})\b",
+            re.IGNORECASE,
+        ),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            hour = _spoken_number(match.group("hour"))
+            minute = (
+                int(match.group("colon_minute"))
+                if match.group("colon_minute") is not None
+                else _spoken_number(match.groupdict().get("word_minute"))
+                if match.groupdict().get("word_minute") is not None
+                else 0
+            )
+            if hour is None or hour > 24 or minute is None or minute > 59:
+                times.append(None)
+                continue
+            meridiem = (match.groupdict().get("meridiem") or "").lower().replace(".", "")
+            if meridiem.startswith("p") and hour < 12:
+                hour += 12
+            elif meridiem.startswith("a") and hour == 12:
+                hour = 0
+            times.append((hour, minute))
+    return times
 
 
 def _sms_value_matches(field: str, actual: Any, expected: Any) -> bool:
@@ -382,6 +526,26 @@ def _scenario_failures(
                 f"{scenario.name}: command {index} expected {field}={value!r}, "
                 f"got {actual.get(field)!r}",
             )
+        if actual.get("kind") in ("timer", "alarm"):
+            command_turn = actual.get("turn")
+            if isinstance(command_turn, int) and not isinstance(command_turn, bool) and 1 <= command_turn <= len(turns):
+                spoken = turns[command_turn - 1]
+                if actual.get("kind") == "timer":
+                    durations = _spoken_durations(spoken)
+                    spoken_units = re.findall(rf"\b{_DURATION_UNIT_PATTERN}\b", spoken, re.IGNORECASE)
+                    require(
+                        len(durations) == len(spoken_units)
+                        and all(duration == actual.get("seconds") for duration in durations),
+                        command_turn,
+                        f"{scenario.name}: spoken timer duration {durations!r} did not match fake phone seconds {actual.get('seconds')!r}",
+                    )
+                else:
+                    times = _spoken_alarm_times(spoken)
+                    require(
+                        all(time == (actual.get("hour"), actual.get("minute")) for time in times),
+                        command_turn,
+                        f"{scenario.name}: spoken alarm time {times!r} did not match fake phone time {(actual.get('hour'), actual.get('minute'))!r}",
+                    )
         if actual.get("kind") == "sms":
             command_turn = actual.get("turn")
             if not require(
