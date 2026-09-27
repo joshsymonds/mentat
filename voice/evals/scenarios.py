@@ -310,6 +310,9 @@ _NUMBER_WORD_VALUES = {
     "ninety": 90,
 }
 _DURATION_UNIT_PATTERN = r"(?:hours?|hrs?|minutes?|mins?|seconds?|secs?)"
+_DURATION_NUMBER_TOKEN_PATTERN = (
+    r"(?:\d+|" + "|".join(_NUMBER_WORD_VALUES) + r"|hundred|thousand|million|billion|trillion)"
+)
 _NUMBER_WORD_PATTERN = (
     r"(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
     r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
@@ -532,7 +535,11 @@ def _scenario_failures(
                 spoken = turns[command_turn - 1]
                 if actual.get("kind") == "timer":
                     durations = _spoken_durations(spoken)
-                    spoken_units = re.findall(rf"\b{_DURATION_UNIT_PATTERN}\b", spoken, re.IGNORECASE)
+                    spoken_units = re.findall(
+                        rf"\b{_DURATION_NUMBER_TOKEN_PATTERN}[\s-]*{_DURATION_UNIT_PATTERN}\b",
+                        spoken,
+                        re.IGNORECASE,
+                    )
                     require(
                         len(durations) == len(spoken_units)
                         and all(duration == actual.get("seconds") for duration in durations),

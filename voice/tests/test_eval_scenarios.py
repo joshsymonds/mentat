@@ -1467,6 +1467,21 @@ class ScenarioCorpusTests(unittest.TestCase):
                     room_closed_after=1,
                 )
 
+    def test_bare_duration_units_do_not_reject_correct_timer_acknowledgments(self):
+        scenario = next(s for s in SCENARIOS if s.name == "timer-300-seconds")
+        command = {"turn": 1, "kind": "timer", "seconds": 300}
+        answers = (
+            "Done, I'll ping you in a couple of minutes.",
+            "Done, I'll let you know when the minutes are up.",
+            "Timer's set, a few minutes to go.",
+            "Okay, five minutes, starting now.",
+            "Timer set for 5 minutes.",
+            "Okay, done.",
+        )
+        for answer in answers:
+            with self.subTest(answer=answer):
+                evaluate_scenario(scenario, [answer], [command], room_closed_after=1)
+
     def test_standalone_seven_am_matches_fake_alarm_payload(self):
         scenario = next(s for s in SCENARIOS if s.name == "equivalent-alarm")
         command = {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0}
