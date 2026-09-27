@@ -1,14 +1,51 @@
 package gg.savecraft.mentat.session
 
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import sun.misc.Unsafe
 import gg.savecraft.mentat.core.SessionEvent
 import gg.savecraft.mentat.core.TranscriptSegment
 import io.livekit.android.events.DisconnectReason
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.shadows.ShadowMediaPlayer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
 class LiveKitSessionTest {
+    @Test
+    fun listeningChimeUsesAssistantAudioUsage() {
+        var player: MediaPlayer? = null
+        ShadowMediaPlayer.setMediaInfoProvider { ShadowMediaPlayer.MediaInfo(1_000, 0) }
+        ShadowMediaPlayer.setCreateListener { created, _ -> player = created }
+        val unsafeField = Unsafe::class.java.getDeclaredField("theUnsafe").apply {
+            isAccessible = true
+        }
+        val session = (unsafeField.get(null) as Unsafe)
+            .allocateInstance(AndroidLiveKitSession::class.java) as AndroidLiveKitSession
+        AndroidLiveKitSession::class.java.getDeclaredField("appContext").apply {
+            isAccessible = true
+        }.set(session, RuntimeEnvironment.getApplication())
+        try {
+            session.playListeningChime()
+
+            assertEquals(
+                AudioAttributes.USAGE_ASSISTANT,
+                shadowOf(checkNotNull(player)).audioAttributes?.usage,
+            )
+        } finally {
+            player?.release()
+            ShadowMediaPlayer.setCreateListener(null)
+        }
+    }
+
     @Test
     fun disconnectReasonsClassifyGracefulEnds() {
         assertTrue(LiveKitSession.gracefulDisconnect(DisconnectReason.ROOM_DELETED))

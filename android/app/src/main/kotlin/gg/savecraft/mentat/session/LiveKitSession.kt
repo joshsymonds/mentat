@@ -1,6 +1,7 @@
 package gg.savecraft.mentat.session
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import gg.savecraft.mentat.R
 import gg.savecraft.mentat.core.SessionEvent
@@ -112,7 +113,16 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
     }
 
     override fun playListeningChime() {
-        val player = checkNotNull(MediaPlayer.create(appContext, R.raw.listening)) {
+        val player = checkNotNull(
+            MediaPlayer.create(
+                appContext,
+                R.raw.listening,
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .build(),
+                0,
+            ),
+        ) {
             "Unable to load listening chime"
         }
         player.setOnCompletionListener { it.release() }
