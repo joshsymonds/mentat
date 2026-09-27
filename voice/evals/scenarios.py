@@ -34,8 +34,8 @@ class Scenario:
 SCENARIOS = (
     Scenario(
         name="timer-300-seconds",
-        caller_lines=("Set a timer for 300 seconds.",),
-        turns=(TurnExpectation((r"\b300[- ]second timer\b", r"\bset\b")),),
+        caller_lines=("Set a timer for five minutes.",),
+        turns=(TurnExpectation((r"\b(?:five|5)[ -]minutes?\b", r"\btimer\b", r"\bset\b")),),
         commands=({"turn": 1, "kind": "timer", "seconds": 300},),
         room_close_after=1,
     ),

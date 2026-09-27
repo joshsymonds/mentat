@@ -135,9 +135,32 @@ class ScenarioCorpusTests(unittest.TestCase):
             room_closed_after=3,
         )
 
+    def test_five_minute_timer_maps_to_300_seconds(self):
+        scenario = next(s for s in SCENARIOS if s.name == "timer-300-seconds")
+        self.assertEqual(scenario.caller_lines, ("Set a timer for five minutes.",))
+        for answer in (
+            "A five-minute timer is set.",
+            "Timer set for 5 minutes.",
+            "I set a timer for five minutes.",
+        ):
+            with self.subTest(answer=answer):
+                evaluate_scenario(
+                    scenario,
+                    turns=[answer],
+                    phone_commands=[{"turn": 1, "kind": "timer", "seconds": 300}],
+                    room_closed_after=1,
+                )
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(
+                scenario,
+                turns=["Timer set for 10 minutes."],
+                phone_commands=[{"turn": 1, "kind": "timer", "seconds": 300}],
+                room_closed_after=1,
+            )
+
     def test_accepts_timer_and_equivalent_alarm_commands(self):
         for name, answer, command in (
-            ("timer-300-seconds", "A 300-second timer is set.", {"turn": 1, "kind": "timer", "seconds": 300}),
+            ("timer-300-seconds", "A five-minute timer is set.", {"turn": 1, "kind": "timer", "seconds": 300}),
             ("equivalent-alarm", "Your 7:00 alarm is set.", {"turn": 1, "kind": "alarm", "hour": 7, "minute": 0}),
         ):
             with self.subTest(name=name):
