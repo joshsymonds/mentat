@@ -30,6 +30,7 @@ export interface Config {
   sessionTtlMs: number;
   maxBudgetUsd?: number;
   voiceToken?: { apiKey: string; apiSecret: string; url: string };
+  voiceGateway?: { url: string; callerKey: string };
   placesApiKey?: string;
 }
 
@@ -78,6 +79,31 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       ? { apiKey, apiSecret, url: voiceUrl }
       : undefined;
 
+  const gatewayUrl =
+    env.MENTAT_VOICE_GATEWAY_URL === '' ? undefined : env.MENTAT_VOICE_GATEWAY_URL;
+  const gatewayKeyFile =
+    env.MENTAT_VOICE_GATEWAY_KEY_FILE === '' ? undefined : env.MENTAT_VOICE_GATEWAY_KEY_FILE;
+  if (gatewayUrl === undefined && gatewayKeyFile !== undefined) {
+    throw new Error('MENTAT_VOICE_GATEWAY_KEY_FILE requires MENTAT_VOICE_GATEWAY_URL');
+  }
+  let voiceGateway: Config['voiceGateway'];
+  if (gatewayUrl !== undefined) {
+    validateVoiceGatewayUrl(gatewayUrl);
+    if (gatewayKeyFile === undefined) {
+      throw new Error('MENTAT_VOICE_GATEWAY_URL requires MENTAT_VOICE_GATEWAY_KEY_FILE');
+    }
+    let callerKey: string;
+    try {
+      callerKey = readFileSync(gatewayKeyFile, 'utf8').trim();
+    } catch (error) {
+      throw new Error(`unable to read caller key file ${gatewayKeyFile}: ${String(error)}`);
+    }
+    if (callerKey === '') {
+      throw new Error(`caller key file ${gatewayKeyFile} is empty`);
+    }
+    voiceGateway = { url: gatewayUrl, callerKey };
+  }
+
   return {
     listen,
     bin,
@@ -106,6 +132,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       maxBudgetUsd: floatOrThrow(env.MENTAT_MAX_BUDGET_USD, 'MENTAT_MAX_BUDGET_USD'),
     }),
     ...(voiceToken !== undefined && { voiceToken }),
+    ...(voiceGateway !== undefined && { voiceGateway }),
     ...(placesApiKey !== undefined && { placesApiKey }),
   };
 }
@@ -140,6 +167,23 @@ export function validateListen(host: string, allowNonLoopback: boolean): void {
     throw new Error(
       `refusing to bind non-loopback ${host}; set MENTAT_ALLOW_NON_LOOPBACK to override`,
     );
+  }
+}
+
+function validateVoiceGatewayUrl(value: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`invalid MENTAT_VOICE_GATEWAY_URL ${value}: want an http: loopback URL`);
+  }
+  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const isLoopback =
+    host === 'localhost' ||
+    host === '::1' ||
+    (isIP(host) === 4 && Number(host.split('.')[0]) === 127);
+  if (parsed.protocol !== 'http:' || !isLoopback) {
+    throw new Error(`invalid MENTAT_VOICE_GATEWAY_URL ${value}: want an http: loopback URL`);
   }
 }
 

@@ -68,6 +68,8 @@ export interface ClaudeCodeConfig {
   addDirs?: string[];
   /** Explicit MCP server map; nothing else is reachable (strictMcpConfig). */
   mcpServers?: Options['mcpServers'];
+  /** Per-voice-session gateway and caller key loaded from its configured file. */
+  voiceGateway?: { url: string; callerKey: string };
   allowedTools?: string[];
   disallowedTools?: string[];
   maxBudgetUsd?: number;
@@ -99,6 +101,7 @@ export interface ClaudeCodeConfig {
 export function buildChildEnv(
   source: Record<string, string | undefined>,
   extraEnv: readonly string[] = [],
+  voiceGateway?: { url: string; callerKey: string },
 ): Record<string, string> {
   const allowExact = new Set([
     'HOME',
@@ -130,6 +133,12 @@ export function buildChildEnv(
       out[key] = value;
     }
   }
+  if (voiceGateway !== undefined) {
+    delete out.ANTHROPIC_API_KEY;
+    delete out.ANTHROPIC_AUTH_TOKEN;
+    out.ANTHROPIC_BASE_URL = voiceGateway.url;
+    out.ANTHROPIC_CUSTOM_HEADERS = `X-Patchbay-Key: ${voiceGateway.callerKey}`;
+  }
   return out;
 }
 
@@ -155,6 +164,15 @@ function effectiveDisallowedTools(config: ClaudeCodeConfig): string[] {
  */
 const SURFACE_SHAPE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const USER_SHAPE = /^[a-zA-Z0-9][a-zA-Z0-9_@.-]{0,63}$/;
+
+function preloadMcpServers(servers: Options['mcpServers']): Options['mcpServers'] {
+  if (servers === undefined) {
+    return undefined;
+  }
+  return Object.fromEntries(
+    Object.entries(servers).map(([name, server]) => [name, { ...server, alwaysLoad: true }]),
+  );
+}
 
 /**
  * The session's surface context as a system-prompt line, or undefined when
@@ -193,6 +211,9 @@ export function buildOptions(
   resumeUuid?: string,
   spawnMeta?: Record<string, string>,
 ): Options {
+  const voiceGateway = spawnMeta?.surface === 'voice' ? config.voiceGateway : undefined;
+  const mcpServers =
+    voiceGateway !== undefined ? preloadMcpServers(config.mcpServers) : config.mcpServers;
   const surfaceLine = surfaceContextLine(spawnMeta);
   const systemPrompt =
     config.systemPrompt !== undefined && surfaceLine !== undefined
@@ -204,13 +225,13 @@ export function buildOptions(
     strictMcpConfig: true,
     includePartialMessages: true,
     pathToClaudeCodeExecutable: config.bin,
-    env: buildChildEnv(process.env, config.extraEnv ?? []),
+    env: buildChildEnv(process.env, config.extraEnv ?? [], voiceGateway),
     disallowedTools: effectiveDisallowedTools(config),
     ...(config.model !== undefined && { model: config.model }),
     ...(config.effort !== undefined && { effort: config.effort }),
     ...(systemPrompt !== undefined && { systemPrompt }),
     ...(config.addDirs !== undefined && { additionalDirectories: config.addDirs }),
-    ...(config.mcpServers !== undefined && { mcpServers: config.mcpServers }),
+    ...(mcpServers !== undefined && { mcpServers }),
     ...(config.allowedTools !== undefined && { allowedTools: config.allowedTools }),
     ...(config.maxBudgetUsd !== undefined && { maxBudgetUsd: config.maxBudgetUsd }),
     ...(resumeUuid !== undefined && { resume: resumeUuid }),

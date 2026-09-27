@@ -29,6 +29,7 @@ try {
     ...(config.systemPrompt !== undefined && { systemPrompt: config.systemPrompt }),
     ...(config.memoryDir !== undefined && { addDirs: [config.memoryDir] }),
     ...(config.mcpServers !== undefined && { mcpServers: config.mcpServers }),
+    ...(config.voiceGateway !== undefined && { voiceGateway: config.voiceGateway }),
     ...(config.allowedTools !== undefined && { allowedTools: config.allowedTools }),
     ...(config.disallowedTools !== undefined && { disallowedTools: config.disallowedTools }),
     ...(config.extraEnv !== undefined && { extraEnv: config.extraEnv }),

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AtCapacityError, type Event } from '../src/backend.ts';
 import {
@@ -96,6 +96,24 @@ function fakeQuery(
   return fake;
 }
 
+beforeEach(() => {
+  for (const name of Object.keys(process.env).filter((key) => key.startsWith('ANTHROPIC_'))) {
+    vi.stubEnv(name, `test-${name.toLowerCase()}`);
+  }
+  for (const name of [
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_CUSTOM_HEADERS',
+  ]) {
+    vi.stubEnv(name, `test-${name.toLowerCase()}`);
+  }
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 function makeConfig(overrides: Partial<ClaudeCodeConfig> = {}): ClaudeCodeConfig {
   return {
     bin: '/pinned/claude',
@@ -174,6 +192,110 @@ describe('buildOptions isolation invariants', () => {
     expect(options.resume).toBeUndefined();
     const respawn = buildOptions(makeConfig(), () => context, 'old-uuid');
     expect(respawn.resume).toBe('old-uuid');
+  });
+
+  it('preloads voice MCP tools and preserves prompt, memory, isolation, and policy', async () => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'fixture-inherited-api-key');
+    vi.stubEnv('ANTHROPIC_AUTH_TOKEN', 'fixture-inherited-auth-token');
+    vi.stubEnv('ANTHROPIC_BASE_URL', 'https://existing.example');
+    vi.stubEnv('ANTHROPIC_CUSTOM_HEADERS', 'Existing: header');
+    const voiceContext: TurnContext = {
+      sessionId: 'voice-session',
+      meta: { surface: 'voice', user: 'josh' },
+    };
+    const voicePolicy: PolicyFn = (_tool, input, seenContext) => {
+      expect(seenContext).toEqual(voiceContext);
+      return { behavior: 'allow', updatedInput: input };
+    };
+    const voiceOptions = buildOptions(
+      makeConfig({
+        systemPrompt: 'voice prompt',
+        addDirs: ['/memory'],
+        voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
+        mcpServers: {
+          web: { type: 'http', url: 'http://127.0.0.1:9000/mcp' },
+          local: { type: 'stdio', command: '/bin/mcp' },
+        },
+        policy: voicePolicy,
+      }),
+      () => voiceContext,
+      undefined,
+      { surface: 'voice', user: 'josh' },
+    );
+
+    expect(voiceOptions.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:4100',
+      ANTHROPIC_CUSTOM_HEADERS: 'X-Patchbay-Key: fixture-caller-key',
+    });
+    expect(voiceOptions.mcpServers).toEqual({
+      web: { type: 'http', url: 'http://127.0.0.1:9000/mcp', alwaysLoad: true },
+      local: { type: 'stdio', command: '/bin/mcp', alwaysLoad: true },
+    });
+    expect(voiceOptions.systemPrompt).toBe(`voice prompt\n\nSession surface: voice (user: josh)`);
+    expect(voiceOptions.additionalDirectories).toEqual(['/memory']);
+    expect(voiceOptions.settingSources).toEqual([]);
+    expect(voiceOptions.skills).toEqual([]);
+    expect(voiceOptions.strictMcpConfig).toBe(true);
+    const decision = await voiceOptions.canUseTool?.('tool_x', {}, {
+      signal: new AbortController().signal,
+      toolUseID: 'tool-use',
+    });
+    expect(decision).toEqual({ behavior: 'allow', updatedInput: {} });
+  });
+
+  it('leaves nonvoice SDK options and child environment unchanged', () => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'fixture-inherited-api-key');
+    vi.stubEnv('ANTHROPIC_AUTH_TOKEN', 'fixture-inherited-auth-token');
+    vi.stubEnv('ANTHROPIC_BASE_URL', 'https://existing.example');
+    vi.stubEnv('ANTHROPIC_CUSTOM_HEADERS', 'Existing: header');
+    try {
+      const expectedEnv = buildChildEnv(process.env);
+      const nonvoiceOptions = buildOptions(
+        makeConfig({
+          systemPrompt: 'existing prompt',
+          addDirs: ['/existing-memory'],
+          voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
+          mcpServers: { local: { type: 'stdio', command: '/bin/mcp' } },
+        }),
+        () => context,
+        undefined,
+        { surface: 'signal', user: 'josh' },
+      );
+
+      expect(nonvoiceOptions.env).toEqual(expectedEnv);
+      expect(nonvoiceOptions.mcpServers).toEqual({
+        local: { type: 'stdio', command: '/bin/mcp' },
+      });
+      expect(nonvoiceOptions.systemPrompt).toBe(`existing prompt\n\nSession surface: signal (user: josh)`);
+      expect(nonvoiceOptions.additionalDirectories).toEqual(['/existing-memory']);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('removes inherited Anthropic credentials from voice child environments', () => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'fixture-inherited-api-key');
+    vi.stubEnv('ANTHROPIC_AUTH_TOKEN', 'fixture-inherited-auth-token');
+    vi.stubEnv('ANTHROPIC_BASE_URL', 'https://existing.example');
+    vi.stubEnv('ANTHROPIC_CUSTOM_HEADERS', 'Existing: header');
+    try {
+      const voiceOptions = buildOptions(
+        makeConfig({
+          voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
+        }),
+        () => context,
+        undefined,
+        { surface: 'voice' },
+      );
+      expect(voiceOptions.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+      expect(voiceOptions.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
+      expect(voiceOptions.env).toMatchObject({
+        ANTHROPIC_BASE_URL: 'http://127.0.0.1:4100',
+        ANTHROPIC_CUSTOM_HEADERS: 'X-Patchbay-Key: fixture-caller-key',
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 

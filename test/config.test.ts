@@ -20,11 +20,69 @@ describe('loadConfig', () => {
     expect(config.sessionTtlMs).toBe(15 * 60 * 1000);
     expect(config.allowedTools).toBeUndefined();
     expect(config.mcpServers).toBeUndefined();
+    expect(config.voiceGateway).toBeUndefined();
   });
 
   it('loads the optional Places API key', () => {
     expect(loadConfig({ ...baseEnv, MENTAT_PLACES_API_KEY: 'places-key' }).placesApiKey).toBe('places-key');
     expect(loadConfig({ ...baseEnv, MENTAT_PLACES_API_KEY: '' }).placesApiKey).toBeUndefined();
+  });
+
+  it('loads a loopback voice gateway and reads its caller key from a file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mentat-test-'));
+    const keyFile = join(dir, 'caller.key');
+    writeFileSync(keyFile, 'fixture-caller-key\n');
+
+    for (const url of [
+      'http://127.0.0.1:4100',
+      'http://127.0.0.2:4100',
+      'http://localhost:4100',
+      'http://[::1]:4100',
+    ]) {
+      const config = loadConfig({
+        ...baseEnv,
+        MENTAT_VOICE_GATEWAY_URL: url,
+        MENTAT_VOICE_GATEWAY_KEY_FILE: keyFile,
+      });
+      expect(config.voiceGateway).toEqual({ url, callerKey: 'fixture-caller-key' });
+    }
+  });
+
+  it('requires a readable, non-empty caller key file for a configured gateway', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mentat-test-'));
+    const keyFile = join(dir, 'caller.key');
+    expect(() =>
+      loadConfig({ ...baseEnv, MENTAT_VOICE_GATEWAY_URL: 'http://127.0.0.1:4100' }),
+    ).toThrow(/MENTAT_VOICE_GATEWAY_KEY_FILE/);
+
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        MENTAT_VOICE_GATEWAY_URL: 'http://127.0.0.1:4100',
+        MENTAT_VOICE_GATEWAY_KEY_FILE: keyFile,
+      }),
+    ).toThrow(/caller key file/);
+
+    writeFileSync(keyFile, '  \n');
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        MENTAT_VOICE_GATEWAY_URL: 'http://127.0.0.1:4100',
+        MENTAT_VOICE_GATEWAY_KEY_FILE: keyFile,
+      }),
+    ).toThrow(/empty/);
+  });
+
+  it('rejects non-loopback or non-http voice gateway URLs', () => {
+    for (const url of ['https://127.0.0.1:4100', 'http://gateway.example:4100', 'not a URL']) {
+      expect(() =>
+        loadConfig({
+          ...baseEnv,
+          MENTAT_VOICE_GATEWAY_URL: url,
+          MENTAT_VOICE_GATEWAY_KEY_FILE: '/unused/key',
+        }),
+      ).toThrow(/MENTAT_VOICE_GATEWAY_URL/);
+    }
   });
 
   it('loads LiveKit voice-token configuration when all variables are set', () => {
