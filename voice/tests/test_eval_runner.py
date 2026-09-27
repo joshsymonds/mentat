@@ -408,6 +408,147 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
             evaluate_scenario(SCENARIOS[0], [traces[0]["transcript"]], [], None)
 
+    async def test_partial_capture_preserves_turn_one_and_names_turn_two_failure(self):
+        cases = ("early deletion", "no post-playout audio", "tts timeout")
+        for failure in cases:
+            with self.subTest(failure=failure):
+                dependencies = self.dependencies_for_failure("other")
+                if failure == "early deletion":
+                    calls = 0
+                    original = dependencies.api.LiveKitAPI.list_rooms
+
+                    async def list_rooms(api_client, request):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 1:
+                            return SimpleNamespace(rooms=[])
+                        return await original(api_client, request)
+
+                    dependencies.api.LiveKitAPI.list_rooms = list_rooms
+                elif failure == "no post-playout audio":
+                    speech_ends = iter((0.0, 1000.0))
+
+                    async def transcribe(*_args):
+                        return [{"start": 0.1, "end": 0.5, "text": "answer"}]
+
+                    class Capture:
+                        starts = iter((10.0, 20.0))
+
+                        def __init__(self, _queue, _ended=None):
+                            pass
+
+                        async def start(self):
+                            pass
+
+                        async def result(self):
+                            return b"audio", 24000, 1, next(self.starts)
+
+                    dependencies = CaptureDependencies(
+                        **{
+                            **dependencies.__dict__,
+                            "transcribe": transcribe,
+                            "capture_factory": Capture,
+                        }
+                    )
+
+                    async def speech_end(_source):
+                        return next(speech_ends)
+
+                    with patch.object(
+                        runner.caller, "_speech_end_after_playout", speech_end
+                    ):
+                        await self.assert_partial_failure(dependencies)
+                    continue
+                else:
+                    calls = 0
+
+                    async def tts(_http, _text):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 2:
+                            await asyncio.sleep(1)
+                        return b"\\x00\\x00"
+
+                    dependencies = CaptureDependencies(
+                        **{**dependencies.__dict__, "tts": tts}
+                    )
+
+                with patch.dict(os.environ, TEST_VOICE_ENV):
+                    with patch.object(runner, "REMOTE_OPERATION_DEADLINE_SECONDS", 0.01):
+                        await self.assert_partial_failure(dependencies)
+
+    async def test_first_turn_tts_and_no_audio_failures_keep_named_zero_turn_envelopes(self):
+        dependencies = self.dependencies_for_failure("other")
+
+        async def stuck_tts(_http, _text):
+            await asyncio.sleep(1)
+
+        dependencies = CaptureDependencies(**{**dependencies.__dict__, "tts": stuck_tts})
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner, "REMOTE_OPERATION_DEADLINE_SECONDS", 0.01),
+            self.assertRaises(runner.PartialCaptureFailure) as caught,
+        ):
+            await capture_script(
+                "android-selected-room",
+                ["First@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+        self.assertEqual(caught.exception.failure["turn"], 1)
+        self.assertEqual(caught.exception.turns, [])
+
+        dependencies = self.dependencies_for_failure("other")
+
+        class Capture:
+            async def start(self):
+                pass
+
+            async def result(self):
+                return b"audio", 24000, 1, time.monotonic() + 0.1
+
+        async def future_speech_end(_source):
+            return time.monotonic() + 1000.0
+
+        dependencies = CaptureDependencies(
+            **{
+                **dependencies.__dict__,
+                "capture_factory": lambda *_args: Capture(),
+            }
+        )
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner.caller, "_speech_end_after_playout", future_speech_end),
+            self.assertRaises(runner.PartialCaptureFailure) as caught,
+        ):
+            await capture_script(
+                "android-selected-room",
+                ["First@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+        self.assertEqual(caught.exception.failure["turn"], 1)
+        self.assertEqual(caught.exception.turns, [])
+        self.assertEqual(
+            caught.exception.failure["message"],
+            "transcription returned no agent audio after speech end",
+        )
+
+    async def assert_partial_failure(self, dependencies):
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            with self.assertRaises(runner.PartialCaptureFailure) as caught:
+                await capture_script(
+                    "android-selected-room",
+                    ["First@0::answer", "Second@0::answer"],
+                    dependencies=dependencies,
+                    room_close_after=None,
+                )
+        self.assertEqual(caught.exception.failure["turn"], 2)
+        self.assertTrue(caught.exception.failure["message"])
+        self.assertEqual(len(caught.exception.turns), 1)
+        self.assertEqual(caught.exception.turns[0]["turn"], 1)
+        self.assertEqual(caught.exception.turns[0]["transcript"], "answer")
+
     async def test_missing_audio_transcript_and_room_deletion_fail_closed(self):
         for failure, expected in (
             ("audio", "no frames"),
@@ -660,6 +801,74 @@ class ScenarioObservationTests(unittest.TestCase):
             ["action", "action"],
         )
 
+    def test_partial_observation_keeps_completed_wrong_answer_as_product_failure(self):
+        import json
+        from subprocess import CompletedProcess
+
+        scenario = SCENARIOS[2]
+        grant = {
+            "token": "header.payload.signature",
+            "room": "partial-product-room",
+            "url": "wss://livekit.invalid",
+        }
+        trace = {
+            "turn": 1,
+            "room": grant["room"],
+            "line": scenario.caller_lines[0],
+            "transcript": "Wrong park.",
+            "speech_started_at": 100.0,
+            "speech_end": 101.0,
+            "first_audio": 102.0,
+            "overlap": False,
+            "capture_started": 101.5,
+            "segments": [{"start": 0.2, "end": 0.5, "text": "Wrong park."}],
+            "room_deleted": None,
+        }
+        capture = {
+            "turns": [trace],
+            "failure": {
+                "turn": 2,
+                "message": "scripted speech synthesis exceeded its deadline",
+            },
+        }
+        record = "".join(
+            json.dumps(message) + "\n"
+            for message in (
+                {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1", "model": "claude-opus-5"}}},
+                {"type": "result", "session_id": "voice-partial-product-room"},
+            )
+        )
+        voice_log = 'INFO eval-delegation {"id":"d1","created_at":100.5}\n'
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, json.dumps(capture), "")
+
+            def run_remote(self, command):
+                if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
+                    output = ""
+                elif command == ["sudo", "cat", "voice.log"]:
+                    output = voice_log
+                elif command == ["sudo", "cat", "records/voice-partial-product-room.jsonl"]:
+                    output = record
+                else:
+                    raise AssertionError(f"unexpected remote command {command!r}")
+                return CompletedProcess(command, 0, output, "")
+
+        with patch.object(runner, "_voice_token", return_value=grant):
+            observation = runner.observe_scenario(scenario, Stack())
+
+        self.assertEqual(observation["turns"][0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+        self.assertEqual(observation["failure"], capture["failure"])
+        product_failures = observation["product_failures"]
+        self.assertTrue(any(failure["turn"] == 1 for failure in product_failures))
+        self.assertTrue(any("missing answer pattern" in failure["message"] for failure in product_failures))
+
     def test_every_scenario_script_fits_the_single_room_capture_format(self):
         for scenario in SCENARIOS:
             with self.subTest(scenario=scenario.name):
@@ -669,6 +878,90 @@ class ScenarioObservationTests(unittest.TestCase):
                     [runner.caller.parse_step(step)[1] for step in steps],
                     list(scenario.caller_lines),
                 )
+
+    def test_partial_capture_envelope_is_strict_and_complete_envelopes_stay_unchanged(self):
+        import json
+
+        trace = {"turn": 1, "speech_started_at": 1_699_999_999.0}
+        partial = json.dumps({
+            "turns": [trace],
+            "failure": {
+                "turn": 2,
+                "message": "transcription returned no agent audio after speech end",
+                "speech_started_at": 1_700_000_000.0,
+            },
+        })
+        self.assertEqual(runner._capture_envelope(partial, 2), (
+            [trace],
+            {
+                "turn": 2,
+                "message": "transcription returned no agent audio after speech end",
+                "speech_started_at": 1_700_000_000.0,
+            },
+        ))
+        first_turn_failure = json.dumps({
+            "turns": [],
+            "failure": {
+                "turn": 1,
+                "message": "scripted speech synthesis exceeded its deadline",
+            },
+        })
+        self.assertEqual(
+            runner._capture_envelope(first_turn_failure, 2),
+            ([], {"turn": 1, "message": "scripted speech synthesis exceeded its deadline"}),
+        )
+        started_failure = json.dumps({
+            "turns": [],
+            "failure": {
+                "turn": 1,
+                "message": "transcription returned no agent audio after speech end",
+                "speech_started_at": 1_700_000_000.0,
+            },
+        })
+        self.assertEqual(
+            runner._capture_envelope(started_failure, 2)[1]["speech_started_at"],
+            1_700_000_000.0,
+        )
+        complete = json.dumps({"turns": [trace, {"turn": 2}]})
+        self.assertEqual(runner._capture_envelope(complete, 2), ([trace, {"turn": 2}], None))
+        for malformed in (
+            {"turns": [trace], "failure": {"turn": True, "message": "room was deleted before all scripted lines were captured"}},
+            {"turns": [trace], "failure": {"turn": 3, "message": "room was deleted before all scripted lines were captured"}},
+            {"turns": [trace], "failure": {"turn": 2, "message": "unrecognized failure"}},
+            {"turns": [trace], "failure": {"turn": 2, "message": "transcription returned no agent audio after speech end"}},
+            {"turns": [trace], "failure": {"turn": 2, "message": "scripted speech synthesis exceeded its deadline", "speech_started_at": 1_700_000_000.0}},
+            {"turns": [], "failure": {"turn": 1, "message": "room was deleted before all scripted lines were captured"}},
+            {"turns": [trace], "failure": None},
+            {"turns": [trace], "extra": "not allowed"},
+        ):
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                RuntimeError, "invalid"
+            ):
+                runner._capture_envelope(json.dumps(malformed), 2)
+
+    def test_remote_cli_emits_partial_capture_envelope_with_zero_completed_turns(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        async def fail_before_first_turn(_room, _steps, *, room_close_after):
+            self.assertEqual(room_close_after, 1)
+            raise runner.PartialCaptureFailure(
+                [], 1, "scripted speech synthesis exceeded its deadline"
+            )
+
+        output = io.StringIO()
+        with patch.object(runner, "run_remote_capture", fail_before_first_turn), redirect_stdout(output):
+            result = runner.main(["android-selected-room", "Question@0::answer"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), {
+            "turns": [],
+            "failure": {
+                "turn": 1,
+                "message": "scripted speech synthesis exceeded its deadline",
+            },
+        })
 
     def test_missing_or_malformed_evidence_fails_closed(self):
         class Response:
@@ -700,6 +993,63 @@ class ScenarioObservationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no transcript segment timestamps"):
             runner._confirmation_time({"capture_started": 5.0, "segments": []})
 
+    def test_first_turn_tts_failure_keeps_named_observation_without_sdk_record(self):
+        import json
+        from subprocess import CompletedProcess
+
+        grant = {
+            "token": "header.payload.signature",
+            "room": "room-zero-turn",
+            "url": "wss://livekit.invalid",
+            "expires_at": "2026-09-26T22:00:00Z",
+        }
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def __init__(self):
+                self.remote_commands = []
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, _command, **_kwargs):
+                return CompletedProcess(
+                    [],
+                    0,
+                    json.dumps({
+                        "turns": [],
+                        "failure": {
+                            "turn": 1,
+                            "message": "scripted speech synthesis exceeded its deadline",
+                        },
+                    }),
+                    "",
+                )
+
+            def run_remote(self, command):
+                self.remote_commands.append(command)
+                if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
+                    return CompletedProcess(command, 0, "", "")
+                if command == ["sudo", "cat", "voice.log"]:
+                    return CompletedProcess(command, 0, "", "")
+                raise AssertionError(f"SDK recording should not be read: {command!r}")
+
+        stack = Stack()
+        with patch.object(runner, "_voice_token", return_value=grant):
+            observation = runner.observe_scenario(SCENARIOS[0], stack)
+
+        self.assertEqual(observation["turns"], [])
+        self.assertEqual(observation["failure"]["turn"], 1)
+        self.assertEqual(
+            observation["failure"]["message"],
+            "scripted speech synthesis exceeded its deadline",
+        )
+        self.assertNotIn(
+            ["sudo", "cat", "records/voice-room-zero-turn.jsonl"],
+            stack.remote_commands,
+        )
+
     def test_backend_results_follow_delegation_timing_not_transcript_text(self):
         traces = [
             {
@@ -728,6 +1078,61 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertEqual([len(trace["model_calls"]) for trace in attributed], [0, 1])
         self.assertEqual(traces[1]["line"], "Okay, who was she?")
         self.assertEqual(traces[1]["transcript"], "Okay who was she?")
+
+    def test_partial_capture_attributes_calls_using_wall_clock_turn_starts_only(self):
+        traces = [{
+            "turn": 1,
+            "speech_started_at": 1_700_000_000.0,
+            "first_audio": 190_000.0,
+        }]
+        voice_log = (
+            'eval-delegation {"id":"d1","created_at":1700000000.5}\n'
+            'eval-delegation {"id":"d2","created_at":1700000002.5}\n'
+        )
+        recorded_turns = [
+            {"model_calls": [{"id": "m1", "model": "claude-opus-5"}], "phone_tools": []},
+            {"model_calls": [{"id": "m2", "model": "claude-opus-5"}], "phone_tools": []},
+        ]
+
+        runner._attribute_model_calls(
+            traces,
+            voice_log,
+            recorded_turns,
+            partial_capture=True,
+            failure_started_at=1_700_000_002.0,
+        )
+
+        self.assertEqual(traces[0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+
+    def test_partial_failed_turn_keeps_tool_attribution_without_backend_metric(self):
+        traces = [{
+            "turn": 1,
+            "speech_started_at": 1_700_000_000.0,
+            "first_audio": 190_000.0,
+        }]
+        voice_log = (
+            'eval-delegation {"id":"d1","created_at":1700000000.5}\n'
+            'eval-delegation {"id":"d2","created_at":1700000002.5}\n'
+        )
+        recorded_turns = [
+            {"model_calls": [{"id": "m1", "model": "claude-opus-5"}], "phone_tools": []},
+            {
+                "model_calls": [{"id": "m2", "model": "claude-opus-5"}],
+                "phone_tools": [{"turn": 2, "kind": "navigate"}],
+            },
+        ]
+
+        runner._attribute_model_calls(
+            traces,
+            voice_log,
+            recorded_turns,
+            partial_capture=True,
+            failure_started_at=1_700_000_002.0,
+            failure_turn=2,
+        )
+
+        self.assertEqual(traces[0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+        self.assertEqual(recorded_turns[1]["phone_tools"][0]["turn"], 2)
 
     def test_unmatched_or_ambiguous_backend_evidence_fails_closed(self):
         traces = [
@@ -1041,6 +1446,62 @@ class LocalEvalCliTests(unittest.TestCase):
         report = json.loads(output[0])
         self.assertFalse(report["passed"])
         self.assertTrue(any("deliberate scenario failure" in failure for failure in report["failures"]))
+    def test_partial_case_is_scored_and_fails_eval_with_named_turn(self):
+        import io
+        import json
+        from contextlib import contextmanager, redirect_stdout
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+
+        def observe(scenario, _stack):
+            turns = []
+            for index, expectation in enumerate(scenario.turns, 1):
+                turns.append({
+                    "kind": "search" if not scenario.commands or (scenario.place_query and index == 1) else "action",
+                    "speech_end": 10.0,
+                    "first_audio": 11.0,
+                    "overlap": False,
+                    "expect_confirmation": expectation.sms_recipient is not None,
+                    "confirmation": 12.0 if expectation.sms_recipient is not None else None,
+                    "expect_hangup": scenario.room_close_after == index,
+                    "room_deleted": 13.0 if scenario.room_close_after == index else None,
+                    "model_calls": [{"model": "claude-opus-5"}],
+                })
+            if scenario is SCENARIOS[2]:
+                return {
+                    "turns": turns[:1],
+                    "failure": {
+                        "turn": 2,
+                        "message": "room was deleted before all scripted lines were captured",
+                    },
+                    "product_failures": [
+                        {"turn": 1, "message": "turn 1 missing answer pattern 'Alice Keck Park'"}
+                    ],
+                }
+            return {"turns": turns}
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            redirect_stdout(output),
+        ):
+            result = runner.main(["eval", "--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(report["passed"])
+        case_report = report["cases"][2]
+        self.assertEqual(len(case_report["turns"]), 1)
+        self.assertEqual(case_report["turns"][0]["model_call_count"], 1)
+        self.assertEqual(case_report["turns"][0]["latency_seconds"]["first_audio"], 1.0)
+        failures = " ".join(case_report["failures"])
+        self.assertIn("place-search-navigation run 1 turn 1", failures)
+        self.assertIn("missing answer pattern 'Alice Keck Park'", failures)
+        self.assertIn("place-search-navigation run 1 turn 2", failures)
+        self.assertIn("room was deleted before all scripted lines were captured", failures)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,27 @@ PHONE_TOOL_KINDS = {
 }
 
 
+class DeadlineExceeded(RuntimeError):
+    """A bounded capture operation did not complete before its deadline."""
+
+
+class PartialCaptureFailure(RuntimeError):
+    """A scripted turn failed after earlier turns were captured completely."""
+
+    def __init__(
+        self,
+        turns: list[dict[str, Any]],
+        turn: int,
+        message: str,
+        speech_started_at: float | None = None,
+    ):
+        super().__init__(message)
+        self.turns = turns
+        self.failure = {"turn": turn, "message": message}
+        if speech_started_at is not None:
+            self.failure["speech_started_at"] = speech_started_at
+
+
 @dataclass(frozen=True)
 class CaptureDependencies:
     """Live services and caller primitives, injectable for offline tests."""
@@ -85,7 +106,7 @@ async def _with_deadline(awaitable: Any, timeout: float, label: str) -> Any:
     try:
         return await asyncio.wait_for(awaitable, timeout=timeout)
     except TimeoutError as error:
-        raise RuntimeError(f"{label} exceeded its deadline") from error
+        raise DeadlineExceeded(f"{label} exceeded its deadline") from error
 
 
 def _finite_timestamp(value: Any, label: str) -> float:
@@ -319,11 +340,16 @@ async def capture_script(
 
         for index, step in enumerate(steps):
             await quiet(step.delay)
-            pcm = await _with_deadline(
-                dependencies.tts(dependencies.http, step.line),
-                REMOTE_OPERATION_DEADLINE_SECONDS,
-                "scripted speech synthesis",
-            )
+            try:
+                pcm = await _with_deadline(
+                    dependencies.tts(dependencies.http, step.line),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "scripted speech synthesis",
+                )
+            except DeadlineExceeded as error:
+                if str(error) == "scripted speech synthesis exceeded its deadline":
+                    raise PartialCaptureFailure(traces, index + 1, str(error)) from error
+                raise
             capture_end = asyncio.Event()
             capture = dependencies.capture_factory(answer_tracks, capture_end)
             await _with_deadline(
@@ -370,7 +396,17 @@ async def capture_script(
             transcript = _trace_text(segments)
             if not transcript:
                 raise RuntimeError("transcription returned an empty transcript")
-            first_audio, overlap = _first_audio_after(capture_started, speech_end, segments)
+            try:
+                first_audio, overlap = _first_audio_after(capture_started, speech_end, segments)
+            except RuntimeError as error:
+                if str(error) == "transcription returned no agent audio after speech end":
+                    raise PartialCaptureFailure(
+                        traces,
+                        index + 1,
+                        str(error),
+                        speech_started_at=speech_started_at,
+                    ) from error
+                raise
             trace = {
                 "turn": index + 1,
                 "room": room_name,
@@ -393,8 +429,18 @@ async def capture_script(
                 if trace["room_deleted"] < speech_end:
                     raise RuntimeError("room deletion timestamp precedes speech end")
                 if index < len(steps) - 1:
-                    raise RuntimeError("room was deleted before all scripted lines were captured")
+                    raise PartialCaptureFailure(
+                        traces,
+                        index + 2,
+                        "room was deleted before all scripted lines were captured",
+                    )
             elif not await _room_exists(api_client, dependencies.api, room_name):
+                if index < len(steps) - 1:
+                    raise PartialCaptureFailure(
+                        traces,
+                        index + 2,
+                        "room was deleted before all scripted lines were captured",
+                    )
                 raise RuntimeError("room was deleted before all scripted lines were captured")
         return traces
     finally:
@@ -476,7 +522,13 @@ def _eval_delegations(voice_log: str) -> list[dict[str, Any]]:
 
 
 def _attribute_model_calls(
-    traces: list[dict[str, Any]], voice_log: str, recorded_turns: list[dict[str, Any]]
+    traces: list[dict[str, Any]],
+    voice_log: str,
+    recorded_turns: list[dict[str, Any]],
+    *,
+    partial_capture: bool = False,
+    failure_started_at: float | None = None,
+    failure_turn: int | None = None,
 ) -> list[dict[str, Any]]:
     all_delegations = _eval_delegations(voice_log)
     starts = []
@@ -488,9 +540,18 @@ def _attribute_model_calls(
             raise RuntimeError("captured caller speech start timestamps are ambiguous or out of order")
         starts.append(started_at)
         trace["model_calls"] = []
+    if failure_started_at is not None:
+        failure_started_at = _finite_timestamp(
+            failure_started_at, "failed caller speech start"
+        )
+        if starts and failure_started_at <= starts[-1]:
+            raise RuntimeError("partial failure speech start is ambiguous or out of order")
 
+    start_boundary = starts[0] if starts else failure_started_at
     delegations = [
-        marker for marker in all_delegations if not starts or marker["created_at"] >= starts[0]
+        marker
+        for marker in all_delegations
+        if start_boundary is not None and marker["created_at"] >= start_boundary
     ]
     if len(delegations) != len(recorded_turns):
         raise RuntimeError("delegation and SDK result counts differ")
@@ -499,15 +560,51 @@ def _attribute_model_calls(
         created_at = delegation["created_at"]
         if created_at in starts:
             raise RuntimeError("ambiguous delegation timestamp coincides with caller speech start")
-        turn_index = next(
-            (index for index in range(len(starts) - 1, -1, -1) if starts[index] < created_at),
-            None,
-        )
-        if turn_index is None:
-            raise RuntimeError("no captured turn precedes delegation")
         model_calls = recorded.get("model_calls") if isinstance(recorded, dict) else None
         if not isinstance(model_calls, list):
             raise RuntimeError("recorded SDK result has invalid model-call evidence")
+        if not starts:
+            if partial_capture:
+                continue
+            raise RuntimeError("no captured turn precedes delegation")
+        if partial_capture:
+            turn_index = next(
+                (
+                    index
+                    for index in range(len(starts) - 1, -1, -1)
+                    if starts[index] < created_at
+                    and (
+                        (index + 1 < len(starts) and created_at < starts[index + 1])
+                        or (index + 1 == len(starts) and (
+                            failure_started_at is None or created_at < failure_started_at
+                        ))
+                    )
+                ),
+                None,
+            )
+            if turn_index is None:
+                if failure_started_at is not None and created_at >= failure_started_at:
+                    phone_tools = recorded.get("phone_tools", [])
+                    if phone_tools:
+                        if (
+                            isinstance(failure_turn, bool)
+                            or not isinstance(failure_turn, int)
+                            or failure_turn != len(starts) + 1
+                        ):
+                            raise RuntimeError("failed-turn phone tools have no valid turn attribution")
+                        for tool in phone_tools:
+                            if not isinstance(tool, dict):
+                                raise RuntimeError("recorded SDK result has invalid phone-tool evidence")
+                            tool["turn"] = failure_turn
+                    continue
+                raise RuntimeError("no captured turn precedes delegation")
+        else:
+            turn_index = next(
+                (index for index in range(len(starts) - 1, -1, -1) if starts[index] < created_at),
+                None,
+            )
+            if turn_index is None:
+                raise RuntimeError("no captured turn precedes delegation")
         traces[turn_index]["model_calls"].extend(model_calls)
         for tool in recorded.get("phone_tools", []):
             tool["turn"] = turn_index + 1
@@ -679,6 +776,59 @@ def _completed_stdout(result: Any, label: str) -> str:
     return stdout
 
 
+def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("remote scripted capture returned malformed JSON") from error
+    if not isinstance(payload, dict) or set(payload) not in ({"turns"}, {"turns", "failure"}):
+        raise RuntimeError("remote scripted capture returned an invalid envelope")
+    traces = payload.get("turns")
+    if not isinstance(traces, list) or len(traces) > expected_turns:
+        raise RuntimeError("remote scripted capture returned missing or invalid turns")
+    if "failure" not in payload:
+        if len(traces) != expected_turns or not traces:
+            raise RuntimeError("remote scripted capture returned missing or incomplete turns")
+        return traces, None
+    failure = payload["failure"]
+    allowed_failure_fields = (
+        {"turn", "message"},
+        {"turn", "message", "speech_started_at"},
+    )
+    if (
+        not isinstance(failure, dict)
+        or set(failure) not in allowed_failure_fields
+        or isinstance(failure.get("turn"), bool)
+        or not isinstance(failure.get("turn"), int)
+        or failure["turn"] != len(traces) + 1
+        or failure["turn"] > expected_turns
+        or failure.get("message") not in {
+            "scripted speech synthesis exceeded its deadline",
+            "transcription returned no agent audio after speech end",
+            "room was deleted before all scripted lines were captured",
+        }
+        or (
+            failure.get("message") == "transcription returned no agent audio after speech end"
+        ) != ("speech_started_at" in failure)
+        or (
+            failure.get("message") == "room was deleted before all scripted lines were captured"
+            and not traces
+        )
+    ):
+        raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
+    if "speech_started_at" in failure:
+        failure_started_at = _finite_timestamp(
+            failure["speech_started_at"], "failed caller speech start"
+        )
+        if traces and not isinstance(traces[-1], dict):
+            raise RuntimeError("remote scripted capture returned invalid partial turn metadata")
+        if traces and failure_started_at <= _finite_timestamp(
+            traces[-1].get("speech_started_at"), "caller speech start"
+        ):
+            raise RuntimeError("partial failure speech start is ambiguous or out of order")
+    return traces, failure
+
+
 def _voice_token(base_url: str) -> dict[str, Any]:
     parsed = urlsplit(base_url)
     try:
@@ -764,30 +914,47 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
         livekit_url=grant["url"],
     )
     capture_text = _completed_stdout(capture, "remote scripted capture")
-    try:
-        capture_data = json.loads(capture_text)
-    except json.JSONDecodeError as error:
-        raise RuntimeError("remote scripted capture returned malformed JSON") from error
-    traces = capture_data.get("turns") if isinstance(capture_data, dict) else None
-    if not isinstance(traces, list) or len(traces) != len(scenario.turns):
-        raise RuntimeError("remote scripted capture returned missing or incomplete turns")
+    traces, capture_failure = _capture_envelope(capture_text, len(scenario.turns))
 
     phone_log_path = "voice/" + FAKE_PHONE_LOG
     phone_text = _completed_stdout(stack.run_remote(["sudo", "cat", phone_log_path]), "fake phone log read")
     phone_commands = _phone_commands(_json_lines(phone_text, "fake phone"))
-    voice_log = _completed_stdout(stack.run_remote(["sudo", "cat", "voice.log"]), "voice worker log read")
-    session_id = "voice-" + room
-    record_path = "records/" + quote(session_id, safe="") + ".jsonl"
-    record_text = _completed_stdout(
-        stack.run_remote(["sudo", "cat", record_path]), "daemon SDK recording read"
+    sdk_recording_applicable = not (
+        not traces
+        and capture_failure is not None
+        and capture_failure["message"] == "scripted speech synthesis exceeded its deadline"
+        and "speech_started_at" not in capture_failure
     )
-    recorded_turns = _recorded_turns(_json_lines(record_text, "SDK recording"))
-    traces = _attribute_model_calls(traces, voice_log, recorded_turns)
+    if sdk_recording_applicable:
+        voice_log = _completed_stdout(
+            stack.run_remote(["sudo", "cat", "voice.log"]), "voice worker log read"
+        )
+        session_id = "voice-" + room
+        record_path = "records/" + quote(session_id, safe="") + ".jsonl"
+        record_text = _completed_stdout(
+            stack.run_remote(["sudo", "cat", record_path]), "daemon SDK recording read"
+        )
+        recorded_turns = _recorded_turns(_json_lines(record_text, "SDK recording"))
+    else:
+        voice_log = ""
+        recorded_turns = []
+    traces = _attribute_model_calls(
+        traces,
+        voice_log,
+        recorded_turns,
+        partial_capture=capture_failure is not None,
+        failure_started_at=(
+            capture_failure.get("speech_started_at")
+            if capture_failure is not None
+            else None
+        ),
+        failure_turn=(capture_failure.get("turn") if capture_failure is not None else None),
+    )
     phone_commands = _match_phone_tools(phone_commands, recorded_turns)
 
     room_deleted_turns = []
     for index, (trace, expected) in enumerate(
-        zip(traces, scenario.turns, strict=True), 1
+        zip(traces, scenario.turns), 1
     ):
         if not isinstance(trace, dict) or trace.get("turn") != index or trace.get("room") != room:
             raise RuntimeError(f"captured turn {index} has invalid turn or room identity")
@@ -814,10 +981,38 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     if len(room_deleted_turns) > 1:
         raise RuntimeError("capture observed room deletion more than once")
     room_closed_after = room_deleted_turns[0] if room_deleted_turns else None
-    from evals.scenarios import evaluate_scenario
+    from evals.scenarios import evaluate_scenario, evaluate_scenario_prefix
 
-    evaluate_scenario(scenario, [trace["transcript"] for trace in traces], phone_commands, room_closed_after)
-    return {"room": room, "turns": traces, "phone_commands": phone_commands, "room_closed_after": room_closed_after}
+    transcripts = [trace["transcript"] for trace in traces]
+    product_failures = []
+    if capture_failure is None:
+        evaluate_scenario(
+            scenario,
+            transcripts,
+            phone_commands,
+            room_closed_after,
+        )
+    else:
+        product_failures = [
+            {"turn": failure.turn, "message": failure.message}
+            for failure in evaluate_scenario_prefix(
+                scenario,
+                transcripts,
+                phone_commands,
+                room_closed_after,
+                failed_turn=capture_failure["turn"],
+            )
+        ]
+    observation = {
+        "room": room,
+        "turns": traces,
+        "phone_commands": phone_commands,
+        "room_closed_after": room_closed_after,
+    }
+    if capture_failure is not None:
+        observation["failure"] = capture_failure
+        observation["product_failures"] = product_failures
+    return observation
 
 
 async def _run_remote_capture_with_fake_phone(
@@ -964,7 +1159,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run_local_eval(arguments[1:])
     room, steps, room_close_after = _parse_arguments(arguments)
     capture = _run_remote_capture_with_fake_phone if "--fake-phone" in arguments else run_remote_capture
-    traces = asyncio.run(capture(room, steps, room_close_after=room_close_after))
+    try:
+        traces = asyncio.run(capture(room, steps, room_close_after=room_close_after))
+    except PartialCaptureFailure as error:
+        envelope = {"turns": error.turns, "failure": error.failure}
+        print(json.dumps(envelope, separators=(",", ":")), flush=True)
+        return 0
     print(json.dumps({"turns": traces}, separators=(",", ":")), flush=True)
     return 0
 

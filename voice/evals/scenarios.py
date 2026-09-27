@@ -203,106 +203,281 @@ def _sms_body_tokens(body: str) -> tuple[str, ...]:
     return tuple(re.findall(r"[a-z0-9]+", normalized.lower()))
 
 
-def evaluate_scenario(
+@dataclass(frozen=True)
+class ScenarioFailure:
+    """A product-level scenario failure attributed to its assistant turn."""
+
+    turn: int
+    message: str
+
+
+def _scenario_failures(
     scenario: Scenario,
     turns: list[str],
     phone_commands: list[Mapping[str, Any]],
     room_closed_after: int | None,
-) -> None:
-    """Assert recorded answers, phone commands, and room close match a scenario.
+    *,
+    complete: bool,
+    failed_turn: int | None = None,
+) -> list[ScenarioFailure]:
+    failures: list[ScenarioFailure] = []
 
-    ``turn`` in each command is one-based and identifies the assistant turn
-    that issued it. Every expected answer pattern must occur in its turn;
-    unexpected, missing, duplicate, mistimed, and incorrectly parameterized
-    commands fail the evaluation.
-    """
-    _require(
-        len(turns) == len(scenario.turns),
-        f"{scenario.name}: expected {len(scenario.turns)} recorded turns, got {len(turns)}",
-    )
+    def fail(turn: int, message: str) -> None:
+        failures.append(ScenarioFailure(turn=turn, message=message))
+
+    def require(condition: bool, turn: int, message: str) -> bool:
+        if not condition:
+            fail(turn, message)
+        return condition
+
+    if len(turns) > len(scenario.turns):
+        fail(
+            len(scenario.turns) + 1,
+            f"{scenario.name}: expected at most {len(scenario.turns)} recorded turns, got {len(turns)}",
+        )
+        return failures
+    if complete and len(turns) != len(scenario.turns):
+        fail(
+            max(1, len(turns) + 1),
+            f"{scenario.name}: expected {len(scenario.turns)} recorded turns, got {len(turns)}",
+        )
+
     spoken_sms: dict[int, tuple[str, str]] = {}
-    for turn_number, (text, expectation) in enumerate(zip(turns, scenario.turns, strict=True), 1):
+    for turn_number, (text, expectation) in enumerate(
+        zip(turns, scenario.turns, strict=False), 1
+    ):
+        if not isinstance(text, str):
+            fail(turn_number, f"{scenario.name}: turn {turn_number} has no transcript text")
+            continue
         for pattern in expectation.answer_patterns:
-            _require(
+            require(
                 re.search(pattern, text, re.IGNORECASE) is not None,
+                turn_number,
                 f"{scenario.name}: turn {turn_number} missing answer pattern {pattern!r}; got {text!r}",
             )
         for pattern in expectation.reject_patterns:
-            _require(
+            require(
                 re.search(pattern, text, re.IGNORECASE) is None,
+                turn_number,
                 f"{scenario.name}: turn {turn_number} contains an uncertain non-answer matching {pattern!r}",
             )
         if expectation.sms_recipient is not None or expectation.sms_body is not None:
-            _require(
+            if not require(
                 expectation.sms_recipient is not None and expectation.sms_body is not None,
+                turn_number,
                 f"{scenario.name}: turn {turn_number} must define both SMS recipient and body",
-            )
-            body = _spoken_sms_body(text, expectation.sms_recipient, scenario.name, turn_number)
-            _require(
-                _sms_body_tokens(body) == _sms_body_tokens(expectation.sms_body),
-                f"{scenario.name}: turn {turn_number} said back {body!r}, expected {expectation.sms_body!r}",
-            )
-            spoken_sms[turn_number] = (expectation.sms_recipient, expectation.sms_body)
+            ):
+                continue
+            try:
+                body = _spoken_sms_body(text, expectation.sms_recipient, scenario.name, turn_number)
+            except AssertionError as error:
+                fail(turn_number, str(error))
+            else:
+                if require(
+                    _sms_body_tokens(body) == _sms_body_tokens(expectation.sms_body),
+                    turn_number,
+                    f"{scenario.name}: turn {turn_number} said back {body!r}, expected {expectation.sms_body!r}",
+                ):
+                    spoken_sms[turn_number] = (expectation.sms_recipient, expectation.sms_body)
 
-    expected_commands = scenario.commands
-    _require(
-        len(phone_commands) == len(expected_commands),
-        f"{scenario.name}: expected {len(expected_commands)} phone commands, got {len(phone_commands)}",
-    )
-    for index, (expected, actual) in enumerate(zip(expected_commands, phone_commands, strict=True), 1):
+    def check_command(
+        index: int,
+        expected: Mapping[str, Any],
+        actual: Mapping[str, Any],
+        command_turn: int,
+    ) -> None:
         for field, value in expected.items():
-            _require(
+            require(
                 field in actual and actual[field] == value,
+                command_turn,
                 f"{scenario.name}: command {index} expected {field}={value!r}, "
                 f"got {actual.get(field)!r}",
             )
         if actual.get("kind") == "sms":
             command_turn = actual.get("turn")
-            _require(
-                isinstance(command_turn, int),
+            if not require(
+                isinstance(command_turn, int) and not isinstance(command_turn, bool),
+                _command_failure_turn([expected], [actual], len(turns)),
                 f"{scenario.name}: SMS command {index} has no integer turn",
-            )
+            ):
+                return
             earlier_confirmations = [turn for turn in spoken_sms if turn < command_turn]
-            _require(
+            if not require(
                 bool(earlier_confirmations),
+                command_turn,
                 f"{scenario.name}: SMS command {index} preceded its message say-back",
-            )
+            ):
+                return
             confirmed_recipient, confirmed_body = spoken_sms[max(earlier_confirmations)]
-            _require(
+            require(
                 actual.get("to") == confirmed_recipient and actual.get("body") == confirmed_body,
+                command_turn,
                 f"{scenario.name}: SMS command {index} did not match the latest confirmed message",
             )
 
         if scenario.place_query is not None and actual.get("kind") == "navigate":
             name = actual.get("name")
-            _require(
+            require(
                 isinstance(name, str) and re.search(scenario.selected_place_pattern or r"(?!)", name),
+                command_turn,
                 f"{scenario.name}: navigation selected an unexpected place name {name!r}",
             )
-            _require(
-                name in turns[0],
+            require(
+                bool(turns) and isinstance(name, str) and name in turns[0],
+                command_turn,
                 f"{scenario.name}: navigation target {name!r} was not among the spoken search results",
             )
-            _require(
+            require(
                 isinstance(actual.get("address"), str) and bool(actual["address"].strip()),
+                command_turn,
                 f"{scenario.name}: navigation command has no result address",
             )
-            _require(
+            require(
                 isinstance(actual.get("place_id"), str) and bool(actual["place_id"].strip()),
+                command_turn,
                 f"{scenario.name}: navigation command has no returned place id",
             )
-            _require(
+            require(
                 isinstance(actual.get("lat"), (int, float))
                 and not isinstance(actual.get("lat"), bool)
                 and math.isfinite(actual["lat"])
                 and isinstance(actual.get("lng"), (int, float))
                 and not isinstance(actual.get("lng"), bool)
                 and math.isfinite(actual["lng"]),
+                command_turn,
                 f"{scenario.name}: navigation command has invalid coordinates",
             )
 
-    _require(
-        room_closed_after == scenario.room_close_after,
-        f"{scenario.name}: expected room close after turn {scenario.room_close_after!r}, "
-        f"got {room_closed_after!r}",
+    if complete:
+        expected_commands = scenario.commands
+        if not require(
+            len(phone_commands) == len(expected_commands),
+            _command_failure_turn(list(expected_commands), phone_commands, len(turns)),
+            f"{scenario.name}: expected {len(expected_commands)} phone commands, got {len(phone_commands)}",
+        ):
+            return failures
+        for index, (expected, actual) in enumerate(
+            zip(expected_commands, phone_commands, strict=True), 1
+        ):
+            command_turn = _command_failure_turn([expected], [actual], len(turns))
+            if not isinstance(actual, Mapping):
+                fail(command_turn, f"{scenario.name}: command {index} is not an object")
+                continue
+            check_command(index, expected, actual, command_turn)
+    else:
+        observed_through = len(turns)
+        if failed_turn is not None:
+            if (
+                isinstance(failed_turn, bool)
+                or not isinstance(failed_turn, int)
+                or failed_turn != len(turns) + 1
+                or failed_turn > len(scenario.turns)
+            ):
+                fail(max(1, len(turns) + 1), f"{scenario.name}: invalid partial failure turn")
+                return failures
+            observed_through = failed_turn
+
+        expected_by_turn: dict[int, list[Mapping[str, Any]]] = {}
+        actual_by_turn: dict[int, list[Mapping[str, Any]]] = {}
+        for expected in scenario.commands:
+            command_turn = expected.get("turn")
+            if isinstance(command_turn, int) and command_turn <= observed_through:
+                expected_by_turn.setdefault(command_turn, []).append(expected)
+        for command in phone_commands:
+            if not isinstance(command, Mapping):
+                fail(max(1, observed_through), f"{scenario.name}: fake phone command is not an object")
+                continue
+            command_turn = command.get("turn")
+            if isinstance(command_turn, bool) or not isinstance(command_turn, int) or command_turn < 1:
+                fail(max(1, observed_through), f"{scenario.name}: phone command has no valid turn")
+                continue
+            if command_turn > observed_through:
+                fail(command_turn, f"{scenario.name}: phone command occurred after the failed turn")
+                continue
+            actual_by_turn.setdefault(command_turn, []).append(command)
+
+        for command_turn in range(1, observed_through + 1):
+            expected_turn_commands = expected_by_turn.get(command_turn, [])
+            actual_turn_commands = actual_by_turn.get(command_turn, [])
+            if command_turn == failed_turn and not actual_turn_commands:
+                continue
+            require(
+                len(expected_turn_commands) == len(actual_turn_commands),
+                command_turn,
+                f"{scenario.name}: expected {len(expected_turn_commands)} phone commands, "
+                f"got {len(actual_turn_commands)}",
+            )
+            for index, (expected, actual) in enumerate(
+                zip(expected_turn_commands, actual_turn_commands), 1
+            ):
+                check_command(index, expected, actual, command_turn)
+
+    if complete:
+        close_turn = (
+            room_closed_after
+            if room_closed_after is not None
+            else scenario.room_close_after or max(1, len(turns))
+        )
+        require(
+            room_closed_after == scenario.room_close_after,
+            close_turn,
+            f"{scenario.name}: expected room close after turn {scenario.room_close_after!r}, "
+            f"got {room_closed_after!r}",
+        )
+    elif room_closed_after is not None and room_closed_after != scenario.room_close_after:
+        fail(
+            room_closed_after,
+            f"{scenario.name}: room closed after unexpected turn {room_closed_after}",
+        )
+    return failures
+
+
+def _command_failure_turn(
+    expected_commands: list[Mapping[str, Any]],
+    phone_commands: list[Mapping[str, Any]],
+    completed_turns: int,
+) -> int:
+    for command in phone_commands:
+        turn = command.get("turn") if isinstance(command, Mapping) else None
+        if isinstance(turn, int) and not isinstance(turn, bool) and turn > 0:
+            return turn
+    for command in expected_commands:
+        turn = command.get("turn")
+        if isinstance(turn, int) and not isinstance(turn, bool) and turn > 0:
+            return turn
+    return max(1, completed_turns)
+
+
+def evaluate_scenario_prefix(
+    scenario: Scenario,
+    turns: list[str],
+    phone_commands: list[Mapping[str, Any]],
+    room_closed_after: int | None,
+    *,
+    failed_turn: int | None = None,
+) -> list[ScenarioFailure]:
+    """Return scenario truth failures for a complete, contiguous turn prefix."""
+    if not isinstance(turns, list) or not isinstance(phone_commands, list):
+        raise ValueError("scenario prefix turns and phone commands must be lists")
+    return _scenario_failures(
+        scenario,
+        turns,
+        phone_commands,
+        room_closed_after,
+        complete=False,
+        failed_turn=failed_turn,
     )
+
+
+def evaluate_scenario(
+    scenario: Scenario,
+    turns: list[str],
+    phone_commands: list[Mapping[str, Any]],
+    room_closed_after: int | None,
+) -> None:
+    """Assert recorded answers, phone commands, and room close match a scenario."""
+    failures = _scenario_failures(
+        scenario, turns, phone_commands, room_closed_after, complete=True
+    )
+    if failures:
+        raise AssertionError(failures[0].message)

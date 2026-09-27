@@ -15,6 +15,11 @@ ANSWER_DEADLINE_SECONDS = 30.0
 CONFIRMATION_DEADLINE_SECONDS = 30.0
 HANGUP_DEADLINE_SECONDS = 60.0
 RUNS_REQUIRED = 10
+PARTIAL_CAPTURE_MESSAGES = {
+    "scripted speech synthesis exceeded its deadline",
+    "transcription returned no agent audio after speech end",
+    "room was deleted before all scripted lines were captured",
+}
 
 
 def nearest_rank(values: list[float], percentile: float) -> float:
@@ -172,8 +177,112 @@ def score_observations(
             case_failures.append(f"{name}: expected {required_runs} runs, found {len(runs)}")
         turns: list[dict[str, Any]] = []
         for run_index, run in enumerate(runs):
-            if not isinstance(run, dict) or not isinstance(run.get("turns"), list) or not run["turns"]:
+            if not isinstance(run, dict) or not isinstance(run.get("turns"), list):
                 case_failures.append(f"{name} run {run_index + 1}: missing turn observations")
+                continue
+            valid_failure = False
+            if "failure" in run:
+                failure = run["failure"]
+                failure_fields = (
+                    {"turn", "message"},
+                    {"turn", "message", "speech_started_at"},
+                )
+                try:
+                    valid_failure = (
+                        isinstance(failure, dict)
+                        and set(failure) in failure_fields
+                        and not isinstance(failure.get("turn"), bool)
+                        and isinstance(failure.get("turn"), int)
+                        and failure["turn"] == len(run["turns"]) + 1
+                        and failure.get("message") in PARTIAL_CAPTURE_MESSAGES
+                        and (
+                            failure.get("message")
+                            == "transcription returned no agent audio after speech end"
+                        ) == ("speech_started_at" in failure)
+                        and not (
+                            failure.get("message")
+                            == "room was deleted before all scripted lines were captured"
+                            and not run["turns"]
+                        )
+                    )
+                    if valid_failure and "speech_started_at" in failure:
+                        failure_start = _timestamp(failure, "speech_started_at")
+                        if run["turns"]:
+                            previous_turn = run["turns"][-1]
+                            if not isinstance(previous_turn, dict):
+                                valid_failure = False
+                            elif failure_start <= _timestamp(
+                                previous_turn, "speech_started_at"
+                            ):
+                                valid_failure = False
+                except (ValueError, TypeError):
+                    valid_failure = False
+                if not valid_failure:
+                    case_failures.append(
+                        f"{name} run {run_index + 1}: invalid partial capture failure metadata"
+                    )
+                    continue
+                case_failures.append(
+                    f"{name} run {run_index + 1} turn {failure['turn']}: "
+                    f"capture failed: {failure['message']}"
+                )
+                product_failures = run.get("product_failures")
+                if not isinstance(product_failures, list):
+                    case_failures.append(
+                        f"{name} run {run_index + 1}: invalid partial product failure metadata"
+                    )
+                else:
+                    for product_failure in product_failures:
+                        product_turn = (
+                            product_failure.get("turn")
+                            if isinstance(product_failure, dict)
+                            else None
+                        )
+                        failed_turn_command = False
+                        if product_turn == failure["turn"]:
+                            commands = run.get("phone_commands")
+                            failed_turn_command = (
+                                isinstance(commands, list)
+                                and any(
+                                    isinstance(command, dict)
+                                    and isinstance(command.get("id"), str)
+                                    and bool(command["id"])
+                                    and isinstance(command.get("kind"), str)
+                                    and bool(command["kind"])
+                                    and isinstance(command.get("turn"), int)
+                                    and not isinstance(command["turn"], bool)
+                                    and command["turn"] == product_turn
+                                    for command in commands
+                                )
+                            )
+                        valid_product_failure = (
+                            isinstance(product_failure, dict)
+                            and set(product_failure) == {"turn", "message"}
+                            and isinstance(product_turn, int)
+                            and not isinstance(product_turn, bool)
+                            and (
+                                1 <= product_turn <= len(run["turns"])
+                                or failed_turn_command
+                            )
+                            and isinstance(product_failure.get("message"), str)
+                            and bool(product_failure["message"].strip())
+                        )
+                        if not valid_product_failure:
+                            case_failures.append(
+                                f"{name} run {run_index + 1}: invalid partial product failure metadata"
+                            )
+                            continue
+                        case_failures.append(
+                            f"{name} run {run_index + 1} turn {product_failure['turn']}: "
+                            f"product failure: {product_failure['message']}"
+                        )
+            elif "product_failures" in run:
+                case_failures.append(
+                    f"{name} run {run_index + 1}: product failures require partial capture metadata"
+                )
+            if not run["turns"]:
+                if not valid_failure:
+                    case_failures.append(f"{name} run {run_index + 1}: missing turn observations")
                 continue
             for turn_index, raw_turn in enumerate(run["turns"]):
                 try:

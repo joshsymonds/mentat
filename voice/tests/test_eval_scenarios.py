@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "evals"))
 
-from scenarios import SCENARIOS, evaluate_scenario
+from scenarios import SCENARIOS, evaluate_scenario, evaluate_scenario_prefix
 
 
 class ScenarioCorpusTests(unittest.TestCase):
@@ -47,6 +47,67 @@ class ScenarioCorpusTests(unittest.TestCase):
             sms = by_name[name]
             self.assertIn(sms_number, sms.caller_lines[0])
             self.assertEqual(sms.commands[0]["to"], sms_number)
+
+    def test_prefix_evaluator_accepts_valid_actions_before_failed_turn(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+
+        failures = evaluate_scenario_prefix(
+            scenario,
+            turns=["Alice Keck Park Memorial Garden is in Santa Barbara."],
+            phone_commands=[{"turn": 1, "kind": "location"}],
+            room_closed_after=None,
+            failed_turn=2,
+        )
+
+        self.assertEqual(failures, [])
+
+    def test_prefix_evaluator_attributes_failed_turn_phone_action_errors(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+        turns = ["Alice Keck Park Memorial Garden is in Santa Barbara."]
+        phone_commands = [
+            {"turn": 1, "kind": "location"},
+            {"turn": 2, "kind": "navigate", "name": "Wrong Park"},
+        ]
+
+        failures = evaluate_scenario_prefix(
+            scenario,
+            turns=turns,
+            phone_commands=phone_commands,
+            room_closed_after=None,
+            failed_turn=2,
+        )
+
+        self.assertTrue(failures)
+        self.assertTrue(all(failure.turn == 2 for failure in failures))
+        self.assertTrue(any("unexpected place name" in failure.message for failure in failures))
+
+    def test_prefix_evaluator_checks_failed_turn_navigation_even_without_location_command(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+        failures = evaluate_scenario_prefix(
+            scenario,
+            turns=["Alice Keck Park Memorial Garden is in Santa Barbara."],
+            phone_commands=[{"turn": 2, "kind": "navigate", "name": "Wrong Park"}],
+            room_closed_after=None,
+            failed_turn=2,
+        )
+
+        self.assertTrue(failures)
+        self.assertTrue(any(failure.turn == 1 and "phone commands" in failure.message for failure in failures))
+        self.assertTrue(any(failure.turn == 2 and "unexpected place name" in failure.message for failure in failures))
+
+    def test_prefix_evaluator_reports_missing_sms_readback_on_completed_turn(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+
+        failures = evaluate_scenario_prefix(
+            scenario,
+            turns=["Would you like me to send that message?"],
+            phone_commands=[],
+            room_closed_after=None,
+        )
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].turn, 1)
+        self.assertIn("no complete +1-202-555-0142 message say-back", failures[0].message)
 
     def test_accepts_equivalent_spoken_sms_and_sends_exact_dictated_text(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")

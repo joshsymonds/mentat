@@ -139,6 +139,176 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("p95", failures)
         self.assertNotIn("turn 1", failures)
 
+    def test_partial_capture_scores_completed_turns_and_names_failed_turn(self):
+        observation = {
+            "cases": [{
+                "name": "send message",
+                "runs": [{
+                    "turns": [turn()],
+                    "failure": {
+                        "turn": 2,
+                        "message": "room was deleted before all scripted lines were captured",
+                    },
+                    "product_failures": [
+                        {"turn": 1, "message": "turn 1 missing answer pattern 'Alice Keck Park'"}
+                    ],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        report = result["cases"][0]
+        self.assertEqual(len(report["turns"]), 1)
+        self.assertEqual(report["turns"][0]["latency_seconds"]["first_audio"], 2.0)
+        self.assertEqual(report["turns"][0]["model_call_count"], 1)
+        self.assertEqual(report["gates"][0]["run_count"], 1)
+        failures = " ".join(result["failures"])
+        self.assertIn("send message run 1 turn 2", failures)
+        self.assertIn("room was deleted before all scripted lines were captured", failures)
+        self.assertIn("send message run 1 turn 1", failures)
+        self.assertIn("missing answer pattern 'Alice Keck Park'", failures)
+        self.assertEqual(report["turns"][0]["model_call_count"], 1)
+        self.assertEqual(report["turns"][0]["latency_seconds"]["first_audio"], 2.0)
+
+    def test_valid_completed_prefix_reports_only_the_later_capture_failure(self):
+        trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
+        trace["expect_confirmation"] = False
+        trace["expect_hangup"] = False
+        observation = {
+            "cases": [{
+                "name": "place-search-navigation",
+                "runs": [{
+                    "turns": [trace],
+                    "failure": {
+                        "turn": 2,
+                        "message": "scripted speech synthesis exceeded its deadline",
+                    },
+                    "product_failures": [],
+                    "phone_commands": [{
+                        "id": "phone-command-1",
+                        "turn": 1,
+                        "kind": "location",
+                    }],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        failures = " ".join(result["failures"])
+        self.assertIn("place-search-navigation run 1 turn 2: capture failed", failures)
+        self.assertNotIn("product failure", failures)
+        self.assertEqual(result["cases"][0]["turns"][0]["latency_seconds"]["first_audio"], 2.0)
+
+    def test_partial_failure_turn_product_error_requires_observed_phone_command(self):
+        trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
+        trace["expect_confirmation"] = False
+        trace["expect_hangup"] = False
+        observation = {
+            "cases": [{
+                "name": "place-search-navigation",
+                "runs": [{
+                    "turns": [trace],
+                    "failure": {
+                        "turn": 2,
+                        "message": "scripted speech synthesis exceeded its deadline",
+                    },
+                    "product_failures": [{
+                        "turn": 2,
+                        "message": "place-search-navigation: navigation selected an unexpected place name 'Wrong Park'",
+                    }],
+                    "phone_commands": [{
+                        "id": "phone-command-2",
+                        "turn": 2,
+                        "kind": "navigate",
+                    }],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        failures = " ".join(result["failures"])
+        self.assertIn("place-search-navigation run 1 turn 2: product failure", failures)
+        self.assertIn("place-search-navigation run 1 turn 2: capture failed", failures)
+        self.assertNotIn("invalid partial product failure metadata", failures)
+        self.assertEqual(result["cases"][0]["turns"][0]["model_call_count"], 1)
+
+    def test_failed_turn_product_error_without_real_phone_evidence_fails_closed(self):
+        trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
+        trace["expect_confirmation"] = False
+        trace["expect_hangup"] = False
+        observation = {
+            "cases": [{
+                "name": "place-search-navigation",
+                "runs": [{
+                    "turns": [trace],
+                    "failure": {
+                        "turn": 2,
+                        "message": "scripted speech synthesis exceeded its deadline",
+                    },
+                    "product_failures": [{"turn": 2, "message": "forged"}],
+                    "phone_commands": [],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        self.assertIn("invalid partial product failure metadata", " ".join(result["failures"]))
+
+    def test_first_turn_capture_failure_is_named_with_no_completed_turns(self):
+        observation = {
+            "cases": [{
+                "name": "timer",
+                "runs": [{
+                    "turns": [],
+                    "failure": {
+                        "turn": 1,
+                        "message": "transcription returned no agent audio after speech end",
+                        "speech_started_at": 1_700_000_000.0,
+                    },
+                    "product_failures": [],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        failures = " ".join(result["failures"])
+        self.assertIn("timer run 1 turn 1", failures)
+        self.assertIn("transcription returned no agent audio after speech end", failures)
+
+    def test_malformed_partial_capture_failure_metadata_fails_closed(self):
+        malformed_failures = (
+            {"turn": "2", "message": "room was deleted before all scripted lines were captured"},
+            {"turn": 2, "message": "transcription returned no agent audio after speech end"},
+            {
+                "turn": 2,
+                "message": "scripted speech synthesis exceeded its deadline",
+                "speech_started_at": 100.0,
+            },
+        )
+        for failure in malformed_failures:
+            with self.subTest(failure=failure):
+                observation = {
+                    "cases": [{
+                        "name": "send message",
+                        "runs": [{"turns": [turn()], "failure": failure}],
+                    }]
+                }
+
+                result = score_observations(observation, required_runs=1)
+
+                self.assertFalse(result["passed"])
+                self.assertIn("invalid partial capture failure", " ".join(result["failures"]))
+
     def test_missing_per_turn_kind_fails_closed(self):
         observation = {"cases": [case()]}
         del observation["cases"][0]["runs"][0]["turns"][0]["kind"]
