@@ -1722,6 +1722,67 @@ class ScenarioCorpusTests(unittest.TestCase):
                 room_closed_after=1,
             )
 
+    def test_run16_live_timer_acknowledgment_requires_matching_fake_seconds(self):
+        scenario = next(s for s in SCENARIOS if s.name == "timer-300-seconds")
+        evaluate_scenario(
+            scenario,
+            ["Your five minutes are on the clock."],
+            [{"turn": 1, "kind": "timer", "seconds": 300}],
+            room_closed_after=1,
+        )
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                scenario,
+                ["Your five minutes are on the clock."],
+                [{"turn": 1, "kind": "timer", "seconds": 60}],
+                room_closed_after=1,
+            )
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                scenario,
+                ["Your five minutes are on the clock. Actually, your ten-minute timer is set."],
+                [{"turn": 1, "kind": "timer", "seconds": 300}],
+                room_closed_after=1,
+            )
+
+    def test_run16_sms_spoken_oh_recipient_requires_exact_readback_and_one_yes_send(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        readback = (
+            "I can text plus-one-two-oh-two-five-five-five-zero-one-four-two: "
+            "I will be there at six. Should I send it?"
+        )
+        command = {
+            "turn": 2,
+            "kind": "sms",
+            "to": "+1-202-555-0142",
+            "body": "I will be there at six.",
+        }
+        evaluate_scenario(
+            scenario,
+            [readback, "Yes, sent that message."],
+            [command],
+            room_closed_after=2,
+        )
+
+        invalid_cases = (
+            ([readback.replace("one-four-two", "one-four-three"), "Yes, sent that message."], [command]),
+            ([readback.replace("at six", "at seven"), "Yes, sent that message."], [command]),
+            (["I can text plus-one-two-oh-two-five-five-five-zero-one-four-two. Should I send it?", "Yes, sent that message."], [command]),
+            ([readback, "Yes, sent that message."], [{**command, "turn": 1}]),
+            ([readback, "Yes, sent that message."], [command, command]),
+        )
+        for turns, commands in invalid_cases:
+            with self.subTest(turns=turns, commands=commands), self.assertRaises(AssertionError):
+                evaluate_scenario(scenario, turns, commands, room_closed_after=2)
+
+        with self.assertRaisesRegex(AssertionError, r"turn 1 has no complete \+1-202-555-0142 message say-back"):
+            evaluate_scenario(
+                scenario,
+                ["I can text I will be there at six. Should I send it?", "Yes, sent that message."],
+                [command],
+                room_closed_after=2,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

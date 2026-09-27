@@ -62,10 +62,11 @@ _NAMED_OTHER_ACTOR = (
 _OTHER_ACTOR = rf"(?:{_OTHER_ROLE}|{_NAMED_OTHER_ACTOR})"
 _ACTION_ACKNOWLEDGMENT = (
     r"\b(?:done|set|start(?:\s+it)?|started|starting|setting|running|sent|sending|texted|cent|scent|"
-    r"navigat\w*|directions|route|taking you|sending you there)\b"
+    r"navigat\w*|directions|route|taking you|sending you there|on the clock)\b"
 )
 _DIGIT_WORDS = {
     "zero": "0",
+    "oh": "0",
     "one": "1",
     "two": "2",
     "three": "3",
