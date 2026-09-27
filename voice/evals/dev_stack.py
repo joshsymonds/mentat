@@ -88,6 +88,21 @@ def _redact_diagnostics(value: str | bytes | None, secrets: Sequence[str] = ()) 
     return _BEARER_VALUE.sub(r"\1[REDACTED]", text)
 
 
+def _redact_machine_json(value: str, secrets: Sequence[str] = ()) -> str:
+    """Redact JSON string values and serialize a valid machine-channel result."""
+    def redact(item: object) -> object:
+        if isinstance(item, dict):
+            return {key: redact(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [redact(child) for child in item]
+        if isinstance(item, str):
+            return _redact_diagnostics(item, secrets)
+        return item
+
+    parsed = json.loads(value)
+    return json.dumps(redact(parsed), separators=(",", ":"), allow_nan=False) + "\n"
+
+
 _MCP_REWRITE_SOURCE = '''def rewrite_mcp_config(raw, production_port, dev_port):
     config = json.loads(raw)
 
@@ -313,7 +328,11 @@ DEV_DIR = Path(sys.argv[2])
 DEV_PORT = sys.argv[3]
 HEALTH_PORT = sys.argv[4]
 sys.path.insert(0, str(DEV_DIR / "voice"))
-from evals.dev_stack import _redact_diagnostics, _secret_environment_values
+from evals.dev_stack import (
+    _redact_diagnostics,
+    _redact_machine_json,
+    _secret_environment_values,
+)
 
 payload = json.load(sys.stdin)
 command = payload.get("command")
@@ -351,8 +370,18 @@ result = subprocess.run(
     stdin=subprocess.DEVNULL,
     capture_output=True, text=True, check=False,
 )
-sys.stdout.write(_redact_diagnostics(result.stdout, secret_values))
 sys.stderr.write(_redact_diagnostics(result.stderr, secret_values))
+try:
+    machine_output = _redact_machine_json(result.stdout, secret_values)
+except (ValueError, TypeError):
+    diagnostic = _redact_diagnostics(result.stdout, secret_values)
+    if diagnostic:
+        sys.stderr.write(diagnostic)
+        if not diagnostic.endswith("\n"):
+            sys.stderr.write("\n")
+    sys.stderr.write("voice caller stdout was not valid JSON\n")
+    sys.exit(result.returncode or 1)
+sys.stdout.write(machine_output)
 sys.exit(result.returncode)
 '''
 
@@ -477,7 +506,7 @@ class DevStack:
         return subprocess.CompletedProcess(
             result.args,
             result.returncode,
-            _redact_diagnostics(result.stdout, (token,)),
+            _redact_machine_json(result.stdout, (token,)),
             _redact_diagnostics(result.stderr, (token,)),
         )
 

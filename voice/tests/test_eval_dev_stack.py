@@ -65,6 +65,8 @@ class DevStackTest(unittest.TestCase):
                 self.assertIn("for _ in range(2)", probe)
                 self.assertIn("for sock in sockets:", probe)
                 return subprocess.CompletedProcess(args, 0, json.dumps(selected_ports), "")
+            if args[:2] == ["ssh", "ultraviolet"] and "python3 -c" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
         with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
@@ -415,7 +417,16 @@ class DevStackTest(unittest.TestCase):
         def run(args, **kwargs):
             calls.append((args, kwargs))
             return subprocess.CompletedProcess(
-                args, 0, f"caller output {token}", f"caller warning {token}"
+                args,
+                0,
+                json.dumps({
+                    "turns": [{
+                        "transcript": f"caller output {token}",
+                        "credential": "API_KEY=assignment-secret",
+                        "authorization": "Authorization: Bearer header-secret",
+                    }],
+                }),
+                f"caller warning {token}",
             )
 
         stack = DevStack(checkout=CHECKOUT, run=run)
@@ -427,7 +438,16 @@ class DevStackTest(unittest.TestCase):
             livekit_url=livekit_url,
         )
 
-        self.assertEqual(result.stdout, "caller output [REDACTED]")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "turns": [{
+                    "transcript": "caller output [REDACTED]",
+                    "credential": "API_KEY=[REDACTED]",
+                    "authorization": "Authorization: Bearer [REDACTED]",
+                }],
+            },
+        )
         self.assertEqual(result.stderr, "caller warning [REDACTED]")
         self.assertEqual(len(calls), 1)
         args, kwargs = calls[0]
@@ -612,7 +632,7 @@ class DevStackTest(unittest.TestCase):
                 "livekit_url": "wss://issued-livekit.invalid",
             })
             result = SimpleNamespace(
-                stdout="DISTINCTIVE-CAUSE private-env-secret " + token,
+                stdout=json.dumps({"turns": [{"transcript": "DISTINCTIVE-CAUSE " + token}]}),
                 stderr="private-env-secret " + token,
                 returncode=0,
             )
@@ -638,6 +658,85 @@ class DevStackTest(unittest.TestCase):
                 run.call_args.kwargs["env"]["LIVEKIT_URL"],
                 "wss://issued-livekit.invalid",
             )
+
+    def test_voice_caller_redacts_json_values_without_corrupting_machine_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dev_dir = Path(temporary)
+            (dev_dir / "voice-python.path").write_text("/nix/store/python/bin/python3")
+            (dev_dir / "setpriv.path").write_text("/usr/bin/setpriv")
+            (dev_dir / "voice.env.json").write_text(json.dumps({
+                "PATH": "/usr/bin",
+                "LIVEKIT_API_SECRET": "private-env-secret",
+            }))
+            token = "issued-token.header.signature"
+            machine = {
+                "turns": [{
+                    "transcript": f'Assistant got "{token}"',
+                    "diagnostic": "API_KEY=assignment-secret",
+                    "authorization": "Authorization: Bearer header-secret",
+                    "payload": {"LIVEKIT_API_SECRET": "private-env-secret"},
+                }],
+            }
+            caller_result = SimpleNamespace(
+                stdout=json.dumps(machine),
+                stderr=f"caller warning {token} private-env-secret",
+                returncode=0,
+            )
+            caller_payload = json.dumps({
+                "command": ["evals/runner.py", "--room", "caller-room"],
+                "token": token,
+                "livekit_url": "wss://issued-livekit.invalid",
+            })
+            caller_stdout = io.StringIO()
+            caller_stderr = io.StringIO()
+            with patch("sys.argv", ["-c", "--", str(dev_dir), "8485", "8486"]):
+                with patch("sys.stdin", io.StringIO(caller_payload)):
+                    with patch("sys.stdout", caller_stdout), patch("sys.stderr", caller_stderr):
+                        with patch("subprocess.run", return_value=caller_result):
+                            with patch("sys.exit") as exit_process:
+                                exec(_RUN_VOICE_SCRIPT, {})
+            exit_process.assert_called_once_with(0)
+            output = caller_stdout.getvalue()
+            parsed = json.loads(output)
+            self.assertEqual(parsed["turns"][0]["transcript"], "Assistant got \"[REDACTED]\"")
+            self.assertEqual(parsed["turns"][0]["diagnostic"], "API_KEY=[REDACTED]")
+            self.assertEqual(parsed["turns"][0]["authorization"], "Authorization: Bearer [REDACTED]")
+            self.assertEqual(parsed["turns"][0]["payload"]["LIVEKIT_API_SECRET"], "[REDACTED]")
+            for secret in (token, "private-env-secret", "assignment-secret", "header-secret"):
+                self.assertNotIn(secret, output)
+                self.assertNotIn(secret, caller_stderr.getvalue())
+
+    def test_voice_caller_rejects_malformed_machine_json_and_scrubs_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dev_dir = Path(temporary)
+            (dev_dir / "voice-python.path").write_text("/nix/store/python/bin/python3")
+            (dev_dir / "setpriv.path").write_text("/usr/bin/setpriv")
+            (dev_dir / "voice.env.json").write_text(json.dumps({
+                "PATH": "/usr/bin",
+                "LIVEKIT_API_SECRET": "private-env-secret",
+            }))
+            token = "issued-token.header.signature"
+            caller_payload = json.dumps({
+                "command": ["evals/runner.py", "--room", "caller-room"],
+                "token": token,
+                "livekit_url": "wss://issued-livekit.invalid",
+            })
+            caller_stdout = io.StringIO()
+            caller_stderr = io.StringIO()
+            with patch("sys.argv", ["-c", "--", str(dev_dir), "8485", "8486"]):
+                with patch("sys.stdin", io.StringIO(caller_payload)):
+                    with patch("sys.stdout", caller_stdout), patch("sys.stderr", caller_stderr):
+                        with patch("subprocess.run", return_value=SimpleNamespace(
+                            stdout='{"turns":[{"transcript":"unterminated ' + token,
+                            stderr="",
+                            returncode=0,
+                        )):
+                            with self.assertRaises(SystemExit) as raised:
+                                exec(_RUN_VOICE_SCRIPT, {})
+            self.assertEqual(raised.exception.code, 1)
+            self.assertEqual(caller_stdout.getvalue(), "")
+            self.assertIn("voice caller stdout was not valid JSON", caller_stderr.getvalue())
+            self.assertNotIn(token, caller_stderr.getvalue())
 
     def test_setup_fails_if_setpriv_cannot_be_resolved(self):
         with tempfile.TemporaryDirectory() as temporary:
