@@ -106,6 +106,12 @@ class PhoneListeningTest(unittest.TestCase):
             min(frequency for frequency, _ in generate.EARCON_TONES),
         )
 
+    def test_listening_asset_starts_with_200ms_silence_and_peaks_at_minus_6_dbfs(self):
+        samples, framerate, _, _ = read_wav(LISTENING)
+        silence_samples = round(0.2 * framerate)
+        self.assertEqual(samples[:silence_samples], array("h", [0] * silence_samples))
+        self.assertAlmostEqual(peak_dbfs(samples), -6.0, delta=0.1)
+
     def test_listening_asset_matches_regeneration(self):
         self.assertTrue(LISTENING.is_file(), f"{LISTENING} not generated")
         with tempfile.TemporaryDirectory() as tmp:
