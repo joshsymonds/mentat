@@ -139,6 +139,48 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("p95", failures)
         self.assertNotIn("turn 1", failures)
 
+    def test_complete_product_failure_scores_captured_turn_and_fails_report(self):
+        captured = turn(first_audio=2.25, confirmation=None, room_deleted=5.0, calls=2)
+        captured["turn"] = 1
+        captured["expect_confirmation"] = False
+        observation = {
+            "cases": [{
+                "name": "place-search-navigation",
+                "runs": [{
+                    "turns": [captured],
+                    "product_failures": [{
+                        "turn": 1,
+                        "message": "place-search-navigation: turn 1 missing answer pattern 'Alice Keck Park'",
+                    }],
+                    "phone_commands": [{"id": "place-command", "turn": 1, "kind": "location"}],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(len(result["cases"][0]["turns"]), 1)
+        self.assertEqual(result["cases"][0]["turns"][0]["model_call_count"], 2)
+        self.assertEqual(result["cases"][0]["turns"][0]["latency_seconds"]["first_audio"], 2.25)
+        self.assertIn("product failure", " ".join(result["cases"][0]["failures"]))
+        self.assertIn("missing answer pattern", " ".join(result["failures"]))
+
+    def test_complete_product_failure_metadata_fails_closed(self):
+        captured = turn()
+        captured["turn"] = 1
+        observation = {
+            "cases": [{
+                "name": "place-search-navigation",
+                "runs": [{"turns": [captured], "product_failures": [{"turn": True, "message": "forged"}]}],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        self.assertIn("invalid complete product failure metadata", " ".join(result["failures"]))
+
     def test_partial_capture_scores_completed_turns_and_names_failed_turn(self):
         observation = {
             "cases": [{

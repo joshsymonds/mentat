@@ -947,6 +947,124 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertTrue(any(failure["turn"] == 1 for failure in product_failures))
         self.assertTrue(any("missing answer pattern" in failure["message"] for failure in product_failures))
 
+    def test_complete_wrong_place_and_missing_sms_confirmation_keep_full_evidence(self):
+        import json
+        from subprocess import CompletedProcess
+
+        def observe_fixture(scenario, transcripts, phone_payloads, tool_payloads):
+            room = "complete-product-room"
+            traces = []
+            for index, transcript in enumerate(transcripts, 1):
+                started = float(index * 100)
+                traces.append({
+                    "turn": index,
+                    "room": room,
+                    "line": scenario.caller_lines[index - 1],
+                    "transcript": transcript,
+                    "speech_started_at": started,
+                    "speech_end": started + 1.0,
+                    "first_audio": started + 2.0,
+                    "overlap": False,
+                    "capture_started": started + 1.5,
+                    "segments": [{"start": 0.2, "end": 0.6, "text": transcript}],
+                    "room_deleted": started + 3.0 if index == len(transcripts) else None,
+                })
+            phone_log = []
+            for index, payload in enumerate(phone_payloads, 1):
+                command = {"id": f"phone-{index}", **payload}
+                phone_log.extend((
+                    {"event": "command", "command": command},
+                    {"event": "result", "result": {"id": command["id"], "status": "ok", "detail": "Fake phone completed"}},
+                ))
+            record = []
+            marker_log = []
+            for index, payload in enumerate(tool_payloads, 1):
+                record.extend((
+                    {"type": "stream_event", "event": {"type": "message_start", "message": {"id": f"m{index}", "model": "claude-opus-5"}}},
+                ))
+                if payload is not None:
+                    name, arguments = payload
+                    record.append({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": f"t{index}", "name": f"mcp__mentat__{name}", "input": arguments}]}})
+                record.append({"type": "result", "session_id": "voice-" + room})
+                marker_log.append({"room": room, "id": f"d{index}", "created_at": index * 100 + 0.5})
+            capture = json.dumps({"turns": traces})
+            encoded_record = "".join(json.dumps(item) + "\n" for item in record)
+            encoded_phone = "".join(json.dumps(item) + "\n" for item in phone_log)
+            encoded_markers = "".join(json.dumps(item) + "\n" for item in marker_log)
+
+            class Stack:
+                base_url = "http://127.0.0.1:8485"
+
+                def start_worker(self, _room):
+                    pass
+
+                def run_voice(self, command, *, token, livekit_url):
+                    return CompletedProcess(command, 0, capture, "")
+
+                def run_remote(self, command):
+                    outputs = {
+                        "voice/evals/phone.jsonl": encoded_phone,
+                        "voice/evals/delegations.jsonl": encoded_markers,
+                        f"records/voice-{room}.jsonl": encoded_record,
+                    }
+                    key = command[-1]
+                    if key not in outputs:
+                        raise AssertionError(f"unexpected remote command {command!r}")
+                    return CompletedProcess(command, 0, outputs[key], "")
+
+            with patch.object(runner, "_voice_token", return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"}):
+                return runner.observe_scenario(scenario, Stack())
+
+        place = SCENARIOS[2]
+        wrong_place = observe_fixture(
+            place,
+            ["Wrong Park is in Santa Barbara.", "Taking you to Wrong Park."],
+            [
+                {"kind": "location", "query": place.place_query},
+                {"kind": "navigate", "name": "Wrong Park", "address": "1 Main St", "place_id": "wrong", "lat": 34.4, "lng": -119.7},
+            ],
+            [
+                ("find_places", {"query": place.place_query}),
+                ("navigate_to", {"name": "Wrong Park", "address": "1 Main St", "place_id": "wrong", "lat": 34.4, "lng": -119.7}),
+            ],
+        )
+        self.assertEqual(len(wrong_place["turns"]), 2)
+        self.assertEqual([len(turn["model_calls"]) for turn in wrong_place["turns"]], [1, 1])
+        self.assertEqual([command["kind"] for command in wrong_place["phone_commands"]], ["location", "navigate"])
+        self.assertTrue(any(item["turn"] == 2 and "unexpected place name" in item["message"] for item in wrong_place["product_failures"]))
+        from evals.report import score_observations
+
+        place_report = score_observations(
+            {"cases": [{"name": place.name, "runs": [wrong_place]}]},
+            required_runs=1,
+        )
+        self.assertFalse(place_report["passed"])
+        self.assertEqual(len(place_report["cases"][0]["turns"]), 2)
+        self.assertEqual(place_report["cases"][0]["turns"][1]["model_call_count"], 1)
+        self.assertEqual(place_report["cases"][0]["turns"][0]["latency_seconds"]["first_audio"], 1.0)
+        self.assertTrue(any("unexpected place name" in failure for failure in place_report["failures"]))
+
+        sms = SCENARIOS[3]
+        missing_prompt = observe_fixture(
+            sms,
+            ["I can text +1-202-555-0142: I will be there at six.", "Sent that message."],
+            [],
+            [None, None],
+        )
+        self.assertEqual(len(missing_prompt["turns"]), 2)
+        self.assertIsNone(missing_prompt["turns"][0]["confirmation"])
+        self.assertTrue(any(item["turn"] == 1 and "say-back" in item["message"] for item in missing_prompt["product_failures"]))
+        sms_report = score_observations(
+            {"cases": [{"name": sms.name, "runs": [missing_prompt]}]},
+            required_runs=1,
+        )
+        self.assertFalse(sms_report["passed"])
+        self.assertEqual(len(sms_report["cases"][0]["turns"]), 2)
+        self.assertEqual(sms_report["cases"][0]["turns"][0]["model_call_count"], 1)
+        sms_failures = " ".join(sms_report["failures"])
+        self.assertIn("say-back", sms_failures)
+        self.assertIn("confirmation observation is missing", sms_failures)
+
     def test_every_scenario_script_fits_the_single_room_capture_format(self):
         for scenario in SCENARIOS:
             with self.subTest(scenario=scenario.name):
@@ -1655,6 +1773,68 @@ class LocalEvalCliTests(unittest.TestCase):
         report = json.loads(output[0])
         self.assertFalse(report["passed"])
         self.assertTrue(any("deliberate scenario failure" in failure for failure in report["failures"]))
+    def test_complete_product_failure_exits_nonzero_with_turn_metrics(self):
+        import io
+        import json
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SCENARIOS[2]
+        observations = {
+            "turns": [
+                {
+                    "turn": 1,
+                    "kind": "search",
+                    "speech_end": 10.0,
+                    "first_audio": 11.0,
+                    "overlap": False,
+                    "expect_confirmation": False,
+                    "confirmation": None,
+                    "expect_hangup": False,
+                    "room_deleted": None,
+                    "model_calls": [{"id": "m1", "model": "claude-opus-5"}],
+                },
+                {
+                    "turn": 2,
+                    "kind": "action",
+                    "speech_end": 20.0,
+                    "first_audio": 21.5,
+                    "overlap": False,
+                    "expect_confirmation": False,
+                    "confirmation": None,
+                    "expect_hangup": True,
+                    "room_deleted": 23.0,
+                    "model_calls": [{"id": "m2", "model": "claude-opus-5"}],
+                },
+            ],
+            "phone_commands": [{"id": "navigate-1", "kind": "navigate", "turn": 2}],
+            "room_closed_after": 2,
+            "product_failures": [{
+                "turn": 2,
+                "message": "place-search-navigation: navigation selected an unexpected place name 'Wrong Park'",
+            }],
+        }
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "observe_scenario", return_value=observations),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(report["passed"])
+        self.assertEqual(len(report["cases"][0]["turns"]), 2)
+        self.assertEqual(report["cases"][0]["turns"][1]["model_call_count"], 1)
+        self.assertEqual(report["cases"][0]["turns"][1]["latency_seconds"]["first_audio"], 1.5)
+        self.assertTrue(any("unexpected place name" in failure for failure in report["failures"]))
+
     def test_partial_case_is_scored_and_fails_eval_with_named_turn(self):
         import io
         import json

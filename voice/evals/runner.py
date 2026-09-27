@@ -745,7 +745,7 @@ def _turn_kind(scenario: Any, turn_index: int) -> str:
     return "action"
 
 
-def _confirmation_time(trace: dict[str, Any]) -> float:
+def _confirmation_time(trace: dict[str, Any]) -> float | None:
     segments = trace.get("segments")
     capture_started = _finite_timestamp(trace.get("capture_started"), "capture start")
     if not isinstance(segments, list) or not segments:
@@ -766,7 +766,7 @@ def _confirmation_time(trace: dict[str, Any]) -> float:
         ranges.append((start, cursor, end))
     match = SMS_CONFIRMATION_PATTERN.search("".join(transcript_parts))
     if match is None:
-        raise RuntimeError("SMS say-back transcript has no confirmation prompt")
+        return None
     for start, end, segment_end in ranges:
         if start < match.end() <= end:
             return capture_started + segment_end
@@ -1006,28 +1006,28 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     if len(room_deleted_turns) > 1:
         raise RuntimeError("capture observed room deletion more than once")
     room_closed_after = room_deleted_turns[0] if room_deleted_turns else None
-    from evals.scenarios import evaluate_scenario, evaluate_scenario_prefix
+    from evals.scenarios import evaluate_scenario_failures, evaluate_scenario_prefix
 
     transcripts = [trace["transcript"] for trace in traces]
-    product_failures = []
     if capture_failure is None:
-        evaluate_scenario(
+        failures = evaluate_scenario_failures(
             scenario,
             transcripts,
             phone_commands,
             room_closed_after,
         )
     else:
-        product_failures = [
-            {"turn": failure.turn, "message": failure.message}
-            for failure in evaluate_scenario_prefix(
-                scenario,
-                transcripts,
-                phone_commands,
-                room_closed_after,
-                failed_turn=(capture_failure["turn"] if capture_failure["turn"] > len(traces) else None),
-            )
-        ]
+        failures = evaluate_scenario_prefix(
+            scenario,
+            transcripts,
+            phone_commands,
+            room_closed_after,
+            failed_turn=(capture_failure["turn"] if capture_failure["turn"] > len(traces) else None),
+        )
+    product_failures = [
+        {"turn": failure.turn, "message": failure.message}
+        for failure in failures
+    ]
     observation = {
         "room": room,
         "turns": traces,
@@ -1036,6 +1036,8 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     }
     if capture_failure is not None:
         observation["failure"] = capture_failure
+        observation["product_failures"] = product_failures
+    elif product_failures:
         observation["product_failures"] = product_failures
     return observation
 

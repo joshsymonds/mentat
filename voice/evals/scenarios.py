@@ -448,6 +448,24 @@ def _command_failure_turn(
     return max(1, completed_turns)
 
 
+def evaluate_scenario_failures(
+    scenario: Scenario,
+    turns: list[str],
+    phone_commands: list[Mapping[str, Any]],
+    room_closed_after: int | None,
+) -> list[ScenarioFailure]:
+    """Return all truth failures for a complete captured scenario."""
+    if not isinstance(turns, list) or not isinstance(phone_commands, list):
+        raise ValueError("scenario turns and phone commands must be lists")
+    return _scenario_failures(
+        scenario,
+        turns,
+        phone_commands,
+        room_closed_after,
+        complete=True,
+    )
+
+
 def evaluate_scenario_prefix(
     scenario: Scenario,
     turns: list[str],
@@ -476,8 +494,8 @@ def evaluate_scenario(
     room_closed_after: int | None,
 ) -> None:
     """Assert recorded answers, phone commands, and room close match a scenario."""
-    failures = _scenario_failures(
-        scenario, turns, phone_commands, room_closed_after, complete=True
+    failures = evaluate_scenario_failures(
+        scenario, turns, phone_commands, room_closed_after
     )
     if failures:
         raise AssertionError(failures[0].message)

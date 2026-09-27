@@ -294,9 +294,36 @@ def score_observations(
                             f"product failure: {product_failure['message']}"
                         )
             elif "product_failures" in run:
-                case_failures.append(
-                    f"{name} run {run_index + 1}: product failures require partial capture metadata"
-                )
+                product_failures = run["product_failures"]
+                if not isinstance(product_failures, list):
+                    case_failures.append(
+                        f"{name} run {run_index + 1}: invalid complete product failure metadata"
+                    )
+                else:
+                    for product_failure in product_failures:
+                        product_turn = (
+                            product_failure.get("turn")
+                            if isinstance(product_failure, dict)
+                            else None
+                        )
+                        valid_product_failure = (
+                            isinstance(product_failure, dict)
+                            and set(product_failure) == {"turn", "message"}
+                            and isinstance(product_turn, int)
+                            and not isinstance(product_turn, bool)
+                            and 1 <= product_turn <= len(run["turns"])
+                            and isinstance(product_failure.get("message"), str)
+                            and bool(product_failure["message"].strip())
+                        )
+                        if not valid_product_failure:
+                            case_failures.append(
+                                f"{name} run {run_index + 1}: invalid complete product failure metadata"
+                            )
+                            continue
+                        case_failures.append(
+                            f"{name} run {run_index + 1} turn {product_turn}: "
+                            f"product failure: {product_failure['message']}"
+                        )
             if not run["turns"]:
                 if not valid_failure:
                     case_failures.append(f"{name} run {run_index + 1}: missing turn observations")

@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "evals"))
 
-from scenarios import SCENARIOS, evaluate_scenario, evaluate_scenario_prefix
+from scenarios import SCENARIOS, evaluate_scenario, evaluate_scenario_failures, evaluate_scenario_prefix
 
 
 class ScenarioCorpusTests(unittest.TestCase):
@@ -47,6 +47,32 @@ class ScenarioCorpusTests(unittest.TestCase):
             sms = by_name[name]
             self.assertIn(sms_number, sms.caller_lines[0])
             self.assertEqual(sms.commands[0]["to"], sms_number)
+
+    def test_complete_evaluator_returns_all_structured_product_failures(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+
+        failures = evaluate_scenario_failures(
+            scenario,
+            turns=["Wrong park in another city.", "Taking you to Wrong Park."],
+            phone_commands=[
+                {"turn": 1, "kind": "location"},
+                {
+                    "turn": 2,
+                    "kind": "navigate",
+                    "name": "Wrong Park",
+                    "address": "1 Main St",
+                    "place_id": "wrong-place-id",
+                    "lat": 34.4,
+                    "lng": -119.7,
+                },
+            ],
+            room_closed_after=2,
+        )
+
+        self.assertTrue(failures)
+        self.assertTrue(all(isinstance(failure.turn, int) for failure in failures))
+        self.assertTrue(any(failure.turn == 1 and "missing answer pattern" in failure.message for failure in failures))
+        self.assertTrue(any(failure.turn == 2 and "unexpected place name" in failure.message for failure in failures))
 
     def test_prefix_evaluator_accepts_valid_actions_before_failed_turn(self):
         scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
