@@ -34,6 +34,12 @@ export class SessionTracker {
     this.now = now;
   }
 
+  trackSession(sessionId: string): void {
+    const activity = this.sessions.get(sessionId) ?? { lastActive: 0, activeTurns: 0 };
+    activity.lastActive = this.now();
+    this.sessions.set(sessionId, activity);
+  }
+
   beginTurn(sessionId: string): void {
     const activity = this.sessions.get(sessionId) ?? { lastActive: 0, activeTurns: 0 };
     activity.activeTurns += 1;
@@ -80,7 +86,7 @@ export function createHandler(
 ): RequestListener {
   return (req, res) => {
     if (req.method === 'POST' && req.url === '/v1/voice/token' && issuer !== undefined) {
-      handleVoiceToken(issuer, logger, req, res).catch((error: unknown) => {
+      handleVoiceToken(backend, tracker, issuer, logger, req, res).catch((error: unknown) => {
         logger.error('voice token handler failed', { error: String(error) });
         if (!res.destroyed) {
           res.destroy();
@@ -279,7 +285,13 @@ async function readTurnRequest(
 
 // The call context in the body only colours the greeting, so a body that is
 // empty or does not parse still gets a token — never a failed call.
+interface VoiceSessionPrestarter {
+  prestartVoiceSession(sessionId: string): Promise<boolean>;
+}
+
 async function handleVoiceToken(
+  backend: Backend,
+  tracker: SessionTracker,
   issuer: TokenIssuer,
   logger: Logger,
   req: IncomingMessage,
@@ -308,7 +320,22 @@ async function handleVoiceToken(
     logger.warn('voice token body is not JSON; issuing without call context');
   }
   try {
-    const grant = JSON.stringify(issuer.issue(parseCallContext(body))) + '\n';
+    const issued = issuer.issue(parseCallContext(body));
+    const prestart = (backend as Backend & Partial<VoiceSessionPrestarter>).prestartVoiceSession;
+    if (prestart !== undefined) {
+      const sessionId = `voice-${issued.room}`;
+      try {
+        if (await prestart.call(backend, sessionId)) {
+          tracker.trackSession(sessionId);
+        }
+      } catch (error) {
+        logger.warn('voice session pre-start failed', {
+          session_id: sessionId,
+          error: String(error),
+        });
+      }
+    }
+    const grant = JSON.stringify(issued) + '\n';
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(grant);
   } catch (error) {

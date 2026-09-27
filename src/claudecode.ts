@@ -439,6 +439,24 @@ export class ClaudeCode implements Backend {
     return this.streamTurn(turn, session, release, false);
   }
 
+  /** Starts the voice child at token time without queuing a synthetic turn. */
+  prestartVoiceSession(sessionId: string): Promise<boolean> {
+    if (this.config.voiceGateway === undefined) {
+      return Promise.resolve(false);
+    }
+    if (sessionId === '') {
+      throw new Error('claudecode: pre-start requires a sessionId');
+    }
+    this.sessionFor({
+      sessionId,
+      text: '',
+      meta: { surface: 'voice', user: 'josh' },
+      effort: 'low',
+      model: 'chatgpt/sol-fast',
+    });
+    return Promise.resolve(true);
+  }
+
   /** Acquires the session's turn slot and sends the turn into the child. */
   private async startTurn(turn: Turn): Promise<{ session: Session; release: () => void }> {
     const session = this.sessionFor(turn);

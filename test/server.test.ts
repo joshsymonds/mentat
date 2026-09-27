@@ -38,8 +38,10 @@ type Script = (turn: Turn) => Event[] | Error;
 class FakeBackend implements Backend {
   readonly turns: Turn[] = [];
   readonly closed: string[] = [];
+  readonly prestarted: string[] = [];
   private readonly script: Script;
   midStreamError: Error | undefined;
+  prestartError: Error | undefined;
 
   constructor(script: Script) {
     this.script = script;
@@ -68,6 +70,12 @@ class FakeBackend implements Backend {
   closeSession(sessionId: string): Promise<void> {
     this.closed.push(sessionId);
     return Promise.resolve();
+  }
+
+  prestartVoiceSession(sessionId: string): Promise<boolean> {
+    this.prestarted.push(sessionId);
+    if (this.prestartError !== undefined) throw this.prestartError;
+    return Promise.resolve(true);
   }
 }
 
@@ -317,6 +325,47 @@ describe('POST /v1/voice/token', () => {
     expires_at: '2026-08-19T13:34:56.000Z',
   };
   const issuer: TokenIssuer = { issue: () => grant };
+
+  it('prestarts the worker session before returning the grant and tracks it for expiry', async () => {
+    let now = 10_000;
+    const tracker = new SessionTracker(() => now);
+    const backend = new FakeBackend(() => []);
+    const base = await serve(backend, tracker, issuer);
+
+    const res = await fetch(`${base}/v1/voice/token`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(grant);
+    expect(backend.prestarted).toEqual(['voice-android-device-id']);
+    now += 1_001;
+    expect(tracker.expireIdle(1_000)).toEqual(['voice-android-device-id']);
+  });
+
+  it('still issues a token when voice session pre-start fails', async () => {
+    const backend = new FakeBackend(() => []);
+    backend.prestartError = new Error('spawn failed');
+    const base = await serve(backend, new SessionTracker(), issuer);
+
+    const res = await fetch(`${base}/v1/voice/token`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(grant);
+    expect(backend.prestarted).toEqual(['voice-android-device-id']);
+  });
+
+  it('does not prestart when the backend has no voice pre-start capability', async () => {
+    const backend = new FakeBackend(() => []);
+    const base = await serve({
+      converse: backend.converse.bind(backend),
+      closeSession: backend.closeSession.bind(backend),
+    }, new SessionTracker(), issuer);
+
+    const res = await fetch(`${base}/v1/voice/token`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(grant);
+    expect(backend.prestarted).toEqual([]);
+  });
 
   it('returns the issued grant as single-line JSON and issues without context for a non-JSON body', async () => {
     const issue = vi.fn<TokenIssuer['issue']>(() => grant);

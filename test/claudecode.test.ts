@@ -2,7 +2,7 @@ import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { Options } from '@anthropic-ai/claude-agent-sdk';
+import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AtCapacityError, type Event } from '../src/backend.ts';
@@ -49,6 +49,7 @@ function resultMsg(sessionUuid: string, text: string): unknown {
 interface FakeQuery {
   fn: QueryFn;
   optionsSeen: Options[];
+  inputs: SDKUserMessage[];
   interrupts: number;
   calls: number;
 }
@@ -66,6 +67,7 @@ function fakeQuery(
 ): FakeQuery {
   const fake: FakeQuery = {
     optionsSeen: [],
+    inputs: [],
     interrupts: 0,
     calls: 0,
     fn: ({ prompt, options }) => {
@@ -73,7 +75,8 @@ function fakeQuery(
       fake.calls += 1;
       async function* messages(): AsyncGenerator {
         let turn = 0;
-        for await (const _user of prompt) {
+        for await (const user of prompt) {
+          fake.inputs.push(user);
           yield* script(turn);
           turn += 1;
           if (endAfter !== undefined && turn >= endAfter) {
@@ -329,6 +332,67 @@ describe('buildChildEnv', () => {
 });
 
 describe('ClaudeCode turns', () => {
+  it('prestarts the voice session without a user turn and reuses it on delegation', async () => {
+    const fake = fakeQuery(() => [resultMsg('voice-cli-uuid', 'ok')]);
+    const policyContexts: TurnContext[] = [];
+    const voicePolicy: PolicyFn = (_tool, input, context) => {
+      policyContexts.push(context);
+      return { behavior: 'allow', updatedInput: input };
+    };
+    const backend = new ClaudeCode(
+      makeConfig({
+        queryFn: fake.fn,
+        policy: voicePolicy,
+        systemPrompt: 'voice prompt',
+        addDirs: ['/memory'],
+        voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
+        mcpServers: { local: { type: 'stdio', command: '/bin/mcp' } },
+      }),
+    );
+
+    await backend.prestartVoiceSession('voice-android-room');
+
+    expect(fake.calls).toBe(1);
+    await fake.optionsSeen[0]?.canUseTool?.('test', {}, {
+      signal: new AbortController().signal,
+      toolUseID: 'before-turn',
+    });
+    expect(policyContexts).toEqual([{ sessionId: 'voice-android-room', meta: {} }]);
+    expect(fake.optionsSeen[0]).toMatchObject({
+      model: 'chatgpt/sol-fast',
+      effort: 'low',
+      systemPrompt: 'voice prompt\n\nSession surface: voice (user: josh)',
+      additionalDirectories: ['/memory'],
+      mcpServers: { local: { type: 'stdio', command: '/bin/mcp', alwaysLoad: true } },
+      settingSources: [],
+      skills: [],
+      strictMcpConfig: true,
+      env: {
+        ANTHROPIC_BASE_URL: 'http://127.0.0.1:4100',
+        ANTHROPIC_CUSTOM_HEADERS: 'X-Patchbay-Key: fixture-caller-key',
+      },
+    });
+
+    const turn = await backend.converse({
+      sessionId: 'voice-android-room',
+      text: 'hello',
+      meta: { surface: 'voice', user: 'josh' },
+      effort: 'low',
+      model: 'chatgpt/sol-fast',
+    });
+    await fake.optionsSeen[0]?.canUseTool?.('test', {}, {
+      signal: new AbortController().signal,
+      toolUseID: 'during-turn',
+    });
+    expect(policyContexts.at(-1)).toEqual({
+      sessionId: 'voice-android-room',
+      meta: { surface: 'voice', user: 'josh' },
+    });
+    await collect(turn);
+    expect(fake.inputs).toHaveLength(1);
+    expect(fake.calls).toBe(1);
+  });
+
   it('streams a recorded turn end to end', async () => {
     const lines = readFileSync('test/fixtures/turn-with-tool.jsonl', 'utf8')
       .trimEnd()
@@ -341,6 +405,14 @@ describe('ClaudeCode turns', () => {
     expect(events.some((e) => e.kind === 'toolStart')).toBe(true);
     expect(events.at(-1)?.kind).toBe('done');
     expect(fake.calls).toBe(1);
+  });
+
+  it('does not prestart voice sessions without a gateway', async () => {
+    const fake = fakeQuery(() => []);
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn }));
+
+    await expect(backend.prestartVoiceSession('voice-android-room')).resolves.toBe(false);
+    expect(fake.calls).toBe(0);
   });
 
   it('requires a sessionId', async () => {
