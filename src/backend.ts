@@ -14,11 +14,12 @@ export const EFFORT_LEVELS: ReadonlySet<string> = new Set<Effort>([
 ]);
 
 /**
- * Shape of an acceptable per-turn model name: a CLI alias ("sonnet") or a
- * full model id ("claude-sonnet-4-6"). Deliberately tighter than what the
- * CLI would accept — the value lands on a child's argv.
+ * Shape of an acceptable per-turn model name: a CLI alias ("sonnet"), a
+ * full model id ("claude-sonnet-4-6"), or a bounded two-segment selector.
+ * Deliberately tighter than what the CLI would accept — the value lands on a
+ * child's argv.
  */
-export const MODEL_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9.-]{0,63}$/;
+export const MODEL_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9.-]{0,63}(?:\/[a-zA-Z0-9][a-zA-Z0-9.-]{0,63})?$/;
 
 /** One user utterance entering a conversation session. */
 export interface Turn {

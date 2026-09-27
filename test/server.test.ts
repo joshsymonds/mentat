@@ -163,6 +163,14 @@ describe('POST /v1/conversation', () => {
     expect(backend.turns[0]?.model).toBe('claude-sonnet-4-6');
   });
 
+  it('accepts and forwards the patchbay model selector', async () => {
+    const backend = new FakeBackend(() => [doneEvent('ok')]);
+    const base = await serve(backend);
+    const res = await post(base, { session_id: 's1', text: 'hi', model: 'chatgpt/sol-fast' });
+    expect(res.status).toBe(200);
+    expect(backend.turns[0]?.model).toBe('chatgpt/sol-fast');
+  });
+
   it('omits model from the turn when the request has none', async () => {
     const backend = new FakeBackend(() => [doneEvent('ok')]);
     const base = await serve(backend);
@@ -180,6 +188,15 @@ describe('POST /v1/conversation', () => {
     );
     expect((await post(base, { session_id: 's1', text: 'hi', model: 7 })).status).toBe(400);
     expect((await post(base, { session_id: 's1', text: 'hi', model: 'so net' })).status).toBe(400);
+    expect((await post(base, { session_id: 's1', text: 'hi', model: 'provider/model/child' })).status).toBe(
+      400,
+    );
+    expect((await post(base, { session_id: 's1', text: 'hi', model: 'chatgpt/../sol-fast' })).status).toBe(
+      400,
+    );
+    expect((await post(base, { session_id: 's1', text: 'hi', model: `chatgpt/${'a'.repeat(65)}` })).status).toBe(
+      400,
+    );
     expect(backend.turns).toHaveLength(0);
   });
 
