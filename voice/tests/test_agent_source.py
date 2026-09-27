@@ -1,8 +1,14 @@
 """Source contract for the runtime-only LiveKit glue."""
 
 import ast
+import json
+import os
+import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 class AgentSourceContractTest(unittest.TestCase):
@@ -16,6 +22,73 @@ class AgentSourceContractTest(unittest.TestCase):
             "append_commentary",
         ):
             self.assertIn(required, source)
+
+    def test_each_delegation_writes_only_private_timed_eval_jsonl_when_opted_in(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        callback = source.split("    def _on_delegation_created(", 1)[1].split(
+            "    def _on_delegation_error(", 1
+        )[0]
+        self.assertIn('os.environ.get("MENTAT_EVAL_DELEGATION_LOG")', callback)
+        self.assertIn('"room": self._room_name', callback)
+        self.assertIn('"id": delegation.id', callback)
+        self.assertIn('"created_at": time.time()', callback)
+        self.assertIn('separators=(",", ":")', callback)
+        marker = callback.split("marker = json.dumps(", 1)[1].split("try:", 1)[0]
+        self.assertNotIn("pending_transcript", marker)
+        self.assertNotIn("credential", marker)
+        self.assertNotIn('"eval-delegation %s"', callback)
+
+    def test_delegation_marker_is_opt_in_compact_jsonl_without_transcript_or_credentials(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        method = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_on_delegation_created"
+        )
+        namespace = {
+            "os": os,
+            "json": json,
+            "time": time,
+            "Path": Path,
+            "logger": Mock(),
+            "AudioConfig": lambda *_args: object(),
+            "EARCON_PATH": agent_path.parent / "assets" / "earcon.wav",
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _room_name="eval-room",
+            _ending_policy=SimpleNamespace(delegation_started=Mock()),
+            _ending_changed=Mock(),
+            _background=SimpleNamespace(play=Mock()),
+            _delegations=SimpleNamespace(start=Mock()),
+        )
+        delegation = SimpleNamespace(id="same-id", pending_transcript="private transcript")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            marker_path = Path(temporary) / "delegations.jsonl"
+            with patch.dict(os.environ, {}, clear=True):
+                namespace["_on_delegation_created"](agent, delegation)
+            self.assertFalse(marker_path.exists())
+
+            with patch.dict(os.environ, {"MENTAT_EVAL_DELEGATION_LOG": str(marker_path)}, clear=True):
+                namespace["_on_delegation_created"](agent, delegation)
+                namespace["_on_delegation_created"](
+                    agent, SimpleNamespace(id="second-id", pending_transcript="another private transcript")
+                )
+
+            lines = marker_path.read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            markers = [json.loads(line) for line in lines]
+            self.assertTrue(all(set(marker) == {"room", "id", "created_at"} for marker in markers))
+            self.assertEqual([marker["room"] for marker in markers], ["eval-room", "eval-room"])
+            self.assertEqual([marker["id"] for marker in markers], ["same-id", "second-id"])
+            self.assertTrue(all(isinstance(marker["created_at"], (int, float)) for marker in markers))
+            self.assertNotIn("private transcript", "\n".join(lines))
+            self.assertNotIn("credential", "\n".join(lines).lower())
 
     def test_agent_has_no_startup_greeting_history(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()

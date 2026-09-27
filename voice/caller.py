@@ -83,29 +83,96 @@ def _format_segments(segments: list[dict[str, Any]]) -> str:
     )
 
 
-async def _capture_answer(track_queue: asyncio.Queue[Any]) -> tuple[bytes, int, int, float]:
+async def _capture_answer(
+    track_queue: asyncio.Queue[Any], ended: asyncio.Event | None = None
+) -> tuple[bytes, int, int, float]:
     from livekit import rtc
 
-    track = await asyncio.wait_for(track_queue.get(), timeout=15)
+    if ended is None:
+        track = await asyncio.wait_for(track_queue.get(), timeout=15)
+    else:
+        track_task = asyncio.create_task(track_queue.get())
+        ended_task = asyncio.create_task(ended.wait())
+        done, pending = await asyncio.wait(
+            (track_task, ended_task), timeout=15, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if track_task not in done:
+            raise RuntimeError("agent audio track produced no frames")
+        track = track_task.result()
     capture_started: float | None = None
     audio_stream = rtc.AudioStream(track)
     frames: list[bytes] = []
+    last_frame: Any = None
+    loop = asyncio.get_running_loop()
     try:
-        async for event in audio_stream:
-            frame = event.frame
+        no_frame_deadline = loop.time() + MAX_ANSWER_SECONDS
+        while True:
+            remaining = (
+                max(0.0, no_frame_deadline - loop.time())
+                if capture_started is None
+                else max(0.0, capture_deadline - loop.time())
+            )
+            try:
+                if ended is None:
+                    event = await asyncio.wait_for(audio_stream.__anext__(), timeout=remaining)
+                else:
+                    next_task = asyncio.create_task(audio_stream.__anext__())
+                    ended_task = asyncio.create_task(ended.wait())
+                    done, pending = await asyncio.wait(
+                        (next_task, ended_task),
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    if next_task not in done:
+                        break
+                    event = next_task.result()
+            except (TimeoutError, StopAsyncIteration):
+                break
+            last_frame = event.frame
             if capture_started is None:
                 capture_started = time.monotonic()
-            raw = bytes(frame.data)
-            frames.append(raw)
-            elapsed = time.monotonic() - capture_started
-            if elapsed >= MAX_ANSWER_SECONDS:
-                break
+                capture_deadline = loop.time() + MAX_ANSWER_SECONDS
+            frames.append(bytes(last_frame.data))
     finally:
         await audio_stream.aclose()
-        track_queue.put_nowait(track)
-    if not frames or capture_started is None:
+        if ended is None or not ended.is_set():
+            track_queue.put_nowait(track)
+    if not frames or capture_started is None or last_frame is None:
         raise RuntimeError("agent audio track produced no frames")
-    return b"".join(frames), frame.sample_rate, frame.num_channels, capture_started
+    return b"".join(frames), last_frame.sample_rate, last_frame.num_channels, capture_started
+
+
+class ContinuousCapture:
+    """Capture agent audio from before caller speech through the answer window."""
+
+    def __init__(
+        self, track_queue: asyncio.Queue[Any], ended: asyncio.Event | None = None
+    ) -> None:
+        self._track_queue = track_queue
+        self._ended = ended
+        self._task: asyncio.Task[tuple[bytes, int, int, float]] | None = None
+
+    async def start(self) -> None:
+        if self._task is not None:
+            raise RuntimeError("continuous capture already started")
+        self._task = asyncio.create_task(_capture_answer(self._track_queue, self._ended))
+        await asyncio.sleep(0)
+
+    async def result(self) -> tuple[bytes, int, int, float]:
+        if self._task is None:
+            raise RuntimeError("continuous capture has not started")
+        return await self._task
+
+
+async def _speech_end_after_playout(source: Any) -> float:
+    await source.wait_for_playout()
+    return time.monotonic()
 
 
 async def _tts(http: Any, text: str) -> bytes:
@@ -159,6 +226,7 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
         )
         room = rtc.Room()
         answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
+        capture_end: asyncio.Event | None = None
 
         @room.on("track_subscribed")
         def _track_subscribed(track: Any, publication: Any, participant: Any) -> None:
@@ -171,6 +239,23 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
                 rtc.TrackSource.SOURCE_MICROPHONE,
             ):
                 answer_tracks.put_nowait(track)
+
+        @room.on("track_unsubscribed")
+        def _track_unsubscribed(track: Any, publication: Any, participant: Any) -> None:
+            if capture_end is not None and is_agent_audio_track(
+                participant.kind,
+                track.kind,
+                publication.source,
+                rtc.ParticipantKind.PARTICIPANT_KIND_AGENT,
+                rtc.TrackKind.KIND_AUDIO,
+                rtc.TrackSource.SOURCE_MICROPHONE,
+            ):
+                capture_end.set()
+
+        @room.on("disconnected")
+        def _disconnected(*_args: Any) -> None:
+            if capture_end is not None:
+                capture_end.set()
 
         await room.connect(os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"), token)
         try:
@@ -198,9 +283,12 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
             for step, pcm in audio:
                 await quiet(step.delay)
                 print(f"say: {step.line}", flush=True)
+                capture_end = asyncio.Event()
+                capture = ContinuousCapture(answer_tracks, capture_end)
+                await capture.start()
                 await push(pcm)
-                speech_end = time.monotonic()
-                answer_pcm, sample_rate, channels, capture_started = await _capture_answer(answer_tracks)
+                speech_end = await _speech_end_after_playout(source)
+                answer_pcm, sample_rate, channels, capture_started = await capture.result()
                 segments = await _transcribe(http, answer_pcm, sample_rate, channels)
                 transcript = _segments_text(segments)
                 latency = first_matching_latency(segments, step.answer_pattern, speech_end, capture_started)

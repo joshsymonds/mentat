@@ -8,14 +8,19 @@ import gg.savecraft.mentat.core.TokenEndpoint
 import gg.savecraft.mentat.core.TokenFetchException
 import gg.savecraft.mentat.core.TokenGrant
 import gg.savecraft.mentat.core.TranscriptSegment
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import java.util.Collections
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -43,42 +48,78 @@ class VoiceSessionServiceTest {
 
         assertEquals(SessionState.Live, service.state.value)
         assertEquals("wss://voice.example.com" to "token", liveKit.connection)
-        assertEquals(
-            listOf("buffer-start", "chime", "connect", "mic", "buffer-end"),
-            liveKit.callOrder,
-        )
+        assertTrue(liveKit.callOrder.indexOf("chime") < liveKit.callOrder.indexOf("buffer-start"))
+        assertTrue(liveKit.callOrder.indexOf("buffer-start") < liveKit.callOrder.indexOf("connect"))
+        assertTrue(liveKit.callOrder.indexOf("connect") < liveKit.callOrder.indexOf("mic"))
+        assertTrue(liveKit.callOrder.indexOf("mic") < liveKit.callOrder.indexOf("buffer-end"))
         assertTrue(liveKit.microphoneEnabled.value)
         assertTrue(service.micEnabled.value)
     }
 
     @Test
-    fun listeningChimeAndPreconnectCaptureStartBeforeTokenFetch() = runBlocking {
-        val callOrder = mutableListOf<String>()
-        val liveKit = FakeLiveKitSession(callOrder = callOrder)
-        val endpoint = RecordingTokenEndpoint(callOrder)
-
-        controller(liveKit, endpoint).start()
-
-        assertEquals(
-            listOf("buffer-start", "chime", "fetch", "connect", "mic", "buffer-end"),
-            callOrder,
+    fun captureWaitsForChimeWhileTokenFetchStartsDuringPlayback() = runBlocking {
+        val callOrder = Collections.synchronizedList(mutableListOf<String>())
+        val chimeCompletion = CompletableDeferred<Unit>()
+        val fetchDuringPlayback = CompletableDeferred<Boolean>()
+        val liveKit = FakeLiveKitSession(
+            callOrder = callOrder,
+            chimeCompletion = chimeCompletion,
         )
+        val endpoint = RecordingTokenEndpoint(callOrder) {
+            fetchDuringPlayback.complete(liveKit.chimePlaying)
+        }
+        val service = controller(liveKit, endpoint, tokenDispatcher = ImmediateDispatcher())
+        val start = async { service.start() }
+
+        assertTrue(withTimeout(2_000) { fetchDuringPlayback.await() })
+        assertEquals(listOf("chime", "fetch"), callOrder.toList())
+
+        chimeCompletion.complete(Unit)
+        start.await()
+
+        assertTrue(callOrder.indexOf("chime-complete") < callOrder.indexOf("buffer-start"))
+        assertTrue(callOrder.indexOf("fetch") < callOrder.indexOf("buffer-start"))
+        assertEquals("wss://voice.example.com" to "token", liveKit.connection)
     }
 
     @Test
-    fun listeningChimeFailureFailsBeforeTokenFetch() = runBlocking {
-        val callOrder = mutableListOf<String>()
+    fun chimeFailureStartsCaptureImmediatelyAndStillConnects() = runBlocking {
+        val callOrder = Collections.synchronizedList(mutableListOf<String>())
+        val fetchStarted = kotlinx.coroutines.CompletableDeferred<Unit>()
         val liveKit = FakeLiveKitSession(
             callOrder = callOrder,
             chimeFailure = IllegalStateException("chime unavailable"),
         )
-        val endpoint = RecordingTokenEndpoint(callOrder)
-
+        val endpoint = RecordingTokenEndpoint(callOrder) { fetchStarted.complete(Unit) }
         val service = controller(liveKit, endpoint)
-        service.start()
 
-        assertEquals(SessionState.Failed("chime unavailable"), service.state.value)
-        assertEquals(listOf("buffer-start", "chime", "buffer-end"), callOrder)
+        service.start()
+        withTimeout(2_000) { fetchStarted.await() }
+
+        assertTrue(callOrder.indexOf("chime") < callOrder.indexOf("buffer-start"))
+        assertTrue(callOrder.indexOf("buffer-start") < callOrder.indexOf("connect"))
+        assertEquals("wss://voice.example.com" to "token", liveKit.connection)
+        assertFalse(service.state.value is SessionState.Failed)
+    }
+
+    @Test
+    fun questionSpokenDuringPreconnectCaptureReachesTheConnectedSession() = runBlocking {
+        val captureStarted = CompletableDeferred<Unit>()
+        val allowConnect = CompletableDeferred<Unit>()
+        val liveKit = FakeLiveKitSession(
+            captureStarted = captureStarted,
+            connectGate = allowConnect,
+        )
+        val service = controller(liveKit)
+        val start = async { service.start() }
+
+        withTimeout(2_000) { captureStarted.await() }
+        liveKit.speakQuestion("Hey Mentat, what's next?")
+        allowConnect.complete(Unit)
+        start.await()
+
+        assertEquals("wss://voice.example.com" to "token", liveKit.connection)
+        assertEquals("Hey Mentat, what's next?", liveKit.questionDeliveredAtConnect)
     }
 
     @Test
@@ -98,10 +139,9 @@ class VoiceSessionServiceTest {
         service.start()
 
         assertEquals(SessionState.Failed("connection refused"), service.state.value)
-        assertEquals(
-            listOf("buffer-start", "chime", "connect", "buffer-end"),
-            liveKit.callOrder,
-        )
+        assertTrue(liveKit.callOrder.indexOf("chime") < liveKit.callOrder.indexOf("buffer-start"))
+        assertTrue(liveKit.callOrder.indexOf("buffer-start") < liveKit.callOrder.indexOf("connect"))
+        assertTrue(liveKit.callOrder.indexOf("connect") < liveKit.callOrder.indexOf("buffer-end"))
     }
 
     @Test
@@ -309,21 +349,33 @@ class VoiceSessionServiceTest {
         tokenEndpoint: TokenEndpoint = FakeTokenEndpoint,
         stopService: () -> Unit = {},
         callContext: () -> CallContext? = { null },
+        tokenDispatcher: CoroutineDispatcher = Dispatchers.IO,
     ) = VoiceSessionController(
         tokenEndpoint = tokenEndpoint,
         liveKitSession = liveKitSession,
         stopService = stopService,
         scope = scope,
         callContext = callContext,
+        tokenDispatcher = tokenDispatcher,
     )
+
+    private class ImmediateDispatcher : CoroutineDispatcher() {
+        override fun isDispatchNeeded(context: kotlin.coroutines.CoroutineContext): Boolean = false
+
+        override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) {
+            block.run()
+        }
+    }
 
     private class RecordingTokenEndpoint(
         private val callOrder: MutableList<String> = mutableListOf(),
+        private val onFetch: () -> Unit = {},
     ) : TokenEndpoint {
         val contexts = mutableListOf<CallContext?>()
 
         override fun fetch(context: CallContext?): TokenGrant {
             callOrder += "fetch"
+            onFetch()
             contexts += context
             return FakeTokenEndpoint.fetch(context)
         }
@@ -350,32 +402,57 @@ class VoiceSessionServiceTest {
         var closeFailure: Exception? = null,
         val callOrder: MutableList<String> = mutableListOf(),
         private val chimeFailure: Exception? = null,
+        private val chimeCompletion: CompletableDeferred<Unit>? = null,
+        private val captureStarted: CompletableDeferred<Unit>? = null,
+        private val connectGate: CompletableDeferred<Unit>? = null,
     ) : LiveKitSession {
         override val events = MutableSharedFlow<LiveKitEvent>()
         override val transcripts = MutableSharedFlow<TranscriptSegment>()
         val microphoneEnabled = MutableStateFlow(false)
         var connection: Pair<String, String>? = null
+        var questionDeliveredAtConnect: String? = null
+        var chimePlaying = false
+            private set
+        private var capturingPreconnectAudio = false
+        private val capturedAudio = mutableListOf<String>()
         var disconnected = false
         var closed = false
 
         override suspend fun withPreconnectAudio(operation: suspend () -> Unit) {
             callOrder += "buffer-start"
+            capturingPreconnectAudio = true
+            captureStarted?.complete(Unit)
             try {
                 operation()
             } finally {
+                capturingPreconnectAudio = false
                 callOrder += "buffer-end"
             }
         }
 
-        override fun playListeningChime() {
+        override suspend fun playListeningChime() {
             callOrder += "chime"
             chimeFailure?.let { throw it }
+            chimePlaying = true
+            try {
+                chimeCompletion?.await()
+                callOrder += "chime-complete"
+            } finally {
+                chimePlaying = false
+            }
+        }
+
+        fun speakQuestion(text: String) {
+            check(capturingPreconnectAudio) { "Question was spoken outside preconnect capture" }
+            capturedAudio += text
         }
 
         override suspend fun connect(url: String, token: String) {
             callOrder += "connect"
             connectFailure?.let { throw it }
+            connectGate?.await()
             connection = url to token
+            questionDeliveredAtConnect = capturedAudio.joinToString("")
             connectEvent?.let { events.emit(it) }
         }
 

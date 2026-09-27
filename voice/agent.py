@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -96,6 +97,22 @@ class FrontAgent(Agent):
         logger.info(
             "delegation %s created: %r", delegation.id, delegation.pending_transcript[:200]
         )
+        marker_path = os.environ.get("MENTAT_EVAL_DELEGATION_LOG")
+        if marker_path:
+            marker = json.dumps(
+                {
+                    "room": self._room_name,
+                    "id": delegation.id,
+                    "created_at": time.time(),
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            try:
+                with Path(marker_path).open("a", encoding="utf-8") as marker_file:
+                    marker_file.write(marker + "\n")
+            except OSError:
+                logger.exception("failed to write eval delegation marker")
         self._ending_policy.delegation_started()
         self._ending_changed()
         self._background.play(AudioConfig(str(EARCON_PATH)))

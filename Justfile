@@ -17,6 +17,10 @@ test-ha:
 test-voice:
     python3 -m unittest discover -s voice/tests
 
+# Opt-in live voice evaluation; RUNS defaults to 10 observations per scenario.
+eval-voice RUNS='10':
+    python3 -m voice.evals.runner eval --live --runs {{quote(RUNS)}}
+
 # Public OAuth front (public/): FastMCP and Uvicorn from the flake environment
 test-public:
     "$(nix build .#public-env --no-link --print-out-paths)/bin/python" -m unittest discover -s public/tests

@@ -47,8 +47,9 @@ EARCON_NAME = "earcon.wav"
 # --- phone listening chime --------------------------------------------------
 # Three notes below the delegation earcon's A5, with a clear upward contour.
 # This is the phone's listening cue, not a change to the delegation earcon.
-LISTENING_TONES = ((440.0, 0.0), (554.37, 0.10), (659.25, 0.20))
+LISTENING_TONES = ((440.0, 0.20), (554.37, 0.30), (659.25, 0.40))
 LISTENING_TONE_S = 0.13
+LISTENING_PEAK_DBFS = -6.0
 LISTENING_NAME = "listening.wav"
 
 
@@ -105,7 +106,7 @@ def listening_signal() -> list[float]:
         step = math.tau * frequency / SAMPLE_RATE
         for i in range(tone_len):
             signal[start + i] += math.sin(step * i) * _chime_envelope(i, tone_len)
-    return _normalize(signal, EARCON_PEAK_DBFS)
+    return _normalize(signal, LISTENING_PEAK_DBFS)
 
 
 def to_pcm16(signal: list[float]) -> array[int]:

@@ -1,6 +1,7 @@
 package gg.savecraft.mentat.session
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import gg.savecraft.mentat.R
 import gg.savecraft.mentat.core.SessionEvent
@@ -19,6 +20,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
 
 sealed interface LiveKitEvent {
     data object Connected : LiveKitEvent
@@ -33,7 +37,7 @@ interface LiveKitSession {
 
     suspend fun withPreconnectAudio(operation: suspend () -> Unit)
 
-    fun playListeningChime()
+    suspend fun playListeningChime()
 
     suspend fun connect(url: String, token: String)
 
@@ -111,16 +115,50 @@ class AndroidLiveKitSession(context: Context) : LiveKitSession {
         room.withPreconnectAudio(operation = operation)
     }
 
-    override fun playListeningChime() {
-        val player = checkNotNull(MediaPlayer.create(appContext, R.raw.listening)) {
+    override suspend fun playListeningChime() {
+        val player = checkNotNull(
+            MediaPlayer.create(
+                appContext,
+                R.raw.listening,
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .build(),
+                0,
+            ),
+        ) {
             "Unable to load listening chime"
         }
-        player.setOnCompletionListener { it.release() }
-        try {
-            player.start()
-        } catch (exception: Exception) {
-            player.release()
-            throw exception
+        val released = AtomicBoolean(false)
+        fun releasePlayer() {
+            if (released.compareAndSet(false, true)) {
+                player.release()
+            }
+        }
+        suspendCancellableCoroutine { continuation ->
+            player.setOnCompletionListener {
+                releasePlayer()
+                continuation.resume(Unit)
+            }
+            player.setOnErrorListener { _, what, extra ->
+                releasePlayer()
+                continuation.resumeWith(
+                    Result.failure(IllegalStateException("Listening chime playback failed ($what, $extra)")),
+                )
+                true
+            }
+            continuation.invokeOnCancellation {
+                if (released.compareAndSet(false, true)) {
+                    player.setOnCompletionListener(null)
+                    player.setOnErrorListener(null)
+                    player.release()
+                }
+            }
+            try {
+                player.start()
+            } catch (exception: Exception) {
+                releasePlayer()
+                throw exception
+            }
         }
     }
 
