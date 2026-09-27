@@ -17,6 +17,18 @@ class AgentSourceContractTest(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
+    def test_each_delegation_emits_a_private_timed_eval_marker(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        callback = source.split("    def _on_delegation_created(", 1)[1].split(
+            "    def _on_delegation_error(", 1
+        )[0]
+        marker = callback.split('"eval-delegation %s"', 1)[1].split(
+            "self._ending_policy", 1
+        )[0]
+        self.assertIn('"id": delegation.id', marker)
+        self.assertIn('"created_at": time.time()', marker)
+        self.assertNotIn("pending_transcript", marker)
+
     def test_agent_has_no_startup_greeting_history(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         self.assertNotIn("CALL_OPENED", source)

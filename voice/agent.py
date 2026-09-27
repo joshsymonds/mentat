@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -95,6 +96,12 @@ class FrontAgent(Agent):
         """A plugin read-loop callback that must hand work to an asyncio task."""
         logger.info(
             "delegation %s created: %r", delegation.id, delegation.pending_transcript[:200]
+        )
+        logger.info(
+            "eval-delegation %s",
+            json.dumps(
+                {"id": delegation.id, "created_at": time.time()}, separators=(",", ":")
+            ),
         )
         self._ending_policy.delegation_started()
         self._ending_changed()

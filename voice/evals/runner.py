@@ -293,6 +293,7 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "continuous answer capture start",
             )
+            speech_started_at = time.time()
             await push(pcm)
             speech_end = _finite_timestamp(
                 await _with_deadline(
@@ -341,6 +342,7 @@ async def capture_script(
                 "room": room_name,
                 "line": step.line,
                 "transcript": transcript,
+                "speech_started_at": speech_started_at,
                 "speech_end": speech_end,
                 "capture_started": capture_started,
                 "first_audio": first_audio,
@@ -407,6 +409,76 @@ def _json_lines(text: str, label: str) -> list[dict[str, Any]]:
     return records
 
 
+def _eval_delegations(voice_log: str) -> list[dict[str, Any]]:
+    if not isinstance(voice_log, str):
+        raise RuntimeError("voice worker log is missing or invalid")
+    delegations = []
+    seen_ids = set()
+    for line_number, line in enumerate(voice_log.splitlines(), 1):
+        if "eval-delegation" not in line:
+            continue
+        prefix = "eval-delegation "
+        marker_at = line.find(prefix)
+        if marker_at < 0:
+            raise RuntimeError(f"voice worker log has a malformed delegation marker at line {line_number}")
+        try:
+            marker = json.loads(line[marker_at + len(prefix):])
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"voice worker log has malformed delegation JSON at line {line_number}"
+            ) from error
+        if not isinstance(marker, dict):
+            raise RuntimeError(f"voice worker delegation marker at line {line_number} is not an object")
+        delegation_id = marker.get("id")
+        created_at = _finite_timestamp(marker.get("created_at"), "delegation creation")
+        if not isinstance(delegation_id, str) or not delegation_id or delegation_id in seen_ids:
+            raise RuntimeError("voice worker log has a missing or repeated delegation id")
+        if delegations and created_at <= delegations[-1]["created_at"]:
+            raise RuntimeError("voice worker delegation timestamps are ambiguous or out of order")
+        seen_ids.add(delegation_id)
+        delegations.append({"id": delegation_id, "created_at": created_at})
+    return delegations
+
+
+def _attribute_model_calls(
+    traces: list[dict[str, Any]], voice_log: str, recorded_turns: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    all_delegations = _eval_delegations(voice_log)
+    starts = []
+    for index, trace in enumerate(traces, 1):
+        if not isinstance(trace, dict) or trace.get("turn") != index:
+            raise RuntimeError(f"captured turn {index} has invalid turn identity")
+        started_at = _finite_timestamp(trace.get("speech_started_at"), "caller speech start")
+        if starts and started_at <= starts[-1]:
+            raise RuntimeError("captured caller speech start timestamps are ambiguous or out of order")
+        starts.append(started_at)
+        trace["model_calls"] = []
+
+    delegations = [
+        marker for marker in all_delegations if not starts or marker["created_at"] >= starts[0]
+    ]
+    if len(delegations) != len(recorded_turns):
+        raise RuntimeError("delegation and SDK result counts differ")
+
+    for delegation, recorded in zip(delegations, recorded_turns, strict=True):
+        created_at = delegation["created_at"]
+        if created_at in starts:
+            raise RuntimeError("ambiguous delegation timestamp coincides with caller speech start")
+        turn_index = next(
+            (index for index in range(len(starts) - 1, -1, -1) if starts[index] < created_at),
+            None,
+        )
+        if turn_index is None:
+            raise RuntimeError("no captured turn precedes delegation")
+        model_calls = recorded.get("model_calls") if isinstance(recorded, dict) else None
+        if not isinstance(model_calls, list):
+            raise RuntimeError("recorded SDK result has invalid model-call evidence")
+        traces[turn_index]["model_calls"].extend(model_calls)
+        for tool in recorded.get("phone_tools", []):
+            tool["turn"] = turn_index + 1
+    return traces
+
+
 def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     turns: list[dict[str, Any]] = []
     current: list[dict[str, Any]] = []
@@ -454,8 +526,6 @@ def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for item in current
     ):
         raise RuntimeError("recorded SDK turn is missing its top-level result boundary")
-    if not turns:
-        raise RuntimeError("SDK recording contains no completed turns")
     return turns
 
 
@@ -673,25 +743,25 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     phone_log_path = "voice/" + FAKE_PHONE_LOG
     phone_text = _completed_stdout(stack.run_remote(["sudo", "cat", phone_log_path]), "fake phone log read")
     phone_commands = _phone_commands(_json_lines(phone_text, "fake phone"))
+    voice_log = _completed_stdout(stack.run_remote(["sudo", "cat", "voice.log"]), "voice worker log read")
     session_id = "voice-" + room
     record_path = "records/" + quote(session_id, safe="") + ".jsonl"
     record_text = _completed_stdout(
         stack.run_remote(["sudo", "cat", record_path]), "daemon SDK recording read"
     )
     recorded_turns = _recorded_turns(_json_lines(record_text, "SDK recording"))
-    if len(recorded_turns) != len(traces):
-        raise RuntimeError("SDK recording turn boundaries do not match captured transcript turns")
+    traces = _attribute_model_calls(traces, voice_log, recorded_turns)
     phone_commands = _match_phone_tools(phone_commands, recorded_turns)
 
     room_deleted_turns = []
-    for index, (trace, expected, recorded) in enumerate(
-        zip(traces, scenario.turns, recorded_turns, strict=True), 1
+    for index, (trace, expected) in enumerate(
+        zip(traces, scenario.turns, strict=True), 1
     ):
         if not isinstance(trace, dict) or trace.get("turn") != index or trace.get("room") != room:
             raise RuntimeError(f"captured turn {index} has invalid turn or room identity")
         if not isinstance(trace.get("transcript"), str) or not trace["transcript"].strip():
             raise RuntimeError(f"captured turn {index} has no complete transcript")
-        for field in ("speech_end", "first_audio", "capture_started"):
+        for field in ("speech_started_at", "speech_end", "first_audio", "capture_started"):
             _finite_timestamp(trace.get(field), field)
         segments = trace.get("segments")
         if not isinstance(segments, list) or not segments:
@@ -699,7 +769,6 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
         for segment in segments:
             _segment_start([segment])
         trace["kind"] = _turn_kind(scenario, index)
-        trace["model_calls"] = recorded["model_calls"]
         trace["expect_confirmation"] = getattr(expected, "sms_recipient", None) is not None
         trace["expect_hangup"] = close_after == index
         trace["confirmation"] = (
