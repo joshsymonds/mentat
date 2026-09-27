@@ -670,7 +670,8 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     if not isinstance(traces, list) or len(traces) != len(scenario.turns):
         raise RuntimeError("remote scripted capture returned missing or incomplete turns")
 
-    phone_text = _completed_stdout(stack.run_remote(["sudo", "cat", FAKE_PHONE_LOG]), "fake phone log read")
+    phone_log_path = "voice/" + FAKE_PHONE_LOG
+    phone_text = _completed_stdout(stack.run_remote(["sudo", "cat", phone_log_path]), "fake phone log read")
     phone_commands = _phone_commands(_json_lines(phone_text, "fake phone"))
     session_id = "voice-" + room
     record_path = "records/" + quote(session_id, safe="") + ".jsonl"

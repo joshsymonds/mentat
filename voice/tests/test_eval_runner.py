@@ -556,7 +556,7 @@ class ScenarioObservationTests(unittest.TestCase):
 
             def run_remote(self, command):
                 self.remote_commands.append(command)
-                if command == ["sudo", "cat", "evals/phone.jsonl"]:
+                if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
                     return CompletedProcess(command, 0, phone_log, "")
                 if command == ["sudo", "cat", "records/voice-android-eval-room.jsonl"]:
                     return CompletedProcess(command, 0, record_text, "")
