@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
@@ -28,6 +29,14 @@ CHECKOUT = Path(__file__).resolve().parents[2]
 
 
 class DevStackTest(unittest.TestCase):
+    def setUp(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = b'{"status":"ok"}\n'
+        self._health_patch = patch("urllib.request.urlopen", return_value=response)
+        self._health_patch.start()
+        self.addCleanup(self._health_patch.stop)
+
     def test_requires_explicit_opt_in_before_any_remote_action(self):
         run = unittest.mock.Mock()
         stack = DevStack(checkout=CHECKOUT, run=run)
@@ -87,6 +96,105 @@ class DevStackTest(unittest.TestCase):
             worker_script.index("systemctl stop mentat-voice"),
         )
         self.assertIn("agent.pid", setup)
+
+    @patch("voice.evals.dev_stack.subprocess.Popen")
+    def test_enter_waits_for_tunneled_health_endpoint_before_returning(self, popen):
+        tunnel = unittest.mock.Mock(poll=lambda: None)
+        popen.return_value = tunnel
+        responses = [
+            urllib.error.URLError("connection refused"),
+            urllib.error.URLError("connection refused"),
+            unittest.mock.MagicMock(),
+        ]
+        responses[-1].__enter__.return_value.status = 200
+        responses[-1].__enter__.return_value.read.return_value = b'{"status":"ok"}\n'
+        calls = []
+
+        def urlopen(url, *, timeout):
+            calls.append((url, timeout))
+            response = responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+        def run(args, **kwargs):
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.ready\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch("urllib.request.urlopen", side_effect=urlopen), patch("time.sleep") as sleep:
+            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+                self.assertEqual(len(calls), 3)
+                self.assertEqual(calls[-1][0], f"{stack.url}/healthz")
+                self.assertTrue(all(timeout > 0 for _, timeout in calls))
+                sleep.assert_called()
+
+        tunnel.terminate.assert_called_once()
+
+    @patch("voice.evals.dev_stack.subprocess.Popen")
+    def test_never_ready_endpoint_times_out_and_cleans_up(self, popen):
+        tunnel = unittest.mock.Mock(poll=lambda: None)
+        popen.return_value = tunnel
+        calls = []
+        now = [0.0]
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.timeout\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")) as urlopen:
+            with patch("time.monotonic", side_effect=lambda: now[0]), patch("time.sleep", side_effect=sleep):
+                with patch("voice.evals.dev_stack._READINESS_TIMEOUT_SECONDS", 0.5, create=True):
+                    stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
+                    with self.assertRaisesRegex(TimeoutError, "health endpoint"):
+                        stack.__enter__()
+
+        self.assertGreater(urlopen.call_count, 1)
+        self.assertLessEqual(now[0], 0.7)
+        tunnel.terminate.assert_called_once()
+        self.assertTrue(any(
+            "systemctl start mentat-voice" in kwargs.get("input", "")
+            for args, kwargs in calls
+            if args[:2] == ["ssh", "ultraviolet"]
+        ))
+        self.assertFalse(stack._entered)
+        self.assertIsNone(stack._local_port)
+
+    @patch("voice.evals.dev_stack.subprocess.Popen")
+    def test_interruption_during_health_wait_cleans_up(self, popen):
+        tunnel = unittest.mock.Mock(poll=lambda: None)
+        popen.return_value = tunnel
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.interrupt\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")):
+            with patch("time.sleep", side_effect=KeyboardInterrupt):
+                stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
+                with self.assertRaises(KeyboardInterrupt):
+                    stack.__enter__()
+
+        tunnel.terminate.assert_called_once()
+        self.assertTrue(any(
+            "systemctl start mentat-voice" in kwargs.get("input", "")
+            for args, kwargs in calls
+            if args[:2] == ["ssh", "ultraviolet"]
+        ))
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_worker_joins_the_room_returned_by_the_voice_token(self, popen):

@@ -9,11 +9,16 @@ import signal
 import socket
 import subprocess
 import threading
+import time
+import urllib.request
 from pathlib import Path
 from types import FrameType
 from typing import Callable, Sequence
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+_READINESS_TIMEOUT_SECONDS = 30.0
+_READINESS_POLL_SECONDS = 0.2
+_READINESS_REQUEST_TIMEOUT_SECONDS = 2.0
 
 
 class RemoteCommandError(subprocess.CalledProcessError):
@@ -575,6 +580,31 @@ class DevStack:
         )
         if self._tunnel.poll() is not None:
             raise RuntimeError("SSH port-forward exited before the dev stack became available")
+        self._wait_until_ready()
+
+    def _wait_until_ready(self) -> None:
+        deadline = time.monotonic() + _READINESS_TIMEOUT_SECONDS
+        health_url = f"{self.url}/healthz"
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for dev stack health endpoint")
+            if self._tunnel is None or self._tunnel.poll() is not None:
+                raise RuntimeError("SSH port-forward exited before the dev stack became ready")
+            try:
+                with urllib.request.urlopen(
+                    health_url,
+                    timeout=min(remaining, _READINESS_REQUEST_TIMEOUT_SECONDS),
+                ) as response:
+                    payload = json.loads(response.read())
+                if response.status == 200 and payload == {"status": "ok"}:
+                    return
+            except (OSError, ValueError):
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for dev stack health endpoint")
+            time.sleep(min(_READINESS_POLL_SECONDS, remaining))
 
     def _remote(
         self, script: str, *args: str, redact: Sequence[str] = ()
