@@ -16,12 +16,15 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class LiveKitSessionTest {
     @Test
-    fun listeningChimeUsesAssistantAudioUsage() {
+    fun listeningChimeUsesAssistantAudioUsage() = runBlocking {
         var player: MediaPlayer? = null
         ShadowMediaPlayer.setMediaInfoProvider { ShadowMediaPlayer.MediaInfo(1_000, 0) }
         ShadowMediaPlayer.setCreateListener { created, _ -> player = created }
@@ -34,7 +37,11 @@ class LiveKitSessionTest {
             isAccessible = true
         }.set(session, RuntimeEnvironment.getApplication())
         try {
-            session.playListeningChime()
+            val playback = async(start = CoroutineStart.UNDISPATCHED) {
+                session.playListeningChime()
+            }
+            shadowOf(checkNotNull(player)).invokeCompletionListener()
+            playback.await()
 
             assertEquals(
                 AudioAttributes.USAGE_ASSISTANT,
