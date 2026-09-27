@@ -1,6 +1,7 @@
 import asyncio
 import http.server
 import json
+import math
 import sys
 import tempfile
 import threading
@@ -24,8 +25,10 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
             {"id": "command-2", "kind": "location"},
         ]
         self.results = []
+        self.events = []
         commands = self.commands
         results = self.results
+        events = self.events
         command_delay = {"seconds": 0.0}
         self.command_delay = command_delay
         result_status = {"code": 204}
@@ -48,6 +51,7 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
                 for index, command in enumerate(commands):
                     if index == 1:
                         time.sleep(command_delay["seconds"])
+                    events.append(("sent", index))
                     payload = (json.dumps(command) + "\n").encode()
                     self.wfile.write(f"{len(payload):X}\r\n".encode() + payload + b"\r\n")
                     self.wfile.flush()
@@ -59,6 +63,7 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
                 self.assert_result_path()
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 results.append(json.loads(body))
+                events.append(("post", len(results) - 1))
                 self.send_response(result_status["code"])
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -96,6 +101,39 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
             "payload": {"lat": 47.6205, "lng": -122.3493, "accuracy_m": 8, "age_s": 3},
         })
         self.assertEqual([entry["result"] for entry in recorded if entry["event"] == "result"], self.results)
+
+    async def test_command_receipt_timestamp_precedes_result_post_without_changing_command(self):
+        clock_values = iter((1_750_000_000.125, 1_750_000_001.25))
+
+        def clock():
+            value = next(clock_values)
+            self.events.append(("clock", value))
+            return value
+
+        await run_fake_phone(self.base_url, self.output, "success", clock=clock)
+
+        recorded = [json.loads(line) for line in self.output.read_text().splitlines()]
+        command_events = [entry for entry in recorded if entry["event"] == "command"]
+        self.assertEqual([entry["command"] for entry in command_events], self.commands)
+        self.assertEqual(
+            [entry["received_at"] for entry in command_events],
+            [1_750_000_000.125, 1_750_000_001.25],
+        )
+        for timestamp in (entry["received_at"] for entry in command_events):
+            self.assertIsInstance(timestamp, (int, float))
+            self.assertNotIsInstance(timestamp, bool)
+            self.assertTrue(math.isfinite(timestamp))
+        for index in range(len(self.commands)):
+            sent = self.events.index(("sent", index))
+            received = next(
+                position
+                for position, event in enumerate(self.events)
+                if event[0] == "clock" and event[1] == (1_750_000_000.125, 1_750_000_001.25)[index]
+            )
+            posted = self.events.index(("post", index))
+            self.assertLess(sent, received)
+            self.assertLess(received, posted)
+        self.assertEqual([result["id"] for result in self.results], [command["id"] for command in self.commands])
 
     async def test_command_after_five_second_idle_window_is_received_and_recorded(self):
         self.command_delay["seconds"] = 5.2

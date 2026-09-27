@@ -4,8 +4,10 @@ import asyncio
 import http.client
 import ipaddress
 import json
+import math
+import time
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 from urllib.parse import urlsplit
 
 Mode = Literal["success"]
@@ -48,7 +50,7 @@ def _record(output: Path, entry: dict[str, object]) -> None:
         stream.write(json.dumps(entry, sort_keys=True) + "\n")
 
 
-def _run_fake_phone(base_url: str, output_path: Path) -> None:
+def _run_fake_phone(base_url: str, output_path: Path, clock: Callable[[], float]) -> None:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("", encoding="utf-8")
@@ -61,6 +63,9 @@ def _run_fake_phone(base_url: str, output_path: Path) -> None:
         if response.status != 200:
             raise RuntimeError(f"phone command stream returned HTTP {response.status}")
         while line := response.readline():
+            received_at = clock()
+            if not math.isfinite(received_at):
+                raise ValueError("phone command receipt timestamp must be finite")
             if not line.strip():
                 continue
             command = json.loads(line)
@@ -68,7 +73,7 @@ def _run_fake_phone(base_url: str, output_path: Path) -> None:
                 raise ValueError("phone command must be a JSON object")
             if command.get("kind") == "ping":
                 continue
-            _record(output, {"event": "command", "command": command})
+            _record(output, {"event": "command", "command": command, "received_at": received_at})
             result = _result(command)
             result_connection = http.client.HTTPConnection(host, port, timeout=5)
             try:
@@ -89,9 +94,15 @@ def _run_fake_phone(base_url: str, output_path: Path) -> None:
         connection.close()
 
 
-async def run_fake_phone(base_url: str, output_path: str | Path, mode: Mode) -> None:
+async def run_fake_phone(
+    base_url: str,
+    output_path: str | Path,
+    mode: Mode,
+    *,
+    clock: Callable[[], float] = time.time,
+) -> None:
     """Listen for commands and record loopback-only deterministic results."""
     if mode != "success":
         raise ValueError(f"unsupported fake phone mode: {mode}")
     _loopback_endpoint(base_url)
-    await asyncio.to_thread(_run_fake_phone, base_url, Path(output_path))
+    await asyncio.to_thread(_run_fake_phone, base_url, Path(output_path), clock)
