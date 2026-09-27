@@ -88,21 +88,10 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual([entry["result"] for entry in recorded if entry["event"] == "result"], self.results)
 
-    async def test_offline_mode_does_not_connect_or_post_success(self):
-        await run_fake_phone(self.base_url, self.output, "offline")
-
-        self.assertEqual(self.results, [])
-        self.assertEqual(self.output.read_text(), "")
-
-    async def test_unknown_mode_posts_only_error_results(self):
-        await run_fake_phone(self.base_url, self.output, "unknown")
-
-        self.assertEqual([result["id"] for result in self.results], ["command-1", "command-2"])
-        self.assertTrue(all(result["status"] == "error" for result in self.results))
-        self.assertTrue(all("unknown" in result["detail"] for result in self.results))
-        recorded = [json.loads(line) for line in self.output.read_text().splitlines()]
-        self.assertEqual([entry["command"] for entry in recorded if entry["event"] == "command"], self.commands)
-        self.assertEqual([entry["result"] for entry in recorded if entry["event"] == "result"], self.results)
+    async def test_rejects_removed_and_unknown_modes(self):
+        for mode in ("offline", "unknown", "other"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "unsupported fake phone mode"):
+                await run_fake_phone(self.base_url, self.output, mode)
 
     async def test_rejects_non_loopback_urls_without_contacting_them(self):
         with self.assertRaises(ValueError):

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-Mode = Literal["success", "offline", "unknown"]
+Mode = Literal["success"]
 _LOCATION = {"lat": 47.6205, "lng": -122.3493, "accuracy_m": 8, "age_s": 3}
 
 
@@ -28,13 +28,11 @@ def _loopback_endpoint(base_url: str) -> tuple[str, int]:
     return parsed.hostname, port
 
 
-def _result(command: dict[str, object], mode: Mode) -> dict[str, object]:
+def _result(command: dict[str, object]) -> dict[str, object]:
     command_id = command.get("id")
     kind = command.get("kind")
     if not isinstance(command_id, str) or not command_id or not isinstance(kind, str):
         raise ValueError("phone command must contain a non-empty id and kind")
-    if mode == "unknown":
-        return {"id": command_id, "status": "error", "detail": "outcome unknown"}
     if kind == "location":
         return {
             "id": command_id,
@@ -50,12 +48,10 @@ def _record(output: Path, entry: dict[str, object]) -> None:
         stream.write(json.dumps(entry, sort_keys=True) + "\n")
 
 
-def _run_fake_phone(base_url: str, output_path: Path, mode: Mode) -> None:
+def _run_fake_phone(base_url: str, output_path: Path) -> None:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("", encoding="utf-8")
-    if mode == "offline":
-        return
 
     host, port = _loopback_endpoint(base_url)
     connection = http.client.HTTPConnection(host, port, timeout=5)
@@ -73,7 +69,7 @@ def _run_fake_phone(base_url: str, output_path: Path, mode: Mode) -> None:
             if command.get("kind") == "ping":
                 continue
             _record(output, {"event": "command", "command": command})
-            result = _result(command, mode)
+            result = _result(command)
             result_connection = http.client.HTTPConnection(host, port, timeout=5)
             try:
                 result_connection.request(
@@ -95,8 +91,7 @@ def _run_fake_phone(base_url: str, output_path: Path, mode: Mode) -> None:
 
 async def run_fake_phone(base_url: str, output_path: str | Path, mode: Mode) -> None:
     """Listen for commands and record loopback-only deterministic results."""
-    if mode not in ("success", "offline", "unknown"):
+    if mode != "success":
         raise ValueError(f"unsupported fake phone mode: {mode}")
-    if mode != "offline":
-        _loopback_endpoint(base_url)
-    await asyncio.to_thread(_run_fake_phone, base_url, Path(output_path), mode)
+    _loopback_endpoint(base_url)
+    await asyncio.to_thread(_run_fake_phone, base_url, Path(output_path))

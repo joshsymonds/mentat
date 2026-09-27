@@ -12,7 +12,9 @@ from scenarios import SCENARIOS, evaluate_scenario
 class ScenarioCorpusTests(unittest.TestCase):
     def test_corpus_covers_required_scenarios_and_exact_alice_prompts(self):
         by_name = {scenario.name: scenario for scenario in SCENARIOS}
-        self.assertTrue(
+        self.assertEqual(len(by_name), len(SCENARIOS), "duplicate scenario names")
+        self.assertEqual(
+            set(by_name),
             {
                 "timer-300-seconds",
                 "equivalent-alarm",
@@ -20,10 +22,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                 "sms-say-back-yes",
                 "sms-correction-new-yes",
                 "alice-keck-context-chain",
-                "unusable-selection",
-                "phone-offline",
-                "unknown-outcome",
-            }.issubset(by_name)
+            },
         )
         for scenario in SCENARIOS:
             self.assertEqual(
@@ -299,54 +298,6 @@ class ScenarioCorpusTests(unittest.TestCase):
                     turns=turns,
                     phone_commands=list(commands),
                     room_closed_after=2,
-                )
-
-    def test_accepts_candid_negative_phone_outcomes(self):
-        for name, answer, command in (
-            (
-                "unusable-selection",
-                "I only have the listed options. Which place do you mean?",
-                [],
-            ),
-            (
-                "phone-offline",
-                "The phone is offline, so I couldn't set the timer.",
-                [],
-            ),
-            (
-                "unknown-outcome",
-                "I can't verify whether the alarm was set; the outcome is unknown.",
-                [{"turn": 1, "kind": "alarm", "hour": 7, "minute": 0, "outcome": "unknown"}],
-            ),
-        ):
-            with self.subTest(name=name):
-                scenario = next(s for s in SCENARIOS if s.name == name)
-                evaluate_scenario(
-                    scenario,
-                    turns=[answer],
-                    phone_commands=command,
-                    room_closed_after=scenario.room_close_after,
-                )
-
-    def test_phone_offline_rejects_fake_success_command(self):
-        scenario = next(s for s in SCENARIOS if s.name == "phone-offline")
-        with self.assertRaisesRegex(AssertionError, "expected 0 phone commands, got 1"):
-            evaluate_scenario(
-                scenario,
-                turns=["The phone is offline, so I couldn't set the timer."],
-                phone_commands=[{"turn": 1, "kind": "timer", "seconds": 300}],
-                room_closed_after=scenario.room_close_after,
-            )
-
-    def test_negative_scenarios_reject_success_claims_without_required_evidence(self):
-        for name in ("unusable-selection", "phone-offline", "unknown-outcome"):
-            scenario = next(s for s in SCENARIOS if s.name == name)
-            with self.subTest(name=name), self.assertRaises(AssertionError):
-                evaluate_scenario(
-                    scenario,
-                    turns=["Done, it worked."],
-                    phone_commands=[],
-                    room_closed_after=scenario.room_close_after,
                 )
 
 

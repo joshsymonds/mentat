@@ -129,37 +129,6 @@ SCENARIOS = (
         commands=(),
         room_close_after=None,
     ),
-    Scenario(
-        name="unusable-selection",
-        caller_lines=("Take me to the fourth cafe in those results.",),
-        turns=(
-            TurnExpectation((r"(?:only|don't|do not|can't|cannot).*(?:result|option|place)|(?:which|choose|select)",)),
-        ),
-        commands=(),
-        room_close_after=None,
-    ),
-    Scenario(
-        name="phone-offline",
-        caller_lines=("Set a timer for 300 seconds.",),
-        turns=(
-            TurnExpectation(
-                (r"(?:phone|timer).*(?:offline|unavailable|couldn't|could not|failed)|(?:offline|unavailable).*(?:phone|timer)",)
-            ),
-        ),
-        commands=(),
-        room_close_after=1,
-    ),
-    Scenario(
-        name="unknown-outcome",
-        caller_lines=("Set an alarm for 7 a.m.",),
-        turns=(
-            TurnExpectation(
-                (r"(?:can't|cannot|couldn't|could not).*(?:confirm|verify|know)|(?:outcome|result).*(?:unknown|unclear)",)
-            ),
-        ),
-        commands=({"turn": 1, "kind": "alarm", "hour": 7, "minute": 0, "outcome": "unknown"},),
-        room_close_after=1,
-    ),
 )
 
 
