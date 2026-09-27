@@ -425,7 +425,16 @@ async def capture_script(
             if room_close_after == index + 1:
                 if deletion_task is None:
                     raise RuntimeError("room deletion observer was not started")
-                trace["room_deleted"] = await deletion_task
+                try:
+                    trace["room_deleted"] = await deletion_task
+                except RuntimeError as error:
+                    if str(error) == "room deletion was not observed before deadline":
+                        raise PartialCaptureFailure(
+                            traces,
+                            index + 1,
+                            str(error),
+                        ) from error
+                    raise
                 if trace["room_deleted"] < speech_end:
                     raise RuntimeError("room deletion timestamp precedes speech end")
                 if index < len(steps) - 1:
@@ -792,17 +801,35 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         {"turn", "message"},
         {"turn", "message", "speech_started_at"},
     )
+    same_turn_hangup_timeout = (
+        isinstance(failure, dict)
+        and failure.get("message") == "room deletion was not observed before deadline"
+        and isinstance(failure.get("turn"), int)
+        and not isinstance(failure.get("turn"), bool)
+        and failure["turn"] == len(traces)
+        and bool(traces)
+        and isinstance(traces[-1], dict)
+        and traces[-1].get("turn") == failure["turn"]
+        and traces[-1].get("room_deleted") is None
+    )
     if (
         not isinstance(failure, dict)
         or set(failure) not in allowed_failure_fields
         or isinstance(failure.get("turn"), bool)
         or not isinstance(failure.get("turn"), int)
-        or failure["turn"] != len(traces) + 1
+        or not (
+            same_turn_hangup_timeout
+            or (
+                failure.get("message") != "room deletion was not observed before deadline"
+                and failure["turn"] == len(traces) + 1
+            )
+        )
         or failure["turn"] > expected_turns
         or failure.get("message") not in {
             "scripted speech synthesis exceeded its deadline",
             "transcription returned no agent audio after speech end",
             "room was deleted before all scripted lines were captured",
+            "room deletion was not observed before deadline",
         }
         or (
             failure.get("message") == "transcription returned no agent audio after speech end"
@@ -998,7 +1025,7 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
                 transcripts,
                 phone_commands,
                 room_closed_after,
-                failed_turn=capture_failure["turn"],
+                failed_turn=(capture_failure["turn"] if capture_failure["turn"] > len(traces) else None),
             )
         ]
     observation = {

@@ -172,6 +172,44 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(report["turns"][0]["model_call_count"], 1)
         self.assertEqual(report["turns"][0]["latency_seconds"]["first_audio"], 2.0)
 
+    def test_same_turn_hangup_timeout_scores_answer_and_keeps_fake_phone_evidence(self):
+        captured = turn(first_audio=2.25, confirmation=None, room_deleted=None, calls=2)
+        captured["turn"] = 1
+        captured["expect_confirmation"] = False
+        observation = {
+            "cases": [{
+                "name": "timer-300-seconds",
+                "runs": [{
+                    "turns": [captured],
+                    "failure": {
+                        "turn": 1,
+                        "message": "room deletion was not observed before deadline",
+                    },
+                    "product_failures": [],
+                    "phone_commands": [{
+                        "id": "fake-timer-1",
+                        "turn": 1,
+                        "kind": "timer",
+                    }],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        report = result["cases"][0]
+        self.assertEqual(len(report["turns"]), 1)
+        self.assertEqual(report["turns"][0]["latency_seconds"]["first_audio"], 2.25)
+        self.assertIsNone(report["turns"][0]["latency_seconds"]["room_deleted"])
+        self.assertEqual(report["turns"][0]["model_call_count"], 2)
+        self.assertEqual(report["gates"][0]["run_count"], 1)
+        failures = " ".join(report["failures"])
+        self.assertIn("timer-300-seconds run 1 turn 1: capture failed", failures)
+        self.assertIn("room deletion was not observed before deadline", failures)
+        self.assertIn("expected room_deleted observation is missing", failures)
+        self.assertEqual(observation["cases"][0]["runs"][0]["phone_commands"][0]["id"], "fake-timer-1")
+
     def test_valid_completed_prefix_reports_only_the_later_capture_failure(self):
         trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
         trace["expect_confirmation"] = False
@@ -289,6 +327,7 @@ class ScoringTests(unittest.TestCase):
         malformed_failures = (
             {"turn": "2", "message": "room was deleted before all scripted lines were captured"},
             {"turn": 2, "message": "transcription returned no agent audio after speech end"},
+            {"turn": 2, "message": "room deletion was not observed before deadline"},
             {
                 "turn": 2,
                 "message": "scripted speech synthesis exceeded its deadline",
@@ -308,6 +347,33 @@ class ScoringTests(unittest.TestCase):
 
                 self.assertFalse(result["passed"])
                 self.assertIn("invalid partial capture failure", " ".join(result["failures"]))
+
+    def test_same_turn_hangup_timeout_requires_the_exact_unclosed_hangup_turn(self):
+        invalid_turns = (
+            {**turn(room_deleted=None), "turn": 1, "expect_hangup": False},
+            {**turn(room_deleted=5.0), "turn": 1},
+            {**turn(room_deleted=None), "turn": 2},
+        )
+        for invalid_turn in invalid_turns:
+            with self.subTest(turn=invalid_turn):
+                result = score_observations({
+                    "cases": [{
+                        "name": "timer",
+                        "runs": [{
+                            "turns": [invalid_turn],
+                            "failure": {
+                                "turn": 1,
+                                "message": "room deletion was not observed before deadline",
+                            },
+                            "product_failures": [],
+                        }],
+                    }]
+                }, required_runs=1)
+                self.assertFalse(result["passed"])
+                self.assertIn(
+                    "invalid partial capture failure metadata",
+                    " ".join(result["failures"]),
+                )
 
     def test_missing_per_turn_kind_fails_closed(self):
         observation = {"cases": [case()]}

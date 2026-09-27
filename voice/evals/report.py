@@ -19,6 +19,7 @@ PARTIAL_CAPTURE_MESSAGES = {
     "scripted speech synthesis exceeded its deadline",
     "transcription returned no agent audio after speech end",
     "room was deleted before all scripted lines were captured",
+    "room deletion was not observed before deadline",
 }
 
 
@@ -193,7 +194,23 @@ def score_observations(
                         and set(failure) in failure_fields
                         and not isinstance(failure.get("turn"), bool)
                         and isinstance(failure.get("turn"), int)
-                        and failure["turn"] == len(run["turns"]) + 1
+                        and (
+                            (
+                                failure.get("message")
+                                == "room deletion was not observed before deadline"
+                                and failure["turn"] == len(run["turns"])
+                                and bool(run["turns"])
+                                and isinstance(run["turns"][-1], dict)
+                                and run["turns"][-1].get("turn") == failure["turn"]
+                                and run["turns"][-1].get("expect_hangup") is True
+                                and run["turns"][-1].get("room_deleted") is None
+                            )
+                            or (
+                                failure.get("message")
+                                != "room deletion was not observed before deadline"
+                                and failure["turn"] == len(run["turns"]) + 1
+                            )
+                        )
                         and failure.get("message") in PARTIAL_CAPTURE_MESSAGES
                         and (
                             failure.get("message")

@@ -549,6 +549,33 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.turns[0]["turn"], 1)
         self.assertEqual(caught.exception.turns[0]["transcript"], "answer")
 
+    async def test_expected_hangup_timeout_preserves_the_completed_same_turn(self):
+        dependencies = self.dependencies_for_failure("other")
+
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            self.assertRaises(runner.PartialCaptureFailure) as caught,
+        ):
+            await capture_script(
+                "android-selected-room",
+                ["Set a timer for five minutes.@0::five minutes"],
+                dependencies=dependencies,
+                room_delete_deadline=0.02,
+                poll_interval=0.005,
+                room_close_after=1,
+            )
+
+        self.assertEqual(caught.exception.failure, {
+            "turn": 1,
+            "message": "room deletion was not observed before deadline",
+        })
+        self.assertEqual(len(caught.exception.turns), 1)
+        trace = caught.exception.turns[0]
+        self.assertEqual(trace["turn"], 1)
+        self.assertEqual(trace["transcript"], "answer")
+        self.assertGreater(trace["first_audio"], trace["speech_end"])
+        self.assertIsNone(trace["room_deleted"])
+
     async def test_missing_audio_transcript_and_room_deletion_fail_closed(self):
         for failure, expected in (
             ("audio", "no frames"),
@@ -696,6 +723,57 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LocalEvalTests(unittest.TestCase):
+    def test_expected_hangup_timeout_emits_failed_report_and_nonzero_exit(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        class Stack:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        observation = {
+            "turns": [{
+                "turn": 1,
+                "kind": "action",
+                "speech_end": 101.0,
+                "first_audio": 102.0,
+                "overlap": False,
+                "confirmation": None,
+                "room_deleted": None,
+                "expect_confirmation": False,
+                "expect_hangup": True,
+                "model_calls": [{"id": "m1", "model": "claude-opus-5"}],
+            }],
+            "failure": {
+                "turn": 1,
+                "message": "room deletion was not observed before deadline",
+            },
+            "product_failures": [],
+            "phone_commands": [{"id": "fake-timer", "turn": 1, "kind": "timer"}],
+        }
+        output = io.StringIO()
+        with (
+            patch.object(runner, "DevStack", Stack),
+            patch.object(runner, "SCENARIOS", (SCENARIOS[0],)),
+            patch.object(runner, "observe_scenario", return_value=observation),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(report["passed"])
+        failures = " ".join(report["failures"])
+        self.assertIn("room deletion was not observed before deadline", failures)
+        self.assertIn("expected room_deleted observation is missing", failures)
+
     def test_stack_setup_failure_emits_structured_failed_report(self):
         import io
         import json
@@ -879,6 +957,100 @@ class ScenarioObservationTests(unittest.TestCase):
                     list(scenario.caller_lines),
                 )
 
+    def test_same_turn_hangup_timeout_retains_sdk_and_fake_phone_evidence(self):
+        import json
+        from subprocess import CompletedProcess
+
+        scenario = SCENARIOS[0]
+        room = "timer-hangup-timeout"
+        capture = {
+            "turns": [{
+                "turn": 1,
+                "room": room,
+                "line": scenario.caller_lines[0],
+                "transcript": "Your timer is set for five minutes.",
+                "speech_started_at": 100.0,
+                "speech_end": 101.0,
+                "first_audio": 101.8,
+                "capture_started": 101.4,
+                "overlap": False,
+                "segments": [{"start": 0.2, "end": 0.6, "text": "Your timer is set for five minutes."}],
+                "room_deleted": None,
+            }],
+            "failure": {
+                "turn": 1,
+                "message": "room deletion was not observed before deadline",
+            },
+        }
+        phone_log = "".join(json.dumps(entry) + "\n" for entry in (
+            {"event": "command", "command": {
+                "id": "fake-timer-command",
+                "kind": "timer",
+                "seconds": 300,
+                "expires_at": "2026-09-26T21:00:00Z",
+            }},
+            {"event": "result", "result": {
+                "id": "fake-timer-command",
+                "status": "ok",
+                "detail": "Fake phone completed timer",
+            }},
+        ))
+        record = "".join(json.dumps(message) + "\n" for message in (
+            {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1", "model": "claude-opus-5"}}},
+            {"type": "assistant", "message": {"content": [{
+                "type": "tool_use",
+                "id": "timer-tool-1",
+                "name": "mcp__mentat__set_timer",
+                "input": {"seconds": 300},
+            }]}},
+            {"type": "result", "session_id": "voice-" + room},
+        ))
+        delegation_markers = json.dumps({"room": room, "id": "d1", "created_at": 100.5}) + "\n"
+        grant = {"token": "header.payload.signature", "room": room, "url": "wss://livekit.invalid"}
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, json.dumps(capture), "")
+
+            def run_remote(self, command):
+                if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
+                    output = phone_log
+                elif command == ["sudo", "cat", "voice/evals/delegations.jsonl"]:
+                    output = delegation_markers
+                elif command == ["sudo", "cat", f"records/voice-{room}.jsonl"]:
+                    output = record
+                else:
+                    raise AssertionError(f"unexpected remote command {command!r}")
+                return CompletedProcess(command, 0, output, "")
+
+        with patch.object(runner, "_voice_token", return_value=grant):
+            observation = runner.observe_scenario(scenario, Stack())
+
+        self.assertEqual(observation["failure"], capture["failure"])
+        self.assertEqual(observation["turns"][0]["transcript"], "Your timer is set for five minutes.")
+        self.assertEqual(observation["turns"][0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+        self.assertEqual(observation["phone_commands"], [{
+            "id": "fake-timer-command",
+            "kind": "timer",
+            "seconds": 300,
+            "expires_at": "2026-09-26T21:00:00Z",
+            "turn": 1,
+        }])
+        self.assertEqual(observation["product_failures"], [])
+        from evals.report import score_observations
+
+        report = score_observations({"cases": [{"name": scenario.name, "runs": [observation]}]}, required_runs=1)
+        self.assertFalse(report["passed"])
+        failures = " ".join(report["failures"])
+        self.assertIn("turn 1: capture failed: room deletion was not observed before deadline", failures)
+        self.assertNotIn("invalid partial", failures)
+        self.assertEqual(report["cases"][0]["turns"][0]["model_call_count"], 1)
+
     def test_partial_capture_envelope_is_strict_and_complete_envelopes_stay_unchanged(self):
         import json
 
@@ -922,6 +1094,17 @@ class ScenarioObservationTests(unittest.TestCase):
             runner._capture_envelope(started_failure, 2)[1]["speech_started_at"],
             1_700_000_000.0,
         )
+        same_turn_timeout = json.dumps({
+            "turns": [{"turn": 1, "room_deleted": None}],
+            "failure": {
+                "turn": 1,
+                "message": "room deletion was not observed before deadline",
+            },
+        })
+        self.assertEqual(runner._capture_envelope(same_turn_timeout, 1), (
+            [{"turn": 1, "room_deleted": None}],
+            {"turn": 1, "message": "room deletion was not observed before deadline"},
+        ))
         complete = json.dumps({"turns": [trace, {"turn": 2}]})
         self.assertEqual(runner._capture_envelope(complete, 2), ([trace, {"turn": 2}], None))
         for malformed in (
@@ -931,6 +1114,9 @@ class ScenarioObservationTests(unittest.TestCase):
             {"turns": [trace], "failure": {"turn": 2, "message": "transcription returned no agent audio after speech end"}},
             {"turns": [trace], "failure": {"turn": 2, "message": "scripted speech synthesis exceeded its deadline", "speech_started_at": 1_700_000_000.0}},
             {"turns": [], "failure": {"turn": 1, "message": "room was deleted before all scripted lines were captured"}},
+            {"turns": [{"turn": 1, "room_deleted": 4.0}], "failure": {"turn": 1, "message": "room deletion was not observed before deadline"}},
+            {"turns": [{"turn": 1, "room_deleted": None}], "failure": {"turn": 1, "message": "room deletion was not observed before deadline", "speech_started_at": 1_700_000_000.0}},
+            {"turns": [trace], "failure": {"turn": 2, "message": "room deletion was not observed before deadline"}},
             {"turns": [trace], "failure": None},
             {"turns": [trace], "extra": "not allowed"},
         ):
