@@ -124,6 +124,7 @@ PY
 # token returned by this daemon's voice-token endpoint.
 python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<'PY'
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -135,6 +136,13 @@ dev_dir = Path(sys.argv[1])
 dev_port = int(sys.argv[2])
 node_bin = sys.argv[3]
 voice_python = sys.argv[4]
+setpriv_path = shutil.which("setpriv")
+if setpriv_path is None:
+    raise RuntimeError("setpriv executable is unavailable in the setup environment")
+setpriv_path = str(Path(setpriv_path).resolve())
+setpriv_file = dev_dir / "setpriv.path"
+setpriv_file.write_text(setpriv_path)
+setpriv_file.chmod(0o644)
 source_env = json.loads((dev_dir / "mentat.env.json").read_text())
 production_listen = source_env.get("MENTAT_LISTEN", "127.0.0.1:8484")
 production_port = int(production_listen.rsplit(":", 1)[1])
@@ -150,7 +158,7 @@ env.update({
 })
 log = (dev_dir / "agent.log").open("ab", buffering=0)
 process = subprocess.Popen(
-    ["setpriv", "--reuid=mentat", "--regid=mentat", "--init-groups", node_bin, str(dev_dir / "mentat/src/main.ts")],
+    [setpriv_path, "--reuid=mentat", "--regid=mentat", "--init-groups", node_bin, str(dev_dir / "mentat/src/main.ts")],
     cwd=dev_dir / "mentat", env=env, stdin=subprocess.DEVNULL,
     stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
 )
@@ -194,6 +202,7 @@ health_port = int(sys.argv[3])
 room = sys.argv[4]
 voice_python = (dev_dir / "voice-python.path").read_text().strip()
 voice_env = json.loads((dev_dir / "voice.env.json").read_text())
+setpriv_path = (dev_dir / "setpriv.path").read_text().strip()
 voice_env.update({
     "LIVEKIT_URL": "ws://127.0.0.1:7880",
     "MENTAT_URL": f"http://127.0.0.1:{dev_port}",
@@ -203,7 +212,7 @@ voice_env.update({
 })
 voice_log = (dev_dir / "voice.log").open("ab", buffering=0)
 voice = subprocess.Popen(
-    ["setpriv", "--reuid=nobody", "--regid=nogroup", "--clear-groups", voice_python, str(dev_dir / "voice/agent.py"), "connect", "--room", room],
+    [setpriv_path, "--reuid=nobody", "--regid=nogroup", "--clear-groups", voice_python, str(dev_dir / "voice/agent.py"), "connect", "--room", room],
     cwd=dev_dir / "voice", env=voice_env, stdin=subprocess.DEVNULL,
     stdout=voice_log, stderr=subprocess.STDOUT, start_new_session=True,
 )
@@ -229,6 +238,7 @@ DEV_PORT = sys.argv[2]
 HEALTH_PORT = sys.argv[3]
 command = __COMMAND__
 voice_python = (DEV_DIR / "voice-python.path").read_text().strip()
+setpriv_path = (DEV_DIR / "setpriv.path").read_text().strip()
 voice_env = json.loads((DEV_DIR / "voice.env.json").read_text())
 voice_env.update({
     "LIVEKIT_URL": "ws://127.0.0.1:7880",
@@ -239,7 +249,7 @@ voice_env.update({
 })
 result = subprocess.run(
     [
-        "setpriv", "--reuid=nobody", "--regid=nogroup", "--clear-groups",
+        setpriv_path, "--reuid=nobody", "--regid=nogroup", "--clear-groups",
         voice_python, *command,
     ],
     cwd=DEV_DIR / "voice",

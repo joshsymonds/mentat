@@ -1,5 +1,6 @@
 """Offline lifecycle tests for the isolated voice-eval development stack."""
 
+import io
 import json
 import os
 import stat
@@ -15,6 +16,7 @@ from voice.evals.dev_stack import (
     DevStack,
     _MCP_REWRITE_SOURCE,
     _PRIVATE_CREDENTIAL_SOURCE,
+    _RUN_VOICE_SCRIPT,
     _SETUP_SCRIPT,
     _START_WORKER_SCRIPT,
 )
@@ -177,6 +179,90 @@ class DevStackTest(unittest.TestCase):
         self.assertIn('"LIVEKIT_URL": "ws://127.0.0.1:7880"', kwargs["input"])
         self.assertIn('"MENTAT_URL": f"http://127.0.0.1:{DEV_PORT}"', kwargs["input"])
         self.assertNotIn(secret, " ".join(args) + kwargs["input"])
+
+    def test_setpriv_is_resolved_outside_service_path_for_all_launches(self):
+        def python_block(script, header):
+            return script.split(header + chr(10), 1)[1].split(chr(10) + "PY" + chr(10), 1)[0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dev_dir = root / "stage"
+            (dev_dir / "mentat").mkdir(parents=True)
+            (dev_dir / "voice").mkdir()
+            service_path = str(root / "service-bin")
+            (dev_dir / "mentat.env.json").write_text(json.dumps({
+                "PATH": service_path,
+                "MENTAT_LISTEN": "127.0.0.1:8484",
+            }))
+            (dev_dir / "voice.env.json").write_text(json.dumps({"PATH": service_path}))
+            (dev_dir / "voice-python.path").write_text("/nix/store/python/bin/python3")
+
+            setup_bin = root / "setup-bin"
+            setup_bin.mkdir()
+            setpriv = setup_bin / "setpriv"
+            setpriv.write_text("fake setpriv executable")
+            setpriv.chmod(0o755)
+            resolved_setpriv = str(setpriv.resolve())
+
+            setup = _SETUP_SCRIPT.replace(
+                "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
+            ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
+            setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
+            setup_body = python_block(setup, setup_header)
+            with patch.dict(os.environ, {"PATH": str(setup_bin)}):
+                with patch("sys.argv", ["setup.py", str(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"]):
+                    with patch("subprocess.Popen", return_value=SimpleNamespace(pid=1234)) as popen:
+                        exec(setup_body, {})
+            daemon_argv = popen.call_args.args[0]
+            self.assertEqual(daemon_argv[0], resolved_setpriv)
+            self.assertEqual(popen.call_args.kwargs["env"]["PATH"], service_path)
+            self.assertEqual((dev_dir / "setpriv.path").read_text(), resolved_setpriv)
+            self.assertEqual(stat.S_IMODE((dev_dir / "setpriv.path").stat().st_mode), 0o644)
+
+            worker_body = python_block(
+                _START_WORKER_SCRIPT,
+                'python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" "$ROOM" <<\'PY\'',
+            )
+            with patch("sys.argv", ["worker.py", str(dev_dir), "8485", "8486", "worker-room"]):
+                with patch("subprocess.Popen") as popen:
+                    exec(worker_body, {})
+            worker_argv = popen.call_args.args[0]
+            self.assertEqual(worker_argv[0], resolved_setpriv)
+            self.assertEqual(popen.call_args.kwargs["env"]["PATH"], service_path)
+
+            caller_body = python_block(
+                _RUN_VOICE_SCRIPT.replace(
+                    "__COMMAND__", repr(["evals/runner.py", "--room", "caller-room"])
+                ),
+                'python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" <<\'PY\'',
+            )
+            result = SimpleNamespace(stdout="", stderr="", returncode=0)
+            with patch("sys.argv", ["caller.py", str(dev_dir), "8485", "8486"]):
+                with patch("sys.stdout", io.StringIO()), patch("sys.stderr", io.StringIO()):
+                    with patch("subprocess.run", return_value=result) as run:
+                        with patch("sys.exit") as exit_process:
+                            exec(caller_body, {})
+            exit_process.assert_called_once_with(0)
+            caller_argv = run.call_args.args[0]
+            self.assertEqual(caller_argv[0], resolved_setpriv)
+            self.assertEqual(run.call_args.kwargs["env"]["PATH"], service_path)
+
+    def test_setup_fails_if_setpriv_cannot_be_resolved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dev_dir = root / "stage"
+            (dev_dir / "mentat").mkdir(parents=True)
+            setup = _SETUP_SCRIPT.replace(
+                "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
+            ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
+            setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
+            setup_body = setup.split(setup_header + chr(10), 1)[1].split(chr(10) + "PY" + chr(10), 1)[0]
+            with patch.dict(os.environ, {"PATH": str(root / "empty-bin")}):
+                with patch("sys.argv", ["setup.py", str(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"]):
+                    with patch("subprocess.Popen") as popen:
+                        with self.assertRaisesRegex(RuntimeError, "setpriv executable is unavailable"):
+                            exec(setup_body, {})
+            popen.assert_not_called()
 
     def test_run_voice_requires_entered_stack_and_propagates_remote_failure(self):
         run = unittest.mock.Mock()
