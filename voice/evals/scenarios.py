@@ -66,39 +66,39 @@ SCENARIOS = (
     ),
     Scenario(
         name="sms-say-back-yes",
-        caller_lines=("Text Alice: I will be there at six.", "Yes."),
+        caller_lines=("Text +1-202-555-0142: I will be there at six.", "Yes."),
         turns=(
             TurnExpectation(
-                (r"\bAlice\b", r"I will be there at six\.", r"\b(?:send|text)\b", r"\b(?:should I|want me to|say yes)\b"),
-                sms_recipient="Alice",
+                (r"\b(?:text|send)\b", r"\b(?:should I|would you like|want me to|say yes)\b"),
+                sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
-            TurnExpectation((r"\bAlice\b", r"\b(?:sent|texted)\b")),
+            TurnExpectation((r"\b(?:sent|texted)\b",)),
         ),
-        commands=({"turn": 2, "kind": "sms", "to": "Alice", "body": "I will be there at six."},),
+        commands=({"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."},),
         room_close_after=2,
     ),
     Scenario(
         name="sms-correction-new-yes",
         caller_lines=(
-            "Text Alice: I will be there at six.",
+            "Text +1-202-555-0142: I will be there at six.",
             "Correction: I will be there at seven.",
             "Yes.",
         ),
         turns=(
             TurnExpectation(
-                (r"\bAlice\b", r"I will be there at six\.", r"\b(?:send|text)\b", r"\b(?:should I|want me to|say yes)\b"),
-                sms_recipient="Alice",
+                (r"\b(?:text|send)\b", r"\b(?:should I|would you like|want me to|say yes)\b"),
+                sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
             TurnExpectation(
-                (r"\bAlice\b", r"I will be there at seven\.", r"\b(?:send|text)\b", r"\b(?:should I|want me to|say yes)\b"),
-                sms_recipient="Alice",
+                (r"\b(?:text|send)\b", r"\b(?:should I|would you like|want me to|say yes)\b"),
+                sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at seven.",
             ),
-            TurnExpectation((r"\bAlice\b", r"\b(?:sent|texted)\b")),
+            TurnExpectation((r"\b(?:sent|texted)\b",)),
         ),
-        commands=({"turn": 3, "kind": "sms", "to": "Alice", "body": "I will be there at seven."},),
+        commands=({"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at seven."},),
         room_close_after=3,
     ),
     Scenario(
@@ -141,13 +141,14 @@ def _require(condition: bool, message: str) -> None:
 def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -> str:
     """Extract the complete say-back between the recipient and confirmation prompt."""
     pattern = re.compile(
-        r"\b(?:text|send)\s+" + re.escape(recipient) + r"\s*:\s*"
+        r"\b(?:text|send)\s+(?P<recipient>[+\d().\s-]+?)\s*:\s*"
         r"(?P<body>.+?)(?=\s+(?:should i|would you like|do you want|shall i)\b)",
         re.IGNORECASE | re.DOTALL,
     )
     match = pattern.search(text)
     _require(
-        match is not None,
+        match is not None
+        and re.sub(r"\D", "", match.group("recipient")) == re.sub(r"\D", "", recipient),
         f"{scenario_name}: turn {turn} has no complete {recipient} message say-back",
     )
     tail = text[match.end():]
@@ -156,6 +157,14 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
         f"{scenario_name}: turn {turn} contradicts its SMS say-back after the confirmation prompt",
     )
     return " ".join(match.group("body").split()).strip(' "“”')
+
+
+def _sms_body_tokens(body: str) -> tuple[str, ...]:
+    """Compare spoken renderings while preserving every message word and value."""
+    normalized = re.sub(r"\bi'll\b", "i will", body, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bsix\b", "6", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bseven\b", "7", normalized, flags=re.IGNORECASE)
+    return tuple(re.findall(r"[a-z0-9]+", normalized.lower()))
 
 
 def evaluate_scenario(
@@ -194,10 +203,10 @@ def evaluate_scenario(
             )
             body = _spoken_sms_body(text, expectation.sms_recipient, scenario.name, turn_number)
             _require(
-                body == expectation.sms_body,
+                _sms_body_tokens(body) == _sms_body_tokens(expectation.sms_body),
                 f"{scenario.name}: turn {turn_number} said back {body!r}, expected {expectation.sms_body!r}",
             )
-            spoken_sms[turn_number] = (expectation.sms_recipient, body)
+            spoken_sms[turn_number] = (expectation.sms_recipient, expectation.sms_body)
 
     expected_commands = scenario.commands
     _require(

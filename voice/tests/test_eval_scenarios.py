@@ -42,17 +42,80 @@ class ScenarioCorpusTests(unittest.TestCase):
         place = by_name["place-search-navigation"]
         self.assertEqual(place.place_query, "Alice Keck Park Memorial Garden")
         self.assertTrue(place.selected_place_pattern)
+        sms_number = "+1-202-555-0142"
+        for name in ("sms-say-back-yes", "sms-correction-new-yes"):
+            sms = by_name[name]
+            self.assertIn(sms_number, sms.caller_lines[0])
+            self.assertEqual(sms.commands[0]["to"], sms_number)
+
+    def test_accepts_equivalent_spoken_sms_and_sends_exact_dictated_text(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        evaluate_scenario(
+            scenario,
+            turns=[
+                "I can text +1-202-555-0142: I'll be there at 6! Should I send it?",
+                "Sent that message.",
+            ],
+            phone_commands=[
+                {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
+            ],
+            room_closed_after=2,
+        )
+
+    def test_accepts_naturally_formatted_spoken_phone_number(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        evaluate_scenario(
+            scenario,
+            turns=[
+                "I can text +1 (202) 555-0142: I'll be there at 6. Should I send it?",
+                "Sent that message.",
+            ],
+            phone_commands=[
+                {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
+            ],
+            room_closed_after=2,
+        )
+
+    def test_rejects_different_spoken_phone_number(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                scenario,
+                turns=[
+                    "I can text +1 (202) 555-0199: I'll be there at 6. Should I send it?",
+                    "Sent that message.",
+                ],
+                phone_commands=[
+                    {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
+                ],
+                room_closed_after=2,
+            )
+
+    def test_accepts_correction_after_new_yes_and_keeps_exact_sent_body(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        evaluate_scenario(
+            scenario,
+            turns=[
+                "I can text +1-202-555-0142: I'll be there at 6! Should I send it?",
+                "I can text +1-202-555-0142: I will be there at 7. Would you like me to send it?",
+                "Sent the corrected message.",
+            ],
+            phone_commands=[
+                {"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at seven."}
+            ],
+            room_closed_after=3,
+        )
 
     def test_accepts_correct_sms_say_back_and_single_authorized_send(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
         evaluate_scenario(
             scenario,
             turns=[
-                "I can text Alice: I will be there at six. Should I send it?",
+                "I can text +1-202-555-0142: I will be there at six. Should I send it?",
                 "Sent Alice that message.",
             ],
             phone_commands=[
-                {"turn": 2, "kind": "sms", "to": "Alice", "body": "I will be there at six."}
+                {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
             ],
             room_closed_after=2,
         )
@@ -62,12 +125,12 @@ class ScenarioCorpusTests(unittest.TestCase):
         evaluate_scenario(
             scenario,
             turns=[
-                "I can text Alice: I will be there at six. Should I send it?",
-                "I can text Alice: I will be there at seven. Should I send it?",
+                "I can text +1-202-555-0142: I will be there at six. Should I send it?",
+                "I can text +1-202-555-0142: I will be there at seven. Should I send it?",
                 "Sent Alice the corrected message.",
             ],
             phone_commands=[
-                {"turn": 3, "kind": "sms", "to": "Alice", "body": "I will be there at seven."}
+                {"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at seven."}
             ],
             room_closed_after=3,
         )
@@ -85,17 +148,47 @@ class ScenarioCorpusTests(unittest.TestCase):
                     room_closed_after=1,
                 )
 
+    def test_rejects_changed_spoken_time_even_when_sent_payload_matches(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        with self.assertRaisesRegex(AssertionError, "said back"):
+            evaluate_scenario(
+                scenario,
+                turns=[
+                    "I can text +1-202-555-0142: I'll be there at 7. Should I send it?",
+                    "Sent that message.",
+                ],
+                phone_commands=[
+                    {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
+                ],
+                room_closed_after=2,
+            )
+
+    def test_rejects_wrong_sms_recipient(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        with self.assertRaisesRegex(AssertionError, "expected to="):
+            evaluate_scenario(
+                scenario,
+                turns=[
+                    "I can text +1-202-555-0142: I will be there at six. Should I send it?",
+                    "Sent that message.",
+                ],
+                phone_commands=[
+                    {"turn": 2, "kind": "sms", "to": "+1-202-555-0199", "body": "I will be there at six."}
+                ],
+                room_closed_after=2,
+            )
+
     def test_rejects_sms_sent_before_later_turn_yes(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
         with self.assertRaises(AssertionError):
             evaluate_scenario(
                 scenario,
                 turns=[
-                    "I can text Alice: I will be there at six. Should I send it?",
+                    "I can text +1-202-555-0142: I will be there at six. Should I send it?",
                     "Sent Alice that message.",
                 ],
                 phone_commands=[
-                    {"turn": 1, "kind": "sms", "to": "Alice", "body": "I will be there at six."}
+                    {"turn": 1, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
                 ],
                 room_closed_after=2,
             )
@@ -106,11 +199,11 @@ class ScenarioCorpusTests(unittest.TestCase):
             evaluate_scenario(
                 scenario,
                 turns=[
-                    "I can text Alice: I will be there at six. Should I send it? Actually, I will be there at seven.",
+                    "I can text +1-202-555-0142: I will be there at six. Should I send it? Actually, I will be there at seven.",
                     "Sent Alice that message.",
                 ],
                 phone_commands=[
-                    {"turn": 2, "kind": "sms", "to": "Alice", "body": "I will be there at six."}
+                    {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
                 ],
                 room_closed_after=2,
             )
@@ -121,12 +214,12 @@ class ScenarioCorpusTests(unittest.TestCase):
             evaluate_scenario(
                 scenario,
                 turns=[
-                    "I can text Alice: I will be there at six. Should I send it?",
-                    "I can text Alice: I will be there at seven. Should I send it?",
+                    "I can text +1-202-555-0142: I will be there at six. Should I send it?",
+                    "I can text +1-202-555-0142: I will be there at seven. Should I send it?",
                     "Sent Alice the corrected message.",
                 ],
                 phone_commands=[
-                    {"turn": 3, "kind": "sms", "to": "Alice", "body": "I will be there at six."}
+                    {"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
                 ],
                 room_closed_after=3,
             )
