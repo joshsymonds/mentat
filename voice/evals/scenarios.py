@@ -36,8 +36,14 @@ _ALICE_DONOR_CLAIM = (
     r"\bAlice Keck(?: Park)?\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice Keck(?: Park)?\b.{0,100}\bshe\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice Keck Park\b.{0,8}\bwho\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice Keck Park,\s+a local philanthropist[,.]\s*who\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\b(?:bought|purchased|donated|gave|gifted|given)\b.{0,80}\b(?:by|from)\s+Alice Keck\b|"
     r"\b(?:gift|donation)\b.{0,80}\b(?:by|from)\s+Alice Keck\b"
+)
+SMS_CONFIRMATION_PATTERN = re.compile(
+    r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|"
+    r"say the word|confirm,\s+and i'll send it|sound right|good to send)\b",
+    re.IGNORECASE,
 )
 _UNCERTAIN_DONOR_CLAIM = (
     r"\b(?:not sure|don't know|do not know|unclear|can't say|cannot say)\b"
@@ -48,7 +54,7 @@ _PARK_LAND_OBJECT = (
     r"(?:Alice Keck Park|(?:(?:the|that|this|her|his|their)\s+)?"
     r"(?:land|property|park|garden|site)|it)"
 )
-_OTHER_ROLE = r"(?:the\s+)?(?:her\s+)?(?:husband|father|family|city|someone else|somebody else|another person)"
+_OTHER_ROLE = r"(?:the\s+)?(?:her\s+)?(?:husband|wife|father|mother|daughter|son|family|city|someone else|somebody else|another person)"
 _NAMED_OTHER_ACTOR = (
     r"(?-i:(?!(?:Alice|Halis)\s+Keck\b)(?!Keck\s+Park\b)"
     r"(?:[A-Z][A-Za-z'’-]+|[A-Z]\.)(?:\s+(?:[A-Z][A-Za-z'’-]+|[A-Z]\.|de|van|von|da)){1,5})"
@@ -73,12 +79,14 @@ _DIGIT_WORDS = {
 _DIGIT_WORD_PATTERN = "|".join(_DIGIT_WORDS)
 _SPOKEN_SMS_RECIPIENT = re.compile(
     rf"(?P<recipient>(?:\+|plus(?:[\s-]+))?"
-    rf"(?:(?:{_DIGIT_WORD_PATTERN}|\d)[\s().-]*){{10,15}})"
+    rf"(?:(?:{_DIGIT_WORD_PATTERN}|\d)[\s().,-]*){{10,15}})"
     r"\s*[:,.]?\s+",
     re.IGNORECASE,
 )
 _NON_ALICE_PARK_DONOR = (
     r"(?:"
+    rf"\b{_OTHER_ROLE}\b\s*,?\s*who\s+\b{_TRANSFER_ACTION}\b"
+    rf"(?:\s+\w+){{0,3}}\s+\b{_PARK_LAND_OBJECT}\b|"
     rf"\b{_OTHER_ROLE}\b(?:\s+\w+){{0,4}}\s+\b{_TRANSFER_ACTION}\b"
     rf"(?:\s+\w+){{0,3}}\s+\b{_PARK_LAND_OBJECT}\b|"
     rf"\b{_NAMED_OTHER_ACTOR}\b(?:\s*,\s*|\s+)(?:(?:was\s+the\s+one\s+)?who\s+)?\b{_TRANSFER_ACTION}\b"
@@ -155,7 +163,7 @@ SCENARIOS = (
         caller_lines=("Text +1-202-555-0142: I will be there at six.", "Yes."),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word|confirm)\b"),
+                (r"\b(?:text|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
@@ -173,12 +181,12 @@ SCENARIOS = (
         ),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word|confirm)\b"),
+                (r"\b(?:text|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
             TurnExpectation(
-                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word|confirm)\b"),
+                (r"\b(?:text|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at seven.",
             ),
@@ -238,11 +246,7 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
     """Extract the complete message say-back before or after its recipient."""
     match = _SPOKEN_SMS_RECIPIENT.search(text)
     prompt = (
-        re.search(
-            r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word|confirm)\b",
-            text[match.end():],
-            re.IGNORECASE,
-        )
+        SMS_CONFIRMATION_PATTERN.search(text[match.end():])
         if match is not None
         else None
     )
@@ -280,6 +284,7 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
             flags=re.IGNORECASE,
         )
     body = " ".join(body.split()).strip(' \t,.:;–—-"“”')
+    body = re.sub(r"^saying\b\s*,?\s*", "", body, flags=re.IGNORECASE)
     _require(bool(body), f"{scenario_name}: turn {turn} has no complete SMS body say-back")
 
     prompt_end = match.end() + prompt.end()

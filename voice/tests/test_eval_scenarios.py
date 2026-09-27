@@ -1510,6 +1510,84 @@ class ScenarioCorpusTests(unittest.TestCase):
                     room_closed_after=1,
                 )
 
+    def test_run15_verbatim_sms_readbacks_accept_body_recipient_and_confirmation(self):
+        simple_scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        correction_scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        run1_readback = (
+            " OK.  and do that now.  Just to confirm, I'm texting 202-  555-0142 "
+            "saying I will be there at 6.  Say the word, and I'll send it."
+        )
+        run2_first_readback = (
+            " Sending that now.  Hang on.  OK, so text him, plus 1, 202-555-0142,  "
+            "saying, I will be there at 6.  Sound right?"
+        )
+        run2_corrected_readback = (
+            " Got it.  Updating the message.  Got it, texting plus one, 202-555-0142.  "
+            "I will be there at 7.  Good to send."
+        )
+        evaluate_scenario(
+            simple_scenario,
+            [run1_readback, "Sent that message."],
+            [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+            room_closed_after=2,
+        )
+        evaluate_scenario(
+            correction_scenario,
+            [run2_first_readback, run2_corrected_readback, "Sent the corrected message."],
+            [{"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at seven."}],
+            room_closed_after=3,
+        )
+
+    def test_run15_alice_philanthropist_appositive_attributes_donor_only_to_alice(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        followups = [
+            "Alice Keck Park was W. M. Keck's daughter.",
+            "Her family's wealth came from Superior Oil.",
+        ]
+        evaluate_scenario(
+            scenario,
+            [
+                "I'll check. It's named after Alice Keck Park, a local philanthropist. "
+                "who donated the land for that garden to the city and they named it in her honor.",
+                *followups,
+            ],
+            [],
+            room_closed_after=None,
+        )
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                scenario,
+                [
+                    "It's named after Alice Keck Park, a local philanthropist and wife of an "
+                    "unnamed heir, who donated the land to the city.",
+                    *followups,
+                ],
+                [],
+                room_closed_after=None,
+            )
+        other_attributions = (
+            "Her husband, who donated the land for that garden to the city.",
+            "Her wife, who donated the land for that garden to the city.",
+            "Her father, who donated the land for that garden to the city.",
+            "Her mother, who donated the land for that garden to the city.",
+            "Her daughter, who donated the land for that garden to the city.",
+            "Her son, who donated the land for that garden to the city.",
+            "Locke de Breadville, who donated the land for that garden to the city.",
+        )
+        for attribution in other_attributions:
+            with self.subTest(attribution=attribution), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    scenario,
+                    [
+                        "It's named after Alice Keck Park, a local philanthropist. "
+                        "who donated the land for that garden to the city. "
+                        + attribution,
+                        *followups,
+                    ],
+                    [],
+                    room_closed_after=None,
+                )
+
     def test_live_sms_body_before_spelled_recipient_requires_yes_and_one_matching_send(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
         readback = (

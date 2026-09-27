@@ -26,6 +26,7 @@ from evals.dev_stack import DevStack, RemoteCommandError, _redact_diagnostics
 from evals.report import NO_ANSWER_FAILURE, score_observations
 from evals.scenarios import (
     SCENARIOS,
+    SMS_CONFIRMATION_PATTERN,
     _sms_body_tokens,
     _spoken_sms_body,
     _uncertain_without_alice_attribution,
@@ -43,10 +44,6 @@ TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
-)
-SMS_CONFIRMATION_PATTERN = re.compile(
-    r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word|confirm,\s+and i'll send it)\b",
-    re.IGNORECASE,
 )
 PHONE_TOOL_KINDS = {
     "send_sms": "sms",

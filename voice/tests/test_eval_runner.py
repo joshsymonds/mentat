@@ -1877,6 +1877,37 @@ class ScenarioObservationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no transcript segment timestamps"):
             runner._confirmation_time({"capture_started": 5.0, "segments": []})
 
+    def test_run15_confirmation_timestamp_uses_post_readback_request(self):
+        from evals import scenarios
+
+        self.assertIs(runner.SMS_CONFIRMATION_PATTERN, scenarios.SMS_CONFIRMATION_PATTERN)
+        cases = (
+            (
+                "Just to confirm, I'm texting 202-  555-0142 saying I will be there at 6.",
+                "Say the word, and I'll send it.",
+            ),
+            (
+                "OK, so text him, plus 1, 202-555-0142, saying, I will be there at 6.",
+                "Sound right?",
+            ),
+            (
+                "Got it, texting plus one, 202-555-0142. I will be there at 7.",
+                "Good to send.",
+            ),
+        )
+        for readback, question in cases:
+            with self.subTest(question=question):
+                self.assertEqual(
+                    runner._confirmation_time({
+                        "capture_started": 10.0,
+                        "segments": [
+                            {"start": 0.0, "end": 0.3, "text": readback},
+                            {"start": 0.4, "end": 0.8, "text": question},
+                        ],
+                    }),
+                    10.8,
+                )
+
     def test_confirmation_timestamp_recognizes_all_approved_prompt_literals(self):
         prompts = (
             "Should I send it?",
