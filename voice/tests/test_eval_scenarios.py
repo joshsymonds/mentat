@@ -349,10 +349,10 @@ class ScenarioCorpusTests(unittest.TestCase):
 
     def test_rejects_missing_hangup_and_hangup_when_chain_must_stay_open(self):
         timer = next(s for s in SCENARIOS if s.name == "timer-300-seconds")
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(AssertionError, "expected room close"):
             evaluate_scenario(
                 timer,
-                turns=["A 300-second timer is set."],
+                turns=["A five-minute timer is set."],
                 phone_commands=[{"turn": 1, "kind": "timer", "seconds": 300}],
                 room_closed_after=None,
             )
