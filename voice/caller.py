@@ -91,21 +91,47 @@ async def _capture_answer(track_queue: asyncio.Queue[Any]) -> tuple[bytes, int, 
     audio_stream = rtc.AudioStream(track)
     frames: list[bytes] = []
     try:
-        async for event in audio_stream:
-            frame = event.frame
-            if capture_started is None:
-                capture_started = time.monotonic()
-            raw = bytes(frame.data)
-            frames.append(raw)
-            elapsed = time.monotonic() - capture_started
-            if elapsed >= MAX_ANSWER_SECONDS:
-                break
+        try:
+            async with asyncio.timeout(MAX_ANSWER_SECONDS):
+                async for event in audio_stream:
+                    frame = event.frame
+                    if capture_started is None:
+                        capture_started = time.monotonic()
+                    frames.append(bytes(frame.data))
+                    if time.monotonic() - capture_started >= MAX_ANSWER_SECONDS:
+                        break
+        except TimeoutError as exc:
+            raise RuntimeError("agent audio capture timed out") from exc
     finally:
         await audio_stream.aclose()
         track_queue.put_nowait(track)
     if not frames or capture_started is None:
         raise RuntimeError("agent audio track produced no frames")
     return b"".join(frames), frame.sample_rate, frame.num_channels, capture_started
+
+
+class ContinuousCapture:
+    """Capture agent audio from before caller speech through the answer window."""
+
+    def __init__(self, track_queue: asyncio.Queue[Any]) -> None:
+        self._track_queue = track_queue
+        self._task: asyncio.Task[tuple[bytes, int, int, float]] | None = None
+
+    async def start(self) -> None:
+        if self._task is not None:
+            raise RuntimeError("continuous capture already started")
+        self._task = asyncio.create_task(_capture_answer(self._track_queue))
+        await asyncio.sleep(0)
+
+    async def result(self) -> tuple[bytes, int, int, float]:
+        if self._task is None:
+            raise RuntimeError("continuous capture has not started")
+        return await self._task
+
+
+async def _speech_end_after_playout(source: Any) -> float:
+    await source.wait_for_playout()
+    return time.monotonic()
 
 
 async def _tts(http: Any, text: str) -> bytes:
@@ -198,9 +224,11 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
             for step, pcm in audio:
                 await quiet(step.delay)
                 print(f"say: {step.line}", flush=True)
+                capture = ContinuousCapture(answer_tracks)
+                await capture.start()
                 await push(pcm)
-                speech_end = time.monotonic()
-                answer_pcm, sample_rate, channels, capture_started = await _capture_answer(answer_tracks)
+                speech_end = await _speech_end_after_playout(source)
+                answer_pcm, sample_rate, channels, capture_started = await capture.result()
                 segments = await _transcribe(http, answer_pcm, sample_rate, channels)
                 transcript = _segments_text(segments)
                 latency = first_matching_latency(segments, step.answer_pattern, speech_end, capture_started)

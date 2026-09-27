@@ -151,6 +151,69 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capture_starts_before_speech_and_preserves_early_frames(self):
+        early = CaptureTests.frame(False)
+        later = CaptureTests.frame(False)
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        capture = caller.ContinuousCapture(queue)
+        speech_started = False
+        first_frame_before_speech = []
+        with patch.dict(
+            sys.modules,
+            {
+                "livekit": SimpleNamespace(
+                    rtc=CaptureTests().fake_rtc([early, later], lambda: first_frame_before_speech.append(not speech_started))
+                )
+            },
+        ):
+            await capture.start()
+            speech_started = True
+            pcm, _, _, capture_started = await capture.result()
+        self.assertEqual(first_frame_before_speech, [True])
+        self.assertEqual(pcm, early.data + later.data)
+        self.assertIsInstance(capture_started, float)
+
+    async def test_capture_has_a_finite_deadline_when_track_never_produces_audio(self):
+        class HangingStream:
+            def __init__(self, track):
+                pass
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Future()
+
+            async def aclose(self):
+                return None
+
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        with patch.object(caller, "MAX_ANSWER_SECONDS", 0.01):
+            with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=HangingStream))}):
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    await asyncio.wait_for(_capture_answer(queue), timeout=0.2)
+
+    async def test_speech_end_timestamp_follows_playout_completion(self):
+        class Clock:
+            now = 1.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = Clock()
+
+        class Source:
+            async def wait_for_playout(self):
+                clock.now = 4.0
+
+        with patch.object(caller, "time", clock):
+            speech_end = await caller._speech_end_after_playout(Source())
+        self.assertEqual(speech_end, 4.0)
+
+
 class PublisherFilteringTests(unittest.TestCase):
     def test_agent_audio_selects_only_microphone_source(self):
         publishers = [
