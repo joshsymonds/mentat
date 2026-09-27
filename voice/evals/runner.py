@@ -889,20 +889,28 @@ def _run_local_eval(argv: list[str]) -> int:
     observations: dict[str, Any] = {"cases": []}
     capture_failures: list[tuple[int, int, str]] = []
     checkout = Path(__file__).resolve().parents[2]
-    with DevStack(checkout=checkout, opt_in=True) as stack:
-        for scenario_index, scenario in enumerate(SCENARIOS):
-            runs = []
-            for run_index in range(arguments.runs):
-                try:
-                    runs.append(observe_scenario(scenario, stack))
-                except Exception as error:
-                    message = f"{scenario.name} run {run_index + 1}: {error}"
-                    capture_failures.append((scenario_index, run_index, message))
-                    runs.append({"failure": str(error)})
-            observations["cases"].append({
-                "name": scenario.name,
-                "runs": runs,
-            })
+    try:
+        with DevStack(checkout=checkout, opt_in=True) as stack:
+            for scenario_index, scenario in enumerate(SCENARIOS):
+                runs = []
+                for run_index in range(arguments.runs):
+                    try:
+                        runs.append(observe_scenario(scenario, stack))
+                    except Exception as error:
+                        message = f"{scenario.name} run {run_index + 1}: {error}"
+                        capture_failures.append((scenario_index, run_index, message))
+                        runs.append({"failure": str(error)})
+                observations["cases"].append({
+                    "name": scenario.name,
+                    "runs": runs,
+                })
+    except Exception as error:
+        message = f"DevStack setup failed: {error}"
+        observations["cases"] = [
+            {"name": scenario.name, "runs": []}
+            for scenario in SCENARIOS
+        ]
+        capture_failures.append((0, 0, message))
 
     report = score_observations(observations, required_runs=arguments.runs)
     for scenario_index, _run_index, message in capture_failures:

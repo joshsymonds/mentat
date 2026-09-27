@@ -283,7 +283,9 @@ class DevStackTest(unittest.TestCase):
         stack._remote_dir = "/tmp/mentat-eval.test"
         with self.assertRaises(subprocess.CalledProcessError) as raised:
             stack.run_voice(["voice/evals/caller.py"])
-        self.assertIs(raised.exception, failure)
+        self.assertIsInstance(raised.exception, subprocess.CalledProcessError)
+        self.assertIs(raised.exception.__cause__, failure)
+        self.assertIn("caller failed", str(raised.exception))
 
     def test_staging_directories_remain_writable_for_unprivileged_scp(self):
         calls = []
@@ -384,6 +386,30 @@ class DevStackTest(unittest.TestCase):
         scripts = [kwargs.get("input", "") for args, kwargs in calls if args[:2] == ["ssh", "ultraviolet"]]
         cleanup = "\n".join(script for script in scripts if script)
         self.assertIn("systemctl start mentat-voice", cleanup)
+
+    def test_remote_setup_error_includes_captured_stderr_without_credentials(self):
+        diagnostic = "DISTINCTIVE_SETUP_FAILURE"
+        secrets = ("credential-value-double-quoted", "credential-value-single-quoted")
+
+        def run(args, **kwargs):
+            error = subprocess.CalledProcessError(
+                1,
+                args,
+                output="",
+                stderr=(
+                    f"setup failed: {diagnostic}\\n"
+                    f'LIVEKIT_API_SECRET="{secrets[0]}"\\n'
+                    f"LIVEKIT_API_KEY='{secrets[1]}'"
+                ),
+            )
+            raise error
+
+        stack = DevStack(checkout=CHECKOUT, run=run)
+        with self.assertRaisesRegex(subprocess.CalledProcessError, diagnostic) as caught:
+            stack._remote("set -euo pipefail", "/tmp/mentat-eval.test")
+
+        for secret in secrets:
+            self.assertNotIn(secret, str(caught.exception))
 
     def test_interruption_during_setup_attempts_production_voice_restart(self):
         calls = []

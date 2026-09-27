@@ -378,6 +378,41 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class LocalEvalTests(unittest.TestCase):
+    def test_stack_setup_failure_emits_structured_failed_report(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from evals.dev_stack import RemoteCommandError
+
+        diagnostic = "DISTINCTIVE_REMOTE_SETUP_FAILURE"
+
+        class FailingStack:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                raise RemoteCommandError(
+                    1,
+                    ["ssh", "ultraviolet", "sudo", "bash"],
+                    output="",
+                    stderr=f"remote setup failed: {diagnostic}",
+                )
+
+            def __exit__(self, *_args):
+                raise AssertionError("failed __enter__ must clean up its own stack")
+
+        output = io.StringIO()
+        with patch.object(runner, "DevStack", FailingStack), redirect_stdout(output):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(report["passed"])
+        self.assertIn(diagnostic, " ".join(report["failures"]))
+        self.assertIn(diagnostic, " ".join(report["cases"][0]["failures"]))
+
+
 class ScenarioObservationTests(unittest.TestCase):
     def test_turn_kinds_cover_search_action_and_search_only_scenarios(self):
         self.assertEqual(

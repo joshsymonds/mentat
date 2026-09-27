@@ -15,6 +15,15 @@ from typing import Callable, Sequence
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+class RemoteCommandError(subprocess.CalledProcessError):
+    """A remote command failure whose diagnostic includes scrubbed stderr."""
+
+    def __str__(self) -> str:
+        message = super().__str__()
+        stderr = self.stderr.strip() if isinstance(self.stderr, str) else ""
+        return f"{message}: {stderr}" if stderr else message
+
+
 _MCP_REWRITE_SOURCE = '''def rewrite_mcp_config(raw, production_port, dev_port):
     config = json.loads(raw)
 
@@ -493,13 +502,30 @@ class DevStack:
             raise RuntimeError("SSH port-forward exited before the dev stack became available")
 
     def _remote(self, script: str, *args: str) -> subprocess.CompletedProcess[str]:
-        return self._run(
-            ["ssh", self.remote, "sudo", "bash", "-s", "--", *args],
-            input=script,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            return self._run(
+                ["ssh", self.remote, "sudo", "bash", "-s", "--", *args],
+                input=script,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as error:
+            stderr = error.stderr or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            stderr = re.sub(
+                r"""(?i)(\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|API_KEY|ACCESS_KEY)[A-Z0-9_]*\s*[=:]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)""",
+                r"\1[REDACTED]",
+                stderr,
+            )
+            stderr = re.sub(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", stderr)
+            raise RemoteCommandError(
+                error.returncode,
+                error.cmd,
+                output=error.output,
+                stderr=stderr,
+            ) from error
 
     def _cleanup(self) -> None:
         try:
