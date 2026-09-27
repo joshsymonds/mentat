@@ -56,6 +56,10 @@ class DevStackTest(unittest.TestCase):
         self.assertIn(".#mentatd", build[0])
         transfers = [call[0] for call in calls if call[0][0] == "scp"]
         self.assertTrue(any("voice/evals/phone.py" in " ".join(args) for args in transfers))
+        self.assertTrue(any(
+            any(arg.startswith("ultraviolet:") and arg.endswith("/voice/evals/runner.py") for arg in args)
+            for args in transfers
+        ))
         self.assertTrue(any("src" in " ".join(args) and "node_modules" in " ".join(args) for args in transfers))
 
         remote_scripts = [kwargs.get("input", "") for args, kwargs in calls if args[:2] == ["ssh", "ultraviolet"]]
@@ -153,7 +157,7 @@ class DevStackTest(unittest.TestCase):
         stack = DevStack(checkout=CHECKOUT, run=run)
         stack._entered = True
         stack._remote_dir = "/tmp/mentat-eval.test"
-        result = stack.run_voice(["caller.py", "--room", "token-room"])
+        result = stack.run_voice(["evals/runner.py", "--room", "token-room"])
 
         self.assertEqual(result.stdout, "caller output")
         self.assertEqual(result.stderr, "caller warning")
@@ -169,7 +173,7 @@ class DevStackTest(unittest.TestCase):
         self.assertIn('voice.env.json', kwargs["input"])
         self.assertIn('voice-python.path', kwargs["input"])
         self.assertIn('"--reuid=nobody"', kwargs["input"])
-        self.assertIn("'caller.py', '--room', 'token-room'", kwargs["input"])
+        self.assertIn("'evals/runner.py', '--room', 'token-room'", kwargs["input"])
         self.assertIn('"LIVEKIT_URL": "ws://127.0.0.1:7880"', kwargs["input"])
         self.assertIn('"MENTAT_URL": f"http://127.0.0.1:{DEV_PORT}"', kwargs["input"])
         self.assertNotIn(secret, " ".join(args) + kwargs["input"])

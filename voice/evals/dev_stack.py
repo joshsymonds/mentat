@@ -432,6 +432,16 @@ class DevStack:
         )
         self._run(
             [
+                "scp",
+                str(self.checkout / "voice" / "evals" / "runner.py"),
+                f"{self.remote}:{self._remote_dir}/voice/evals/runner.py",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self._run(
+            [
                 "scp", "-r", str(self.checkout / "voice" / "assets"),
                 f"{self.remote}:{self._remote_dir}/voice/",
             ],
