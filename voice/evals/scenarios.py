@@ -36,7 +36,7 @@ _ALICE_DONOR_CLAIM = (
     r"\bAlice (?:Bertha )?Keck(?: Park)?\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck(?: Park)?\b.{0,100}\bshe\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck Park\b.{0,8}\bwho\s+(?:bought|purchased|donated|gave|gifted)\b|"
-    r"\bAlice (?:Bertha )?Keck Park,\s+a (?:local|Santa Barbara) philanthropist[,.]?\s*who\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice (?:Bertha )?Keck Park,\s+a (?:local|Santa Barbara)\s+philanthropist[,.]?\s*who\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck Park\s+was\s+a Santa Barbara philanthropist\s+who\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\b(?:bought|purchased|donated|gave|gifted|given)\b.{0,80}\b(?:by|from)\s+Alice Keck\b|"
     r"\b(?:gift|donation)\b.{0,80}\b(?:by|from)\s+Alice Keck\b"
@@ -288,6 +288,7 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
             flags=re.IGNORECASE,
         )
     body = " ".join(body.split()).strip(' \t,.:;–—-"“”')
+    body = re.sub(r"^i'll say[,:.]?\s*", "", body, flags=re.IGNORECASE)
     body = re.sub(r"^saying\b\s*,?\s*", "", body, flags=re.IGNORECASE)
     _require(bool(body), f"{scenario_name}: turn {turn} has no complete SMS body say-back")
 

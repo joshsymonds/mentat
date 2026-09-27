@@ -2127,6 +2127,37 @@ class ScenarioObservationTests(unittest.TestCase):
                     10.0 + (len(texts) - 1) * 0.2,
                 )
 
+    def test_run17_exact_sms_correction_segments_get_answer_and_confirmation_timestamps(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        trace = {
+            "capture_started": 10.0,
+            "speech_end": 10.0,
+            "segments": [
+                {"start": 0.0, "end": 0.8399999737739563, "text": " Okay, hang on."},
+                {
+                    "start": 0.0,
+                    "end": 6.559999942779541,
+                    "text": " OK, so to plus 1, 2, 0, 2, 5, 5, 5, 0, 1, 4, 2, I'll say.",
+                },
+                {"start": 0.0, "end": 2.0, "text": " I will be there at six."},
+                {
+                    "start": 0.0,
+                    "end": 1.600000023841858,
+                    "text": " just say when and I'll send it.",
+                },
+            ],
+        }
+        self.assertEqual(
+            runner._answer_time(
+                trace,
+                scenario.turns[0],
+                scenario_name=scenario.name,
+                turn_index=1,
+            ),
+            10.0,
+        )
+        self.assertEqual(runner._confirmation_time(trace), 11.600000023841858)
+
     def test_confirmation_timestamp_recognizes_all_approved_prompt_literals(self):
         prompts = (
             "Should I send it?",

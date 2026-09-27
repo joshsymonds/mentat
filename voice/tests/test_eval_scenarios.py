@@ -1844,6 +1844,46 @@ class ScenarioCorpusTests(unittest.TestCase):
                 room_closed_after=2,
             )
 
+    def test_run17_exact_sms_correction_segments_accept_only_correct_spoken_body(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        segments = (
+            " Okay, hang on.",
+            " OK, so to plus 1, 2, 0, 2, 5, 5, 5, 0, 1, 4, 2, I'll say.",
+            " I will be there at six.",
+            " just say when and I'll send it.",
+        )
+        transcript = " ".join(segments)
+        failures = evaluate_scenario_prefix(scenario, [transcript], [], None)
+        self.assertEqual(failures, [])
+        wrong_body = transcript.replace("I will be there at six.", "I will be there at seven.")
+        self.assertTrue(evaluate_scenario_prefix(scenario, [wrong_body], [], None))
+
+    def test_run17_exact_alice_segments_keep_donor_and_followup_truth_strict(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        segments = (
+            " Checking that",
+            " It's named after Alice Keck Park, a Santa Barbara",
+            " philanthropist who bought the old hotel lot in 75",
+            " and gave it to the city for a park.",
+            " and then they dedicated the garden to her memory.",
+        )
+        transcript = " ".join(segments)
+        followups = [
+            "Alice Keck Park was W. M. Keck's daughter.",
+            "Her family's wealth came from Superior Oil.",
+        ]
+        self.assertEqual(
+            evaluate_scenario_prefix(scenario, [transcript, *followups], [], None),
+            [],
+        )
+        husband_donor = (
+            "It's named after Alice Keck Park. Her husband bought the old hotel lot in 75 "
+            "and gave it to the city for a park."
+        )
+        self.assertTrue(
+            evaluate_scenario_prefix(scenario, [husband_donor, *followups], [], None)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
