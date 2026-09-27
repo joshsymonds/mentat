@@ -149,6 +149,37 @@ class ScenarioCorpusTests(unittest.TestCase):
             room_closed_after=2,
         )
 
+    def test_accepts_normalized_sms_command_in_complete_and_prefix_evaluators(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        turns = [
+            "I'll text +1-202-555-0142: I'll be there at six. Should I send it?",
+            "Sent that message.",
+        ]
+        phone_commands = [
+            {
+                "turn": 2,
+                "kind": "sms",
+                "to": "+12025550142",
+                "body": "I WILL be there at 6!",
+            }
+        ]
+
+        evaluate_scenario(
+            scenario,
+            turns=turns,
+            phone_commands=phone_commands,
+            room_closed_after=2,
+        )
+        self.assertEqual(
+            evaluate_scenario_prefix(
+                scenario,
+                turns=turns,
+                phone_commands=phone_commands,
+                room_closed_after=None,
+            ),
+            [],
+        )
+
     def test_accepts_naturally_formatted_spoken_phone_number(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
         evaluate_scenario(
@@ -221,6 +252,22 @@ class ScenarioCorpusTests(unittest.TestCase):
             ],
             room_closed_after=3,
         )
+
+    def test_rejects_correction_send_without_new_consent_prompt(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(
+                scenario,
+                turns=[
+                    "I can text +1-202-555-0142: I will be there at six. Should I send it?",
+                    "I can text +1-202-555-0142: I will be there at seven. I'll send it now.",
+                    "Sent Alice the corrected message.",
+                ],
+                phone_commands=[
+                    {"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at seven."}
+                ],
+                room_closed_after=3,
+            )
 
     def test_five_minute_timer_maps_to_300_seconds(self):
         scenario = next(s for s in SCENARIOS if s.name == "timer-300-seconds")

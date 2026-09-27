@@ -203,6 +203,23 @@ def _sms_body_tokens(body: str) -> tuple[str, ...]:
     return tuple(re.findall(r"[a-z0-9]+", normalized.lower()))
 
 
+def _sms_value_matches(field: str, actual: Any, expected: Any) -> bool:
+    """Compare SMS payload values without accepting a changed recipient or message."""
+    if field == "to":
+        return (
+            isinstance(actual, str)
+            and isinstance(expected, str)
+            and re.sub(r"\D", "", actual) == re.sub(r"\D", "", expected)
+        )
+    if field == "body":
+        return (
+            isinstance(actual, str)
+            and isinstance(expected, str)
+            and _sms_body_tokens(actual) == _sms_body_tokens(expected)
+        )
+    return actual == expected
+
+
 @dataclass(frozen=True)
 class ScenarioFailure:
     """A product-level scenario failure attributed to its assistant turn."""
@@ -287,8 +304,13 @@ def _scenario_failures(
         command_turn: int,
     ) -> None:
         for field, value in expected.items():
+            matches = (
+                _sms_value_matches(field, actual.get(field), value)
+                if expected.get("kind") == "sms" and field in ("to", "body")
+                else field in actual and actual[field] == value
+            )
             require(
-                field in actual and actual[field] == value,
+                field in actual and matches,
                 command_turn,
                 f"{scenario.name}: command {index} expected {field}={value!r}, "
                 f"got {actual.get(field)!r}",
@@ -310,7 +332,8 @@ def _scenario_failures(
                 return
             confirmed_recipient, confirmed_body = spoken_sms[max(earlier_confirmations)]
             require(
-                actual.get("to") == confirmed_recipient and actual.get("body") == confirmed_body,
+                _sms_value_matches("to", actual.get("to"), confirmed_recipient)
+                and _sms_value_matches("body", actual.get("body"), confirmed_body),
                 command_turn,
                 f"{scenario.name}: SMS command {index} did not match the latest confirmed message",
             )
