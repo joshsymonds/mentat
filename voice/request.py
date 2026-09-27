@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 SESSION_PREFIX = "voice-"
 TURN_META = {"surface": "voice", "user": "josh"}
 TURN_EFFORT = "low"
-TURN_MODEL = "sonnet"
+TURN_MODEL = "chatgpt/sol-fast"
 
 CONSULT_FRAMING = (
     "Your answer is streamed to the voice as it arrives and spoken in its own words. "

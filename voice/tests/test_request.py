@@ -55,7 +55,7 @@ class RequestTest(unittest.TestCase):
                 "text": "what's on today?",
                 "meta": {"surface": "voice", "user": "josh"},
                 "effort": "low",
-                "model": "sonnet",
+                "model": "chatgpt/sol-fast",
             },
         )
 
@@ -145,7 +145,7 @@ class RequestTest(unittest.TestCase):
     def test_turn_constants_are_pinned(self):
         self.assertEqual(TURN_META, {"surface": "voice", "user": "josh"})
         self.assertEqual(TURN_EFFORT, "low")
-        self.assertEqual(TURN_MODEL, "sonnet")
+        self.assertEqual(TURN_MODEL, "chatgpt/sol-fast")
 
 
 class Delegation:
