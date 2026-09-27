@@ -175,7 +175,67 @@ class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pcm, early.data + later.data)
         self.assertIsInstance(capture_started, float)
 
-    async def test_capture_has_a_finite_deadline_when_track_never_produces_audio(self):
+    async def test_capture_returns_frames_when_stream_hangs_at_finite_window(self):
+        frame = CaptureTests.frame(False)
+
+        class HangingAfterFrameStream:
+            def __init__(self, track):
+                self.frames = iter([frame])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return SimpleNamespace(frame=next(self.frames))
+                except StopIteration:
+                    await asyncio.Future()
+
+            async def aclose(self):
+                return None
+
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        with patch.object(caller, "MAX_ANSWER_SECONDS", 0.01):
+            with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=HangingAfterFrameStream))}):
+                pcm, rate, channels, _ = await asyncio.wait_for(_capture_answer(queue), timeout=0.2)
+        self.assertEqual(pcm, frame.data)
+        self.assertEqual((rate, channels), (1000, 1))
+
+    async def test_capture_returns_frames_promptly_when_agent_audio_ends(self):
+        frame = CaptureTests.frame(False)
+        ended = asyncio.Event()
+        frame_arrived = asyncio.Event()
+
+        class HangingAfterFrameStream:
+            def __init__(self, track):
+                self.frames = iter([frame])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    event = SimpleNamespace(frame=next(self.frames))
+                    frame_arrived.set()
+                    return event
+                except StopIteration:
+                    await asyncio.Future()
+
+            async def aclose(self):
+                return None
+
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        with patch.object(caller, "MAX_ANSWER_SECONDS", 5):
+            with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=HangingAfterFrameStream))}):
+                capture = asyncio.create_task(_capture_answer(queue, ended))
+                await asyncio.wait_for(frame_arrived.wait(), timeout=0.2)
+                ended.set()
+                pcm, _, _, _ = await asyncio.wait_for(capture, timeout=0.2)
+        self.assertEqual(pcm, frame.data)
+
+    async def test_capture_fails_finitely_when_no_frames_arrive(self):
         class HangingStream:
             def __init__(self, track):
                 pass
@@ -193,7 +253,7 @@ class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
         queue.put_nowait(object())
         with patch.object(caller, "MAX_ANSWER_SECONDS", 0.01):
             with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=HangingStream))}):
-                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                with self.assertRaisesRegex(RuntimeError, "no frames"):
                     await asyncio.wait_for(_capture_answer(queue), timeout=0.2)
 
     async def test_speech_end_timestamp_follows_playout_completion(self):

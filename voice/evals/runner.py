@@ -200,6 +200,7 @@ async def capture_script(
         raise RuntimeError("endpoint-issued LiveKit URL is missing or invalid")
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
+    capture_end: asyncio.Event | None = None
 
     @room.on("track_subscribed")
     def track_subscribed(track: Any, publication: Any, participant: Any) -> None:
@@ -212,6 +213,23 @@ async def capture_script(
             dependencies.rtc.TrackSource.SOURCE_MICROPHONE,
         ):
             answer_tracks.put_nowait(track)
+
+    @room.on("track_unsubscribed")
+    def track_unsubscribed(track: Any, publication: Any, participant: Any) -> None:
+        if capture_end is not None and caller.is_agent_audio_track(
+            participant.kind,
+            track.kind,
+            publication.source,
+            dependencies.rtc.ParticipantKind.PARTICIPANT_KIND_AGENT,
+            dependencies.rtc.TrackKind.KIND_AUDIO,
+            dependencies.rtc.TrackSource.SOURCE_MICROPHONE,
+        ):
+            capture_end.set()
+
+    @room.on("disconnected")
+    def disconnected(*_args: Any) -> None:
+        if capture_end is not None:
+            capture_end.set()
 
     api_client = dependencies.api.LiveKitAPI(livekit_url, api_key, api_secret)
     traces: list[dict[str, Any]] = []
@@ -288,7 +306,8 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "scripted speech synthesis",
             )
-            capture = dependencies.capture_factory(answer_tracks)
+            capture_end = asyncio.Event()
+            capture = dependencies.capture_factory(answer_tracks, capture_end)
             await _with_deadline(
                 capture.start(),
                 REMOTE_OPERATION_DEADLINE_SECONDS,

@@ -94,7 +94,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
         class ContinuousCapture:
-            def __init__(self, _queue):
+            def __init__(self, _queue, _ended=None):
                 pass
 
             async def start(self):
@@ -292,6 +292,17 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 room_delete_deadline=0.05,
             )
 
+    async def test_room_disconnect_ends_the_active_capture_window(self):
+        dependencies = self.dependencies_for_failure("room-disconnect")
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            traces = await capture_script(
+                "android-selected-room",
+                ["Question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+        self.assertEqual(len(traces), 1)
+
     async def test_missing_audio_transcript_and_room_deletion_fail_closed(self):
         for failure, expected in (
             ("audio", "no frames"),
@@ -320,12 +331,17 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     def dependencies_for_failure(failure):
         class Room:
             remote_participants = {"agent": object()}
+            callbacks = {}
             local_participant = SimpleNamespace(
                 publish_track=lambda *_args, **_kwargs: asyncio.sleep(0)
             )
 
-            def on(self, _event):
-                return lambda callback: callback
+            def on(self, event):
+                def register(callback):
+                    self.callbacks[event] = callback
+                    return callback
+
+                return register
 
             async def connect(self, *_args, **_kwargs):
                 pass
@@ -376,13 +392,17 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         class Capture:
-            def __init__(self, _queue):
-                pass
+            def __init__(self, _queue, ended=None):
+                self.ended = ended
 
             async def start(self):
                 pass
 
             async def result(self):
+                if failure == "room-disconnect":
+                    Room.callbacks["disconnected"]()
+                    if self.ended is None or not self.ended.is_set():
+                        raise AssertionError("room disconnect did not end the capture")
                 if failure == "audio":
                     raise RuntimeError("agent audio track produced no frames")
                 if failure == "capture":
