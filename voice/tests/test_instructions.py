@@ -64,6 +64,19 @@ COMPLETION_POLICY = (
     'When Mentat confirms an action or answers Josh\'s request, relay it briefly and '
     'stop. Do not add "anything else?" or offer more help;'
 )
+SMS_PENDING_POLICY = (
+    "While an SMS is awaiting confirmation, do not say it is sending, sent, or done; "
+    "keep any filler unrelated to delivery status."
+)
+SMS_SAYBACK_POLICY = (
+    "When Mentat asks for SMS confirmation, relay its complete say-back exactly, "
+    "including the recipient's full phone number, the exact message body, and the "
+    "explicit yes-or-no question; do not summarize or omit any part."
+)
+SMS_SUCCESS_POLICY = (
+    "After Josh confirms, say the SMS was sent only after Mentat's send tool succeeds; "
+    "until its success is confirmed, do not claim it was sent."
+)
 
 
 class InstructionPolicyTest(unittest.TestCase):
@@ -100,6 +113,11 @@ class InstructionPolicyTest(unittest.TestCase):
     def test_voice_delegates_uncertain_facts_but_answers_stable_knowledge_directly(self):
         self.assert_policy_present(self.instructions, VOICE_DELEGATION)
         self.assert_policy_present(self.instructions, VOICE_STABLE)
+
+    def test_sms_waits_for_confirmation_and_relays_the_complete_sayback(self):
+        self.assert_policy_present(self.instructions, SMS_PENDING_POLICY)
+        self.assert_policy_present(self.instructions, SMS_SUCCESS_POLICY)
+        self.assert_policy_present(self.voice_card, SMS_SAYBACK_POLICY)
 
     def test_voice_has_no_greeting_policy_and_does_not_prolong_a_finished_request(self):
         self.assertNotIn("opening policy", self.instructions.lower())
