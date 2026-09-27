@@ -20,7 +20,6 @@ NO_ANSWER_FAILURE = (
 PARTIAL_CAPTURE_MESSAGES = {
     "scripted speech synthesis exceeded its deadline",
     NO_ANSWER_FAILURE,
-    "room was deleted before all scripted lines were captured",
     "room deletion was not observed before deadline",
 }
 
@@ -241,11 +240,6 @@ def score_observations(
                         and (
                             failure.get("message") == NO_ANSWER_FAILURE
                         ) == ("speech_started_at" in failure)
-                        and not (
-                            failure.get("message")
-                            == "room was deleted before all scripted lines were captured"
-                            and not run["turns"]
-                        )
                     )
                     if valid_failure and "speech_started_at" in failure:
                         failure_start = _timestamp(failure, "speech_started_at")

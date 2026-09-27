@@ -2100,13 +2100,11 @@ class LocalEvalCliTests(unittest.TestCase):
             if scenario is SCENARIOS[2]:
                 return {
                     "turns": turns[:1],
-                    "failure": {
-                        "turn": 2,
-                        "message": "room was deleted before all scripted lines were captured",
-                    },
-                    "product_failures": [
-                        {"turn": 1, "message": "turn 1 missing answer pattern 'Alice Keck Park'"}
-                    ],
+                    "room_closed_after": 1,
+                    "product_failures": [{
+                        "turn": 1,
+                        "message": "call ended after turn 1 with 1 follow-ups remaining",
+                    }],
                 }
             return {"turns": turns}
 
@@ -2126,10 +2124,111 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertEqual(case_report["turns"][0]["model_call_count"], 1)
         self.assertEqual(case_report["turns"][0]["latency_seconds"]["first_audio"], 1.0)
         failures = " ".join(case_report["failures"])
-        self.assertIn("place-search-navigation run 1 turn 1", failures)
-        self.assertIn("missing answer pattern 'Alice Keck Park'", failures)
-        self.assertIn("place-search-navigation run 1 turn 2", failures)
-        self.assertIn("room was deleted before all scripted lines were captured", failures)
+        self.assertIn("place-search-navigation run 1 turn 1: product failure", failures)
+        self.assertIn("call ended after turn 1 with 1 follow-ups remaining", failures)
+        self.assertNotIn("capture failed", failures)
+
+    def test_room_closing_before_followups_is_a_product_failure_with_completed_evidence(self):
+        import json
+        from subprocess import CompletedProcess
+
+        from evals.report import score_observations
+
+        scenario = SimpleNamespace(
+            name="three-turn-call",
+            caller_lines=("Set a timer.", "What time is it?", "Thanks."),
+            turns=tuple(
+                SimpleNamespace(
+                    answer_patterns=(r"Timer set",) if index == 1 else (r"answer",),
+                    reject_patterns=(),
+                    sms_recipient=None,
+                    sms_body=None,
+                )
+                for index in range(3)
+            ),
+            commands=({"turn": 1, "kind": "timer", "seconds": 300},),
+            room_close_after=3,
+            place_query=None,
+        )
+        room = "early-close-three-turn"
+        capture = {
+            "turns": [{
+                "turn": 1,
+                "room": room,
+                "line": scenario.caller_lines[0],
+                "transcript": "Timer set for five minutes.",
+                "speech_started_at": 100.0,
+                "speech_end": 101.0,
+                "first_audio": 102.0,
+                "capture_started": 101.5,
+                "overlap": False,
+                "segments": [{"start": 0.2, "end": 0.6, "text": "Timer set for five minutes."}],
+                "room_deleted": None,
+            }],
+            "failure": {
+                "turn": 2,
+                "message": "room was deleted before all scripted lines were captured",
+            },
+        }
+        phone_log = "".join(json.dumps(entry) + "\n" for entry in (
+            {"event": "command", "received_at": 101.5, "command": {
+                "id": "timer-command", "kind": "timer", "seconds": 300,
+            }},
+            {"event": "result", "result": {"id": "timer-command", "status": "ok"}},
+        ))
+        record = "".join(json.dumps(message) + "\n" for message in (
+            {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1", "model": "claude-opus-5"}}},
+            {"type": "assistant", "message": {"content": [{
+                "type": "tool_use", "id": "tool1", "name": "mcp__mentat__set_timer",
+                "input": {"seconds": 300},
+            }]}},
+            {"type": "result", "session_id": "voice-" + room},
+        ))
+        delegation_markers = json.dumps({"room": room, "id": "d1", "created_at": 100.5}) + "\n"
+        grant = {"token": "header.payload.signature", "room": room, "url": "wss://livekit.invalid"}
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, _command, **_kwargs):
+                return CompletedProcess([], 0, json.dumps(capture), "")
+
+            def run_remote(self, command):
+                outputs = {
+                    "voice/evals/phone.jsonl": phone_log,
+                    "voice/evals/delegations.jsonl": delegation_markers,
+                    f"records/voice-{room}.jsonl": record,
+                }
+                return CompletedProcess(command, 0, outputs[command[-1]], "")
+
+        with patch.object(runner, "_voice_token", return_value=grant):
+            observation = runner.observe_scenario(scenario, Stack())
+
+        self.assertEqual(len(observation["turns"]), 1)
+        self.assertEqual(observation["turns"][0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+        self.assertEqual(observation["phone_commands"][0]["turn"], 1)
+        self.assertEqual(observation["room_closed_after"], 1)
+        self.assertNotIn("failure", observation)
+        self.assertTrue(any(
+            failure["turn"] == 1
+            and "call ended after turn 1 with 2 follow-ups remaining" in failure["message"]
+            for failure in observation["product_failures"]
+        ))
+
+        report = score_observations(
+            {"cases": [{"name": scenario.name, "runs": [observation]}]},
+            required_runs=1,
+        )
+        self.assertFalse(report["passed"])
+        failures = " ".join(report["failures"])
+        self.assertIn("product failure", failures)
+        self.assertIn("call ended after turn 1 with 2 follow-ups remaining", failures)
+        self.assertNotIn("capture failed", failures)
+        self.assertEqual(report["cases"][0]["turns"][0]["latency_seconds"]["first_audio"], 1.0)
+        self.assertEqual(report["cases"][0]["turns"][0]["model_call_count"], 1)
 
 
 if __name__ == "__main__":

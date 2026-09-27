@@ -251,7 +251,7 @@ class ScoringTests(unittest.TestCase):
                     "turns": [turn()],
                     "failure": {
                         "turn": 2,
-                        "message": "room was deleted before all scripted lines were captured",
+                        "message": "scripted speech synthesis exceeded its deadline",
                     },
                     "product_failures": [
                         {"turn": 1, "message": "turn 1 missing answer pattern 'Alice Keck Park'"}
@@ -270,7 +270,7 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(report["gates"][0]["run_count"], 1)
         failures = " ".join(result["failures"])
         self.assertIn("send message run 1 turn 2", failures)
-        self.assertIn("room was deleted before all scripted lines were captured", failures)
+        self.assertIn("scripted speech synthesis exceeded its deadline", failures)
         self.assertIn("send message run 1 turn 1", failures)
         self.assertIn("missing answer pattern 'Alice Keck Park'", failures)
         self.assertEqual(report["turns"][0]["model_call_count"], 1)
@@ -673,6 +673,42 @@ class ScoringTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("send message", result.stdout)
         self.assertIn('"passed": false', result.stdout)
+
+    def test_early_room_close_is_reported_as_product_failure_not_capture_failure(self):
+        captured = turn(first_audio=2.25, confirmation=None, room_deleted=None, calls=2)
+        captured.update({
+            "turn": 1,
+            "expect_confirmation": False,
+            "expect_hangup": False,
+            "command_received_at": 2.5,
+            "answer_at": 2.25,
+        })
+        observation = {
+            "cases": [{
+                "name": "three-turn-call",
+                "runs": [{
+                    "turns": [captured],
+                    "phone_commands": [{"id": "timer-1", "turn": 1, "kind": "timer"}],
+                    "room_closed_after": 1,
+                    "product_failures": [{
+                        "turn": 1,
+                        "message": "call ended after turn 1 with 2 follow-ups remaining",
+                    }],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        report = result["cases"][0]
+        self.assertEqual(len(report["turns"]), 1)
+        self.assertEqual(report["turns"][0]["model_call_count"], 2)
+        self.assertEqual(report["turns"][0]["latency_seconds"]["first_audio"], 2.25)
+        failures = " ".join(result["failures"])
+        self.assertIn("three-turn-call run 1 turn 1: product failure", failures)
+        self.assertIn("call ended after turn 1 with 2 follow-ups remaining", failures)
+        self.assertNotIn("capture failed", failures)
 
 
 if __name__ == "__main__":

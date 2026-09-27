@@ -1158,7 +1158,17 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
             room_deleted_turns.append(index)
     if len(room_deleted_turns) > 1:
         raise RuntimeError("capture observed room deletion more than once")
-    room_closed_after = room_deleted_turns[0] if room_deleted_turns else None
+    early_close = (
+        capture_failure is not None
+        and capture_failure["message"]
+        == "room was deleted before all scripted lines were captured"
+    )
+    early_close_after = capture_failure["turn"] - 1 if early_close else None
+    room_closed_after = (
+        early_close_after
+        if early_close
+        else room_deleted_turns[0] if room_deleted_turns else None
+    )
     from evals.scenarios import evaluate_scenario_failures, evaluate_scenario_prefix
 
     transcripts = [trace["transcript"] for trace in traces]
@@ -1174,20 +1184,35 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
             scenario,
             transcripts,
             phone_commands,
-            room_closed_after,
-            failed_turn=(capture_failure["turn"] if capture_failure["turn"] > len(traces) else None),
+            None if early_close else room_closed_after,
+            failed_turn=(
+                None
+                if early_close
+                else capture_failure["turn"]
+                if capture_failure["turn"] > len(traces)
+                else None
+            ),
         )
     product_failures = [
         {"turn": failure.turn, "message": failure.message}
         for failure in failures
     ]
+    if early_close:
+        follow_ups = len(raw_steps) - early_close_after
+        product_failures.append({
+            "turn": early_close_after,
+            "message": (
+                f"call ended after turn {early_close_after} with "
+                f"{follow_ups} follow-ups remaining"
+            ),
+        })
     observation = {
         "room": room,
         "turns": traces,
         "phone_commands": phone_commands,
         "room_closed_after": room_closed_after,
     }
-    if capture_failure is not None:
+    if capture_failure is not None and not early_close:
         observation["failure"] = capture_failure
         observation["product_failures"] = product_failures
     elif product_failures:
