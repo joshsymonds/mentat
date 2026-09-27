@@ -142,6 +142,56 @@ class DevStackTest(unittest.TestCase):
         self.assertIn('if kill -0 "$previous_pid" 2>/dev/null; then', replacement)
         self.assertNotIn('(dev_dir / "voice.env.json").unlink()', _START_WORKER_SCRIPT)
 
+    def test_run_voice_uses_staged_python_and_private_remote_environment(self):
+        calls = []
+        secret = "remote-openai-secret"
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 0, "caller output", "caller warning")
+
+        stack = DevStack(checkout=CHECKOUT, run=run)
+        stack._entered = True
+        stack._remote_dir = "/tmp/mentat-eval.test"
+        result = stack.run_voice(["caller.py", "--room", "token-room"])
+
+        self.assertEqual(result.stdout, "caller output")
+        self.assertEqual(result.stderr, "caller warning")
+        self.assertEqual(len(calls), 1)
+        args, kwargs = calls[0]
+        self.assertEqual(
+            args,
+            ["ssh", "ultraviolet", "sudo", "bash", "-s", "--", "/tmp/mentat-eval.test", "8485", "8486"],
+        )
+        self.assertTrue(kwargs["check"])
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        self.assertIn('voice.env.json', kwargs["input"])
+        self.assertIn('voice-python.path', kwargs["input"])
+        self.assertIn('"--reuid=nobody"', kwargs["input"])
+        self.assertIn("'caller.py', '--room', 'token-room'", kwargs["input"])
+        self.assertIn('"LIVEKIT_URL": "ws://127.0.0.1:7880"', kwargs["input"])
+        self.assertIn('"MENTAT_URL": f"http://127.0.0.1:{DEV_PORT}"', kwargs["input"])
+        self.assertNotIn(secret, " ".join(args) + kwargs["input"])
+
+    def test_run_voice_requires_entered_stack_and_propagates_remote_failure(self):
+        run = unittest.mock.Mock()
+        stack = DevStack(checkout=CHECKOUT, run=run)
+
+        with self.assertRaisesRegex(RuntimeError, "dev stack is not running"):
+            stack.run_voice(["voice/evals/caller.py"])
+        run.assert_not_called()
+
+        failure = subprocess.CalledProcessError(
+            7, ["ssh"], output="caller output", stderr="caller failed"
+        )
+        run.side_effect = failure
+        stack._entered = True
+        stack._remote_dir = "/tmp/mentat-eval.test"
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            stack.run_voice(["voice/evals/caller.py"])
+        self.assertIs(raised.exception, failure)
+
     def test_staging_directories_remain_writable_for_unprivileged_scp(self):
         calls = []
 

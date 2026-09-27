@@ -214,6 +214,46 @@ trap - EXIT
 '''
 
 
+_RUN_VOICE_SCRIPT = r'''set -euo pipefail
+DEV_DIR=$1
+DEV_PORT=$2
+HEALTH_PORT=$3
+python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+DEV_DIR = Path(sys.argv[1])
+DEV_PORT = sys.argv[2]
+HEALTH_PORT = sys.argv[3]
+command = __COMMAND__
+voice_python = (DEV_DIR / "voice-python.path").read_text().strip()
+voice_env = json.loads((DEV_DIR / "voice.env.json").read_text())
+voice_env.update({
+    "LIVEKIT_URL": "ws://127.0.0.1:7880",
+    "MENTAT_URL": f"http://127.0.0.1:{DEV_PORT}",
+    "HOME": str(DEV_DIR / "home/voice"),
+    "XDG_CACHE_HOME": str(DEV_DIR / "home/voice/cache"),
+    "MENTAT_VOICE_HTTP_PORT": HEALTH_PORT,
+})
+result = subprocess.run(
+    [
+        "setpriv", "--reuid=nobody", "--regid=nogroup", "--clear-groups",
+        voice_python, *command,
+    ],
+    cwd=DEV_DIR / "voice",
+    env=voice_env,
+    stdin=subprocess.DEVNULL,
+    capture_output=True, text=True, check=False,
+)
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+sys.exit(result.returncode)
+PY
+'''
+
+
 class DevStack:
     """Start candidate mentatd and join a token-selected room on ultraviolet.
 
@@ -297,6 +337,20 @@ class DevStack:
             check=True,
             capture_output=True,
             text=True,
+        )
+
+    def run_voice(self, command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        """Run a staged caller as the voice worker with its private environment."""
+        if not self._entered:
+            raise RuntimeError("dev stack is not running")
+        if not command or any(not isinstance(arg, str) or "\x00" in arg for arg in command):
+            raise ValueError("voice command must contain non-empty safe arguments")
+        script = _RUN_VOICE_SCRIPT.replace("__COMMAND__", repr(list(command)))
+        return self._remote(
+            script,
+            self._remote_dir or "",
+            str(self.dev_port),
+            str(self.health_port),
         )
 
     def start_worker(self, room: str) -> None:
