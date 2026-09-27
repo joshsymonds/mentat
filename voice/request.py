@@ -38,8 +38,8 @@ CONSULT_ENDING_RULE = (
     "Load end_conversation in the same tool search as any other tool the turn needs. "
     "To end the call, say the closing words, then call end_conversation, and say nothing after."
 )
-CONSULT_WINDOW_TURNS = 2
-CONSULT_TURN_CHARS = 500
+CONSULT_HISTORY_CHARS = 6000
+CONSULT_TURN_CHARS = 1500
 VOICE_CARD_MARKER = "---VOICE-CARD---"
 PRIVATE_CONTEXT_ENV = "MENTAT_VOICE_PRIVATE"
 CLOSE_TAIL_S = 1.0
@@ -293,17 +293,14 @@ def with_private_context(instructions: str, private: PrivateContext) -> str:
     return rendered
 
 
-def recent_turns(
-    items: Iterable[Any], count: int = CONSULT_WINDOW_TURNS
-) -> list[tuple[str, str]]:
-    """Return the latest text-bearing message turns, oldest first."""
-    turns = [
+def recent_turns(items: Iterable[Any]) -> list[tuple[str, str]]:
+    """Return text-bearing message turns, oldest first."""
+    return [
         (str(item.role), str(item.text_content))
         for item in items
         if getattr(item, "type", None) == "message"
         and getattr(item, "text_content", None)
     ]
-    return turns[-count:]
 
 
 def turn_request(
@@ -344,18 +341,40 @@ def consult_envelope(
     ]
     if summary.strip():
         sections.append("Conversation so far:\n" + summary)
-    window = "\n".join(f"{role}: {_capped(text)}" for role, text in last_turns)
+    window = _bounded_history(last_turns)
     if window:
-        sections.append(window)
+        sections.append("Recent conversation:\n" + window)
     sections.append("Question:\n" + question)
     return "\n\n".join(sections)
 
 
+def _bounded_history(turns: Iterable[tuple[str, str]]) -> str:
+    """Render the newest turns first, bounded by per-turn and total character caps."""
+    selected: list[str] = []
+    used = 0
+    for role, text in reversed(list(turns)):
+        prefix = f"{role}: "
+        capped = _capped(text)
+        separator = 1 if selected else 0
+        remaining = CONSULT_HISTORY_CHARS - used - separator
+        line_size = len(prefix) + len(capped)
+        if line_size <= remaining:
+            selected.append(prefix + capped)
+            used += separator + line_size
+            continue
+        content_size = remaining - len(prefix)
+        if content_size > 0:
+            content = capped[: content_size - 1] + "…"
+            selected.append(prefix + content)
+        break
+    return "\n".join(reversed(selected))
+
+
 def _capped(text: str) -> str:
-    """Cap one carried turn with an explicit truncation marker."""
+    """Cap one carried turn, including its explicit truncation marker."""
     if len(text) <= CONSULT_TURN_CHARS:
         return text
-    return text[:CONSULT_TURN_CHARS] + "…"
+    return text[: CONSULT_TURN_CHARS - 1] + "…"
 
 
 # participant attributes mentatd stamps on the phone's token from its call context

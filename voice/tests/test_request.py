@@ -16,6 +16,7 @@ from request import (
     CLOSE_TAIL_S,
     CLOSE_UNSPOKEN_S,
     CONSULT_FRAMING,
+    CONSULT_HISTORY_CHARS,
     CONSULT_TURN_CHARS,
     IDLE_S,
     TURN_EFFORT,
@@ -59,13 +60,65 @@ class RequestTest(unittest.TestCase):
             },
         )
 
-    def test_recent_turns_keeps_latest_messages_in_order(self):
+    def test_recent_turns_keeps_all_recent_messages_in_order(self):
         self.assertEqual(
             recent_turns(
                 [Message("user", "old"), Message("assistant", "reply"), Message("user", "new")]
             ),
-            [("assistant", "reply"), ("user", "new")],
+            [("user", "old"), ("assistant", "reply"), ("user", "new")],
         )
+
+    def test_recent_turns_omits_non_messages_and_empty_messages(self):
+        class NonMessage:
+            type = "function_call"
+            role = "assistant"
+            text_content = "tool payload"
+
+        self.assertEqual(
+            recent_turns(
+                [NonMessage(), Message("user", ""), Message("assistant", "kept")]
+            ),
+            [("assistant", "kept")],
+        )
+
+    def test_consult_envelope_keeps_request_context_for_short_delegated_question(self):
+        request = "Who is the person I met at the conference named Alice?"
+        for question in ("PI", ""):
+            with self.subTest(question=question):
+                envelope = consult_envelope(
+                    "card",
+                    "",
+                    recent_turns(
+                        [Message("user", request), Message("assistant", "I will look that up."), Message("user", question)]
+                    ),
+                    question,
+                )
+                self.assertIn(f"user: {request}", envelope)
+                self.assertIn("assistant: I will look that up.", envelope)
+
+    def test_consult_envelope_caps_each_turn_and_history_budget(self):
+        turns = [("user", "a" * 2000), ("assistant", "b" * 2000), ("user", "c" * 2000), ("assistant", "newest")]
+        envelope = consult_envelope("card", "", turns, "question")
+        history = envelope.split("Recent conversation:\n", 1)[1].split("\n\nQuestion:\n", 1)[0]
+        rendered_turns = history.splitlines()
+        self.assertEqual(CONSULT_HISTORY_CHARS, 6000)
+        self.assertEqual(CONSULT_TURN_CHARS, 1500)
+        self.assertLessEqual(len(history), CONSULT_HISTORY_CHARS)
+        self.assertIn("assistant: newest", history)
+        self.assertTrue(any(line.endswith("…") for line in rendered_turns))
+        self.assertTrue(all(len(line.split(": ", 1)[1]) <= CONSULT_TURN_CHARS for line in rendered_turns))
+
+    def test_consult_envelope_truncates_oldest_turn_to_history_budget(self):
+        turns = [("user", "a" * 2000), ("assistant", "b" * 2000), ("user", "c" * 2000), ("assistant", "d" * 2000)]
+        envelope = consult_envelope("card", "", turns, "question")
+        history = envelope.split("Recent conversation:\n", 1)[1].split("\n\nQuestion:\n", 1)[0]
+        rendered_turns = history.splitlines()
+        self.assertLessEqual(len(history), CONSULT_HISTORY_CHARS)
+        self.assertTrue(rendered_turns[0].startswith("user: a"))
+        self.assertTrue(rendered_turns[0].endswith("…"))
+        self.assertLess(len(rendered_turns[0].split(": ", 1)[1]), CONSULT_TURN_CHARS)
+        self.assertTrue(rendered_turns[1].startswith("assistant: b"))
+        self.assertTrue(rendered_turns[-1].startswith("assistant: d"))
 
     def test_recent_turns_does_not_filter_former_opening_cue_text(self):
         former_cue = "(Josh just opened the call.)"
@@ -111,7 +164,7 @@ class RequestTest(unittest.TestCase):
         self.assertIn("Question:\nWhat is on my calendar?", envelope)
 
     def test_consult_turn_cap_and_persona_split(self):
-        self.assertEqual(CONSULT_TURN_CHARS, 500)
+        self.assertEqual(CONSULT_TURN_CHARS, 1500)
         text = f"front\n{VOICE_CARD_MARKER}\ncard"
         self.assertEqual(split_persona(text), ("front", "card"))
         with self.assertRaises(ValueError):
