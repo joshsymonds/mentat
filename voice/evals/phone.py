@@ -54,7 +54,7 @@ def _run_fake_phone(base_url: str, output_path: Path) -> None:
     output.write_text("", encoding="utf-8")
 
     host, port = _loopback_endpoint(base_url)
-    connection = http.client.HTTPConnection(host, port, timeout=5)
+    connection = http.client.HTTPConnection(host, port, timeout=25)
     try:
         connection.request("GET", "/v1/phone/commands", headers={"X-Mentat-Phone": "fake-phone"})
         response = connection.getresponse()

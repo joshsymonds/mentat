@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -25,6 +26,10 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
         self.results = []
         commands = self.commands
         results = self.results
+        command_delay = {"seconds": 0.0}
+        self.command_delay = command_delay
+        result_status = {"code": 204}
+        self.result_status = result_status
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -40,20 +45,24 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
                 self.send_header("Content-Type", "application/x-ndjson")
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
-                for command in commands:
+                for index, command in enumerate(commands):
+                    if index == 1:
+                        time.sleep(command_delay["seconds"])
                     payload = (json.dumps(command) + "\n").encode()
                     self.wfile.write(f"{len(payload):X}\r\n".encode() + payload + b"\r\n")
                     self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
+                self.close_connection = True
 
             def do_POST(self):
                 self.assert_result_path()
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 results.append(json.loads(body))
-                self.send_response(204)
+                self.send_response(result_status["code"])
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+                self.close_connection = True
 
             def assert_result_path(self):
                 if self.path != "/v1/phone/results":
@@ -87,6 +96,25 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
             "payload": {"lat": 47.6205, "lng": -122.3493, "accuracy_m": 8, "age_s": 3},
         })
         self.assertEqual([entry["result"] for entry in recorded if entry["event"] == "result"], self.results)
+
+    async def test_command_after_five_second_idle_window_is_received_and_recorded(self):
+        self.command_delay["seconds"] = 5.2
+
+        await run_fake_phone(self.base_url, self.output, "success")
+
+        recorded_commands = [
+            entry["command"]
+            for entry in map(json.loads, self.output.read_text().splitlines())
+            if entry["event"] == "command"
+        ]
+        self.assertEqual(recorded_commands, self.commands)
+        self.assertEqual([result["id"] for result in self.results], ["command-1", "command-2"])
+
+    async def test_missing_fake_result_remains_a_failure(self):
+        self.result_status["code"] = 503
+
+        with self.assertRaisesRegex(RuntimeError, "phone result returned HTTP 503"):
+            await run_fake_phone(self.base_url, self.output, "success")
 
     async def test_rejects_removed_and_unknown_modes(self):
         for mode in ("offline", "unknown", "other"):
