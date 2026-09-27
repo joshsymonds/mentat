@@ -630,7 +630,7 @@ class AssistActivityTest {
             operation()
         }
 
-        override fun playListeningChime() {}
+        override suspend fun playListeningChime() {}
 
         override suspend fun connect(url: String, token: String) {}
 

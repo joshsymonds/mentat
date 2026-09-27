@@ -23,15 +23,18 @@ import gg.savecraft.mentat.core.TranscriptSegment
 import java.time.ZoneId
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 open class VoiceSessionService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -158,6 +161,7 @@ internal class VoiceSessionController(
     private val stopService: () -> Unit,
     private val scope: CoroutineScope,
     private val callContext: () -> CallContext? = { null },
+    private val tokenDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val machine = SessionStateMachine()
     private val transcriptStore = Transcript()
@@ -184,10 +188,18 @@ internal class VoiceSessionController(
         }
         transition(SessionEvent.AssistInvoked)
         try {
-            liveKitSession.withPreconnectAudio {
-                liveKitSession.playListeningChime()
-                val grant = try {
-                    withContext(Dispatchers.IO) {
+            coroutineScope {
+                val chimeResult = async(start = CoroutineStart.UNDISPATCHED) {
+                    try {
+                        liveKitSession.playListeningChime()
+                    } catch (exception: CancellationException) {
+                        throw exception
+                    } catch (exception: Exception) {
+                        Log.w("MentatAssist", "Unable to play listening chime", exception)
+                    }
+                }
+                val grantResult = async(tokenDispatcher) {
+                    try {
                         // the context only colours the greeting; failing to read it never blocks a call
                         val context = try {
                             callContext()
@@ -195,19 +207,27 @@ internal class VoiceSessionController(
                             Log.w("MentatAssist", "Unable to read call context", exception)
                             null
                         }
-                        tokenEndpoint.fetch(context)
+                        Result.success(tokenEndpoint.fetch(context))
+                    } catch (exception: CancellationException) {
+                        throw exception
+                    } catch (exception: Exception) {
+                        Result.failure(exception)
                     }
-                } catch (exception: Exception) {
-                    transition(SessionEvent.TokenFailed(exception.message ?: "Unable to fetch voice token"))
-                    return@withPreconnectAudio
                 }
-                transition(SessionEvent.TokenReceived(grant))
-                try {
-                    liveKitSession.connect(grant.url, grant.token)
-                    liveKitSession.setMicEnabled(true)
-                    mutableMicEnabled.value = true
-                } catch (exception: Exception) {
-                    transition(SessionEvent.ConnectFailed(exception.message ?: "Unable to connect to voice session"))
+                chimeResult.await()
+                liveKitSession.withPreconnectAudio {
+                    val grant = grantResult.await().getOrElse { exception ->
+                        transition(SessionEvent.TokenFailed(exception.message ?: "Unable to fetch voice token"))
+                        return@withPreconnectAudio
+                    }
+                    transition(SessionEvent.TokenReceived(grant))
+                    try {
+                        liveKitSession.connect(grant.url, grant.token)
+                        liveKitSession.setMicEnabled(true)
+                        mutableMicEnabled.value = true
+                    } catch (exception: Exception) {
+                        transition(SessionEvent.ConnectFailed(exception.message ?: "Unable to connect to voice session"))
+                    }
                 }
             }
         } catch (exception: Exception) {
