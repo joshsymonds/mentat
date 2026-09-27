@@ -1574,5 +1574,76 @@ class ScenarioCorpusTests(unittest.TestCase):
                 evaluate_scenario(scenario, turns, commands, room_closed_after=2)
 
 
+    def test_run14_live_places_gardens_name_and_asr_acknowledgments_remain_fake_strict(self):
+        place = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+        search_result = "Alice Keck Park Memorial Gardens is in Santa Barbara."
+        navigate = {
+            "turn": 2,
+            "kind": "navigate",
+            "name": "Alice Keck Park Memorial Gardens",
+            "address": "1500 Santa Barbara Street",
+            "place_id": "alice-keck-live-place-id",
+            "lat": 34.42,
+            "lng": -119.70,
+        }
+        evaluate_scenario(
+            place,
+            [search_result, "Start it."],
+            [{"turn": 1, "kind": "location"}, navigate],
+            room_closed_after=2,
+        )
+        with self.assertRaisesRegex(AssertionError, "unexpected place name"):
+            evaluate_scenario(
+                place,
+                [search_result, "Start it."],
+                [{"turn": 1, "kind": "location"}, {**navigate, "name": "Another Santa Barbara Garden"}],
+                room_closed_after=2,
+            )
+
+    def test_run14_live_sms_confirm_cent_ack_requires_exact_readback_and_one_send(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        readback = "I'll text +1-202-555-0142: I'll be there at six. Confirm, and I'll send it."
+        command = {
+            "turn": 2,
+            "kind": "sms",
+            "to": "+1-202-555-0142",
+            "body": "I will be there at six.",
+        }
+        evaluate_scenario(
+            scenario,
+            [readback, "Yes. cent"],
+            [command],
+            room_closed_after=2,
+        )
+
+        invalid_cases = (
+            ([readback.replace("0142", "0199"), "Yes. cent"], [command], "wrong spoken recipient"),
+            ([readback.replace("I'll be there at six", ""), "Yes. cent"], [command], "missing spoken body"),
+            ([readback, "Yes. cent"], [{**command, "body": "I will be there at seven."}], "wrong sent body"),
+            ([readback, "Yes. cent"], [{**command, "to": "+1-202-555-0199"}], "wrong sent recipient"),
+            ([readback, "Yes. cent"], [{**command, "turn": 1}], "pre-Yes send"),
+            ([readback, "Yes. cent"], [command, command], "duplicate send"),
+        )
+        for turns, commands, label in invalid_cases:
+            with self.subTest(label=label), self.assertRaises(AssertionError):
+                evaluate_scenario(scenario, turns, commands, room_closed_after=2)
+
+    def test_run14_start_it_acknowledgment_still_requires_exact_timer_command(self):
+        scenario = next(s for s in SCENARIOS if s.name == "timer-300-seconds")
+        evaluate_scenario(
+            scenario,
+            ["Start it."],
+            [{"turn": 1, "kind": "timer", "seconds": 300}],
+            room_closed_after=1,
+        )
+        with self.assertRaisesRegex(AssertionError, "expected seconds=300"):
+            evaluate_scenario(
+                scenario,
+                ["Start it."],
+                [{"turn": 1, "kind": "timer", "seconds": 60}],
+                room_closed_after=1,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

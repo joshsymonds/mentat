@@ -55,7 +55,7 @@ _NAMED_OTHER_ACTOR = (
 )
 _OTHER_ACTOR = rf"(?:{_OTHER_ROLE}|{_NAMED_OTHER_ACTOR})"
 _ACTION_ACKNOWLEDGMENT = (
-    r"\b(?:done|set|started|starting|setting|running|sent|sending|texted|scent|"
+    r"\b(?:done|set|start(?:\s+it)?|started|starting|setting|running|sent|sending|texted|cent|scent|"
     r"navigat\w*|directions|route|taking you|sending you there)\b"
 )
 _DIGIT_WORDS = {
@@ -147,7 +147,7 @@ SCENARIOS = (
         ),
         room_close_after=2,
         place_query="Alice Keck Park Memorial Garden",
-        selected_place_pattern=r"(?i)^Alice Keck Park Memorial Garden$",
+        selected_place_pattern=r"(?i)^Alice Keck Park Memorial Gardens?$",
         spoken_place_pattern=r"(?i)\b(?:Alice|Halis) Keck Park(?: Memorial Gardens?)?\b",
     ),
     Scenario(
@@ -155,7 +155,7 @@ SCENARIOS = (
         caller_lines=("Text +1-202-555-0142: I will be there at six.", "Yes."),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word)\b"),
+                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word|confirm)\b"),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
@@ -173,12 +173,12 @@ SCENARIOS = (
         ),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word)\b"),
+                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word|confirm)\b"),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
             TurnExpectation(
-                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word)\b"),
+                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word|confirm)\b"),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at seven.",
             ),
@@ -239,7 +239,7 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
     match = _SPOKEN_SMS_RECIPIENT.search(text)
     prompt = (
         re.search(
-            r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word)\b",
+            r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word|confirm)\b",
             text[match.end():],
             re.IGNORECASE,
         )
