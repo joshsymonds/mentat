@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -417,6 +418,48 @@ class DevStackTest(unittest.TestCase):
                     self.assertNotIn(secret, str(error))
                     self.assertNotIn(secret, error.stderr)
                     self.assertNotIn(secret, error.output)
+
+    def test_voice_python_keeps_package_wrapper_and_checks_caller_imports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            underlying = root / "python3"
+            invocation = root / "invocation"
+            underlying.write_text(f"#!/bin/sh\nprintf '%s' \"$*\" > {shlex.quote(str(invocation))}\n")
+            underlying.chmod(0o755)
+            wrapper = root / "python-env"
+            wrapper.symlink_to(underlying)
+            proc_exe = root / "proc-exe"
+            proc_exe.symlink_to(underlying)
+            cmdline = root / "cmdline"
+            cmdline.write_bytes(os.fsencode(wrapper) + b"\0agent.py\0start\0")
+
+            capture = next(
+                line for line in _SETUP_SCRIPT.splitlines()
+                if "VOICE_PY" in line and "/proc/$VOICE_PID/" in line
+            )
+            capture = capture.replace('"/proc/$VOICE_PID/exe"', shlex.quote(str(proc_exe)))
+            capture = capture.replace('"/proc/$VOICE_PID/cmdline"', shlex.quote(str(cmdline)))
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", capture + '\nprintf "%s" "$VOICE_PY"'],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, str(wrapper))
+
+            import_check = next(
+                line for line in _SETUP_SCRIPT.splitlines()
+                if line.startswith('"$VOICE_PY" -c ') and "aiohttp" in line
+            )
+            check = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", f"VOICE_PY={shlex.quote(str(wrapper))}\n{import_check}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(check.returncode, 0, check.stderr)
+            self.assertIn("import aiohttp", invocation.read_text())
 
     def test_setpriv_is_resolved_outside_service_path_for_all_launches(self):
         def python_block(script, header):

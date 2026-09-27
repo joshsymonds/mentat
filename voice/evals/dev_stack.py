@@ -120,7 +120,13 @@ VOICE_PID=$(systemctl show mentat-voice --property=MainPID --value)
 test "$MENTAT_PID" -gt 0
 test "$VOICE_PID" -gt 0
 NODE_BIN=$(readlink -f "/proc/$MENTAT_PID/exe")
-VOICE_PY=$(readlink -f "/proc/$VOICE_PID/exe")
+# Keep the service's Nix Python environment wrapper; /proc/exe loses its site packages.
+IFS= read -r -d '' VOICE_PY < "/proc/$VOICE_PID/cmdline"
+case "$VOICE_PY" in
+  /*) test -x "$VOICE_PY" ;;
+  *) echo "voice Python executable must be an absolute path" >&2; exit 1 ;;
+esac
+"$VOICE_PY" -c 'import aiohttp; from livekit import api, rtc'
 
 mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records"
 umask 077
