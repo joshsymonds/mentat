@@ -36,7 +36,7 @@ ROOM_POLL_INTERVAL_SECONDS = 0.25
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 SMS_CONFIRMATION_PATTERN = re.compile(
-    r"\b(?:should i|would you like|do you want|shall i|want me to|say yes)\b",
+    r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word)\b",
     re.IGNORECASE,
 )
 PHONE_TOOL_KINDS = {

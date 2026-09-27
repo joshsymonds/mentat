@@ -1386,6 +1386,29 @@ class ScenarioObservationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no transcript segment timestamps"):
             runner._confirmation_time({"capture_started": 5.0, "segments": []})
 
+    def test_confirmation_timestamp_recognizes_all_approved_prompt_literals(self):
+        prompts = (
+            "Should I send it?",
+            "Shall I send it?",
+            "Want me to send it?",
+            "Would you like me to send it?",
+            "Say yes to send it.",
+            "Say send to confirm.",
+            "Say the word and I'll send it.",
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(
+                    runner._confirmation_time({
+                        "capture_started": 10.0,
+                        "segments": [
+                            {"start": 0.0, "end": 0.3, "text": "Please confirm."},
+                            {"start": 0.4, "end": 0.8, "text": prompt},
+                        ],
+                    }),
+                    10.8,
+                )
+
     def test_first_turn_tts_failure_keeps_named_observation_without_sdk_record(self):
         import json
         from subprocess import CompletedProcess

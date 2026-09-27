@@ -436,9 +436,8 @@ class ScenarioCorpusTests(unittest.TestCase):
                 room_closed_after=2,
             )
 
-    def test_accepts_observed_halis_keck_asr_variation_in_complete_and_prefix_paths(self):
+    def test_accepts_short_and_full_keck_name_variants_in_complete_and_prefix_paths(self):
         scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
-        search_result = "Halis Keck Park Memorial Gardens. Right there in Santa Barbara."
         navigate = {
             "turn": 2,
             "kind": "navigate",
@@ -448,22 +447,33 @@ class ScenarioCorpusTests(unittest.TestCase):
             "lat": 34.42,
             "lng": -119.70,
         }
-        evaluate_scenario(
-            scenario,
-            turns=[search_result, "Navigating to Alice Keck Park Memorial Garden now."],
-            phone_commands=[{"turn": 1, "kind": "location"}, navigate],
-            room_closed_after=2,
-        )
-        self.assertEqual(
-            evaluate_scenario_prefix(
-                scenario,
-                turns=[search_result],
-                phone_commands=[{"turn": 1, "kind": "location"}, navigate],
-                room_closed_after=None,
-                failed_turn=2,
-            ),
-            [],
-        )
+        for name in (
+            "Alice Keck Park",
+            "Alice Keck Park Memorial Garden",
+            "Alice Keck Park Memorial Gardens",
+            "Halis Keck Park",
+            "Halis Keck Park Memorial Garden",
+            "Halis Keck Park Memorial Gardens",
+        ):
+            search_result = f"{name}. Right there in Santa Barbara."
+            commands = [{"turn": 1, "kind": "location"}, navigate]
+            with self.subTest(name=name):
+                evaluate_scenario(
+                    scenario,
+                    turns=[search_result, "Navigating to Alice Keck Park Memorial Garden now."],
+                    phone_commands=commands,
+                    room_closed_after=2,
+                )
+                self.assertEqual(
+                    evaluate_scenario_prefix(
+                        scenario,
+                        turns=[search_result],
+                        phone_commands=commands,
+                        room_closed_after=None,
+                        failed_turn=2,
+                    ),
+                    [],
+                )
 
     def test_rejects_absent_or_unobserved_keck_name_and_wrong_navigation_target(self):
         scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
@@ -482,7 +492,7 @@ class ScenarioCorpusTests(unittest.TestCase):
         invalid_search_results = (
             "Santa Barbara Street is the result.",
             "Alice Park Memorial Garden. Right there in Santa Barbara.",
-            "Halis Keck Park by Santa Barbara.",
+            "Memorial Garden is right there in Santa Barbara.",
         )
         for search_result in invalid_search_results:
             with self.subTest(search_result=search_result), self.assertRaises(AssertionError):
@@ -801,7 +811,7 @@ class ScenarioCorpusTests(unittest.TestCase):
         scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
         first_turns = (
             "I'm checking that now. It's named for Alice Keck Park, who bought the entire block back in 75 and gave it to the city for a park, without saying who she was. The city dedicated the garden to her in 1980.",
-            "Sure, I'll check. It's actually named after a person, Alice Keck Park. Park was her married name, and she was related to the Kecks, as in W. M. Keck. The city got the land as an anonymous gift, turned it into a garden, and dedicated it to her in 1980.",
+            "Sure, I'll check. It's actually named after Alice Keck Park. Park was her married name, and Alice Keck gave the land to the city, which received it as an anonymous gift and dedicated the garden to her in 1980.",
         )
         for first_turn in first_turns:
             with self.subTest(first_turn=first_turn):
@@ -826,6 +836,8 @@ class ScenarioCorpusTests(unittest.TestCase):
         false_facts = (
             (0, "Alice Keck Park was not donated by Alice Keck; someone else gave it."),
             (0, "Alice Keck Park was donated by the city as an anonymous gift and was dedicated in 1980."),
+            (0, "Alice Keck Park was donated by her husband."),
+            (0, "Alice Keck Park was donated by her husband. The city got the land as an anonymous gift and dedicated it to her in 1980."),
             (1, "Alice Keck Park was not W. M. Keck's daughter."),
             (2, "Her family's wealth did not come from Superior Oil."),
         )
@@ -834,6 +846,295 @@ class ScenarioCorpusTests(unittest.TestCase):
             turns[index] = false_answer
             with self.subTest(turn=false_answer), self.assertRaises(AssertionError):
                 evaluate_scenario(scenario, turns=turns, phone_commands=[], room_closed_after=None)
+
+    def test_accepts_generic_navigation_acknowledgment_only_for_canonical_fake_target(self):
+        scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
+        turns = [
+            "Alice Keck Park Memorial Garden is in Santa Barbara.",
+            "Okay, starting navigation now.",
+        ]
+        canonical_command = {
+            "turn": 2,
+            "kind": "navigate",
+            "name": "Alice Keck Park Memorial Garden",
+            "address": "1 Garden Road",
+            "place_id": "alice-keck-place-id",
+            "lat": 34.42,
+            "lng": -119.70,
+        }
+        commands = [{"turn": 1, "kind": "location"}, canonical_command]
+        evaluate_scenario(
+            scenario,
+            turns=turns,
+            phone_commands=commands,
+            room_closed_after=2,
+        )
+        self.assertEqual(
+            evaluate_scenario_prefix(
+                scenario,
+                turns=turns,
+                phone_commands=commands,
+                room_closed_after=None,
+            ),
+            [],
+        )
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                scenario,
+                turns=turns,
+                phone_commands=[
+                    {"turn": 1, "kind": "location"},
+                    {**canonical_command, "name": "Another Santa Barbara Garden"},
+                ],
+                room_closed_after=2,
+            )
+
+    def test_sms_confirmation_literals_accept_national_number_and_sent_asr_variants(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        confirmation_prompts = (
+            "Should I send it?",
+            "Shall I send it?",
+            "Want me to send it?",
+            "Would you like me to send it?",
+            "Say yes to send it.",
+            "Say send to confirm.",
+            "Say the word and I'll send it.",
+        )
+        for prompt in confirmation_prompts:
+            for acknowledgment in ("Sending to 202-555-0142.", "Scent to 202-555-0142."):
+                with self.subTest(prompt=prompt, acknowledgment=acknowledgment):
+                    evaluate_scenario(
+                        scenario,
+                        turns=[
+                            f"I'll text 202-555-0142: I will be there at six. {prompt}",
+                            acknowledgment,
+                        ],
+                        phone_commands=[
+                            {"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}
+                        ],
+                        room_closed_after=2,
+                    )
+
+    def test_run11_alice_transcripts_accept_alice_and_reject_named_husband(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        followups = [
+            "Alice Keck Park was W. M. Keck's daughter.",
+            "Her family's wealth came from Superior Oil.",
+        ]
+        evaluate_scenario(
+            scenario,
+            turns=[
+                "Hmm, I'm not sure, let's find out. Well it is named for Alice Keck Park. She bought the land, the former El Mirasol hotel site, and gave it to the city in the mid 70s. They dedicated the gardens in her honor.",
+                *followups,
+            ],
+            phone_commands=[],
+            room_closed_after=None,
+        )
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                scenario,
+                turns=[
+                    "Let's see what I can dig up. Alice Keck Park was the wife of Locke de Breadville Park, who gave that land to the city. That's why the garden has her name.",
+                    *followups,
+                ],
+                phone_commands=[],
+                room_closed_after=None,
+            )
+
+    def test_director_attribution_probe_cases(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        followups = [
+            "Alice Keck Park was W. M. Keck's daughter.",
+            "Her family's wealth came from Superior Oil.",
+        ]
+        cases = (
+            ("no-but uncertainty", "I am not sure at first glance Alice Keck Park bought the land and donated it to the city.", True),
+            ("father fortune context", "Alice Keck Park's father gave her a fortune. Alice Keck bought the land and gave it to the city.", True),
+            ("father land donor", "Alice Keck Park's father gave the land to the city. The garden was named for Alice Keck.", False),
+            ("other buyer", "Alice Keck Park is the name of the garden. Her husband bought the land and donated it to the city.", False),
+            ("other payer", "Alice Keck Park gave the land to the city, but her husband paid for the land.", False),
+            ("other family donor", "Alice Keck Park is the garden's namesake. Her family gave the land to the city.", False),
+            ("Alice pronoun purchase", "The park is named for Alice Keck Park; she bought the land and gave it to the city.", True),
+            ("uncertain non-answer", "I am not sure at first glance it is named for Alice Keck Park.", False),
+        )
+        for label, first_turn, expected_pass in cases:
+            with self.subTest(case=label):
+                if expected_pass:
+                    evaluate_scenario(
+                        scenario,
+                        turns=[first_turn, *followups],
+                        phone_commands=[],
+                        room_closed_after=None,
+                    )
+                else:
+                    with self.assertRaises(AssertionError):
+                        evaluate_scenario(
+                            scenario,
+                            turns=[first_turn, *followups],
+                            phone_commands=[],
+                            room_closed_after=None,
+                        )
+
+    def test_alice_purchased_the_land_counts_as_buyer_attribution(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        evaluate_scenario(
+            scenario,
+            turns=[
+                "Alice Keck Park purchased the land and gave it to the city.",
+                "Alice Keck Park was W. M. Keck's daughter.",
+                "Her family's wealth came from Superior Oil.",
+            ],
+            phone_commands=[],
+            room_closed_after=None,
+        )
+
+    def test_later_definitive_pronoun_attribution_overrides_uncertainty(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        evaluate_scenario(
+            scenario,
+            turns=[
+                "I don't know whether Alice Keck gave the land away. I checked and she purchased the land and donated it to the city.",
+                "Alice Keck Park was W. M. Keck's daughter.",
+                "Her family's wealth came from Superior Oil.",
+            ],
+            phone_commands=[],
+            room_closed_after=None,
+        )
+
+    def test_repeated_uncertainty_without_definitive_claim_fails(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(
+                scenario,
+                turns=[
+                    "I don't know whether Alice Keck gave the land away. I'm not sure if she donated it.",
+                    "Alice Keck Park was W. M. Keck's daughter.",
+                    "Her family's wealth came from Superior Oil.",
+                ],
+                phone_commands=[],
+                room_closed_after=None,
+            )
+
+    def test_later_definitive_alice_attribution_overrides_uncertain_donor_preamble(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        evaluate_scenario(
+            scenario,
+            turns=[
+                "I am not sure whether Alice Keck gave the land to the city. I checked: Alice Keck Park bought the land and donated it to the city.",
+                "Alice Keck Park was W. M. Keck's daughter.",
+                "Her family's wealth came from Superior Oil.",
+            ],
+            phone_commands=[],
+            room_closed_after=None,
+        )
+
+    def test_accepts_alice_attribution_after_uncertainty_with_or_without_punctuation_or_but(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        first_turns = (
+            "I'm not sure let's find out Alice Keck Park she gave land",
+            "I'm not sure. Alice Keck Park she gave land",
+            "I'm not sure at first glance, but Alice Keck Park was named for Alice Keck; she bought the block and gave it to the city.",
+        )
+        for first_turn in first_turns:
+            with self.subTest(first_turn=first_turn):
+                evaluate_scenario(
+                    scenario,
+                    turns=[
+                        first_turn,
+                        "Alice Keck Park was W. M. Keck's daughter.",
+                        "Her family's wealth came from Superior Oil.",
+                    ],
+                    phone_commands=[],
+                    room_closed_after=None,
+                )
+
+    def test_accepts_unpunctuated_alice_attribution_after_uncertainty(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        attributions = (
+            "Alice Keck Park was bought by Alice Keck and she gave it to the city",
+            "Alice Keck Park was given by Alice Keck to the city",
+            "Alice Keck Park was a gift from Alice Keck",
+            "Alice Keck Park was a donation by Alice Keck",
+        )
+        for attribution in attributions:
+            with self.subTest(attribution=attribution):
+                evaluate_scenario(
+                    scenario,
+                    turns=[
+                        f"I am not sure at first glance but {attribution}",
+                        "Alice Keck Park was W. M. Keck's daughter.",
+                        "Her family's wealth came from Superior Oil.",
+                    ],
+                    phone_commands=[],
+                    room_closed_after=None,
+                )
+
+    def test_rejects_uncertainty_and_city_gift_without_alice_attribution(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        first_turns = (
+            "I am not sure at first glance",
+            "Alice Keck Park was given to the city as an anonymous gift and dedicated to her in 1980",
+            "The city received Alice Keck Park as an anonymous gift and dedicated it to Alice Keck",
+        )
+        for first_turn in first_turns:
+            with self.subTest(first_turn=first_turn), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    scenario,
+                    turns=[
+                        first_turn,
+                        "Alice Keck Park was W. M. Keck's daughter.",
+                        "Her family's wealth came from Superior Oil.",
+                    ],
+                    phone_commands=[],
+                    room_closed_after=None,
+                )
+
+    def test_rejects_named_non_alice_donors_of_park_even_with_alice_attribution(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        valid = [
+            "Alice Keck Park was bought by Alice Keck.",
+            "Alice Keck Park was W. M. Keck's daughter.",
+            "Her family's wealth came from Superior Oil.",
+        ]
+        false_donor_claims = (
+            "Her husband was the donor of Alice Keck Park.",
+            "Her father bought Alice Keck Park.",
+            "The family donated Alice Keck Park.",
+            "The city gave Alice Keck Park to the public.",
+            "Her husband paid for the land.",
+            "Locke de Breadville Park bought that land.",
+            "Locke de Breadville Park paid for that land.",
+            "Locke de Breadville Park, who gave that land to the city.",
+            "Alice Keck Park was a gift from her husband.",
+            "Alice Keck Park was given by her father.",
+            "The family was the giver of Alice Keck Park.",
+            "Alice Keck Park's donor was the city.",
+        )
+        for false_claim in false_donor_claims:
+            turns = valid.copy()
+            turns[0] = f"{valid[0]} {false_claim}"
+            with self.subTest(false_claim=false_claim), self.assertRaises(AssertionError):
+                evaluate_scenario(scenario, turns=turns, phone_commands=[], room_closed_after=None)
+
+    def test_husband_and_father_unrelated_context_does_not_override_alice_donor(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        first_turns = (
+            "Alice Keck Park was bought by Alice Keck. Her husband lived nearby and the city received the land as an anonymous gift.",
+            "Alice Keck Park was bought by Alice Keck. Her father gave her a fortune from oil.",
+            "Alice Keck Park's father gave her a fortune. Alice Keck bought the land and gave it to the city.",
+        )
+        for first_turn in first_turns:
+            with self.subTest(first_turn=first_turn):
+                evaluate_scenario(
+                    scenario,
+                    turns=[
+                        first_turn,
+                        "Alice Keck Park was W. M. Keck's daughter.",
+                        "Her family's wealth came from Superior Oil.",
+                    ],
+                    phone_commands=[],
+                    room_closed_after=None,
+                )
 
 
 if __name__ == "__main__":

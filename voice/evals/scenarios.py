@@ -32,6 +32,62 @@ class Scenario:
     spoken_place_pattern: str | None = None
 
 
+_ALICE_DONOR_CLAIM = (
+    r"\bAlice Keck(?: Park)?\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice Keck(?: Park)?\b.{0,100}\bshe\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice Keck Park\b.{0,8}\bwho\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\b(?:bought|purchased|donated|gave|gifted|given)\b.{0,80}\b(?:by|from)\s+Alice Keck\b|"
+    r"\b(?:gift|donation)\b.{0,80}\b(?:by|from)\s+Alice Keck\b"
+)
+_UNCERTAIN_DONOR_CLAIM = (
+    r"\b(?:not sure|don't know|do not know|unclear|can't say|cannot say)\b"
+    r".{0,40}?\b(?:whether|if)\b.{0,100}?\b(?:bought|purchased|donat\w*|gave|gift\w*)\b"
+)
+_TRANSFER_ACTION = r"(?:bought|purchased|paid(?:\s+for)?|donat\w*|gave|gift\w*|given)"
+_PARK_LAND_OBJECT = (
+    r"(?:Alice Keck Park|(?:(?:the|that|this|her|his|their)\s+)?"
+    r"(?:land|property|park|garden|site)|it)"
+)
+_OTHER_ROLE = r"(?:the\s+)?(?:her\s+)?(?:husband|father|family|city|someone else|somebody else|another person)"
+_NAMED_OTHER_ACTOR = (
+    r"(?-i:(?!(?:Alice|Halis)\s+Keck\b)(?!Keck\s+Park\b)"
+    r"(?:[A-Z][A-Za-z'’-]+|[A-Z]\.)(?:\s+(?:[A-Z][A-Za-z'’-]+|[A-Z]\.|de|van|von|da)){1,5})"
+)
+_OTHER_ACTOR = rf"(?:{_OTHER_ROLE}|{_NAMED_OTHER_ACTOR})"
+_NON_ALICE_PARK_DONOR = (
+    r"(?:"
+    rf"\b{_OTHER_ROLE}\b(?:\s+\w+){{0,4}}\s+\b{_TRANSFER_ACTION}\b"
+    rf"(?:\s+\w+){{0,3}}\s+\b{_PARK_LAND_OBJECT}\b|"
+    rf"\b{_NAMED_OTHER_ACTOR}\b(?:\s*,\s*|\s+)(?:(?:was\s+the\s+one\s+)?who\s+)?\b{_TRANSFER_ACTION}\b"
+    rf"(?:\s+\w+){{0,3}}\s+\b{_PARK_LAND_OBJECT}\b|"
+    rf"\b{_PARK_LAND_OBJECT}\b[^\n.!?;]{{0,50}}\b{_TRANSFER_ACTION}\b"
+    rf"(?:\s+\w+){{0,3}}\s+\b(?:by|from)\s+{_OTHER_ACTOR}\b|"
+    rf"\b{_OTHER_ACTOR}\b[^\n.!?;]{{0,30}}\b(?:buyer|purchaser|payer|donor|giver)\b"
+    rf"[^\n.!?;]{{0,30}}\bof\s+{_PARK_LAND_OBJECT}\b|"
+    rf"\b(?:buyer|purchaser|payer|donor|giver)\b[^\n.!?;]{{0,30}}\bof\s+{_PARK_LAND_OBJECT}\b"
+    rf"[^\n.!?;]{{0,30}}\b(?:was|is)\s+{_OTHER_ACTOR}\b|"
+    rf"\b{_PARK_LAND_OBJECT}\b[^\n.!?;]{{0,30}}\b(?:buyer|purchaser|payer|donor|giver)\b"
+    rf"[^\n.!?;]{{0,30}}\b(?:was|is)\s+{_OTHER_ACTOR}\b|"
+    rf"\b{_PARK_LAND_OBJECT}\b[^\n.!?;]{{0,40}}\b(?:gift|donation)\b[^\n.!?;]{{0,40}}"
+    rf"\b(?:by|from)\s+{_OTHER_ACTOR}\b)"
+)
+
+
+def _uncertain_without_alice_attribution(text: str) -> bool:
+    uncertainties = list(re.finditer(_UNCERTAIN_DONOR_CLAIM, text, re.IGNORECASE))
+    if not uncertainties:
+        return False
+    last_uncertainty = uncertainties[-1]
+    later = text[last_uncertainty.end():]
+    if re.search(_ALICE_DONOR_CLAIM, later, re.IGNORECASE):
+        return False
+    alice_named = re.search(r"\bAlice Keck(?: Park)?\b", text[:last_uncertainty.end()], re.IGNORECASE)
+    later_pronoun_claim = re.search(
+        r"\bshe\s+(?:bought|purchased|donated|gave|gifted)\b", later, re.IGNORECASE
+    )
+    return alice_named is None or later_pronoun_claim is None
+
+
 SCENARIOS = (
     Scenario(
         name="timer-300-seconds",
@@ -70,8 +126,9 @@ SCENARIOS = (
             "Navigate to Alice Keck Park Memorial Garden.",
         ),
         turns=(
-            TurnExpectation((r"\b(?:Alice Keck Park Memorial Garden|Halis Keck Park Memorial Gardens)\b", r"Santa Barbara")),
-            TurnExpectation((r"Alice Keck Park", r"(?:navigat|directions|route|taking you)")),
+            TurnExpectation((r"\b(?:Alice|Halis) Keck Park(?: Memorial Gardens?)?\b", r"Santa Barbara")),
+
+            TurnExpectation((r"\b(?:navigat\w*|directions|route|taking you)\b",)),
         ),
         commands=(
             {"turn": 1, "kind": "location"},
@@ -80,18 +137,18 @@ SCENARIOS = (
         room_close_after=2,
         place_query="Alice Keck Park Memorial Garden",
         selected_place_pattern=r"(?i)^Alice Keck Park Memorial Garden$",
-        spoken_place_pattern=r"(?i)\b(?:Alice Keck Park Memorial Garden|Halis Keck Park Memorial Gardens)\b",
+        spoken_place_pattern=r"(?i)\b(?:Alice|Halis) Keck Park(?: Memorial Gardens?)?\b",
     ),
     Scenario(
         name="sms-say-back-yes",
         caller_lines=("Text +1-202-555-0142: I will be there at six.", "Yes."),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|send)\b", r"\b(?:should I|would you like|want me to|say yes)\b"),
+                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word)\b"),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
-            TurnExpectation((r"\b(?:sent|texted)\b",)),
+            TurnExpectation((r"\b(?:sent|sending|texted|scent)\b",)),
         ),
         commands=({"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."},),
         room_close_after=2,
@@ -105,16 +162,16 @@ SCENARIOS = (
         ),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|send)\b", r"\b(?:should I|would you like|want me to|say yes)\b"),
+                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word)\b"),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
             TurnExpectation(
-                (r"\b(?:text|send)\b", r"\b(?:should I|would you like|want me to|say yes)\b"),
+                (r"\b(?:text|send)\b", r"\b(?:should I|shall I|would you like|want me to|say yes|say send|say the word)\b"),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at seven.",
             ),
-            TurnExpectation((r"\b(?:sent|texted)\b",)),
+            TurnExpectation((r"\b(?:sent|sending|texted|scent)\b",)),
         ),
         commands=({"turn": 3, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at seven."},),
         room_close_after=3,
@@ -129,19 +186,12 @@ SCENARIOS = (
         turns=(
             TurnExpectation(
                 (
-                    r"\bAlice Keck Park\b",
-                    r"\bAlice Keck\b(?: Park)?\s+(?:donated|gave|gifted)\b|"
-                    r"\bAlice Keck Park\b.{0,8}\bwho\s+(?:bought|donated|gave|gifted)\b|"
-                    r"\b(?:donated|given|gifted)\b.{0,80}\bby Alice Keck\b|"
-                    r"\bcity\b.{0,80}\b(?:got|received)\b.{0,80}\banonymous gift\b.{0,100}\bdedicated\b",
+                    r"\bAlice Keck(?: Park)?\b",
+                    _ALICE_DONOR_CLAIM,
                 ),
                 reject_patterns=(
-                    r"\b(?:not sure|don't know|do not know|unclear|can't say|cannot say)\b.{0,100}\b(?:donat|gave|gift)\w*\b",
-                    r"\b(?:not|never|did not|didn't|was not|wasn't)\b.{0,100}\b(?:donat|gave|gift)\w*\b",
-                    r"\b(?:donated|given|gifted)\b.{0,40}\bby (?:the )?city\b|"
-                    r"\b(?:the )?city\b.{0,40}\b(?:donated|gave|gifted)\b",
-                    r"\b(?:someone else|somebody else|another person)\b.{0,80}\b(?:donated|gave|gifted)\b|"
-                    r"\b(?:donated|gave|gifted)\b.{0,80}\b(?:someone else|somebody else|another person)\b",
+                    r"\b(?:not(?!\s+sure)|never|did not|didn't|was not|wasn't)\b.{0,100}\b(?:bought|purchased|donat\w*|gave|gift\w*)\b",
+                    _NON_ALICE_PARK_DONOR,
                 ),
             ),
             TurnExpectation(
@@ -177,7 +227,7 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
     """Extract the complete say-back between the recipient and confirmation prompt."""
     pattern = re.compile(
         r"\b(?:text|send)\s+(?P<recipient>[+\d().\s-]*\d)\s*[:,.]?\s+"
-        r"(?P<body>.+?)(?=\s+(?:should i|would you like|do you want|shall i|want me to)\b)",
+        r"(?P<body>.+?)(?=\s+(?:should i|would you like|do you want|shall i|want me to|say yes|say send|say the word)\b)",
         re.IGNORECASE | re.DOTALL,
     )
     match = pattern.search(text)
@@ -279,6 +329,12 @@ def _scenario_failures(
                 re.search(pattern, text, re.IGNORECASE) is None,
                 turn_number,
                 f"{scenario.name}: turn {turn_number} contains an uncertain non-answer matching {pattern!r}",
+            )
+        if scenario.name == "alice-keck-context-chain" and turn_number == 1:
+            require(
+                not _uncertain_without_alice_attribution(text),
+                turn_number,
+                f"{scenario.name}: turn {turn_number} has uncertainty without a later Alice attribution",
             )
         if expectation.sms_recipient is not None or expectation.sms_body is not None:
             if not require(
