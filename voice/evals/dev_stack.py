@@ -284,6 +284,9 @@ if [ -f "$DEV_DIR/voice.pid" ]; then
   fi
   rm -f -- "$DEV_DIR/voice.pid"
 fi
+: > "$DEV_DIR/voice/evals/delegations.jsonl"
+chown nobody:nogroup "$DEV_DIR/voice/evals/delegations.jsonl"
+chmod 600 "$DEV_DIR/voice/evals/delegations.jsonl"
 python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" "$ROOM" <<'PY'
 import json
 import subprocess
@@ -303,6 +306,7 @@ voice_env.update({
     "HOME": str(dev_dir / "home/voice"),
     "XDG_CACHE_HOME": str(dev_dir / "home/voice/cache"),
     "MENTAT_VOICE_HTTP_PORT": str(health_port),
+    "MENTAT_EVAL_DELEGATION_LOG": str(dev_dir / "voice/evals/delegations.jsonl"),
 })
 voice_log = (dev_dir / "voice.log").open("ab", buffering=0)
 voice = subprocess.Popen(

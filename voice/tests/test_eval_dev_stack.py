@@ -374,6 +374,13 @@ class DevStackTest(unittest.TestCase):
         self.assertNotIn("systemctl stop mentat-voice", daemon_script)
         self.assertIn(room, worker_args)
         self.assertIn('"$ROOM"', worker_script)
+        self.assertIn('"MENTAT_EVAL_DELEGATION_LOG": str(dev_dir / "voice/evals/delegations.jsonl")', worker_script)
+        self.assertIn('voice/evals/delegations.jsonl', worker_script)
+        marker_stage = worker_script.index(': > "$DEV_DIR/voice/evals/delegations.jsonl"')
+        worker_launch = worker_script.index('voice = subprocess.Popen(')
+        self.assertLess(marker_stage, worker_launch)
+        self.assertIn('chown nobody:nogroup "$DEV_DIR/voice/evals/delegations.jsonl"', worker_script)
+        self.assertIn('chmod 600 "$DEV_DIR/voice/evals/delegations.jsonl"', worker_script)
         self.assertIn("systemctl stop mentat-voice", worker_script)
 
     @patch("voice.evals.dev_stack.subprocess.Popen")

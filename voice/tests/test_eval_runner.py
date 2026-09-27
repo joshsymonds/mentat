@@ -838,7 +838,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 {"type": "result", "session_id": "voice-partial-product-room"},
             )
         )
-        voice_log = 'INFO eval-delegation {"id":"d1","created_at":100.5}\n'
+        delegation_markers = '{"room":"partial-product-room","id":"d1","created_at":100.5}\n'
 
         class Stack:
             base_url = "http://127.0.0.1:8485"
@@ -852,8 +852,8 @@ class ScenarioObservationTests(unittest.TestCase):
             def run_remote(self, command):
                 if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
                     output = ""
-                elif command == ["sudo", "cat", "voice.log"]:
-                    output = voice_log
+                elif command == ["sudo", "cat", "voice/evals/delegations.jsonl"]:
+                    output = delegation_markers
                 elif command == ["sudo", "cat", "records/voice-partial-product-room.jsonl"]:
                     output = record
                 else:
@@ -1031,7 +1031,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 self.remote_commands.append(command)
                 if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
                     return CompletedProcess(command, 0, "", "")
-                if command == ["sudo", "cat", "voice.log"]:
+                if command == ["sudo", "cat", "voice/evals/delegations.jsonl"]:
                     return CompletedProcess(command, 0, "", "")
                 raise AssertionError(f"SDK recording should not be read: {command!r}")
 
@@ -1067,17 +1067,35 @@ class ScenarioObservationTests(unittest.TestCase):
             },
         ]
         delegation_log = (
-            'INFO mentat.voice: eval-delegation {"id":"old","created_at":1.0}\n'
-            '2026-09-26T22:00:00 INFO mentat.voice: '
-            'eval-delegation {"id":"delegation-2","created_at":102.25}\n'
+            '{"room":"different-room","id":"old","created_at":1.0}\n'
+            '{"room":"android-eval-room","id":"delegation-2","created_at":102.25}\n'
         )
         recorded_turns = [{"model_calls": [{"id": "model-call-1", "model": "claude-opus-5"}]}]
 
-        attributed = runner._attribute_model_calls(traces, delegation_log, recorded_turns)
+        attributed = runner._attribute_model_calls(
+            traces, delegation_log, "android-eval-room", recorded_turns
+        )
 
         self.assertEqual([len(trace["model_calls"]) for trace in attributed], [0, 1])
         self.assertEqual(traces[1]["line"], "Okay, who was she?")
         self.assertEqual(traces[1]["transcript"], "Okay who was she?")
+
+    def test_delegation_jsonl_is_room_scoped_and_rejects_malformed_or_local_duplicates(self):
+        records = (
+            '{"room":"room-a","id":"same","created_at":10.0}\n'
+            '{"room":"room-b","id":"same","created_at":11.0}\n'
+        )
+        self.assertEqual(
+            runner._eval_delegations(records, "room-a"),
+            [{"id": "same", "created_at": 10.0}],
+        )
+        with self.assertRaisesRegex(RuntimeError, "repeated delegation id"):
+            runner._eval_delegations(
+                records + '{"room":"room-a","id":"same","created_at":12.0}\n',
+                "room-a",
+            )
+        with self.assertRaisesRegex(RuntimeError, "malformed JSON"):
+            runner._eval_delegations('{broken}\n', "room-a")
 
     def test_partial_capture_attributes_calls_using_wall_clock_turn_starts_only(self):
         traces = [{
@@ -1086,8 +1104,8 @@ class ScenarioObservationTests(unittest.TestCase):
             "first_audio": 190_000.0,
         }]
         voice_log = (
-            'eval-delegation {"id":"d1","created_at":1700000000.5}\n'
-            'eval-delegation {"id":"d2","created_at":1700000002.5}\n'
+            '{"room":"room-a","id":"d1","created_at":1700000000.5}\n'
+            '{"room":"room-a","id":"d2","created_at":1700000002.5}\n'
         )
         recorded_turns = [
             {"model_calls": [{"id": "m1", "model": "claude-opus-5"}], "phone_tools": []},
@@ -1097,6 +1115,7 @@ class ScenarioObservationTests(unittest.TestCase):
         runner._attribute_model_calls(
             traces,
             voice_log,
+            "room-a",
             recorded_turns,
             partial_capture=True,
             failure_started_at=1_700_000_002.0,
@@ -1111,8 +1130,8 @@ class ScenarioObservationTests(unittest.TestCase):
             "first_audio": 190_000.0,
         }]
         voice_log = (
-            'eval-delegation {"id":"d1","created_at":1700000000.5}\n'
-            'eval-delegation {"id":"d2","created_at":1700000002.5}\n'
+            '{"room":"room-a","id":"d1","created_at":1700000000.5}\n'
+            '{"room":"room-a","id":"d2","created_at":1700000002.5}\n'
         )
         recorded_turns = [
             {"model_calls": [{"id": "m1", "model": "claude-opus-5"}], "phone_tools": []},
@@ -1125,6 +1144,7 @@ class ScenarioObservationTests(unittest.TestCase):
         runner._attribute_model_calls(
             traces,
             voice_log,
+            "room-a",
             recorded_turns,
             partial_capture=True,
             failure_started_at=1_700_000_002.0,
@@ -1144,19 +1164,22 @@ class ScenarioObservationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "delegation and SDK result counts differ"):
             runner._attribute_model_calls(
                 traces,
-                'eval-delegation {"id":"d1","created_at":99.0}\n',
+                '{"room":"room-a","id":"d1","created_at":99.0}\n',
+                "room-a",
                 [call],
             )
         with self.assertRaisesRegex(RuntimeError, "delegation and SDK result counts differ"):
             runner._attribute_model_calls(
                 traces,
-                'eval-delegation {"id":"d1","created_at":100.5}\n',
+                '{"room":"room-a","id":"d1","created_at":100.5}\n',
+                "room-a",
                 [call, call],
             )
         with self.assertRaisesRegex(RuntimeError, "ambiguous delegation timestamp"):
             runner._attribute_model_calls(
                 traces,
-                'eval-delegation {"id":"d1","created_at":102.0}\n',
+                '{"room":"room-a","id":"d1","created_at":102.0}\n',
+                "room-a",
                 [call],
             )
 
@@ -1266,10 +1289,10 @@ class ScenarioObservationTests(unittest.TestCase):
             {"type": "result", "session_id": "voice-android-eval-room"},
         ]
         record_text = "".join(json.dumps(message) + "\n" for message in record)
-        voice_log = (
-            'INFO mentat.voice: eval-delegation {"id":"previous","created_at":1.0}\n'
-            'INFO mentat.voice: eval-delegation {"id":"d1","created_at":99.25}\n'
-            'INFO mentat.voice: eval-delegation {"id":"d2","created_at":200.25}\n'
+        delegation_markers = (
+            '{"room":"old-room","id":"previous","created_at":1.0}\n'
+            '{"room":"android-eval-room","id":"d1","created_at":99.25}\n'
+            '{"room":"android-eval-room","id":"d2","created_at":200.25}\n'
         )
 
         class Stack:
@@ -1295,8 +1318,8 @@ class ScenarioObservationTests(unittest.TestCase):
                 self.remote_commands.append(command)
                 if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
                     return CompletedProcess(command, 0, phone_log, "")
-                if command == ["sudo", "cat", "voice.log"]:
-                    return CompletedProcess(command, 0, voice_log, "")
+                if command == ["sudo", "cat", "voice/evals/delegations.jsonl"]:
+                    return CompletedProcess(command, 0, delegation_markers, "")
                 if command == ["sudo", "cat", "records/voice-android-eval-room.jsonl"]:
                     return CompletedProcess(command, 0, record_text, "")
                 raise AssertionError(f"unexpected remote command {command!r}")

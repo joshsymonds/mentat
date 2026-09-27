@@ -490,47 +490,44 @@ def _json_lines(text: str, label: str) -> list[dict[str, Any]]:
     return records
 
 
-def _eval_delegations(voice_log: str) -> list[dict[str, Any]]:
-    if not isinstance(voice_log, str):
-        raise RuntimeError("voice worker log is missing or invalid")
+def _eval_delegations(marker_log: str, room_name: str) -> list[dict[str, Any]]:
+    records = _json_lines(marker_log, "delegation marker")
     delegations = []
     seen_ids = set()
-    for line_number, line in enumerate(voice_log.splitlines(), 1):
-        if "eval-delegation" not in line:
-            continue
-        prefix = "eval-delegation "
-        marker_at = line.find(prefix)
-        if marker_at < 0:
-            raise RuntimeError(f"voice worker log has a malformed delegation marker at line {line_number}")
-        try:
-            marker = json.loads(line[marker_at + len(prefix):])
-        except json.JSONDecodeError as error:
-            raise RuntimeError(
-                f"voice worker log has malformed delegation JSON at line {line_number}"
-            ) from error
-        if not isinstance(marker, dict):
-            raise RuntimeError(f"voice worker delegation marker at line {line_number} is not an object")
+    for line_number, marker in enumerate(records, 1):
+        if set(marker) != {"room", "id", "created_at"}:
+            raise RuntimeError(f"delegation marker line {line_number} has an invalid shape")
+        marker_room = marker.get("room")
+        if not isinstance(marker_room, str) or not marker_room:
+            raise RuntimeError(f"delegation marker line {line_number} has an invalid room")
         delegation_id = marker.get("id")
+        if not isinstance(delegation_id, str) or not delegation_id:
+            raise RuntimeError(f"delegation marker line {line_number} has an invalid id")
         created_at = _finite_timestamp(marker.get("created_at"), "delegation creation")
-        if not isinstance(delegation_id, str) or not delegation_id or delegation_id in seen_ids:
-            raise RuntimeError("voice worker log has a missing or repeated delegation id")
+        if marker_room != room_name:
+            continue
+        if delegation_id in seen_ids:
+            raise RuntimeError("delegation marker file has a missing or repeated delegation id")
         if delegations and created_at <= delegations[-1]["created_at"]:
-            raise RuntimeError("voice worker delegation timestamps are ambiguous or out of order")
+            raise RuntimeError("delegation marker timestamps are ambiguous or out of order")
         seen_ids.add(delegation_id)
         delegations.append({"id": delegation_id, "created_at": created_at})
+    if not delegations:
+        raise RuntimeError("delegation marker file has no records for the current room")
     return delegations
 
 
 def _attribute_model_calls(
     traces: list[dict[str, Any]],
-    voice_log: str,
+    marker_log: str,
+    room_name: str,
     recorded_turns: list[dict[str, Any]],
     *,
     partial_capture: bool = False,
     failure_started_at: float | None = None,
     failure_turn: int | None = None,
 ) -> list[dict[str, Any]]:
-    all_delegations = _eval_delegations(voice_log)
+    all_delegations = _eval_delegations(marker_log, room_name)
     starts = []
     for index, trace in enumerate(traces, 1):
         if not isinstance(trace, dict) or trace.get("turn") != index:
@@ -926,8 +923,9 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
         and "speech_started_at" not in capture_failure
     )
     if sdk_recording_applicable:
-        voice_log = _completed_stdout(
-            stack.run_remote(["sudo", "cat", "voice.log"]), "voice worker log read"
+        marker_log = _completed_stdout(
+            stack.run_remote(["sudo", "cat", "voice/evals/delegations.jsonl"]),
+            "delegation marker log read",
         )
         session_id = "voice-" + room
         record_path = "records/" + quote(session_id, safe="") + ".jsonl"
@@ -935,21 +933,21 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
             stack.run_remote(["sudo", "cat", record_path]), "daemon SDK recording read"
         )
         recorded_turns = _recorded_turns(_json_lines(record_text, "SDK recording"))
+        traces = _attribute_model_calls(
+            traces,
+            marker_log,
+            room,
+            recorded_turns,
+            partial_capture=capture_failure is not None,
+            failure_started_at=(
+                capture_failure.get("speech_started_at")
+                if capture_failure is not None
+                else None
+            ),
+            failure_turn=(capture_failure.get("turn") if capture_failure is not None else None),
+        )
     else:
-        voice_log = ""
         recorded_turns = []
-    traces = _attribute_model_calls(
-        traces,
-        voice_log,
-        recorded_turns,
-        partial_capture=capture_failure is not None,
-        failure_started_at=(
-            capture_failure.get("speech_started_at")
-            if capture_failure is not None
-            else None
-        ),
-        failure_turn=(capture_failure.get("turn") if capture_failure is not None else None),
-    )
     phone_commands = _match_phone_tools(phone_commands, recorded_turns)
 
     room_deleted_turns = []
