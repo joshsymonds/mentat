@@ -198,6 +198,7 @@ describe('buildOptions isolation invariants', () => {
   });
 
   it('preloads voice MCP tools and preserves prompt, memory, isolation, and policy', async () => {
+    vi.stubEnv('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', '0');
     vi.stubEnv('ANTHROPIC_API_KEY', 'fixture-inherited-api-key');
     vi.stubEnv('ANTHROPIC_AUTH_TOKEN', 'fixture-inherited-auth-token');
     vi.stubEnv('ANTHROPIC_BASE_URL', 'https://existing.example');
@@ -229,7 +230,14 @@ describe('buildOptions isolation invariants', () => {
     expect(voiceOptions.env).toMatchObject({
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:4100',
       ANTHROPIC_CUSTOM_HEADERS: 'X-Patchbay-Key: fixture-caller-key',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     });
+    const inheritedEnv = buildChildEnv(process.env);
+    const proxyEntries = (
+      env: Record<string, string | undefined>,
+    ): Record<string, string | undefined> =>
+      Object.fromEntries(Object.entries(env).filter(([key]) => key.toLowerCase().includes('proxy')));
+    expect(proxyEntries(voiceOptions.env ?? {})).toEqual(proxyEntries(inheritedEnv));
     expect(voiceOptions.mcpServers).toEqual({
       web: { type: 'http', url: 'http://127.0.0.1:9000/mcp', alwaysLoad: true },
       local: { type: 'stdio', command: '/bin/mcp', alwaysLoad: true },

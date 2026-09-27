@@ -138,6 +138,7 @@ export function buildChildEnv(
     delete out.ANTHROPIC_AUTH_TOKEN;
     out.ANTHROPIC_BASE_URL = voiceGateway.url;
     out.ANTHROPIC_CUSTOM_HEADERS = `X-Patchbay-Key: ${voiceGateway.callerKey}`;
+    out.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
   }
   return out;
 }
