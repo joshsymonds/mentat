@@ -417,7 +417,7 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE),
         turn_handling={
             "turn_detection": "stt",
-            "endpointing": {"min_delay": 0.0},
+            "endpointing": {"min_delay": 0.5},
         },
     )
     voice_room_io = room_io.RoomIO(
