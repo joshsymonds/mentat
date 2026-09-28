@@ -16,11 +16,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 SESSION_PREFIX = "voice-"
 TURN_META = {"surface": "voice", "user": "josh"}
 TURN_EFFORT = "low"
-TURN_MODEL = "chatgpt/sol-fast"
 
 CONSULT_FRAMING = (
     "Your answer is streamed to the voice as it arrives. "
-    "Keep facts, outcomes and uncertainty intact, in concise spoken prose."
+    "Keep facts, outcomes and uncertainty intact, in concise spoken prose. "
+    "Immediately stream a brief, truthful spoken acknowledgement before searching for tools "
+    "or taking backend action; acknowledge the request, not its outcome. "
+    "Do not say or imply anything is set, sent, or done until the relevant tool succeeds."
 )
 CONSULT_SMS_RULE = (
     "Before asking for authorization to send a text, say the recipient's full phone number "
@@ -320,7 +322,6 @@ def turn_request(
     room_name: str,
     text: str,
     effort: str = TURN_EFFORT,
-    model: str = TURN_MODEL,
 ) -> dict[str, Any]:
     """Build one voice request for the conversation API."""
     return {
@@ -328,7 +329,6 @@ def turn_request(
         "text": text,
         "meta": TURN_META,
         "effort": effort,
-        "model": model,
     }
 
 

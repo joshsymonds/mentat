@@ -21,7 +21,6 @@ from request import (
     IDLE_S,
     TURN_EFFORT,
     TURN_META,
-    TURN_MODEL,
     VOICE_CARD_MARKER,
     DelegationRunner,
     EndingPolicy,
@@ -56,9 +55,17 @@ class RequestTest(unittest.TestCase):
                 "text": "what's on today?",
                 "meta": {"surface": "voice", "user": "josh"},
                 "effort": "low",
-                "model": "chatgpt/sol-fast",
             },
         )
+
+    def test_turn_request_preserves_effort_without_exposing_model_selection(self):
+        request = turn_request("kitchen", "what's on today?", effort="high")
+        self.assertEqual(request["effort"], "high")
+        self.assertEqual(request["session_id"], "voice-kitchen")
+        self.assertEqual(request["meta"], TURN_META)
+        self.assertNotIn("model", request)
+        with self.assertRaises(TypeError):
+            turn_request("kitchen", "what's on today?", model="another-model")
 
     def test_recent_turns_keeps_all_recent_messages_in_order(self):
         self.assertEqual(
@@ -125,6 +132,18 @@ class RequestTest(unittest.TestCase):
         self.assertEqual(
             recent_turns([Message("user", former_cue), Message("assistant", "Reply")]),
             [("user", former_cue), ("assistant", "Reply")],
+        )
+
+    def test_consult_envelope_acknowledges_truthfully_before_backend_action(self):
+        envelope = " ".join(consult_envelope("card", "", [], "Set a timer").lower().split())
+        self.assertIn(
+            "immediately stream a brief, truthful spoken acknowledgement before searching for tools or taking backend action",
+            envelope,
+        )
+        self.assertIn("acknowledge the request, not its outcome", envelope)
+        self.assertIn(
+            "do not say or imply anything is set, sent, or done until the relevant tool succeeds",
+            envelope,
         )
 
     def test_consult_envelope_ends_after_a_fulfilled_action_and_confirmation(self):
@@ -240,7 +259,6 @@ class RequestTest(unittest.TestCase):
     def test_turn_constants_are_pinned(self):
         self.assertEqual(TURN_META, {"surface": "voice", "user": "josh"})
         self.assertEqual(TURN_EFFORT, "low")
-        self.assertEqual(TURN_MODEL, "chatgpt/sol-fast")
 
 
 class Delegation:
