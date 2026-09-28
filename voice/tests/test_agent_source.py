@@ -256,6 +256,154 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertFalse(namespace["is_sms_request"]("What does the text say?"))
         self.assertFalse(namespace["is_sms_followup"]("What time is it?"))
 
+    def test_sms_text_blocks_reach_speech_as_separate_sentences_after_done(self):
+        from collections.abc import AsyncGenerator
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        method = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_backend_text"
+        )
+
+        class FakeToolStart:
+            pass
+
+        class FakeToolResult:
+            def __init__(self, name, is_error=False):
+                self.name = name
+                self.is_error = is_error
+
+        class FakeTurnDone:
+            pass
+
+        class FakeTurnStream:
+            done = False
+
+            def feed(self, data):
+                event = json.loads(data)
+                if event["kind"] == "text_delta":
+                    return [event["text"]]
+                if event["kind"] == "tool_start":
+                    return [FakeToolStart()]
+                if event["kind"] == "tool_result":
+                    return [FakeToolResult(event["tool"], event["is_error"])]
+                if event["kind"] == "done":
+                    self.done = True
+                    return [FakeTurnDone()]
+                return []
+
+        class FakeContent:
+            def __init__(self, chunks, speech):
+                self._chunks = chunks
+                self._speech = speech
+                self.observed_before_done = []
+
+            async def iter_any(self):
+                for chunk in self._chunks:
+                    yield chunk
+                    if b'"kind":"done"' not in chunk:
+                        self.observed_before_done.append(list(self._speech))
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, chunks, speech):
+                self.content = FakeContent(chunks, speech)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeHttp:
+            def __init__(self, response):
+                self._response = response
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, *_args, **_kwargs):
+                return self._response
+
+        speech = []
+        response = None
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "json": json,
+            "re": re,
+            "aiohttp": SimpleNamespace(
+                ClientSession=lambda **_kwargs: FakeHttp(response),
+                ClientError=Exception,
+            ),
+            "TIMEOUT": None,
+            "CONSULT_FAILED": "request failed",
+            "TurnError": RuntimeError,
+            "TurnStream": FakeTurnStream,
+            "is_sms_request": lambda _text: True,
+            "is_sms_decline": lambda _text: False,
+            "is_sms_followup": lambda _text: False,
+            "consult_envelope": lambda *_args, **_kwargs: "envelope",
+            "recent_turns": lambda _items: [],
+            "turn_request": lambda *_args: {},
+            "write_turn_marker": Mock(),
+            "logger": Mock(),
+            "SEND_SMS_TOOL": "mcp__mentat__send_sms",
+            "END_CONVERSATION_TOOL": "mcp__mentat__end_conversation",
+            "ToolResult": FakeToolResult,
+            "ToolStart": FakeToolStart,
+            "TurnDone": FakeTurnDone,
+            "TurnFailure": type("FakeTurnFailure", (), {}),
+            "time": time,
+        }
+        buffer_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SmsCommentaryBuffer"
+        )
+        exec(compile(ast.Module(body=[buffer_class, method], type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _sms_consent=False,
+            _voice_card="voice card",
+            _room_name="eval-room",
+            _mentat_url="http://127.0.0.1:8484",
+            _ending_policy=SimpleNamespace(
+                tool_result_seen=Mock(), turn_done=Mock(), describe=lambda: "test policy"
+            ),
+            _ending_changed=Mock(),
+        )
+        wire = [
+            b'{"kind":"text_delta","text":"Text Alex: I will be there at six"}',
+            b'{"kind":"tool_start","tool":"lookup"}',
+            b'{"kind":"tool_result","tool":"lookup","is_error":false}',
+            b'{"kind":"text_delta","text":"The message is sent."}',
+            b'{"kind":"done"}',
+        ]
+        response = FakeResponse(wire, speech)
+
+        async def consume_as_speech():
+            async for text in namespace["_backend_text"](
+                agent, "Text Alex that I'll be there at six", "turn-id", SimpleNamespace(items=[])
+            ):
+                speech.append(text)
+
+        asyncio.run(consume_as_speech())
+
+        self.assertTrue(response.content.observed_before_done)
+        self.assertTrue(all(not observed for observed in response.content.observed_before_done))
+        self.assertEqual(
+            speech,
+            ["Text Alex: I will be there at six.", None, "The message is sent."],
+        )
+
     def test_sms_commentary_buffer_withholds_until_send_result_and_appends_atomically(self):
         agent_path = Path(__file__).resolve().parents[1] / "agent.py"
         tree = ast.parse(agent_path.read_text())

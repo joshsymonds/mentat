@@ -101,17 +101,23 @@ def is_sms_decline(text: str) -> bool:
 
 
 class SmsCommentaryBuffer:
-    """Append a complete SMS delegation as one unit, after any send result."""
+    """Append a complete SMS delegation after its result, retaining tool boundaries."""
 
-    def __init__(self, append: Callable[[str], None]) -> None:
+    def __init__(self, append: Callable[[str | None], None]) -> None:
         self._append = append
         self._parts: list[str] = []
+        self._blocks: list[str] = []
         self._send_sms_seen = False
         self._send_sms_succeeded = False
         self._finished = False
 
     def add(self, text: str) -> None:
         self._parts.append(text)
+
+    def tool_boundary(self) -> None:
+        if self._parts:
+            self._blocks.append("".join(self._parts))
+            self._parts.clear()
 
     def tool_result(self, name: str, *, is_error: bool) -> None:
         if name == SEND_SMS_TOOL:
@@ -125,9 +131,23 @@ class SmsCommentaryBuffer:
         if self._send_sms_seen and not self._send_sms_succeeded:
             self._append("I couldn't send that text. Please try again.")
             return
-        text = "".join(self._parts)
-        if text:
-            self._append(text)
+        if self._parts:
+            self._blocks.append("".join(self._parts))
+        if len(self._blocks) < 2:
+            text = "".join(self._blocks)
+            if text:
+                self._append(text)
+            return
+        for index, block in enumerate(self._blocks):
+            text = block
+            if index < len(self._blocks) - 1:
+                ending = text.rstrip().rstrip("\\\"'”’")
+                if ending and ending[-1] not in ".!?…":
+                    text = text.rstrip() + "."
+            if text:
+                self._append(text)
+                if index < len(self._blocks) - 1:
+                    self._append(None)
 
 
 def load_persona(path: Path = PERSONA_PATH) -> tuple[str, str]:
@@ -296,7 +316,7 @@ class FrontAgent(Agent):
         )
         write_turn_marker(self._room_name, turn_id)
         turn = TurnStream()
-        pending_sms_text: list[str] = []
+        pending_sms_text: list[str | None] = []
         sms_buffer = SmsCommentaryBuffer(pending_sms_text.append) if sms_mode else None
         commentary_logged = False
         commentary_tail = ""
@@ -329,7 +349,9 @@ class FrontAgent(Agent):
                                     log_first_commentary()
                                     yield item
                             elif isinstance(item, ToolStart):
-                                if sms_buffer is None and commentary_tail:
+                                if sms_buffer is not None:
+                                    sms_buffer.tool_boundary()
+                                elif commentary_tail:
                                     ending = commentary_tail.rstrip()
                                     if not re.search(r"[.!?…][\"'”’)]*$", ending):
                                         yield ". "
@@ -358,7 +380,9 @@ class FrontAgent(Agent):
                                 if sms_buffer is not None:
                                     sms_buffer.finish()
                                     for text in pending_sms_text:
-                                        if text:
+                                        if text is None:
+                                            yield None
+                                        elif text:
                                             log_first_commentary()
                                             yield text
                                 done_seen = True
