@@ -1,8 +1,14 @@
 """Offline checks for the opt-in voice evaluation recipe."""
 
+import contextlib
+import io
+import os
 import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from voice.evals import runner
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +48,41 @@ class EvalRecipeTests(unittest.TestCase):
             "python3 -m voice.evals.runner eval --live --runs '2'",
             self.output(configured),
         )
+
+    def test_eval_recipe_exports_supported_model_for_each_command_arm(self):
+        default = self.dry_run("eval-voice")
+        sol = self.dry_run("eval-voice", "2", "chatgpt/sol-fast")
+        opus = self.dry_run("eval-voice", "10", "claude-opus-5-5")
+
+        for result in (default, sol, opus):
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "MENTAT_VOICE_MODEL='chatgpt/sol-fast' python3 -m voice.evals.runner eval --live --runs '10'",
+            self.output(default),
+        )
+        self.assertIn(
+            "MENTAT_VOICE_MODEL='chatgpt/sol-fast' python3 -m voice.evals.runner eval --live --runs '2'",
+            self.output(sol),
+        )
+        self.assertIn(
+            "MENTAT_VOICE_MODEL='claude-opus-5-5' python3 -m voice.evals.runner eval --live --runs '10'",
+            self.output(opus),
+        )
+        self.assertNotIn("fast-mode", self.output(opus))
+        self.assertNotIn("--speed", self.output(opus))
+
+    def test_runner_rejects_unknown_model_before_constructing_dev_stack(self):
+        stderr = io.StringIO()
+        with (
+            patch.dict(os.environ, {"MENTAT_VOICE_MODEL": "unapproved-model"}),
+            patch.object(runner, "DevStack") as dev_stack,
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        self.assertEqual(result, 2)
+        self.assertIn("unsupported requested voice model", stderr.getvalue())
+        dev_stack.assert_not_called()
 
     def test_readme_documents_safety_scenarios_and_strict_report(self):
         readme = (ROOT / "voice" / "README.md").read_text()

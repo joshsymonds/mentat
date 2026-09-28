@@ -18,8 +18,8 @@ test-voice:
     python3 -m unittest discover -s voice/tests
 
 # Opt-in live voice evaluation; RUNS defaults to 10 observations per scenario.
-eval-voice RUNS='10':
-    python3 -m voice.evals.runner eval --live --runs {{quote(RUNS)}}
+eval-voice RUNS='10' MODEL='chatgpt/sol-fast':
+    MENTAT_VOICE_MODEL={{quote(MODEL)}} python3 -m voice.evals.runner eval --live --runs {{quote(RUNS)}}
 
 # Public OAuth front (public/): FastMCP and Uvicorn from the flake environment
 test-public:
