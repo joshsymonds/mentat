@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -184,10 +186,31 @@ chmod 700 "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice" "$DEV_DIR/home/voice/cach
 chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat" "$DEV_DIR/records"
 chown -R nobody:nogroup "$DEV_DIR/voice" "$DEV_DIR/home/voice"
 
-# Install recovery before the only production service transition.
+if systemctl is-active --quiet mentat-voice; then
+  RESTORE_ACTION=start
+else
+  RESTORE_ACTION=stop
+fi
+RESTORE_UNIT="mentat-eval-restore-${DEV_DIR##*.}"
+printf '%s\n' "$RESTORE_ACTION" > "$DEV_DIR/restore-action"
+printf '%s\n' "$RESTORE_UNIT" > "$DEV_DIR/restore-unit"
+
+# The transient timer runs outside this shell and survives runner death.
 cat > "$DEV_DIR/cleanup.sh" <<'CLEANUP'
 set +e
-trap 'systemctl start mentat-voice' EXIT
+RESTORE_ACTION=$(cat "$DEV_DIR/restore-action" 2>/dev/null)
+RESTORE_UNIT=$(cat "$DEV_DIR/restore-unit" 2>/dev/null)
+restore_voice() {
+  if [ -n "$RESTORE_UNIT" ]; then
+    systemctl stop "$RESTORE_UNIT.timer" "$RESTORE_UNIT.service" >/dev/null 2>&1
+  fi
+  if [ "$RESTORE_ACTION" = start ]; then
+    systemctl start mentat-voice
+  elif [ "$RESTORE_ACTION" = stop ]; then
+    systemctl stop mentat-voice
+  fi
+}
+trap restore_voice EXIT
 for pid_file in "$DEV_DIR/agent.pid" "$DEV_DIR/voice.pid"; do
   if [ -f "$pid_file" ]; then
     pid=$(cat "$pid_file")
@@ -199,10 +222,12 @@ for pid_file in "$DEV_DIR/agent.pid" "$DEV_DIR/voice.pid"; do
     kill -KILL -- "-$pid" 2>/dev/null || true
   fi
 done
-systemctl start mentat-voice
+restore_voice
+trap - EXIT
 rm -rf -- "$DEV_DIR"
 CLEANUP
 chmod 700 "$DEV_DIR/cleanup.sh"
+systemd-run --quiet --unit="$RESTORE_UNIT" --on-active=30m "$(command -v systemctl)" "$RESTORE_ACTION" mentat-voice
 
 # Preserve service environments in private files before stopping the worker.
 python3 - "$DEV_DIR" "$MENTAT_PID" "$VOICE_PID" <<'PY'
@@ -281,12 +306,39 @@ PY
 '''
 
 
+_RETAIN_EVIDENCE_SCRIPT = r'''set -euo pipefail
+DEV_DIR=$1
+python3 - "$DEV_DIR" <<'PY'
+import os
+import pwd
+import sys
+import tarfile
+from pathlib import Path
+
+root = Path(sys.argv[1])
+archive = root / "retained-evidence.tar.gz"
+with tarfile.open(archive, "w:gz") as output:
+    for relative in ("agent.log", "voice.log", "voice/evals/delegations.jsonl"):
+        source = root / relative
+        if source.is_file() and not source.is_symlink():
+            output.add(source, arcname=relative, recursive=False)
+    records = root / "records"
+    if records.is_dir() and not records.is_symlink():
+        for source in sorted(records.glob("*.jsonl")):
+            if source.is_file() and not source.is_symlink():
+                output.add(source, arcname=f"records/{source.name}", recursive=False)
+os.chmod(archive, 0o600)
+owner = pwd.getpwnam(os.environ["SUDO_USER"])
+os.chown(archive, owner.pw_uid, owner.pw_gid)
+PY
+'''
+
+
 _START_WORKER_SCRIPT = r'''set -euo pipefail
 DEV_DIR=$1
 DEV_PORT=$2
 HEALTH_PORT=$3
 ROOM=$4
-trap 'systemctl start mentat-voice' EXIT
 systemctl stop mentat-voice
 if [ -f "$DEV_DIR/voice.pid" ]; then
   previous_pid=$(cat "$DEV_DIR/voice.pid")
@@ -334,6 +386,14 @@ voice = subprocess.Popen(
 voice_log.close()
 PY
 trap - EXIT
+'''
+
+
+_REFRESH_RESTORE_GUARD_SCRIPT = r'''set -euo pipefail
+DEV_DIR=$1
+RESTORE_UNIT=$(cat "$DEV_DIR/restore-unit")
+test -n "$RESTORE_UNIT"
+systemctl restart "$RESTORE_UNIT.timer"
 '''
 
 
@@ -446,6 +506,8 @@ class DevStack:
         self._tunnel: subprocess.Popen[bytes] | None = None
         self._signal_handlers: dict[int, signal.Handlers] = {}
         self._entered = False
+        self._restore_guard_armed = False
+        self.retained_evidence_dir: Path | None = None
 
     @property
     def url(self) -> str:
@@ -647,6 +709,7 @@ class DevStack:
             str(self.dev_port),
             str(self.health_port),
         )
+        self._restore_guard_armed = True
         self._tunnel = subprocess.Popen(
             [
                 "ssh",
@@ -719,8 +782,18 @@ class DevStack:
             time.sleep(min(_READINESS_POLL_SECONDS, remaining))
 
     def _remote(
-        self, script: str, *args: str, redact: Sequence[str] = ()
+        self,
+        script: str,
+        *args: str,
+        redact: Sequence[str] = (),
+        refresh_guard: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        if self._restore_guard_armed and refresh_guard:
+            self._remote(
+                _REFRESH_RESTORE_GUARD_SCRIPT,
+                self._remote_dir or "",
+                refresh_guard=False,
+            )
         try:
             return self._run(
                 ["ssh", self.remote, "sudo", "bash", "-s", "--", *args],
@@ -737,6 +810,50 @@ class DevStack:
                 stderr=_redact_diagnostics(error.stderr, redact),
             ) from error
 
+    def _retain_evidence(self) -> None:
+        if self._remote_dir is None or not self._restore_guard_armed:
+            return
+        evidence_dir = Path(tempfile.mkdtemp(prefix="mentat-voice-eval-"))
+        os.chmod(evidence_dir, 0o700)
+        self.retained_evidence_dir = evidence_dir
+        self._remote(_RETAIN_EVIDENCE_SCRIPT, self._remote_dir)
+        archive = evidence_dir / "retained-evidence.tar.gz"
+        self._run(
+            [
+                "scp", "-p",
+                f"{self.remote}:{self._remote_dir}/retained-evidence.tar.gz",
+                str(archive),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if not archive.is_file():
+            evidence_dir.rmdir()
+            self.retained_evidence_dir = None
+            return
+        try:
+            import tarfile
+
+            with tarfile.open(archive, "r:gz") as retained:
+                for member in retained.getmembers():
+                    name = member.name
+                    allowed = name in {"agent.log", "voice.log", "voice/evals/delegations.jsonl"}
+                    if name.startswith("records/"):
+                        filename = name.removeprefix("records/")
+                        allowed = bool(filename) and Path(filename).name == filename and filename.endswith(".jsonl")
+                    if not allowed or not member.isfile():
+                        continue
+                    source = retained.extractfile(member)
+                    if source is None:
+                        continue
+                    destination = evidence_dir / name
+                    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    destination.write_bytes(source.read())
+                    os.chmod(destination, 0o600)
+        finally:
+            archive.unlink(missing_ok=True)
+
     def _cleanup(self) -> None:
         try:
             if self._tunnel is not None:
@@ -749,20 +866,30 @@ class DevStack:
                 self._tunnel = None
         finally:
             script = r'''set +e
-trap 'systemctl start mentat-voice' EXIT
 DEV_DIR=$1
 if [ -n "$DEV_DIR" ] && [ -f "$DEV_DIR/cleanup.sh" ]; then
   DEV_DIR="$DEV_DIR" bash "$DEV_DIR/cleanup.sh"
 elif [ -n "$DEV_DIR" ]; then
   rm -rf -- "$DEV_DIR"
 fi
-systemctl start mentat-voice
 '''
+            retention_error: BaseException | None = None
             try:
-                self._remote(script, self._remote_dir or "")
+                self._retain_evidence()
+            except BaseException as error:
+                retention_error = error
+            try:
+                self._remote(
+                    script,
+                    self._remote_dir or "",
+                    refresh_guard=False,
+                )
             finally:
                 self._remote_dir = None
                 self._local_port = None
+                self._restore_guard_armed = False
+            if retention_error is not None:
+                raise retention_error
 
     def _install_signal_handlers(self) -> None:
         if threading.current_thread() is not threading.main_thread():
