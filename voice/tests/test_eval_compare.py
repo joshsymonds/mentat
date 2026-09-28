@@ -49,28 +49,42 @@ def report(
 
     cases = []
     for scenario in SCENARIOS:
+        action_turns = {command["turn"] for command in scenario.commands}
         turns = []
         gates = []
         for turn_number in range(1, len(scenario.turns) + 1):
-            p50 = sorted(latencies)[(len(latencies) + 1) // 2 - 1] if latencies else None
-            gates.append({
+            kind = "action" if turn_number in action_turns else "search"
+            metric = "command_receipt" if kind == "action" else "answer"
+            observations = [latency for latency in latencies]
+            ordered = sorted(observations)
+            p50 = ordered[(len(ordered) + 1) // 2 - 1] if ordered else None
+            p95 = ordered[(len(ordered) * 95 + 99) // 100 - 1] if ordered else None
+            gate = {
                 "turn": turn_number,
-                "kind": "action",
-                "run_count": len(latencies),
-                "command_receipt_p50_seconds": p50,
-            })
+                "kind": kind,
+                "run_count": len(observations),
+                f"{metric}_p50_seconds": p50,
+                f"{metric}_p95_seconds": p95,
+                "first_speech_p50_seconds": p50,
+                "first_speech_p95_seconds": p95,
+            }
+            gates.append(gate)
             for index, latency in enumerate(latencies):
                 turns.append({
                     "run": index + 1,
                     "turn": turn_number,
-                    "kind": "action",
+                    "kind": kind,
                     "model_call_count": 1,
                     "model_provenance": {
                         "requested_model": requested_model,
                         "verified": True,
                         "model_calls": [{**calls[index]}],
                     },
-                    "latency_seconds": {"command_receipt": latency},
+                    "latency_seconds": {
+                        "first_speech": latency,
+                        "command_receipt": latency if kind == "action" else None,
+                        "answer": latency if kind == "search" else None,
+                    },
                 })
         cases.append({
             "name": scenario.name,
@@ -97,6 +111,44 @@ def sonnet_report(latencies, **kwargs):
 
 
 class CompareTests(unittest.TestCase):
+    def test_latency_gate_failures_do_not_disqualify_and_correctness_is_summarized(self):
+        sol = report([1.0] * 10, passed=False, failures=[
+            "timer-300-seconds turn 1: first-speech p50 3s exceeds 2s",
+            "timer-300-seconds turn 1: command-receipt p50 3s exceeds 2s",
+        ])
+        sol["cases"][0]["failures"] = [
+            "timer-300-seconds turn 1: answer p50 3s exceeds 2s",
+        ]
+
+        result = compare_reports(sol, opus_report([2.0] * 10))
+
+        self.assertTrue(result["candidates"]["sol"]["eligible"])
+        self.assertTrue(result["candidates"]["sol"]["correctness"]["passed"])
+        self.assertEqual(result["candidates"]["sol"]["correctness"]["failure_count"], 0)
+        self.assertIsNone(result["winner"])
+
+    def test_two_and_three_arm_results_include_per_turn_latency_table(self):
+        two_arm = compare_reports(report([1.0] * 10), opus_report([2.0] * 10))
+        three_arm = compare_reports(
+            report([1.0] * 10), opus_report([2.0] * 10), sonnet_report([0.5] * 10)
+        )
+
+        for result, expected_fastest in ((two_arm, "sol"), (three_arm, "sonnet")):
+            self.assertIsNone(result["winner"])
+            self.assertEqual(result["fastest_eligible"], [expected_fastest])
+            self.assertEqual(result["decision"], "informational_fastest_eligible")
+            for candidate in result["candidates"].values():
+                table = candidate["turn_metrics"]
+                self.assertTrue(table)
+                self.assertTrue(all("scenario" in row and "turn" in row for row in table))
+                self.assertTrue(all("first_speech_p50_seconds" in row for row in table))
+                self.assertTrue(all("first_speech_p95_seconds" in row for row in table))
+                self.assertTrue(all("command_receipt_p50_seconds" in row for row in table))
+                self.assertTrue(all("command_receipt_p95_seconds" in row for row in table))
+                self.assertTrue(all("answer_p50_seconds" in row for row in table))
+                self.assertTrue(all("answer_p95_seconds" in row for row in table))
+                self.assertIn("correctness", candidate)
+
     def test_omitting_contracted_scenarios_makes_that_arm_ineligible(self):
         sol = report([1.0] * 10)
         opus = opus_report([2.0] * 10)
@@ -104,7 +156,8 @@ class CompareTests(unittest.TestCase):
 
         result = compare_reports(sol, opus)
 
-        self.assertEqual(result["winner"], "sol")
+        self.assertIsNone(result["winner"])
+        self.assertEqual(result["fastest_eligible"], ["sol"])
         self.assertTrue(result["candidates"]["sol"]["eligible"])
         self.assertFalse(result["candidates"]["opus"]["eligible"])
 
@@ -152,7 +205,7 @@ class CompareTests(unittest.TestCase):
 
         result = compare_reports(sol, opus)
 
-        self.assertEqual(result["winner"], "opus")
+        self.assertIsNone(result["winner"])
         self.assertFalse(result["candidates"]["sol"]["eligible"])
         self.assertTrue(result["candidates"]["opus"]["eligible"])
         self.assertTrue(any("requested_model" in reason for reason in result["candidates"]["sol"]["reasons"]))
@@ -164,7 +217,7 @@ class CompareTests(unittest.TestCase):
 
         result = compare_reports(sol, opus_report([2.0] * 10))
 
-        self.assertEqual(result["winner"], "opus")
+        self.assertIsNone(result["winner"])
         self.assertFalse(result["candidates"]["sol"]["eligible"])
         self.assertTrue(any("observed model" in reason for reason in result["candidates"]["sol"]["reasons"]))
 
@@ -177,31 +230,54 @@ class CompareTests(unittest.TestCase):
 
         result = compare_reports(sol, opus)
 
-        self.assertEqual(result["winner"], "sol")
+        self.assertIsNone(result["winner"])
         self.assertFalse(result["candidates"]["opus"]["eligible"])
         self.assertTrue(any("speed" in reason for reason in result["candidates"]["opus"]["reasons"]))
         self.assertTrue(any("fast mode" in reason for reason in result["candidates"]["opus"]["reasons"]))
 
-    def test_faster_eligible_action_receipt_p50_wins(self):
+    def test_fastest_eligible_action_receipt_p50_is_informational(self):
         sol = report([1.0] * 10)
         opus = opus_report([1.5] * 10)
 
         result = compare_reports(sol, opus)
 
-        self.assertEqual(result["winner"], "sol")
+        self.assertIsNone(result["winner"])
         self.assertTrue(result["candidates"]["sol"]["eligible"])
         self.assertTrue(result["candidates"]["opus"]["eligible"])
         self.assertEqual(result["candidates"]["sol"]["action_receipt_p50_seconds"], 1.0)
         self.assertEqual(result["candidates"]["opus"]["action_receipt_p50_seconds"], 1.5)
+        self.assertEqual(result["fastest_eligible"], ["sol"])
+        self.assertEqual(result["decision"], "informational_fastest_eligible")
 
-    def test_within_ten_percent_tie_favors_sol(self):
+    def test_within_ten_percent_has_no_sol_tie_preference(self):
         sol = report([1.0] * 10)
         opus = opus_report([1.1] * 10)
 
         result = compare_reports(sol, opus)
 
-        self.assertEqual(result["winner"], "sol")
-        self.assertEqual(result["decision"], "within_10_percent_tie")
+        self.assertIsNone(result["winner"])
+        self.assertEqual(result["fastest_eligible"], ["sol"])
+        self.assertEqual(result["decision"], "informational_fastest_eligible")
+
+    def test_missing_latency_observations_disqualify_without_becoming_latency_only(self):
+        sol = report([1.0] * 10)
+        turn = sol["cases"][0]["turns"][0]
+        turn["latency_seconds"]["first_speech"] = None
+        turn["latency_seconds"]["command_receipt"] = None
+        sol["cases"][0]["gates"][0]["run_count"] = 9
+        sol["cases"][0]["gates"][0]["command_receipt_p50_seconds"] = 1.0
+        sol["cases"][0]["gates"][0]["command_receipt_p95_seconds"] = 1.0
+
+        result = compare_reports(sol, opus_report([2.0] * 10))
+
+        self.assertFalse(result["candidates"]["sol"]["eligible"])
+        self.assertTrue(any("observations were missing" in reason for reason in result["candidates"]["sol"]["reasons"]))
+
+    def test_exact_latency_tie_reports_both_arms_without_sol_preference(self):
+        result = compare_reports(report([1.0] * 10), opus_report([1.0] * 10))
+
+        self.assertIsNone(result["winner"])
+        self.assertEqual(result["fastest_eligible"], ["sol", "opus"])
 
     def test_reports_with_fewer_than_ten_runs_are_ineligible(self):
         sol = report([1.0, 1.0])
@@ -224,9 +300,15 @@ class CompareTests(unittest.TestCase):
         self.assertFalse(result["candidates"]["sol"]["eligible"])
         self.assertFalse(result["candidates"]["opus"]["eligible"])
         self.assertIn("observed", " ".join(result["candidates"]["sol"]["reasons"]))
+        self.assertFalse(result["candidates"]["sol"]["correctness"]["passed"])
+        self.assertIn(
+            "one or more runs were not observed",
+            " ".join(result["candidates"]["sol"]["correctness"]["failures"]),
+        )
         self.assertIn("provenance", " ".join(result["candidates"]["opus"]["reasons"]))
+        self.assertFalse(result["candidates"]["opus"]["correctness"]["passed"])
         self.assertEqual(result["decision"], "no_eligible_candidate")
-        self.assertIn("no winner can be deployed", result["message"].lower())
+        self.assertIn("no candidate is eligible", result["message"].lower())
 
     def test_capture_failures_make_a_candidate_ineligible_even_if_report_claims_passed(self):
         sol = report([1.0] * 10)
@@ -234,18 +316,25 @@ class CompareTests(unittest.TestCase):
 
         result = compare_reports(sol, opus_report([2.0] * 10))
 
-        self.assertEqual(result["winner"], "opus")
+        self.assertIsNone(result["winner"])
         self.assertFalse(result["candidates"]["sol"]["eligible"])
+        self.assertFalse(result["candidates"]["sol"]["correctness"]["passed"])
+        self.assertIn(
+            "one or more capture failures",
+            " ".join(result["candidates"]["sol"]["correctness"]["failures"]),
+        )
         self.assertIn("capture failures", " ".join(result["candidates"]["sol"]["reasons"]))
 
-    def test_case_gate_failures_make_a_candidate_ineligible(self):
-        sol = report([1.0] * 10, case_failures=["command-receipt p95 exceeded limit"])
+    def test_latency_case_gate_failures_do_not_disqualify_a_candidate(self):
+        sol = report([1.0] * 10, case_failures=[
+            "timer-300-seconds turn 1: command-receipt p95 4s exceeds 3s"
+        ])
         opus = opus_report([2.0] * 10)
 
         result = compare_reports(sol, opus)
 
-        self.assertEqual(result["winner"], "opus")
-        self.assertFalse(result["candidates"]["sol"]["eligible"])
+        self.assertIsNone(result["winner"])
+        self.assertTrue(result["candidates"]["sol"]["eligible"])
         self.assertTrue(result["candidates"]["opus"]["eligible"])
 
     def test_rejects_unmatched_malformed_action_gate(self):
@@ -273,26 +362,28 @@ class CompareTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compare_reports(missing, opus_report([2.0] * 10))
 
-    def test_fastest_eligible_arm_wins_three_arm_comparison(self):
+    def test_fastest_eligible_arm_is_informational_in_three_arm_comparison(self):
         result = compare_reports(
             report([1.0] * 10),
             opus_report([1.4] * 10),
             sonnet_report([0.8] * 10),
         )
 
-        self.assertEqual(result["winner"], "sonnet")
-        self.assertEqual(result["decision"], "faster_action_receipt_p50")
+        self.assertIsNone(result["winner"])
+        self.assertEqual(result["fastest_eligible"], ["sonnet"])
+        self.assertEqual(result["decision"], "informational_fastest_eligible")
         self.assertTrue(result["candidates"]["sonnet"]["eligible"])
 
-    def test_sol_wins_when_within_ten_percent_of_fastest_eligible_arm(self):
+    def test_slightly_slower_sol_does_not_replace_fastest_sonnet(self):
         result = compare_reports(
             report([1.05] * 10),
             opus_report([1.4] * 10),
             sonnet_report([1.0] * 10),
         )
 
-        self.assertEqual(result["winner"], "sol")
-        self.assertEqual(result["decision"], "within_10_percent_tie")
+        self.assertIsNone(result["winner"])
+        self.assertEqual(result["fastest_eligible"], ["sonnet"])
+        self.assertEqual(result["decision"], "informational_fastest_eligible")
 
     def test_sonnet_fastest_and_eligible_with_dated_model_alias(self):
         sonnet = sonnet_report([0.8] * 10)
@@ -305,7 +396,7 @@ class CompareTests(unittest.TestCase):
 
         result = compare_reports(report([1.0] * 10), opus_report([1.4] * 10), sonnet)
 
-        self.assertEqual(result["winner"], "sonnet")
+        self.assertIsNone(result["winner"])
         self.assertTrue(result["candidates"]["sonnet"]["eligible"])
 
     def test_sonnet_unproven_standard_speed_makes_arm_ineligible(self):
@@ -316,7 +407,7 @@ class CompareTests(unittest.TestCase):
 
         result = compare_reports(report([1.0] * 10), opus_report([1.4] * 10), sonnet)
 
-        self.assertEqual(result["winner"], "sol")
+        self.assertIsNone(result["winner"])
         self.assertFalse(result["candidates"]["sonnet"]["eligible"])
         self.assertTrue(any("standard" in reason for reason in result["candidates"]["sonnet"]["reasons"]))
 
@@ -346,7 +437,9 @@ class CompareTests(unittest.TestCase):
             )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(json.loads(completed.stdout)["winner"], "sonnet")
+        result = json.loads(completed.stdout)
+        self.assertIsNone(result["winner"])
+        self.assertEqual(result["fastest_eligible"], ["sonnet"])
 
     def test_cli_rejects_report_counts_other_than_two_or_three(self):
         compare_script = str(ROOT / "voice" / "evals" / "compare.py")
@@ -377,8 +470,9 @@ class CompareTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
-        self.assertEqual(result["winner"], "sol")
-        self.assertEqual(result["decision"], "within_10_percent_tie")
+        self.assertIsNone(result["winner"])
+        self.assertEqual(result["fastest_eligible"], ["sol"])
+        self.assertEqual(result["decision"], "informational_fastest_eligible")
 
 
 if __name__ == "__main__":
