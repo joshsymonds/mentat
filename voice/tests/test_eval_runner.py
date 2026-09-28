@@ -1316,7 +1316,10 @@ class LocalEvalTests(unittest.TestCase):
                 "room_deleted": None,
                 "expect_confirmation": False,
                 "expect_hangup": True,
-                "model_calls": [{"id": "m1", "model": "claude-opus-5"}],
+                "model_calls": [{
+            "id": "m1", "model": "claude-opus-5", "service_tier": None,
+            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+        }],
             }],
             "failure": {
                 "turn": 1,
@@ -1672,7 +1675,10 @@ class ScenarioObservationTests(unittest.TestCase):
         with patch.object(runner, "_voice_token", return_value=grant):
             observation = runner.observe_scenario(scenario, Stack())
 
-        self.assertEqual(observation["turns"][0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+        self.assertEqual(observation["turns"][0]["model_calls"], [{
+            "id": "m1", "model": "claude-opus-5", "service_tier": None,
+            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+        }])
         self.assertEqual(observation["failure"], capture["failure"])
         product_failures = observation["product_failures"]
         self.assertTrue(any(failure["turn"] == 1 for failure in product_failures))
@@ -1886,7 +1892,10 @@ class ScenarioObservationTests(unittest.TestCase):
 
         self.assertEqual(observation["failure"], capture["failure"])
         self.assertEqual(observation["turns"][0]["transcript"], "Your timer is set for five minutes.")
-        self.assertEqual(observation["turns"][0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+        self.assertEqual(observation["turns"][0]["model_calls"], [{
+            "id": "m1", "model": "claude-opus-5", "service_tier": None,
+            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+        }])
         self.assertEqual(observation["phone_commands"], [{
             "id": "fake-timer-command",
             "kind": "timer",
@@ -2569,10 +2578,14 @@ class ScenarioObservationTests(unittest.TestCase):
             '{"room":"room-a","id":"d2","created_at":1700000002.5}\n'
         )
         recorded_turns = [
-            {"model_calls": [{"id": "m1", "model": "claude-opus-5"}], "phone_tools": []},
+            {"model_calls": [{
+            "id": "m1", "model": "claude-opus-5", "service_tier": None,
+            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+        }], "phone_tools": []},
             {"model_calls": [{"id": "m2", "model": "claude-opus-5"}], "phone_tools": []},
         ]
 
+        post_failure_calls = []
         runner._attribute_model_calls(
             traces,
             voice_log,
@@ -2580,9 +2593,17 @@ class ScenarioObservationTests(unittest.TestCase):
             recorded_turns,
             partial_capture=True,
             failure_started_at=1_700_000_002.0,
+            failure_turn=2,
+            unattributed_model_calls=post_failure_calls,
         )
 
-        self.assertEqual(traces[0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+        self.assertEqual(post_failure_calls, [{
+            "id": "m2", "model": "claude-opus-5", "turn": 2,
+        }])
+        self.assertEqual(traces[0]["model_calls"], [{
+            "id": "m1", "model": "claude-opus-5", "service_tier": None,
+            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+        }])
 
     def test_partial_failed_turn_keeps_tool_attribution_without_backend_metric(self):
         traces = [{
@@ -2595,13 +2616,17 @@ class ScenarioObservationTests(unittest.TestCase):
             '{"room":"room-a","id":"d2","created_at":1700000002.5}\n'
         )
         recorded_turns = [
-            {"model_calls": [{"id": "m1", "model": "claude-opus-5"}], "phone_tools": []},
+            {"model_calls": [{
+            "id": "m1", "model": "claude-opus-5", "service_tier": None,
+            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+        }], "phone_tools": []},
             {
                 "model_calls": [{"id": "m2", "model": "claude-opus-5"}],
                 "phone_tools": [{"turn": 2, "kind": "navigate"}],
             },
         ]
 
+        post_failure_calls = []
         runner._attribute_model_calls(
             traces,
             voice_log,
@@ -2610,9 +2635,15 @@ class ScenarioObservationTests(unittest.TestCase):
             partial_capture=True,
             failure_started_at=1_700_000_002.0,
             failure_turn=2,
+            unattributed_model_calls=post_failure_calls,
         )
 
-        self.assertEqual(traces[0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+        self.assertEqual(post_failure_calls[0]["turn"], 2)
+        self.assertEqual(recorded_turns[1]["phone_tools"][0]["turn"], 2)
+        self.assertEqual(traces[0]["model_calls"], [{
+            "id": "m1", "model": "claude-opus-5", "service_tier": None,
+            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+        }])
         self.assertEqual(recorded_turns[1]["phone_tools"][0]["turn"], 2)
 
     def test_unmatched_or_ambiguous_backend_evidence_fails_closed(self):
@@ -2874,12 +2905,21 @@ class LocalEvalCliTests(unittest.TestCase):
                     "confirmation": 12.0 if expectation.sms_recipient is not None else None,
                     "expect_hangup": scenario.room_close_after == index,
                     "room_deleted": 13.0 if scenario.room_close_after == index else None,
-                    "model_calls": [],
+                    "model_calls": [{
+                        "id": f"synthetic-{index}",
+                        "model": "claude-opus-5-5",
+                        "service_tier": "standard",
+                        "result_service_tier": "standard",
+                        "speed": "standard",
+                        "fast_mode_state": "off",
+                    }],
                 })
             return {"turns": turns}
 
         output = []
-        with patch.object(runner, "DevStack", side_effect=dev_stack, create=True), patch.object(
+        with patch.dict(os.environ, {"MENTAT_VOICE_MODEL": "claude-opus-5-5"}), patch.object(
+            runner, "DevStack", side_effect=dev_stack, create=True
+        ), patch.object(
             runner, "observe_scenario", side_effect=observe
         ), patch("builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])):
             result = runner.main(["eval", "--live", "--runs", "2"])
@@ -2980,7 +3020,10 @@ class LocalEvalCliTests(unittest.TestCase):
                     "confirmation": None,
                     "expect_hangup": False,
                     "room_deleted": None,
-                    "model_calls": [{"id": "m1", "model": "claude-opus-5"}],
+                    "model_calls": [{
+            "id": "m1", "model": "claude-opus-5", "service_tier": None,
+            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+        }],
                 },
                 {
                     "turn": 2,
@@ -3165,7 +3208,10 @@ class LocalEvalCliTests(unittest.TestCase):
             observation = runner.observe_scenario(scenario, Stack())
 
         self.assertEqual(len(observation["turns"]), 1)
-        self.assertEqual(observation["turns"][0]["model_calls"], [{"id": "m1", "model": "claude-opus-5"}])
+        self.assertEqual(observation["turns"][0]["model_calls"], [{
+            "id": "m1", "model": "claude-opus-5", "service_tier": None,
+            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+        }])
         self.assertEqual(observation["phone_commands"][0]["turn"], 1)
         self.assertEqual(observation["room_closed_after"], 1)
         self.assertNotIn("failure", observation)
@@ -3186,6 +3232,254 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertNotIn("capture failed", failures)
         self.assertEqual(report["cases"][0]["turns"][0]["latency_seconds"]["first_audio"], 1.0)
         self.assertEqual(report["cases"][0]["turns"][0]["model_call_count"], 1)
+
+
+    def test_recorded_turns_capture_model_and_standard_speed_service_evidence(self):
+        messages = [
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg-proof",
+                        "model": "claude-opus-5",
+                        "usage": {"service_tier": "standard"},
+                    },
+                },
+            },
+            {
+                "type": "result",
+                "usage": {"speed": "standard", "service_tier": "standard"},
+                "fast_mode_state": "off",
+            },
+        ]
+
+        recorded = runner._recorded_turns(messages)
+
+        self.assertEqual(recorded[0]["model_calls"], [{
+            "id": "msg-proof",
+            "model": "claude-opus-5",
+            "service_tier": "standard",
+            "speed": "standard",
+            "result_service_tier": "standard",
+            "fast_mode_state": "off",
+        }])
+
+    def test_sol_recorded_shape_proves_service_from_result_usage(self):
+        messages = [
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg-sol",
+                        "model": "gpt-6-sol",
+                        "usage": {"input_tokens": 32},
+                    },
+                },
+            },
+            {
+                "type": "result",
+                "usage": {"service_tier": "standard", "speed": "standard"},
+                "fast_mode_state": "off",
+            },
+        ]
+
+        call = runner._recorded_turns(messages)[0]["model_calls"][0]
+        provenance = runner._model_call_provenance(call, "chatgpt/sol-fast")
+
+        self.assertIsNone(call["service_tier"])
+        self.assertEqual(call["result_service_tier"], "standard")
+        self.assertEqual(provenance["failures"], [])
+
+    def test_printed_report_includes_per_request_provenance_and_fails_unproven_usage(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        class Stack:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        scenario = SimpleNamespace(name="synthetic-provenance")
+        base_turn = {
+            "kind": "search",
+            "speech_end": 10.0,
+            "speech_end_wall": 10.0,
+            "first_audio": 11.0,
+            "answer_at": 11.0,
+            "command_received_at": None,
+            "overlap": False,
+            "expect_confirmation": False,
+            "confirmation": None,
+            "expect_hangup": False,
+            "room_deleted": None,
+        }
+        observations = (
+            ({
+                "id": "msg-ok",
+                "model": "claude-opus-5-5",
+                "service_tier": "standard",
+                "result_service_tier": "standard",
+                "speed": "standard",
+                "fast_mode_state": "off",
+            }, True),
+            ({
+                "id": "msg-unproven",
+                "model": "claude-opus-5-5",
+                "service_tier": "standard",
+                "result_service_tier": "standard",
+                "fast_mode_state": "off",
+            }, False),
+            ({
+                "id": "msg-no-model",
+                "model": None,
+                "service_tier": "standard",
+                "result_service_tier": "standard",
+                "speed": "standard",
+                "fast_mode_state": "off",
+            }, False),
+        )
+        for call, expected_pass in observations:
+            with self.subTest(call=call):
+                output = io.StringIO()
+                with (
+                    patch.dict(os.environ, {"MENTAT_VOICE_MODEL": "claude-opus-5-5"}),
+                    patch.object(runner, "SCENARIOS", [scenario]),
+                    patch.object(runner, "DevStack", return_value=Stack()),
+                    patch.object(runner, "observe_scenario", return_value={
+                        "turns": [{**base_turn, "model_calls": [call]}],
+                        "unattributed_model_calls": [{"turn": 2, **call}],
+                    }),
+                    redirect_stdout(output),
+                ):
+                    result = runner.main(["eval", "--live", "--runs", "1"])
+
+                report = json.loads(output.getvalue())
+                self.assertEqual(report["requested_model"], "claude-opus-5-5")
+                self.assertEqual(report["passed"], expected_pass)
+                self.assertEqual(result, 0 if expected_pass else 1)
+                provenance = report["cases"][0]["turns"][0]["model_provenance"]
+                self.assertEqual(provenance["requested_model"], "claude-opus-5-5")
+                self.assertEqual(provenance["model_calls"][0]["observed_model"], call.get("model"))
+                self.assertEqual(provenance["model_calls"][0]["speed"], call.get("speed"))
+                if call.get("model") is None:
+                    self.assertIn("observed model is unproven", " ".join(report["failures"]))
+                self.assertEqual(provenance["model_calls"][0]["service_tier"], "standard")
+                self.assertEqual(provenance["verified"], expected_pass)
+                extra = report["cases"][0]["unattributed_model_calls"][0]["model_calls"][0]
+                self.assertEqual(extra["turn"], 2)
+                self.assertEqual(extra["observed_model"], call.get("model"))
+
+    def test_model_provenance_report_fails_mismatched_or_unproven_requests(self):
+        requested = "claude-opus-5-5"
+        wrong_model = runner._model_call_provenance({
+            "id": "msg-wrong",
+            "model": "claude-sonnet-5",
+            "service_tier": "standard",
+            "speed": "standard",
+            "result_service_tier": "standard",
+            "fast_mode_state": "off",
+        }, requested)
+        unproven_speed = runner._model_call_provenance({
+            "id": "msg-unknown",
+            "model": "claude-opus-5-5",
+            "service_tier": "standard",
+            "result_service_tier": "standard",
+            "fast_mode_state": "off",
+        }, requested)
+        fast_mode = runner._model_call_provenance({
+            "id": "msg-fast",
+            "model": "claude-opus-5-5",
+            "service_tier": "standard",
+            "speed": "fast",
+            "result_service_tier": "standard",
+            "fast_mode_state": "on",
+        }, requested)
+        priority_tier = runner._model_call_provenance({
+            "id": "msg-priority",
+            "model": "claude-opus-5-5",
+            "service_tier": "priority",
+            "speed": "standard",
+            "result_service_tier": "priority",
+            "fast_mode_state": "off",
+        }, requested)
+
+        self.assertIn("observed claude-sonnet-5", " ".join(wrong_model["failures"]))
+        self.assertIn("speed", " ".join(unproven_speed["failures"]))
+        self.assertIn("standard", " ".join(fast_mode["failures"]))
+        self.assertIn("service tier", " ".join(priority_tier["failures"]))
+        dated_alias = runner._model_call_provenance({
+            "id": "msg-snapshot",
+            "model": "claude-opus-5-5-20260901",
+            "service_tier": "standard",
+            "speed": "standard",
+            "result_service_tier": "standard",
+            "fast_mode_state": "off",
+        }, requested)
+        self.assertEqual(dated_alias["failures"], [])
+
+
+    def test_requested_model_comes_from_a_safe_configured_arm(self):
+        for model in ("chatgpt/sol-fast", "claude-opus-5-5"):
+            with self.subTest(model=model), patch.dict(os.environ, {"MENTAT_VOICE_MODEL": model}):
+                self.assertEqual(runner._requested_voice_model(), model)
+        with patch.dict(os.environ, {"MENTAT_VOICE_MODEL": "claude-opus-5"}):
+            with self.assertRaisesRegex(RuntimeError, "unsupported requested voice model"):
+                runner._requested_voice_model()
+
+    def test_partial_capture_keeps_post_failure_backend_request_provenance(self):
+        traces = [{
+            "turn": 1,
+            "speech_started_at": 100.0,
+            "speech_end": 101.0,
+        }]
+        recorded_turns = [
+            {"model_calls": [{"id": "msg-1", "model": "gpt-6-sol"}], "phone_tools": []},
+            {"model_calls": [{"id": "msg-2", "model": "gpt-6-sol"}], "phone_tools": []},
+        ]
+        post_failure_calls = []
+
+        runner._attribute_model_calls(
+            traces,
+            '{"room":"room-a","id":"d1","created_at":100.5}\n'
+            '{"room":"room-a","id":"d2","created_at":101.5}\n',
+            "room-a",
+            recorded_turns,
+            partial_capture=True,
+            failure_started_at=101.0,
+            failure_turn=2,
+            unattributed_model_calls=post_failure_calls,
+        )
+
+        self.assertEqual(
+            post_failure_calls,
+            [{"turn": 2, "id": "msg-2", "model": "gpt-6-sol"}],
+        )
+
+    def test_sol_service_tier_uses_result_usage_while_opus_requires_start_proof(self):
+        sol = runner._model_call_provenance({
+            "id": "msg-sol",
+            "model": "gpt-6-sol",
+            "service_tier": None,
+            "result_service_tier": "standard",
+            "speed": "standard",
+            "fast_mode_state": "off",
+        }, "chatgpt/sol-fast")
+        opus_without_start_tier = runner._model_call_provenance({
+            "id": "msg-opus",
+            "model": "claude-opus-5-5-20260901",
+            "service_tier": None,
+            "result_service_tier": "standard",
+            "speed": "standard",
+            "fast_mode_state": "off",
+        }, "claude-opus-5-5")
+
+        self.assertEqual(sol["failures"], [])
+        self.assertIn("service tier", " ".join(opus_without_start_tier["failures"]))
 
 
 if __name__ == "__main__":
