@@ -35,6 +35,9 @@ class Scenario:
 _ALICE_DONOR_CLAIM = (
     r"\bAlice (?:Bertha )?Keck(?: Park)?\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck(?: Park)?\b.{0,100}\bshe\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice (?:Bertha )?Keck(?: Park)?\b.{0,240}\bshe\s+"
+    r"(?:put\s+up|provid\w*|suppl\w*|paid)\s+(?:the\s+)?(?:money|funds?)\b"
+    r".{0,60}\bfor\s+(?:the\s+)?city\s+to\s+(?:buy|purchase)\b|"
     r"\bAlice (?:Bertha )?Keck Park\b.{0,8}\bwho\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck Park\b[.!?]\s+(?:anonymously\s+)?(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck Park,\s+a (?:local|Santa Barbara)\s+philanthropist[,.]?\s*who\s+(?:bought|purchased|donated|gave|gifted)\b|"
@@ -50,7 +53,11 @@ SMS_CONFIRMATION_PATTERN = re.compile(
 )
 _UNCERTAIN_DONOR_CLAIM = (
     r"\b(?:not sure|don't know|do not know|unclear|can't say|cannot say)\b"
-    r".{0,40}?\b(?:whether|if)\b.{0,100}?\b(?:bought|purchased|donat\w*|gave|gift\w*)\b"
+    r".{0,40}?\b(?:whether|if)\b.{0,100}?\b(?:bought|purchased|donat\w*|gave|gift\w*|"
+    r"put\s+up\s+(?:the\s+)?(?:money|funds?)|"
+    r"provid\w*\s+(?:the\s+)?(?:money|funds?)|"
+    r"suppl\w*\s+(?:the\s+)?(?:money|funds?)|"
+    r"paid\s+(?:the\s+)?(?:money|funds?)\s+for)\b"
 )
 _TRANSFER_ACTION = r"(?:bought|purchased|paid(?:\s+for)?|donat\w*|gave|gift\w*|given)"
 _PARK_LAND_OBJECT = (
@@ -105,7 +112,9 @@ _NON_ALICE_PARK_DONOR = (
     rf"\b{_PARK_LAND_OBJECT}\b[^\n.!?;]{{0,30}}\b(?:buyer|purchaser|payer|donor|giver)\b"
     rf"[^\n.!?;]{{0,30}}\b(?:was|is)\s+{_OTHER_ACTOR}\b|"
     rf"\b{_PARK_LAND_OBJECT}\b[^\n.!?;]{{0,40}}\b(?:gift|donation)\b[^\n.!?;]{{0,40}}"
-    rf"\b(?:by|from)\s+{_OTHER_ACTOR}\b)"
+    rf"\b(?:by|from)\s+{_OTHER_ACTOR}\b|"
+    rf"\b{_OTHER_ACTOR}\b\s+(?:put\s+up|provided|supplied|paid)\s+"
+    r"(?:the\s+)?(?:money|funds?)\s+for\s+(?:the\s+)?city\s+to\s+(?:buy|purchase)\b)"
 )
 
 

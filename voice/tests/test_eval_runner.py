@@ -2441,6 +2441,39 @@ class ScenarioObservationTests(unittest.TestCase):
         )
         self.assertEqual(runner._confirmation_time(correction), 31.44)
 
+    def test_alice_oil_heiress_funding_answer_gets_live_answer_timestamp(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        answer = (
+            "Alice Keck Park was an oil heiress, daughter of Superior Oil founder William Keck. "
+            "In the mid-70s, the block was slated for a hotel, and she put up the money "
+            "for the city to buy it instead, on the condition it became a public park."
+        )
+        trace = {
+            "capture_started": 40.0,
+            "speech_end": 40.0,
+            "segments": [
+                {"start": 0.2, "end": 8.4, "text": answer},
+            ],
+        }
+        self.assertEqual(
+            runner._answer_time(
+                trace,
+                scenario.turns[0],
+                scenario_name=scenario.name,
+                turn_index=1,
+            ),
+            40.2,
+        )
+        trace["segments"][0]["text"] += " However, John Smith put up the money for the city to buy it instead."
+        self.assertIsNone(
+            runner._answer_time(
+                trace,
+                scenario.turns[0],
+                scenario_name=scenario.name,
+                turn_index=1,
+            )
+        )
+
     def test_run17_live_alice_answer_timestamps_match_sentence_break_and_full_name(self):
         scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
         first = {

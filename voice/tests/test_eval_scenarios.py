@@ -1902,6 +1902,34 @@ class ScenarioCorpusTests(unittest.TestCase):
         wrong_body = transcript.replace("I will be there at six.", "I will be there at seven.")
         self.assertTrue(evaluate_scenario_prefix(scenario, [wrong_body], [], None))
 
+    def test_alice_oil_heiress_city_purchase_funding_answer_and_false_attributions(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        first_turn = (
+            "Alice Keck Park was an oil heiress, daughter of Superior Oil founder William Keck. "
+            "In the mid-70s, the block was slated for a hotel, and she put up the money "
+            "for the city to buy it instead, on the condition it became a public park."
+        )
+        followups = [
+            "Alice Keck Park was W. M. Keck's daughter.",
+            "Her family's wealth came from Superior Oil.",
+        ]
+        self.assertEqual(evaluate_scenario_prefix(scenario, [first_turn, *followups], [], None), [])
+
+        false_attributions = (
+            first_turn.replace("she put up the money", "her husband put up the money"),
+            first_turn.replace("she put up the money", "the city put up the money"),
+            first_turn.replace("she put up the money", "John Smith put up the money"),
+            *(first_turn + " However, " + actor + " put up the money for the city to buy it instead."
+              for actor in ("her husband", "the city", "John Smith")),
+            first_turn.replace(
+                "she put up the money",
+                "I'm not sure whether she put up the money",
+            ),
+        )
+        for answer in false_attributions:
+            with self.subTest(answer=answer):
+                self.assertTrue(evaluate_scenario_prefix(scenario, [answer, *followups], [], None))
+
     def test_run17_exact_alice_segments_keep_donor_and_followup_truth_strict(self):
         scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
         segments = (
