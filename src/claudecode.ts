@@ -397,7 +397,6 @@ interface Session {
   /** The ACTIVE turn's identity context — set at turn start, cleared at turn
    * end, never carried across turns (authority is per-turn). */
   context: { current: TurnContext | null };
-  isVoice: boolean;
   recorder: Recorder;
   dead: boolean;
 }
@@ -476,32 +475,24 @@ export class ClaudeCode implements Backend {
   }
 
   /** Starts the voice child at token time without queuing a synthetic turn. */
-  prestartVoiceSession(sessionId: string): Promise<boolean> {
+  async prestartVoiceSession(sessionId: string): Promise<boolean> {
     if (this.config.voiceGateway === undefined) {
-      return Promise.resolve(false);
+      return false;
     }
     if (sessionId === '') {
       throw new Error('claudecode: pre-start requires a sessionId');
     }
-    return this.ensureVoiceSession({
+    const turn: Turn = {
       sessionId,
       text: '',
       meta: { surface: 'voice', user: 'josh' },
       effort: 'low',
       model: this.config.voiceModel ?? DEFAULT_VOICE_MODEL,
-    });
-  }
-
-  private async ensureVoiceSession(turn: Turn): Promise<boolean> {
+    };
     for (;;) {
       const session = this.sessionFor(turn);
       const release = await session.mutex.acquire();
       if (session.dead) {
-        release();
-        continue;
-      }
-      if (!session.isVoice) {
-        this.dropSession(turn.sessionId, session);
         release();
         continue;
       }
@@ -517,11 +508,6 @@ export class ClaudeCode implements Backend {
     // The session may have died while this turn waited on the previous one;
     // respawn rather than reading a dead iterator.
     if (session.dead) {
-      release();
-      return this.startTurn(turn);
-    }
-    if (session.isVoice !== (turn.meta?.surface === 'voice')) {
-      this.dropSession(turn.sessionId, session);
       release();
       return this.startTurn(turn);
     }
@@ -706,7 +692,6 @@ export class ClaudeCode implements Backend {
       translator: new Translator(),
       mutex: new Mutex(),
       context,
-      isVoice,
       recorder: makeRecorder(this.config.recordDir, sessionId, this.logger),
       dead: false,
     };

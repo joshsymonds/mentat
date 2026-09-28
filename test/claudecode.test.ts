@@ -628,19 +628,13 @@ describe('ClaudeCode turns', () => {
     expect(nonvoiceFake.optionsSeen[0]?.env).not.toHaveProperty('CLAUDE_CODE_DISABLE_FAST_MODE');
   });
 
-  it('respawns a shared nonvoice session as voice with model, resume, and turn authority', async () => {
-    const contexts: TurnContext[] = [];
-    const policy: PolicyFn = (_tool, input, context) => {
-      contexts.push(context);
-      return { behavior: 'allow', updatedInput: input };
-    };
+  it('reuses an existing child when the turn surface changes', async () => {
     const fake = fakeQuery((turn) => [resultMsg('shared-cli-uuid', String(turn))]);
     const backend = new ClaudeCode(
       makeConfig({
         model: 'daemon-model',
         voiceModel: 'claude-opus-5-5',
         queryFn: fake.fn,
-        policy,
         voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
       }),
     );
@@ -653,51 +647,18 @@ describe('ClaudeCode turns', () => {
         model: 'signal-model',
       }),
     );
-    const voiceTurn = await backend.converse({
-      sessionId: 'shared-session',
-      text: 'voice',
-      meta: { surface: 'voice', user: 'josh' },
-      model: 'chatgpt/sol-fast',
-    });
-    await fake.optionsSeen[1]?.canUseTool?.('test', {}, {
-      signal: new AbortController().signal,
-      toolUseID: 'voice-turn',
-    });
-    await collect(voiceTurn);
-
-    expect(fake.calls).toBe(2);
-    expect(fake.optionsSeen[1]?.model).toBe('claude-opus-5-5');
-    expect(fake.optionsSeen[1]?.resume).toBe('shared-cli-uuid');
-    expect(fake.optionsSeen[1]?.env).toMatchObject({ CLAUDE_CODE_DISABLE_FAST_MODE: '1' });
-    expect(contexts).toEqual([
-      { sessionId: 'shared-session', meta: { surface: 'voice', user: 'josh' } },
-    ]);
-  });
-
-  it('replaces a shared nonvoice child when prestarting voice', async () => {
-    const fake = fakeQuery(() => [resultMsg('shared-cli-uuid', 'ok')]);
-    const backend = new ClaudeCode(
-      makeConfig({
-        model: 'daemon-model',
-        voiceModel: 'claude-opus-5-5',
-        queryFn: fake.fn,
-        voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
-      }),
-    );
     await collect(
       await backend.converse({
         sessionId: 'shared-session',
-        text: 'signal',
-        meta: { surface: 'signal' },
+        text: 'voice',
+        meta: { surface: 'voice', user: 'josh' },
+        model: 'chatgpt/sol-fast',
       }),
     );
 
-    await expect(backend.prestartVoiceSession('shared-session')).resolves.toBe(true);
-
-    expect(fake.calls).toBe(2);
-    expect(fake.optionsSeen[1]?.model).toBe('claude-opus-5-5');
-    expect(fake.optionsSeen[1]?.resume).toBe('shared-cli-uuid');
-    expect(fake.optionsSeen[1]?.env).toMatchObject({ CLAUDE_CODE_DISABLE_FAST_MODE: '1' });
+    expect(fake.calls).toBe(1);
+    expect(fake.inputs).toHaveLength(2);
+    expect(fake.optionsSeen[0]?.model).toBe('signal-model');
   });
 
   it('does not prestart voice sessions without a gateway', async () => {
@@ -1003,7 +964,7 @@ describe('policy seam', () => {
       meta: { surface: 'signal', user: 'guest' },
     });
     const iterator2 = second[Symbol.asyncIterator]();
-    await callPolicy(1);
+    await callPolicy(0);
     while (!(await iterator2.next()).done) {
       // drain
     }
