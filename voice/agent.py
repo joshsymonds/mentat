@@ -437,7 +437,10 @@ async def entrypoint(ctx: JobContext) -> None:
     """Serve one room until mentatd or the close policy ends it."""
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
-        stt=inference.STT("deepgram/flux-general"),
+        stt=inference.STT(
+            "deepgram/flux-general",
+            extra_kwargs={"eot_threshold": 0.85, "eot_timeout_ms": 8000},
+        ),
         tts=inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE),
         turn_handling={
             "turn_detection": "stt",

@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 class AgentSourceContractTest(unittest.TestCase):
     def test_agent_uses_flux_turn_detection_and_sonic_without_gpt_live(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
-        self.assertIn('inference.STT("deepgram/flux-general")', source)
+        self.assertIn('inference.STT(\n            "deepgram/flux-general",', source)
         self.assertIn('"turn_detection": "stt"', source)
         self.assertIn('inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE)', source)
         self.assertIn("TTS_VOICE =", source)
@@ -1195,6 +1195,19 @@ class AgentSourceContractTest(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "AgentSession"
         )
+        stt = next(
+            keyword.value for keyword in session_call.keywords
+            if keyword.arg == "stt"
+        )
+        extra_kwargs = next(
+            keyword.value for keyword in stt.keywords
+            if keyword.arg == "extra_kwargs"
+        )
+        self.assertEqual(
+            ast.literal_eval(extra_kwargs),
+            {"eot_threshold": 0.85, "eot_timeout_ms": 8000},
+        )
+
         turn_handling = next(
             keyword.value for keyword in session_call.keywords
             if keyword.arg == "turn_handling"
