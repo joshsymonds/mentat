@@ -41,11 +41,26 @@ def _finite_latency(value: Any, label: str) -> float:
     return numeric
 
 
-def _p50(values: list[float]) -> float:
+def _percentile(values: list[float], percentile: float, label: str) -> float:
     if not values:
-        raise ValueError("cannot calculate p50 without action receipt observations")
+        raise ValueError(f"cannot calculate {label} without observations")
     ordered = sorted(values)
-    return ordered[math.ceil(0.5 * len(ordered)) - 1]
+    return ordered[math.ceil(percentile * len(ordered)) - 1]
+
+
+def _p50(values: list[float]) -> float:
+    return _percentile(values, 0.5, "p50")
+
+
+def _is_latency_gate_failure(failure: str) -> bool:
+    return re.fullmatch(
+        r".+ turn [1-9][0-9]*: (?:"
+        r"first-speech p50 [0-9.eE+-]+s exceeds [0-9.eE+-]+s|"
+        r"command-receipt p50 [0-9.eE+-]+s exceeds [0-9.eE+-]+s|"
+        r"command-receipt p95 [0-9.eE+-]+s exceeds [0-9.eE+-]+s|"
+        r"answer p50 [0-9.eE+-]+s exceeds [0-9.eE+-]+s)\Z",
+        failure,
+    ) is not None
 
 
 def _string_failures(value: Any, label: str) -> list[str]:
@@ -187,19 +202,29 @@ def _score_candidate(report: Any, candidate: str) -> tuple[dict[str, Any], set[t
         raise ValueError(f"{candidate} report passed must be a boolean")
 
     reasons: list[str] = []
+    correctness_failures: list[str] = []
     requested_model = EXPECTED_MODELS[candidate]
     if report.get("requested_model") != requested_model:
-        reasons.append(f"requested_model must be {requested_model}")
+        reason = f"requested_model must be {requested_model}"
+        reasons.append(reason)
+        correctness_failures.append(reason)
     failures = _string_failures(report.get("failures"), f"{candidate} report failures")
-    if not report["passed"]:
+    non_latency_failures = [failure for failure in failures if not _is_latency_gate_failure(failure)]
+    if not report["passed"] and (non_latency_failures or not failures):
         reasons.append("report passed is false")
-    reasons.extend(f"report failure: {failure}" for failure in failures)
+        if not failures:
+            correctness_failures.append("report passed is false without latency-only failure evidence")
+    for failure in non_latency_failures:
+        reason = f"report failure: {failure}"
+        reasons.append(reason)
+        correctness_failures.append(reason)
 
     cases = report.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError(f"{candidate} report cases must be a non-empty list")
 
     all_receipts: list[float] = []
+    turn_metrics: list[dict[str, Any]] = []
     action_signatures: set[tuple[str, int]] = set()
     seen_case_names: set[str] = set()
 
@@ -222,7 +247,11 @@ def _score_candidate(report: Any, candidate: str) -> tuple[dict[str, Any], set[t
                 f"{name}: expected {RUNS_REQUIRED} runs, found {expected_runs}"
             )
         case_failures = _string_failures(case.get("failures"), f"{label} failures")
-        reasons.extend(f"{name}: {failure}" for failure in case_failures)
+        for failure in case_failures:
+            if not _is_latency_gate_failure(failure):
+                reason = f"{name}: {failure}"
+                reasons.append(reason)
+                correctness_failures.append(reason)
         capture_failures = case.get("capture_failures")
         if not isinstance(capture_failures, list):
             raise ValueError(f"{label} capture_failures must be a list")
@@ -237,7 +266,6 @@ def _score_candidate(report: Any, candidate: str) -> tuple[dict[str, Any], set[t
 
         records_by_turn: dict[int, dict[int, str]] = {}
         turn_records: dict[tuple[int, int], dict[str, Any]] = {}
-        action_turns: set[int] = set()
         for turn_index, turn in enumerate(turns, start=1):
             turn_label = f"{label} turn record {turn_index}"
             if not isinstance(turn, dict):
@@ -253,8 +281,6 @@ def _score_candidate(report: Any, candidate: str) -> tuple[dict[str, Any], set[t
                 raise ValueError(f"{turn_label} duplicates run {run_number}, turn {turn_number}")
             records_by_turn[turn_number][run_number] = kind
             turn_records[(run_number, turn_number)] = turn
-            if kind == "action":
-                action_turns.add(turn_number)
 
         if not turns:
             reasons.append(f"{name}: no run observations")
@@ -271,18 +297,18 @@ def _score_candidate(report: Any, candidate: str) -> tuple[dict[str, Any], set[t
             if set(records_by_turn) != expected_turns:
                 reasons.append(f"{name}: scenario turn observations are incomplete")
         for (run_number, turn_number), turn_record in turn_records.items():
-            reasons.extend(
-                _turn_provenance_failures(
-                    turn_record,
-                    requested_model,
-                    f"{name} run {run_number} turn {turn_number}",
-                )
+            provenance_failures = _turn_provenance_failures(
+                turn_record,
+                requested_model,
+                f"{name} run {run_number} turn {turn_number}",
             )
-        reasons.extend(
-            _unattributed_provenance_failures(
-                case, requested_model, expected_runs, name
-            )
+            reasons.extend(provenance_failures)
+            correctness_failures.extend(provenance_failures)
+        unattributed_failures = _unattributed_provenance_failures(
+            case, requested_model, expected_runs, name
         )
+        reasons.extend(unattributed_failures)
+        correctness_failures.extend(unattributed_failures)
 
         for turn_number, run_records in records_by_turn.items():
             kinds = set(run_records.values())
@@ -306,55 +332,81 @@ def _score_candidate(report: Any, candidate: str) -> tuple[dict[str, Any], set[t
             if gate.get("kind") not in set(observed_kinds.values()):
                 raise ValueError(f"{label} kind does not match observed turn {gate_turn}")
 
-        for turn_number in sorted(action_turns):
-            action_signatures.add((name, turn_number))
+        case_turn_metrics: list[dict[str, Any]] = []
+        for turn_number in sorted(records_by_turn):
             observed = records_by_turn[turn_number]
-            receipt_values: list[float] = []
-            missing_receipts = 0
-            for run_number, turn_kind in observed.items():
-                if turn_kind != "action":
-                    continue
+            turn_kind = next(iter(observed.values()))
+            expected_metric = "command_receipt" if turn_kind == "action" else "answer"
+            metric_values: dict[str, list[float]] = {
+                "first_speech": [],
+                "command_receipt": [],
+                "answer": [],
+            }
+            missing_counts = {key: 0 for key in metric_values}
+            for run_number in sorted(observed):
                 turn_record = turn_records[(run_number, turn_number)]
                 latency = turn_record.get("latency_seconds")
                 if not isinstance(latency, dict):
                     raise ValueError(f"{name} run {run_number} turn {turn_number} latency_seconds must be an object")
-                if "command_receipt" not in latency:
-                    raise ValueError(f"{name} run {run_number} turn {turn_number} is missing command_receipt")
-                value = latency["command_receipt"]
-                if value is None:
-                    missing_receipts += 1
-                else:
-                    receipt_values.append(
-                        _finite_latency(value, f"{name} run {run_number} turn {turn_number} command_receipt")
-                    )
+                for metric in metric_values:
+                    if metric not in latency:
+                        raise ValueError(f"{name} run {run_number} turn {turn_number} is missing {metric}")
+                    value = latency[metric]
+                    if value is None:
+                        if metric == "first_speech" or metric == expected_metric:
+                            missing_counts[metric] += 1
+                    else:
+                        metric_values[metric].append(
+                            _finite_latency(value, f"{name} run {run_number} turn {turn_number} {metric}")
+                        )
 
             gate = gates_by_turn.get(turn_number)
             if gate is None:
-                raise ValueError(f"{name} turn {turn_number} is missing its action gate")
-            if gate.get("kind") != "action":
-                raise ValueError(f"{name} turn {turn_number} gate kind must be action")
+                raise ValueError(f"{name} turn {turn_number} is missing its latency gate")
+            if gate.get("kind") != turn_kind:
+                raise ValueError(f"{name} turn {turn_number} gate kind does not match observed turn")
             gate_run_count = gate.get("run_count")
             if not isinstance(gate_run_count, int) or isinstance(gate_run_count, bool) or gate_run_count < 0:
                 raise ValueError(f"{name} turn {turn_number} gate run_count must be a non-negative integer")
-            if gate_run_count != len(receipt_values):
+            expected_values = metric_values[expected_metric]
+            if gate_run_count != len(expected_values):
                 reasons.append(
-                    f"{name} turn {turn_number}: action gate observed {gate_run_count} of "
-                    f"{len(receipt_values)} command receipts"
+                    f"{name} turn {turn_number}: latency gate observed {gate_run_count} of "
+                    f"{len(expected_values)} {expected_metric} observations"
                 )
-            gate_p50 = gate.get("command_receipt_p50_seconds")
-            if receipt_values:
-                gate_p50_value = _finite_latency(
-                    gate_p50, f"{name} turn {turn_number} command_receipt_p50_seconds"
-                )
-                if gate_run_count == len(receipt_values) and gate_p50_value != _p50(receipt_values):
-                    raise ValueError(f"{name} turn {turn_number} action gate p50 does not match its observations")
-            elif gate_p50 is not None:
-                raise ValueError(f"{name} turn {turn_number} action gate p50 has no observations")
-            if missing_receipts:
-                reasons.append(
-                    f"{name} turn {turn_number}: {missing_receipts} command receipts were not observed"
-                )
-            all_receipts.extend(receipt_values)
+            for metric in ("first_speech", expected_metric):
+                if missing_counts[metric]:
+                    reasons.append(
+                        f"{name} turn {turn_number}: {missing_counts[metric]} {metric} observations were missing"
+                    )
+            for metric in ("first_speech", expected_metric):
+                p50_key = f"{metric}_p50_seconds"
+                p95_key = f"{metric}_p95_seconds"
+                expected_p50 = _p50(metric_values[metric]) if metric_values[metric] else None
+                expected_p95 = _percentile(metric_values[metric], 0.95, "p95") if metric_values[metric] else None
+                for key, expected_value in ((p50_key, expected_p50), (p95_key, expected_p95)):
+                    if key not in gate and metric == "first_speech" and key == p95_key:
+                        continue
+                    if key not in gate:
+                        raise ValueError(f"{name} turn {turn_number} gate is missing {key}")
+                    gate_value = gate[key]
+                    if expected_value is None:
+                        if gate_value is not None:
+                            raise ValueError(f"{name} turn {turn_number} gate {key} has no observations")
+                    else:
+                        validated = _finite_latency(gate_value, f"{name} turn {turn_number} {key}")
+                        if gate_run_count == len(expected_values) and validated != expected_value:
+                            raise ValueError(f"{name} turn {turn_number} gate {key} does not match its observations")
+            row: dict[str, Any] = {"scenario": name, "turn": turn_number, "kind": turn_kind}
+            for metric in metric_values:
+                values = metric_values[metric]
+                row[f"{metric}_p50_seconds"] = _p50(values) if values else None
+                row[f"{metric}_p95_seconds"] = _percentile(values, 0.95, "p95") if values else None
+            case_turn_metrics.append(row)
+            if turn_kind == "action":
+                action_signatures.add((name, turn_number))
+                all_receipts.extend(metric_values["command_receipt"])
+        turn_metrics.extend(case_turn_metrics)
 
     missing_scenarios = set(SCENARIO_TURN_COUNTS) - seen_case_names
     if missing_scenarios:
@@ -364,9 +416,18 @@ def _score_candidate(report: Any, candidate: str) -> tuple[dict[str, Any], set[t
     if not action_signatures:
         raise ValueError(f"{candidate} report has no action command-receipt metrics")
 
+    correctness_failures.extend(
+        reason for reason in reasons if reason not in correctness_failures
+    )
     result = {
         "eligible": not reasons and len(all_receipts) > 0,
         "action_receipt_p50_seconds": _p50(all_receipts) if all_receipts else None,
+        "correctness": {
+            "passed": not correctness_failures,
+            "failure_count": len(correctness_failures),
+            "failures": correctness_failures,
+        },
+        "turn_metrics": turn_metrics,
         "reasons": reasons,
     }
     if not all_receipts and not reasons:
@@ -378,7 +439,7 @@ def _score_candidate(report: Any, candidate: str) -> tuple[dict[str, Any], set[t
 def compare_reports(
     sol_report: Any, opus_report: Any, sonnet_report: Any | None = None
 ) -> dict[str, Any]:
-    """Compare two or three scored reports and select an eligible winner."""
+    """Compare eligibility and report the fastest eligible arm as information."""
     scored = {
         "sol": _score_candidate(sol_report, "sol"),
         "opus": _score_candidate(opus_report, "opus"),
@@ -408,48 +469,32 @@ def compare_reports(
     if not eligible:
         return {
             "winner": None,
+            "fastest_eligible": [],
             "decision": "no_eligible_candidate",
-            "message": "No winner can be deployed because no candidate is eligible.",
-            "candidates": candidates,
-        }
-    if len(eligible) == 1:
-        winner = eligible[0]
-        return {
-            "winner": winner,
-            "decision": "only_eligible_candidate",
-            "message": f"{winner} is the only eligible candidate.",
+            "message": "No candidate is eligible for comparison.",
             "candidates": candidates,
         }
 
-    fastest = min(
-        eligible, key=lambda name: candidates[name]["action_receipt_p50_seconds"]
+    fastest_latency = min(
+        candidates[name]["action_receipt_p50_seconds"] for name in eligible
     )
-    fastest_p50 = candidates[fastest]["action_receipt_p50_seconds"]
-    sol_eligible = candidates["sol"]["eligible"]
-    sol_p50 = candidates["sol"]["action_receipt_p50_seconds"]
-    if sol_eligible and sol_p50 <= fastest_p50 * 1.1:
-        winner = "sol"
-        decision = (
-            "within_10_percent_tie"
-            if fastest != "sol"
-            or any(
-                name != "sol"
-                and candidates[name]["action_receipt_p50_seconds"] <= sol_p50 * 1.1
-                for name in eligible
-            )
-            else "faster_action_receipt_p50"
-        )
-        message = (
-            "Action command-receipt p50s are within 10%; Sol wins the tie-break."
-            if decision == "within_10_percent_tie"
-            else "Sol has the faster action command-receipt p50."
-        )
-    else:
-        winner = fastest
-        decision = "faster_action_receipt_p50"
-        label = {"sol": "Sol", "opus": "Opus", "sonnet": "Sonnet"}[winner]
-        message = f"{label} has the fastest action command-receipt p50."
-    return {"winner": winner, "decision": decision, "message": message, "candidates": candidates}
+    fastest = [
+        name
+        for name in eligible
+        if candidates[name]["action_receipt_p50_seconds"] == fastest_latency
+    ]
+    labels = {"sol": "Sol", "opus": "Opus", "sonnet": "Sonnet"}
+    fastest_label = ", ".join(labels[name] for name in fastest)
+    return {
+        "winner": None,
+        "fastest_eligible": fastest,
+        "decision": "informational_fastest_eligible",
+        "message": (
+            f"{fastest_label} has the fastest action command-receipt p50; "
+            "deployment choice remains with Josh."
+        ),
+        "candidates": candidates,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
