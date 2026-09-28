@@ -44,6 +44,8 @@ REMOTE_OPERATION_DEADLINE_SECONDS = 30.0
 ROOM_POLL_INTERVAL_SECONDS = 0.25
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
+DEFAULT_VOICE_MODEL = "chatgpt/sol-fast"
+SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5"})
 SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
 )
@@ -752,6 +754,13 @@ def _json_lines(text: str, label: str) -> list[dict[str, Any]]:
     return records
 
 
+def _requested_voice_model() -> str:
+    model = os.environ.get("MENTAT_VOICE_MODEL", DEFAULT_VOICE_MODEL)
+    if model not in SUPPORTED_VOICE_MODELS:
+        raise RuntimeError(f"unsupported requested voice model: {model!r}")
+    return model
+
+
 def _eval_delegations(marker_log: str, room_name: str) -> list[dict[str, Any]]:
     records = _json_lines(marker_log, "delegation marker")
     delegations = []
@@ -786,6 +795,7 @@ def _attribute_model_calls(
     partial_capture: bool = False,
     failure_started_at: float | None = None,
     failure_turn: int | None = None,
+    unattributed_model_calls: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     all_delegations = _eval_delegations(marker_log, room_name)
     starts = []
@@ -841,18 +851,24 @@ def _attribute_model_calls(
             )
             if turn_index is None:
                 if failure_started_at is not None and created_at >= failure_started_at:
-                    phone_tools = recorded.get("phone_tools", [])
-                    if phone_tools:
+                    if model_calls or recorded.get("phone_tools", []):
                         if (
                             isinstance(failure_turn, bool)
                             or not isinstance(failure_turn, int)
                             or failure_turn != len(starts) + 1
                         ):
-                            raise RuntimeError("failed-turn phone tools have no valid turn attribution")
-                        for tool in phone_tools:
-                            if not isinstance(tool, dict):
-                                raise RuntimeError("recorded SDK result has invalid phone-tool evidence")
-                            tool["turn"] = failure_turn
+                            raise RuntimeError("failed-turn SDK evidence has no valid turn attribution")
+                    if model_calls:
+                        if unattributed_model_calls is None:
+                            raise RuntimeError("failed-turn model calls have no provenance destination")
+                        for call in model_calls:
+                            if not isinstance(call, dict):
+                                raise RuntimeError("recorded SDK result has invalid model-call evidence")
+                            unattributed_model_calls.append({**call, "turn": failure_turn})
+                    for tool in recorded.get("phone_tools", []):
+                        if not isinstance(tool, dict):
+                            raise RuntimeError("recorded SDK result has invalid phone-tool evidence")
+                        tool["turn"] = failure_turn
                     continue
                 raise RuntimeError("no captured turn precedes delegation")
         else:
@@ -886,9 +902,14 @@ def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         raise RuntimeError("recorded message_start has no message object")
                     model = started.get("model")
                     message_id = started.get("id")
-                    if not isinstance(model, str) or not model or not isinstance(message_id, str) or not message_id:
+                    if not isinstance(message_id, str) or not message_id:
                         raise RuntimeError("recorded message_start has no finite model-call evidence")
-                    calls.append({"id": message_id, "model": model})
+                    usage = started.get("usage")
+                    calls.append({
+                        "id": message_id,
+                        "model": model if isinstance(model, str) and model else None,
+                        "service_tier": usage.get("service_tier") if isinstance(usage, dict) else None,
+                    })
             if raw.get("type") == "assistant":
                 assistant_message = raw.get("message")
                 blocks = assistant_message.get("content") if isinstance(assistant_message, dict) else None
@@ -906,6 +927,12 @@ def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         tools.append({"turn": len(turns) + 1, "name": name, "kind": tool_kind, "input": arguments})
         if not calls:
             raise RuntimeError("recorded assistant result has no message_start model-call evidence")
+        result_usage = message.get("usage")
+        result_usage = result_usage if isinstance(result_usage, dict) else {}
+        for call in calls:
+            call["speed"] = result_usage.get("speed")
+            call["result_service_tier"] = result_usage.get("service_tier")
+            call["fast_mode_state"] = message.get("fast_mode_state")
         turns.append({"model_calls": calls, "phone_tools": tools})
         current = []
     if any(
@@ -916,6 +943,156 @@ def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ):
         raise RuntimeError("recorded SDK turn is missing its top-level result boundary")
     return turns
+
+
+def _model_call_provenance(
+    call: dict[str, Any], requested_model: str
+) -> dict[str, Any]:
+    evidence = {
+        "id": call.get("id"),
+        "requested_model": requested_model,
+        "observed_model": call.get("model"),
+        "service_tier": call.get("service_tier"),
+        "result_service_tier": call.get("result_service_tier"),
+        "speed": call.get("speed"),
+        "fast_mode_state": call.get("fast_mode_state"),
+    }
+    failures = []
+    observed_model = evidence["observed_model"]
+    model_matches = observed_model == requested_model
+    if requested_model == "chatgpt/sol-fast":
+        model_matches = model_matches or observed_model == "gpt-6-sol"
+    elif requested_model == "claude-opus-5-5" and isinstance(observed_model, str):
+        model_matches = model_matches or re.fullmatch(
+            r"claude-opus-5-5-[0-9]{8}", observed_model
+        ) is not None
+    if not isinstance(observed_model, str) or not observed_model:
+        failures.append(f"observed model is unproven (requested {requested_model})")
+    elif not model_matches:
+        failures.append(
+            f"requested model {requested_model} but observed {observed_model}"
+        )
+    if evidence["result_service_tier"] != "standard":
+        failures.append(
+            f"result usage service tier is unproven or nonstandard: "
+            f"{evidence['result_service_tier']!r}"
+        )
+    if requested_model == "claude-opus-5-5":
+        if evidence["service_tier"] != "standard":
+            failures.append(
+                f"message_start service tier is unproven or nonstandard: "
+                f"{evidence['service_tier']!r}"
+            )
+        if evidence["speed"] != "standard":
+            failures.append(
+                f"result usage speed is unproven or nonstandard: {evidence['speed']!r}"
+            )
+        if evidence["fast_mode_state"] != "off":
+            failures.append(
+                f"fast mode is unproven or enabled: {evidence['fast_mode_state']!r}"
+            )
+    elif evidence["service_tier"] not in (None, "standard"):
+        failures.append(
+            f"message_start service tier is nonstandard: {evidence['service_tier']!r}"
+        )
+    evidence["failures"] = failures
+    return evidence
+
+
+def _add_model_provenance(
+    report: dict[str, Any], observations: dict[str, Any], requested_model: str
+) -> None:
+    observation_cases = observations.get("cases")
+    if not isinstance(observation_cases, list):
+        return
+    for case_index, case_report in enumerate(report.get("cases", [])):
+        if case_index >= len(observation_cases):
+            continue
+        case_observation = observation_cases[case_index]
+        if not isinstance(case_observation, dict):
+            continue
+        runs = case_observation.get("runs")
+        if not isinstance(runs, list):
+            continue
+        for run_index, run in enumerate(runs):
+            if not isinstance(run, dict):
+                continue
+            run_turns = run.get("turns")
+            if not isinstance(run_turns, list):
+                run_turns = []
+            for turn_index, turn in enumerate(run_turns, 1):
+                if not isinstance(turn, dict):
+                    continue
+                calls = turn.get("model_calls")
+                calls = calls if isinstance(calls, list) else []
+                proven_calls = [
+                    _model_call_provenance(call, requested_model)
+                    for call in calls
+                    if isinstance(call, dict)
+                ]
+                provenance_failures = [
+                    failure
+                    for call in proven_calls
+                    for failure in call["failures"]
+                ]
+                if len(proven_calls) != len(calls):
+                    provenance_failures.append("model-call evidence is invalid")
+                if not proven_calls:
+                    provenance_failures.append("model-call evidence is missing")
+                provenance = {
+                    "requested_model": requested_model,
+                    "model_calls": proven_calls,
+                    "verified": not provenance_failures,
+                }
+                case_turn = next(
+                    (
+                        item for item in case_report.get("turns", [])
+                        if item.get("run") == run_index + 1
+                        and item.get("turn") == turn_index
+                    ),
+                    None,
+                )
+                if case_turn is not None:
+                    case_turn["model_provenance"] = provenance
+                for failure in dict.fromkeys(provenance_failures):
+                    message = (
+                        f"{case_report['name']} run {run_index + 1} turn {turn_index}: "
+                        f"model provenance failure: {failure}"
+                    )
+                    case_report["failures"].append(message)
+                    report["failures"].append(message)
+            extra_calls = run.get("unattributed_model_calls", [])
+            if not isinstance(extra_calls, list):
+                extra_calls = [{"turn": 1, "invalid": True}]
+            extra_provenance = []
+            for call in extra_calls:
+                turn_number = call.get("turn") if isinstance(call, dict) else None
+                if (
+                    isinstance(turn_number, bool)
+                    or not isinstance(turn_number, int)
+                    or turn_number <= 0
+                    or not isinstance(call, dict)
+                ):
+                    evidence = {"turn": turn_number, "failures": ["model-call evidence is invalid"]}
+                else:
+                    evidence = {
+                        "turn": turn_number,
+                        **_model_call_provenance(call, requested_model),
+                    }
+                extra_provenance.append(evidence)
+                for failure in evidence["failures"]:
+                    message = (
+                        f"{case_report['name']} run {run_index + 1} turn {evidence['turn']}: "
+                        f"model provenance failure: {failure}"
+                    )
+                    case_report["failures"].append(message)
+                    report["failures"].append(message)
+            if extra_provenance:
+                case_report.setdefault("unattributed_model_calls", []).append({
+                    "run": run_index + 1,
+                    "model_calls": extra_provenance,
+                })
+    report["passed"] = not report["failures"]
 
 
 def _phone_commands(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1379,6 +1556,7 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
             if record_text is None
             else _recorded_turns(_json_lines(record_text, "SDK recording"))
         )
+        unattributed_model_calls: list[dict[str, Any]] = []
         traces = _attribute_model_calls(
             traces,
             marker_log,
@@ -1391,8 +1569,10 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
                 else None
             ),
             failure_turn=(capture_failure.get("turn") if capture_failure is not None else None),
+            unattributed_model_calls=unattributed_model_calls,
         )
     else:
+        unattributed_model_calls = []
         recorded_turns = []
     phone_commands = _match_phone_tools(phone_commands, recorded_turns)
     # Phone receipt and paired speech-end timestamps use the same epoch clock.
@@ -1502,6 +1682,8 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
         "phone_commands": phone_commands,
         "room_closed_after": room_closed_after,
     }
+    if unattributed_model_calls:
+        observation["unattributed_model_calls"] = unattributed_model_calls
     if capture_failure is not None and not early_close:
         observation["failure"] = capture_failure
         observation["product_failures"] = product_failures
@@ -1609,6 +1791,11 @@ def _run_local_eval(argv: list[str]) -> int:
     if arguments.runs <= 0:
         print("eval --runs must be a positive integer", file=sys.stderr)
         return 2
+    try:
+        requested_model = _requested_voice_model()
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 2
 
     observations: dict[str, Any] = {"cases": []}
     capture_failures: list[tuple[int, int, str]] = []
@@ -1643,6 +1830,8 @@ def _run_local_eval(argv: list[str]) -> int:
         report["failures"].append(message)
         case = report["cases"][scenario_index]
         case["failures"].append(message)
+    report["requested_model"] = requested_model
+    _add_model_provenance(report, observations, requested_model)
     report["passed"] = not report["failures"]
     print(json.dumps(report, indent=2, sort_keys=True), flush=True)
     return 0 if report["passed"] else 1
