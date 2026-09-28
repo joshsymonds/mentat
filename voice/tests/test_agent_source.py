@@ -4,6 +4,7 @@ import ast
 import asyncio
 import json
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -32,9 +33,9 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertIn("self._backend_text(", completed)
         self.assertIn("self.session.say(", completed)
         self.assertIn("allow_interruptions=True", completed)
-        self.assertIn("await speech_handle.wait_for_playout()", completed)
-        self.assertIn("speech_handle.interrupted", completed)
-        self.assertIn("speech_handle.exception()", completed)
+        self.assertIn("handle.wait_for_playout()", completed)
+        self.assertIn("handle.interrupted", completed)
+        self.assertIn("handle.exception()", completed)
         self.assertIn("await backend_text.aclose()", completed)
         backend = source.split("    async def _backend_text(", 1)[1].split(
             "\n\ndef log_turn_metrics", 1
@@ -483,6 +484,543 @@ class AgentSourceContractTest(unittest.TestCase):
                 self.assertEqual(asyncio.run(collect()), expected)
                 policy.turn_done.assert_not_called()
 
+    def test_interrupt_closes_backend_stream_while_next_read_is_pending(self):
+        from collections.abc import AsyncGenerator
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        method = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "on_user_turn_completed"
+        )
+
+        backend_open = asyncio.Event()
+        backend_closed = asyncio.Event()
+        speech_started = asyncio.Event()
+        hold_backend = asyncio.Event()
+
+        async def backend_text(_question, _turn_id, _chat_ctx):
+            try:
+                yield "On it."
+                backend_open.set()
+                await hold_backend.wait()
+            finally:
+                backend_closed.set()
+
+        class FakeSpeechHandle:
+            def __init__(self, task):
+                self._task = task
+                self.interrupted = False
+
+            async def wait_for_playout(self):
+                await self._task
+
+            def interrupt(self):
+                self.interrupted = True
+                self._task.cancel()
+
+            def exception(self):
+                return None
+
+        class FakeSession:
+            def __init__(self):
+                self.handle = None
+
+            def say(self, source, *, allow_interruptions):
+                self.assert_interruptions = allow_interruptions
+
+                async def capture():
+                    async for _text in source:
+                        speech_started.set()
+
+                self.handle = FakeSpeechHandle(asyncio.create_task(capture()))
+                return self.handle
+
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "uuid4": lambda: SimpleNamespace(hex="turn-id"),
+            "AudioConfig": lambda *_args, **_kwargs: object(),
+            "EARCON_PATH": Path("earcon.wav"),
+            "logger": Mock(),
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(agent_path), "exec"), namespace)
+        session = FakeSession()
+        agent = SimpleNamespace(
+            _ending_policy=SimpleNamespace(delegation_started=Mock()),
+            _ending_changed=Mock(),
+            _background=SimpleNamespace(play=Mock()),
+            _backend_text=backend_text,
+            session=session,
+        )
+
+        async def interrupt_while_backend_open():
+            turn = asyncio.create_task(
+                namespace["on_user_turn_completed"](
+                    agent,
+                    SimpleNamespace(items=[]),
+                    SimpleNamespace(text_content="Tell me now"),
+                )
+            )
+            await asyncio.wait_for(backend_open.wait(), timeout=1)
+            await asyncio.wait_for(speech_started.wait(), timeout=1)
+            self.assertFalse(backend_closed.is_set())
+            session.handle.interrupt()
+            await asyncio.wait_for(turn, timeout=1)
+
+        asyncio.run(interrupt_while_backend_open())
+        self.assertTrue(session.handle.interrupted)
+        self.assertTrue(backend_closed.is_set())
+
+    def test_speech_interrupt_during_segment_flush_returns_without_cancelling_turn(self):
+        from collections.abc import AsyncGenerator
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        method = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "on_user_turn_completed"
+        )
+
+        playout_waiting = asyncio.Event()
+        backend_closed = asyncio.Event()
+        hold_playout = asyncio.Event()
+
+        async def backend_text(_question, _turn_id, _chat_ctx):
+            try:
+                yield "On it."
+                yield None
+            finally:
+                backend_closed.set()
+
+        class FakeSpeechHandle:
+            def __init__(self, task):
+                self._task = task
+                self.interrupted = False
+
+            async def wait_for_playout(self):
+                await self._task
+
+            def interrupt(self):
+                self.interrupted = True
+                self._task.cancel()
+
+            def exception(self):
+                return None
+
+        class FakeSession:
+            def __init__(self):
+                self.handle = None
+
+            def say(self, source, *, allow_interruptions):
+                async def play():
+                    async for _text in source:
+                        pass
+                    playout_waiting.set()
+                    await hold_playout.wait()
+
+                self.handle = FakeSpeechHandle(asyncio.create_task(play()))
+                return self.handle
+
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "uuid4": lambda: SimpleNamespace(hex="turn-id"),
+            "AudioConfig": lambda *_args, **_kwargs: object(),
+            "EARCON_PATH": Path("earcon.wav"),
+            "logger": Mock(),
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(agent_path), "exec"), namespace)
+        session = FakeSession()
+        agent = SimpleNamespace(
+            _ending_policy=SimpleNamespace(delegation_started=Mock()),
+            _ending_changed=Mock(),
+            _background=SimpleNamespace(play=Mock()),
+            _backend_text=backend_text,
+            session=session,
+        )
+
+        async def interrupt_during_flush():
+            turn = asyncio.create_task(
+                namespace["on_user_turn_completed"](
+                    agent,
+                    SimpleNamespace(items=[]),
+                    SimpleNamespace(text_content="Tell me now"),
+                )
+            )
+            await asyncio.wait_for(playout_waiting.wait(), timeout=1)
+            session.handle.interrupt()
+            await asyncio.wait_for(turn, timeout=1)
+
+        asyncio.run(interrupt_during_flush())
+        self.assertTrue(session.handle.interrupted)
+        self.assertTrue(backend_closed.is_set())
+
+    def test_default_tts_path_flushes_punctuated_text_before_tool_result(self):
+        from collections.abc import AsyncGenerator
+        from types import MethodType
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        methods = {
+            node.name: node
+            for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name in {"_backend_text", "on_user_turn_completed"}
+        }
+
+        class FakeTurnStart:
+            pass
+
+        class FakeToolResult:
+            def __init__(self, name, is_error=False):
+                self.name = name
+                self.is_error = is_error
+
+        class FakeTurnDone:
+            pass
+
+        class FakeTurnStream:
+            def __init__(self):
+                self.done = False
+
+            def feed(self, data):
+                event = json.loads(data)
+                if event["kind"] == "text_delta":
+                    return [event["text"]]
+                if event["kind"] == "tool_start":
+                    return [FakeTurnStart()]
+                if event["kind"] == "tool_result":
+                    return [FakeToolResult(event["tool"])]
+                if event["kind"] == "done":
+                    self.done = True
+                    return [FakeTurnDone()]
+                return []
+
+        class FakeContent:
+            def __init__(self, chunks):
+                self._chunks = chunks
+
+            async def iter_any(self):
+                for chunk in self._chunks:
+                    yield chunk
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, chunks):
+                self.content = FakeContent(chunks)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeHttp:
+            def __init__(self, response):
+                self._response = response
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, *_args, **_kwargs):
+                return self._response
+
+        async def livekit_markdown_filter(source):
+            # LiveKit 1.8.1 filter_markdown holds the last inline split token.
+            buffer = ""
+            async for chunk in source:
+                buffer += chunk
+                last_split = max(buffer.rfind(char) for char in " ,.?!;，。？！；")
+                if last_split >= 1:
+                    yield buffer[:last_split]
+                    buffer = buffer[last_split:]
+            if buffer:
+                yield buffer
+
+        def cartesia_sentence_flush(text):
+            # Plain-text subset of LiveKit's 1.8.1 defaults: min context 10,
+            # min sentence 20; end_input flushes its remaining short sentence.
+            ends = [match.end() for match in re.finditer(r"[.!?](?=\s|$)", text)]
+            sentences = []
+            start = 0
+            for end in ends:
+                if len(text[start:end]) >= 20:
+                    sentences.append(text[start:end].strip())
+                    start = end
+            if start < len(text) and text[start:].strip():
+                sentences.append(text[start:].strip())
+            return sentences
+
+        timeline = []
+        response = None
+
+        class FakeSpeechHandle:
+            interrupted = False
+
+            def __init__(self, task):
+                self._task = task
+
+            async def wait_for_playout(self):
+                await self._task
+
+            def interrupt(self):
+                self._task.cancel()
+
+            def exception(self):
+                return None
+
+        class FakeSession:
+            def say(self, source, *, allow_interruptions):
+                self.assert_interruptions = allow_interruptions
+
+                async def synthesize():
+                    filtered = []
+                    async for text in livekit_markdown_filter(source):
+                        filtered.append(text)
+                    for sentence in cartesia_sentence_flush("".join(filtered)):
+                        timeline.append(("tts", sentence))
+
+                return FakeSpeechHandle(asyncio.create_task(synthesize()))
+
+        policy = SimpleNamespace(
+            delegation_started=Mock(),
+            tool_result_seen=lambda name, _error: timeline.append(("tool", name)),
+            turn_done=Mock(),
+            describe=lambda: "test policy",
+        )
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "json": json,
+            "re": re,
+            "aiohttp": SimpleNamespace(
+                ClientSession=lambda **_kwargs: FakeHttp(response),
+                ClientError=Exception,
+            ),
+            "TIMEOUT": None,
+            "CONSULT_FAILED": "request failed",
+            "TurnError": RuntimeError,
+            "TurnStream": FakeTurnStream,
+            "is_sms_request": lambda _text: False,
+            "is_sms_decline": lambda _text: False,
+            "is_sms_followup": lambda _text: False,
+            "consult_envelope": lambda *_args, **_kwargs: "envelope",
+            "recent_turns": lambda _items: [],
+            "turn_request": lambda *_args: {},
+            "write_turn_marker": Mock(),
+            "logger": Mock(),
+            "SEND_SMS_TOOL": "mcp__mentat__send_sms",
+            "END_CONVERSATION_TOOL": "mcp__mentat__end_conversation",
+            "ToolResult": FakeToolResult,
+            "ToolStart": FakeTurnStart,
+            "TurnDone": FakeTurnDone,
+            "TurnFailure": type("FakeTurnFailure", (), {}),
+            "time": time,
+            "uuid4": lambda: SimpleNamespace(hex="turn-id"),
+            "AudioConfig": lambda *_args, **_kwargs: object(),
+            "EARCON_PATH": Path("earcon.wav"),
+        }
+        exec(compile(ast.Module(body=list(methods.values()), type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _sms_consent=False,
+            _voice_card="voice card",
+            _room_name="eval-room",
+            _mentat_url="http://127.0.0.1:8484",
+            _ending_policy=policy,
+            _ending_changed=Mock(),
+            _background=SimpleNamespace(play=Mock()),
+            session=FakeSession(),
+        )
+        agent._backend_text = MethodType(namespace["_backend_text"], agent)
+        wire = [
+            b'{"kind":"text_delta","text":"On it."}',
+            b'{"kind":"tool_start","tool":"lookup"}',
+            b'{"kind":"tool_result","tool":"lookup","is_error":false}',
+            b'{"kind":"text_delta","text":"The time is 3:45."}',
+            b'{"kind":"done"}',
+        ]
+        response = FakeResponse(wire)
+
+        asyncio.run(
+            namespace["on_user_turn_completed"](
+                agent,
+                SimpleNamespace(items=[]),
+                SimpleNamespace(text_content="Check the time"),
+            )
+        )
+
+        self.assertEqual(
+            [text for kind, text in timeline if kind == "tts"],
+            ["On it.", "The time is 3:45."],
+        )
+        tool_result = timeline.index(("tool", "lookup"))
+        self.assertLess(timeline.index(("tts", "On it.")), tool_result)
+
+    def test_text_before_tool_start_reaches_tts_as_a_sentence_before_tool_result(self):
+        from collections.abc import AsyncGenerator
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        method = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_backend_text"
+        )
+
+        class FakeTurnStart:
+            pass
+
+        class FakeToolResult:
+            def __init__(self, name, is_error=False):
+                self.name = name
+                self.is_error = is_error
+
+        class FakeTurnDone:
+            pass
+
+        class FakeTurnStream:
+            def __init__(self):
+                self.done = False
+
+            def feed(self, data):
+                items = []
+                for line in data.splitlines():
+                    event = json.loads(line)
+                    if event["kind"] == "text_delta":
+                        items.append(event["text"])
+                    elif event["kind"] == "tool_start":
+                        items.append(FakeTurnStart())
+                    elif event["kind"] == "tool_result":
+                        items.append(FakeToolResult(event["tool"]))
+                    elif event["kind"] == "done":
+                        self.done = True
+                        items.append(FakeTurnDone())
+                return items
+
+        class FakeContent:
+            def __init__(self, chunks):
+                self._chunks = chunks
+
+            async def iter_any(self):
+                for chunk in self._chunks:
+                    yield chunk
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, chunks):
+                self.content = FakeContent(chunks)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeHttp:
+            def __init__(self, response):
+                self._response = response
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, *_args, **_kwargs):
+                return self._response
+
+        timeline = []
+        response = None
+        policy = SimpleNamespace(
+            tool_result_seen=lambda name, is_error: timeline.append(("tool", name)),
+            turn_done=Mock(),
+            describe=lambda: "test policy",
+        )
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "json": json,
+            "re": re,
+            "aiohttp": SimpleNamespace(
+                ClientSession=lambda **_kwargs: FakeHttp(response),
+                ClientError=Exception,
+            ),
+            "TIMEOUT": None,
+            "CONSULT_FAILED": "request failed",
+            "TurnError": RuntimeError,
+            "TurnStream": FakeTurnStream,
+            "is_sms_request": lambda _text: False,
+            "is_sms_decline": lambda _text: False,
+            "is_sms_followup": lambda _text: False,
+            "consult_envelope": lambda *_args, **_kwargs: "envelope",
+            "recent_turns": lambda _items: [],
+            "turn_request": lambda *_args: {},
+            "write_turn_marker": Mock(),
+            "logger": Mock(),
+            "SEND_SMS_TOOL": "mcp__mentat__send_sms",
+            "END_CONVERSATION_TOOL": "mcp__mentat__end_conversation",
+            "ToolResult": FakeToolResult,
+            "ToolStart": FakeTurnStart,
+            "TurnDone": FakeTurnDone,
+            "TurnFailure": type("FakeTurnFailure", (), {}),
+            "time": time,
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _sms_consent=False,
+            _voice_card="voice card",
+            _room_name="eval-room",
+            _mentat_url="http://127.0.0.1:8484",
+            _ending_policy=policy,
+            _ending_changed=Mock(),
+        )
+        wire = (
+            b'{"kind":"text_delta","text":"The time is 3:45"}\n'
+            b'{"kind":"tool_start","tool":"lookup"}\n'
+            b'{"kind":"tool_result","tool":"lookup","is_error":false}\n'
+            b'{"kind":"text_delta","text":"That is correct."}\n'
+            b'{"kind":"done"}\n'
+        )
+
+        async def consume_as_tts():
+            return [
+                (timeline.append(("tts", text)) or text)
+                async for text in namespace["_backend_text"](
+                    agent, "What time is it?", "turn-id", SimpleNamespace(items=[])
+                )
+            ]
+
+        response = FakeResponse([wire])
+        spoken = asyncio.run(consume_as_tts())
+        self.assertEqual(spoken, ["The time is 3:45", ". ", None, "That is correct."])
+        tool_result = timeline.index(("tool", "lookup"))
+        self.assertLess(timeline.index(("tts", "The time is 3:45")), tool_result)
+        self.assertLess(timeline.index(("tts", ". ")), tool_result)
+        self.assertEqual("".join(text for text in spoken if text is not None), "The time is 3:45. That is correct.")
+
     def test_first_commentary_is_logged_at_the_tts_handoff(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         backend = source.split("    async def _backend_text(", 1)[1].split(
@@ -492,7 +1030,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(backend.count(log_line), 1)
         self.assertLess(backend.index("if not commentary_logged"), backend.index(log_line))
         self.assertLess(backend.index(log_line), backend.index("yield item"))
-        self.assertIn("self.session.say(backend_text, allow_interruptions=True)", source)
+        self.assertIn("self.session.say(speech_source(queue), allow_interruptions=True)", source)
         self.assertLess(backend.index("write_turn_marker("), backend.index("http.post("))
         self.assertNotIn("append_commentary", source)
 

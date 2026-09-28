@@ -43,7 +43,7 @@ from request import (
     turn_request,
     with_private_context,
 )
-from stream import ToolResult, TurnDone, TurnError, TurnFailure, TurnStream
+from stream import ToolResult, ToolStart, TurnDone, TurnError, TurnFailure, TurnStream
 
 logger = logging.getLogger("mentat.voice")
 
@@ -185,24 +185,98 @@ class FrontAgent(Agent):
         self._ending_changed()
         self._background.play(AudioConfig(str(EARCON_PATH)))
         backend_text = self._backend_text(question, turn_id, chat_ctx)
-        speech_handle = self.session.say(backend_text, allow_interruptions=True)
+        speech_queue: asyncio.Queue[str | None] | None = None
+        speech_handle: Any = None
+        speech_completion: asyncio.Task[None] | None = None
+
+        async def speech_source(
+            queue: asyncio.Queue[str | None],
+        ) -> AsyncGenerator[str, None]:
+            while (text := await queue.get()) is not None:
+                yield text
+
+        def start_speech() -> tuple[
+            asyncio.Queue[str | None], Any, asyncio.Task[None]
+        ]:
+            queue: asyncio.Queue[str | None] = asyncio.Queue()
+            handle = self.session.say(speech_source(queue), allow_interruptions=True)
+            completion = asyncio.create_task(handle.wait_for_playout())
+            return queue, handle, completion
+
+        async def finish_speech() -> bool:
+            nonlocal speech_queue, speech_handle, speech_completion
+            if speech_queue is None or speech_handle is None or speech_completion is None:
+                return False
+            queue, handle, completion = speech_queue, speech_handle, speech_completion
+            speech_queue = None
+            speech_handle = None
+            speech_completion = None
+            await queue.put(None)
+            try:
+                await completion
+            except asyncio.CancelledError:
+                if handle.interrupted:
+                    logger.info("delegation %s interrupted", turn_id)
+                    return True
+                handle.interrupt()
+                raise
+            if handle.interrupted:
+                logger.info("delegation %s interrupted", turn_id)
+                return True
+            speech_exception = handle.exception()
+            if speech_exception is not None:
+                raise speech_exception
+            return False
+
+        backend_iterator = backend_text.__aiter__()
+        backend_next: asyncio.Task[str | None] | None = None
         try:
-            await speech_handle.wait_for_playout()
-        except asyncio.CancelledError:
-            speech_handle.interrupt()
-            raise
+            while True:
+                backend_next = asyncio.create_task(backend_iterator.__anext__())
+                if speech_completion is None:
+                    await backend_next
+                else:
+                    done, _ = await asyncio.wait(
+                        (backend_next, speech_completion),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if speech_completion in done:
+                        if speech_handle is not None and speech_handle.interrupted:
+                            backend_next.cancel()
+                            await asyncio.gather(backend_next, return_exceptions=True)
+                            backend_next = None
+                            logger.info("delegation %s interrupted", turn_id)
+                            return
+                        await speech_completion
+                        raise RuntimeError("speech ended before the backend segment boundary")
+                try:
+                    text = backend_next.result()
+                except StopAsyncIteration:
+                    backend_next = None
+                    break
+                backend_next = None
+                if text is None:
+                    if await finish_speech():
+                        return
+                    continue
+                if speech_queue is None:
+                    speech_queue, speech_handle, speech_completion = start_speech()
+                await speech_queue.put(text)
+            if await finish_speech():
+                return
         finally:
+            if backend_next is not None:
+                backend_next.cancel()
+                await asyncio.gather(backend_next, return_exceptions=True)
+            if speech_handle is not None:
+                speech_handle.interrupt()
+                if speech_completion is not None:
+                    await asyncio.gather(speech_completion, return_exceptions=True)
             await backend_text.aclose()
-        if speech_handle.interrupted:
-            logger.info("delegation %s interrupted", turn_id)
-            return
-        speech_exception = speech_handle.exception()
-        if speech_exception is not None:
-            raise speech_exception
 
     async def _backend_text(
         self, question: str, turn_id: str, chat_ctx: Any
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[str | None, None]:
         sms_mode = is_sms_request(question)
         sms_declined = self._sms_consent and is_sms_decline(question)
         if self._sms_consent and (is_sms_followup(question) or sms_declined):
@@ -225,6 +299,7 @@ class FrontAgent(Agent):
         pending_sms_text: list[str] = []
         sms_buffer = SmsCommentaryBuffer(pending_sms_text.append) if sms_mode else None
         commentary_logged = False
+        commentary_tail = ""
         saw_text = False
         end_tool_succeeded = False
 
@@ -250,8 +325,18 @@ class FrontAgent(Agent):
                                 if sms_buffer is not None:
                                     sms_buffer.add(item)
                                 else:
+                                    commentary_tail = (commentary_tail + item)[-16:]
                                     log_first_commentary()
                                     yield item
+                            elif isinstance(item, ToolStart):
+                                if sms_buffer is None and commentary_tail:
+                                    ending = commentary_tail.rstrip()
+                                    if not re.search(r"[.!?…][\"'”’)]*$", ending):
+                                        yield ". "
+                                    elif ending == commentary_tail:
+                                        yield " "
+                                    yield None
+                                    commentary_tail = ""
                             elif isinstance(item, ToolResult):
                                 if sms_buffer is not None:
                                     sms_buffer.tool_result(item.name, is_error=item.is_error)
