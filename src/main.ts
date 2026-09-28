@@ -25,6 +25,7 @@ try {
     logger,
     maxSessions: config.maxSessions,
     ...(config.model !== undefined && { model: config.model }),
+    voiceModel: config.voiceModel,
     ...(config.effort !== undefined && { effort: config.effort }),
     ...(config.systemPrompt !== undefined && { systemPrompt: config.systemPrompt }),
     ...(config.memoryDir !== undefined && { addDirs: [config.memoryDir] }),

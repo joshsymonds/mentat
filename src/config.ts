@@ -17,6 +17,7 @@ export interface Config {
   listen: ListenAddress;
   bin: string;
   model?: string;
+  voiceModel: string;
   effort?: Options['effort'];
   systemPrompt?: string;
   memoryDir?: string;
@@ -113,6 +114,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
         ? parseDuration(env.MENTAT_SESSION_TTL)
         : DEFAULT_SESSION_TTL_MS,
     ...(env.MENTAT_MODEL !== undefined && { model: env.MENTAT_MODEL }),
+    voiceModel: env.MENTAT_VOICE_MODEL ?? 'chatgpt/sol-fast',
     ...(env.MENTAT_EFFORT !== undefined && { effort: parseEffort(env.MENTAT_EFFORT) }),
     ...(env.MENTAT_SYSTEM_PROMPT !== undefined && { systemPrompt: env.MENTAT_SYSTEM_PROMPT }),
     ...(env.MENTAT_MEMORY_DIR !== undefined && { memoryDir: env.MENTAT_MEMORY_DIR }),

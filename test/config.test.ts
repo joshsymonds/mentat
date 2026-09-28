@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,6 +21,27 @@ describe('loadConfig', () => {
     expect(config.allowedTools).toBeUndefined();
     expect(config.mcpServers).toBeUndefined();
     expect(config.voiceGateway).toBeUndefined();
+  });
+
+  it('defaults the voice model independently of the global model', () => {
+    const config = loadConfig(baseEnv);
+    expect(config.voiceModel).toBe('chatgpt/sol-fast');
+    expect(config.model).toBeUndefined();
+  });
+
+  it('loads an explicit voice model and leaves the global model unchanged', () => {
+    const config = loadConfig({
+      ...baseEnv,
+      MENTAT_MODEL: 'global-model',
+      MENTAT_VOICE_MODEL: 'claude-opus-5-5',
+    });
+    expect(config.voiceModel).toBe('claude-opus-5-5');
+    expect(config.model).toBe('global-model');
+  });
+
+  it('forwards the voice model from config to ClaudeCode', () => {
+    const mainSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8');
+    expect(mainSource).toMatch(/voiceModel: config\.voiceModel/);
   });
 
   it('loads the optional Places API key', () => {
