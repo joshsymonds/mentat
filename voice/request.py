@@ -33,6 +33,12 @@ CONSULT_SMS_RULE = (
     "Only say the text was sent after send_sms returns successfully; if send_sms fails, say it "
     "was not sent."
 )
+CONSULT_PLACE_FIND_RULE = (
+    "For a place-finding question such as 'Find <place>' or 'Where is <place>?', use "
+    "find_places and speak the returned name and address. Do not call navigate_to; "
+    "wait for an explicit navigation request before calling navigate_to. For a find-only "
+    "turn, keep the call open for Josh's explicit navigation request."
+)
 CONSULT_ENDING_RULE = (
     "Has the intent been fulfilled of the conversation? If so, hang up. If plausibly not, stay. "
     "After a successful action that fulfills Josh's intent, such as setting a timer or alarm, "
@@ -344,7 +350,12 @@ def consult_envelope(
     sections = [
         CONSULT_FRAMING,
         persona_card,
-        "Backend rules:\n" + CONSULT_SMS_RULE + "\n" + CONSULT_ENDING_RULE,
+        "Backend rules:\n"
+        + CONSULT_SMS_RULE
+        + "\n"
+        + CONSULT_PLACE_FIND_RULE
+        + "\n"
+        + CONSULT_ENDING_RULE,
     ]
     if summary.strip():
         sections.append("Conversation so far:\n" + summary)

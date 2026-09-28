@@ -140,6 +140,18 @@ class RequestTest(unittest.TestCase):
         self.assertIn("who was she", envelope)
         self.assertIn("do not offer anything else or more help", envelope)
 
+    def test_consult_envelope_separates_place_finding_from_navigation(self):
+        for question in ("Find 1500 Santa Barbara Street", "Where is 1500 Santa Barbara Street?"):
+            with self.subTest(question=question):
+                envelope = " ".join(consult_envelope("card", "", [], question).lower().split())
+                self.assertIn("use find_places", envelope)
+                self.assertIn("speak the returned name and address", envelope)
+                self.assertIn("wait for an explicit navigation request", envelope)
+                self.assertIn("before calling navigate_to", envelope)
+                self.assertIn("keep the call open for josh's explicit navigation request", envelope)
+                self.assertIn("a yes authorizes exactly that message once", envelope)
+                self.assertIn("has the intent been fulfilled of the conversation? if so, hang up. if plausibly not, stay.", envelope)
+
     def test_consult_envelope_preserves_sms_confirmation_wording(self):
         envelope = " ".join(consult_envelope("card", "", [], "Text Alice").lower().split())
         self.assertIn("a yes authorizes exactly that message once", envelope)
