@@ -19,7 +19,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertIn('"turn_detection": "stt"', source)
         self.assertIn('inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE)', source)
         self.assertIn("TTS_VOICE =", source)
-        self.assertIn("tts_text_transforms=None", source)
+        self.assertNotIn("tts_text_transforms=", source)
         self.assertIn("async def on_user_turn_completed(", source)
         self.assertNotIn("GPTLive", source)
         self.assertNotIn("openai.realtime", source)

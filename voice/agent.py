@@ -329,7 +329,6 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=ctx.proc.userdata["vad"],
         stt=inference.STT("deepgram/flux-general"),
         tts=inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE),
-        tts_text_transforms=None,
         turn_handling={
             "turn_detection": "stt",
             "endpointing": {"min_delay": 0.0},
