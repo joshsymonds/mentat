@@ -45,7 +45,7 @@ ROOM_POLL_INTERVAL_SECONDS = 0.25
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 DEFAULT_VOICE_MODEL = "chatgpt/sol-fast"
-SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5"})
+SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5", "claude-sonnet-5-5"})
 SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
 )
@@ -932,7 +932,8 @@ def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for call in calls:
             call["speed"] = result_usage.get("speed")
             call["result_service_tier"] = result_usage.get("service_tier")
-            call["fast_mode_state"] = message.get("fast_mode_state")
+            if "fast_mode_state" in message:
+                call["fast_mode_state"] = message["fast_mode_state"]
         turns.append({"model_calls": calls, "phone_tools": tools})
         current = []
     if any(
@@ -962,9 +963,9 @@ def _model_call_provenance(
     model_matches = observed_model == requested_model
     if requested_model == "chatgpt/sol-fast":
         model_matches = model_matches or observed_model == "gpt-6-sol"
-    elif requested_model == "claude-opus-5-5" and isinstance(observed_model, str):
+    elif requested_model in ("claude-opus-5-5", "claude-sonnet-5-5") and isinstance(observed_model, str):
         model_matches = model_matches or re.fullmatch(
-            r"claude-opus-5-5-[0-9]{8}", observed_model
+            rf"{re.escape(requested_model)}-[0-9]{{8}}", observed_model
         ) is not None
     if not isinstance(observed_model, str) or not observed_model:
         failures.append(f"observed model is unproven (requested {requested_model})")
@@ -988,6 +989,20 @@ def _model_call_provenance(
                 f"result usage speed is unproven or nonstandard: {evidence['speed']!r}"
             )
         if evidence["fast_mode_state"] != "off":
+            failures.append(
+                f"fast mode is unproven or enabled: {evidence['fast_mode_state']!r}"
+            )
+    elif requested_model == "claude-sonnet-5-5":
+        if evidence["service_tier"] != "standard":
+            failures.append(
+                f"message_start service tier is unproven or nonstandard: "
+                f"{evidence['service_tier']!r}"
+            )
+        if evidence["speed"] != "standard":
+            failures.append(
+                f"result usage speed is unproven or nonstandard: {evidence['speed']!r}"
+            )
+        if "fast_mode_state" in call and evidence["fast_mode_state"] != "off":
             failures.append(
                 f"fast mode is unproven or enabled: {evidence['fast_mode_state']!r}"
             )

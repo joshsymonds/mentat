@@ -1681,7 +1681,7 @@ class ScenarioObservationTests(unittest.TestCase):
 
         self.assertEqual(observation["turns"][0]["model_calls"], [{
             "id": "m1", "model": "claude-opus-5", "service_tier": None,
-            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+            "speed": None, "result_service_tier": None,
         }])
         self.assertEqual(observation["failure"], capture["failure"])
         product_failures = observation["product_failures"]
@@ -1898,7 +1898,7 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertEqual(observation["turns"][0]["transcript"], "Your timer is set for five minutes.")
         self.assertEqual(observation["turns"][0]["model_calls"], [{
             "id": "m1", "model": "claude-opus-5", "service_tier": None,
-            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+            "speed": None, "result_service_tier": None,
         }])
         self.assertEqual(observation["phone_commands"], [{
             "id": "fake-timer-command",
@@ -3224,7 +3224,7 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertEqual(len(observation["turns"]), 1)
         self.assertEqual(observation["turns"][0]["model_calls"], [{
             "id": "m1", "model": "claude-opus-5", "service_tier": None,
-            "speed": None, "result_service_tier": None, "fast_mode_state": None,
+            "speed": None, "result_service_tier": None,
         }])
         self.assertEqual(observation["phone_commands"][0]["turn"], 1)
         self.assertEqual(observation["room_closed_after"], 1)
@@ -3278,6 +3278,31 @@ class LocalEvalCliTests(unittest.TestCase):
             "result_service_tier": "standard",
             "fast_mode_state": "off",
         }])
+
+    def test_recorded_sonnet_call_does_not_invent_fast_mode_evidence(self):
+        messages = [
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg-sonnet",
+                        "model": "claude-sonnet-5-5",
+                        "usage": {"service_tier": "standard"},
+                    },
+                },
+            },
+            {
+                "type": "result",
+                "usage": {"service_tier": "standard", "speed": "standard"},
+            },
+        ]
+
+        call = runner._recorded_turns(messages)[0]["model_calls"][0]
+        provenance = runner._model_call_provenance(call, "claude-sonnet-5-5")
+
+        self.assertNotIn("fast_mode_state", call)
+        self.assertEqual(provenance["failures"], [])
 
     def test_sol_recorded_shape_proves_service_from_result_usage(self):
         messages = [
@@ -3440,12 +3465,72 @@ class LocalEvalCliTests(unittest.TestCase):
 
 
     def test_requested_model_comes_from_a_safe_configured_arm(self):
-        for model in ("chatgpt/sol-fast", "claude-opus-5-5"):
+        for model in ("chatgpt/sol-fast", "claude-opus-5-5", "claude-sonnet-5-5"):
             with self.subTest(model=model), patch.dict(os.environ, {"MENTAT_VOICE_MODEL": model}):
                 self.assertEqual(runner._requested_voice_model(), model)
-        with patch.dict(os.environ, {"MENTAT_VOICE_MODEL": "claude-opus-5"}):
-            with self.assertRaisesRegex(RuntimeError, "unsupported requested voice model"):
-                runner._requested_voice_model()
+        for model in ("claude-opus-5", "claude-sonnet-5"):
+            with self.subTest(model=model), patch.dict(os.environ, {"MENTAT_VOICE_MODEL": model}):
+                with self.assertRaisesRegex(RuntimeError, "unsupported requested voice model"):
+                    runner._requested_voice_model()
+
+    def test_sonnet_model_provenance_requires_observed_model_and_standard_tier_and_speed(self):
+        requested = "claude-sonnet-5-5"
+        exact = runner._model_call_provenance({
+            "id": "msg-sonnet",
+            "model": requested,
+            "service_tier": "standard",
+            "result_service_tier": "standard",
+            "speed": "standard",
+            "fast_mode_state": "off",
+        }, requested)
+        dated_alias = runner._model_call_provenance({
+            "id": "msg-sonnet-snapshot",
+            "model": "claude-sonnet-5-5-20260915",
+            "service_tier": "standard",
+            "result_service_tier": "standard",
+            "speed": "standard",
+        }, requested)
+        mismatch = runner._model_call_provenance({
+            "id": "msg-other-model",
+            "model": "claude-sonnet-5",
+            "service_tier": "standard",
+            "result_service_tier": "standard",
+            "speed": "standard",
+        }, requested)
+        missing_speed = runner._model_call_provenance({
+            "id": "msg-no-speed",
+            "model": requested,
+            "service_tier": "standard",
+            "result_service_tier": "standard",
+        }, requested)
+        missing_tier = runner._model_call_provenance({
+            "id": "msg-no-tier",
+            "model": requested,
+            "service_tier": "standard",
+            "speed": "standard",
+        }, requested)
+        missing_start_tier = runner._model_call_provenance({
+            "id": "msg-no-start-tier",
+            "model": requested,
+            "result_service_tier": "standard",
+            "speed": "standard",
+        }, requested)
+        fast_mode_on = runner._model_call_provenance({
+            "id": "msg-fast-mode",
+            "model": requested,
+            "service_tier": "standard",
+            "result_service_tier": "standard",
+            "speed": "standard",
+            "fast_mode_state": "on",
+        }, requested)
+
+        self.assertEqual(exact["failures"], [])
+        self.assertEqual(dated_alias["failures"], [])
+        self.assertIn("observed claude-sonnet-5", " ".join(mismatch["failures"]))
+        self.assertIn("speed", " ".join(missing_speed["failures"]))
+        self.assertIn("service tier", " ".join(missing_tier["failures"]))
+        self.assertIn("service tier", " ".join(missing_start_tier["failures"]))
+        self.assertIn("fast mode", " ".join(fast_mode_on["failures"]))
 
     def test_partial_capture_keeps_post_failure_backend_request_provenance(self):
         traces = [{
