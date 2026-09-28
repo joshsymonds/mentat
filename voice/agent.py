@@ -49,6 +49,7 @@ logger = logging.getLogger("mentat.voice")
 
 DEFAULT_MENTAT_URL = "http://127.0.0.1:8484"
 TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_read=600)
+TURN_CONTINUATION_WINDOW = 3.0
 CONSULT_FAILED = "I couldn't complete that request with Mentat. Please try again."
 HERE = Path(__file__).parent
 PERSONA_PATH = HERE / "persona.md"
@@ -194,12 +195,53 @@ class FrontAgent(Agent):
         self._ending_policy = ending_policy
         self._ending_changed = ending_changed
         self._sms_consent = False
+        self._turn_task: asyncio.Task[None] | None = None
+        self._turn_text = ""
+        self._turn_started_at: float | None = None
+        self._closed = False
 
     async def on_user_turn_completed(self, chat_ctx: Any, new_message: Any) -> None:
-        """Ask mentatd for this turn and speak its streamed text verbatim."""
+        """Start backend work immediately, merging only a short continuation."""
         question = str(getattr(new_message, "text_content", "")).strip()
-        if not question:
+        if not question or self._closed:
             return
+        turn_started_at = time.monotonic()
+        task = self._turn_task
+        if task is not None and not task.done():
+            started_at = self._turn_started_at
+            if (
+                started_at is not None
+                and turn_started_at - started_at <= TURN_CONTINUATION_WINDOW
+            ):
+                question = f"{self._turn_text} {question}"
+                turn_started_at = started_at
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self._closed:
+            return
+        self._turn_text = question
+        self._turn_started_at = turn_started_at
+        self._turn_task = asyncio.create_task(self._run_turn(question, chat_ctx))
+
+    async def aclose(self) -> None:
+        """Cancel and drain active backend and speech work before session close."""
+        self._closed = True
+        task = self._turn_task
+        self._turn_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _run_turn(self, question: str, chat_ctx: Any) -> None:
+        try:
+            await self._speak_turn(question, chat_ctx)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("delegation turn failed")
+
+    async def _speak_turn(self, question: str, chat_ctx: Any) -> None:
+        """Ask mentatd for this turn and speak its streamed text verbatim."""
         turn_id = uuid4().hex
         self._ending_policy.delegation_started()
         self._ending_changed()
@@ -518,7 +560,11 @@ async def entrypoint(ctx: JobContext) -> None:
     async def _shutdown_job() -> None:
         get_job_context().shutdown()
 
+    agent: FrontAgent | None = None
+
     async def _close_audio() -> None:
+        if agent is not None:
+            await agent.aclose()
         await _close_voice_room_io()
         await background.aclose()
 

@@ -27,7 +27,7 @@ class AgentSourceContractTest(unittest.TestCase):
 
     def test_each_user_turn_streams_backend_text_directly_to_speech(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
-        completed = source.split("    async def on_user_turn_completed(", 1)[1].split(
+        completed = source.split("    async def _speak_turn(", 1)[1].split(
             "\n\ndef log_turn_metrics", 1
         )[0]
         self.assertIn("self._backend_text(", completed)
@@ -37,6 +37,10 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertIn("handle.interrupted", completed)
         self.assertIn("handle.exception()", completed)
         self.assertIn("await backend_text.aclose()", completed)
+        dispatch = source.split("    async def on_user_turn_completed(", 1)[1].split(
+            "    async def aclose(", 1
+        )[0]
+        self.assertIn("asyncio.create_task(self._run_turn(question, chat_ctx))", dispatch)
         backend = source.split("    async def _backend_text(", 1)[1].split(
             "\n\ndef log_turn_metrics", 1
         )[0]
@@ -632,6 +636,284 @@ class AgentSourceContractTest(unittest.TestCase):
                 self.assertEqual(asyncio.run(collect()), expected)
                 policy.turn_done.assert_not_called()
 
+    def test_lone_turn_starts_backend_without_waiting_for_a_coalesce_window(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FrontAgent")
+        methods = [node for node in front_agent.body if isinstance(node, ast.AsyncFunctionDef) and node.name in {"on_user_turn_completed", "aclose"}]
+        method = methods[0]
+        self.assertIn("self._run_turn(", ast.unparse(method))
+        started = asyncio.Event()
+
+        async def run_turn(question, _chat_ctx):
+            self.assertEqual(question, "Tell me now")
+            started.set()
+            await asyncio.Event().wait()
+
+        namespace = {"asyncio": asyncio, "time": time, "uuid4": lambda: SimpleNamespace(hex="turn-id")}
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _closed=False,
+            _turn_task=None,
+            _turn_text="",
+            _turn_started_at=None,
+            _run_turn=run_turn,
+        )
+
+        async def submit_lone_turn():
+            await namespace["on_user_turn_completed"](
+                agent, SimpleNamespace(items=[]), SimpleNamespace(text_content="Tell me now")
+            )
+            await asyncio.wait_for(started.wait(), timeout=0.1)
+            self.assertFalse(agent._turn_task.done())
+            await namespace["aclose"](agent)
+
+        asyncio.run(submit_lone_turn())
+
+    def test_continuation_cancels_active_turn_and_reposts_combined_transcript(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FrontAgent")
+        methods = [node for node in front_agent.body if isinstance(node, ast.AsyncFunctionDef) and node.name in {"on_user_turn_completed", "aclose"}]
+        method = methods[0]
+        self.assertIn("self._run_turn(", ast.unparse(method))
+        started = [asyncio.Event() for _ in range(3)]
+        posted = []
+        now = [100.0]
+
+        async def run_turn(question, _chat_ctx):
+            posted.append(question)
+            started[len(posted) - 1].set()
+            await asyncio.Event().wait()
+
+        namespace = {"asyncio": asyncio, "time": SimpleNamespace(monotonic=lambda: now[0]), "uuid4": lambda: SimpleNamespace(hex="turn-id"), "TURN_CONTINUATION_WINDOW": 3.0}
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _closed=False,
+            _turn_task=None,
+            _turn_text="",
+            _turn_started_at=None,
+            _run_turn=run_turn,
+        )
+
+        async def submit_continuation():
+            chat_ctx = SimpleNamespace(items=[])
+            await namespace["on_user_turn_completed"](agent, chat_ctx, SimpleNamespace(text_content="Text this number"))
+            first_started_at = agent._turn_started_at
+            await asyncio.wait_for(started[0].wait(), timeout=1)
+            now[0] = 102.9
+            await namespace["on_user_turn_completed"](agent, chat_ctx, SimpleNamespace(text_content="I will be there at six"))
+            self.assertEqual(agent._turn_started_at, first_started_at)
+            await asyncio.wait_for(started[1].wait(), timeout=1)
+            now[0] = 103.1
+            await namespace["on_user_turn_completed"](agent, chat_ctx, SimpleNamespace(text_content="A separate new request"))
+            await asyncio.wait_for(started[2].wait(), timeout=1)
+            await namespace["aclose"](agent)
+
+        asyncio.run(submit_continuation())
+        self.assertEqual(
+            posted,
+            [
+                "Text this number",
+                "Text this number I will be there at six",
+                "A separate new request",
+            ],
+        )
+
+    def test_continuation_closes_backend_and_interrupts_provisional_speech(self):
+        from collections.abc import AsyncGenerator
+        from types import MethodType
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        methods = [
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name in {"on_user_turn_completed", "aclose", "_run_turn", "_speak_turn"}
+        ]
+        now = [100.0]
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "time": SimpleNamespace(monotonic=lambda: now[0]),
+            "TURN_CONTINUATION_WINDOW": 3.0,
+            "uuid4": lambda: SimpleNamespace(hex="turn-id"),
+            "AudioConfig": lambda *_args, **_kwargs: object(),
+            "EARCON_PATH": Path("earcon.wav"),
+            "logger": Mock(),
+        }
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+
+        async def exercise():
+            posted = []
+            spoken = []
+            handles = []
+            first_post = asyncio.Event()
+            first_speech = asyncio.Event()
+            first_closed = asyncio.Event()
+            hold_backend = asyncio.Event()
+            hold_playout = asyncio.Event()
+
+            async def backend_text(question, _turn_id, _chat_ctx):
+                posted.append(question)
+                if len(posted) == 1:
+                    first_post.set()
+                    try:
+                        yield "Provisional answer."
+                        await hold_backend.wait()
+                    finally:
+                        first_closed.set()
+                else:
+                    yield "Combined answer."
+
+            class SpeechHandle:
+                def __init__(self, task):
+                    self.task = task
+                    self.interrupted = False
+
+                async def wait_for_playout(self):
+                    await self.task
+
+                def interrupt(self):
+                    self.interrupted = True
+                    self.task.cancel()
+
+                def exception(self):
+                    return None
+
+            class Session:
+                def say(self, source, *, allow_interruptions):
+                    assert allow_interruptions
+                    provisional = not handles
+
+                    async def capture():
+                        async for text in source:
+                            if provisional:
+                                first_speech.set()
+                                await hold_playout.wait()
+                            spoken.append(text)
+
+                    handle = SpeechHandle(asyncio.create_task(capture()))
+                    handles.append(handle)
+                    return handle
+
+            agent = SimpleNamespace(
+                _closed=False,
+                _turn_task=None,
+                _turn_text="",
+                _turn_started_at=None,
+                _ending_policy=SimpleNamespace(delegation_started=Mock()),
+                _ending_changed=Mock(),
+                _background=SimpleNamespace(play=Mock()),
+                _backend_text=backend_text,
+                session=Session(),
+            )
+            agent._speak_turn = MethodType(namespace["_speak_turn"], agent)
+            agent._run_turn = MethodType(namespace["_run_turn"], agent)
+            callback = MethodType(namespace["on_user_turn_completed"], agent)
+            chat_ctx = SimpleNamespace(items=[])
+            await callback(chat_ctx, SimpleNamespace(text_content="Text this number"))
+            await asyncio.wait_for(first_post.wait(), timeout=1)
+            await asyncio.wait_for(first_speech.wait(), timeout=1)
+            now[0] = 102.0
+            await callback(chat_ctx, SimpleNamespace(text_content="I will be there at six"))
+            await asyncio.wait_for(agent._turn_task, timeout=1)
+            await namespace["aclose"](agent)
+            return posted, spoken, handles, first_closed.is_set()
+
+        posted, spoken, handles, first_closed = asyncio.run(exercise())
+        self.assertEqual(posted, ["Text this number", "Text this number I will be there at six"])
+        self.assertTrue(first_closed)
+        self.assertEqual(len(handles), 2)
+        self.assertTrue(handles[0].interrupted)
+        self.assertNotIn("Provisional answer.", spoken)
+        self.assertIn("Combined answer.", spoken)
+        self.assertFalse(handles[1].interrupted)
+
+    def test_late_barge_in_cancels_without_reusing_the_old_transcript(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FrontAgent")
+        method = next(node for node in front_agent.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "on_user_turn_completed")
+        self.assertIn("self._run_turn(", ast.unparse(method))
+        started = asyncio.Event()
+        posted = []
+
+        async def run_turn(question, _chat_ctx):
+            posted.append(question)
+            if len(posted) == 1:
+                started.set()
+                await asyncio.Event().wait()
+
+        namespace = {"asyncio": asyncio, "time": time, "uuid4": lambda: SimpleNamespace(hex="turn-id"), "TURN_CONTINUATION_WINDOW": 3.0}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _closed=False,
+            _turn_task=None,
+            _turn_text="",
+            _turn_started_at=time.monotonic() - 4,
+            _run_turn=run_turn,
+        )
+
+        async def submit_late_barge_in():
+            chat_ctx = SimpleNamespace(items=[])
+            await namespace["on_user_turn_completed"](agent, chat_ctx, SimpleNamespace(text_content="Old question"))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            agent._turn_started_at = time.monotonic() - 4
+            await namespace["on_user_turn_completed"](agent, chat_ctx, SimpleNamespace(text_content="New words only"))
+            await asyncio.sleep(0)
+
+        asyncio.run(submit_late_barge_in())
+        self.assertEqual(posted, ["Old question", "New words only"])
+
+    def test_close_cancels_and_drains_detached_turn_and_rejects_later_posts(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        source = agent_path.read_text()
+        close_audio = source.split("    async def _close_audio()", 1)[1].split(
+            "    @session.on(\"close\")", 1
+        )[0]
+        self.assertIn("await agent.aclose()", close_audio)
+        tree = ast.parse(source)
+        front_agent = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FrontAgent")
+        methods = [node for node in front_agent.body if isinstance(node, ast.AsyncFunctionDef) and node.name in {"on_user_turn_completed", "aclose"}]
+        self.assertIn("self._run_turn(", ast.unparse(methods[0]))
+        started = asyncio.Event()
+        drained = asyncio.Event()
+        posted = []
+
+        async def run_turn(question, _chat_ctx):
+            posted.append(question)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                drained.set()
+
+        namespace = {"asyncio": asyncio, "time": time, "uuid4": lambda: SimpleNamespace(hex="turn-id")}
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _closed=False,
+            _turn_task=None,
+            _turn_text="",
+            _turn_started_at=None,
+            _run_turn=run_turn,
+        )
+
+        async def close_during_turn():
+            chat_ctx = SimpleNamespace(items=[])
+            await namespace["on_user_turn_completed"](agent, chat_ctx, SimpleNamespace(text_content="Do not post after close"))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            await namespace["aclose"](agent)
+            await namespace["on_user_turn_completed"](agent, chat_ctx, SimpleNamespace(text_content="Closed already"))
+
+        asyncio.run(close_during_turn())
+        self.assertTrue(drained.is_set())
+        self.assertEqual(posted, ["Do not post after close"])
+
     def test_interrupt_closes_backend_stream_while_next_read_is_pending(self):
         from collections.abc import AsyncGenerator
 
@@ -644,7 +926,7 @@ class AgentSourceContractTest(unittest.TestCase):
         method = next(
             node for node in front_agent.body
             if isinstance(node, ast.AsyncFunctionDef)
-            and node.name == "on_user_turn_completed"
+            and node.name == "_speak_turn"
         )
 
         backend_open = asyncio.Event()
@@ -709,11 +991,7 @@ class AgentSourceContractTest(unittest.TestCase):
 
         async def interrupt_while_backend_open():
             turn = asyncio.create_task(
-                namespace["on_user_turn_completed"](
-                    agent,
-                    SimpleNamespace(items=[]),
-                    SimpleNamespace(text_content="Tell me now"),
-                )
+                namespace["_speak_turn"](agent, "Tell me now", SimpleNamespace(items=[]))
             )
             await asyncio.wait_for(backend_open.wait(), timeout=1)
             await asyncio.wait_for(speech_started.wait(), timeout=1)
@@ -737,7 +1015,7 @@ class AgentSourceContractTest(unittest.TestCase):
         method = next(
             node for node in front_agent.body
             if isinstance(node, ast.AsyncFunctionDef)
-            and node.name == "on_user_turn_completed"
+            and node.name == "_speak_turn"
         )
 
         playout_waiting = asyncio.Event()
@@ -800,11 +1078,7 @@ class AgentSourceContractTest(unittest.TestCase):
 
         async def interrupt_during_flush():
             turn = asyncio.create_task(
-                namespace["on_user_turn_completed"](
-                    agent,
-                    SimpleNamespace(items=[]),
-                    SimpleNamespace(text_content="Tell me now"),
-                )
+                namespace["_speak_turn"](agent, "Tell me now", SimpleNamespace(items=[]))
             )
             await asyncio.wait_for(playout_waiting.wait(), timeout=1)
             session.handle.interrupt()
@@ -828,7 +1102,7 @@ class AgentSourceContractTest(unittest.TestCase):
             node.name: node
             for node in front_agent.body
             if isinstance(node, ast.AsyncFunctionDef)
-            and node.name in {"_backend_text", "on_user_turn_completed"}
+            and node.name in {"_backend_text", "_speak_turn"}
         }
 
         class FakeTurnStart:
@@ -1009,11 +1283,7 @@ class AgentSourceContractTest(unittest.TestCase):
         response = FakeResponse(wire)
 
         asyncio.run(
-            namespace["on_user_turn_completed"](
-                agent,
-                SimpleNamespace(items=[]),
-                SimpleNamespace(text_content="Check the time"),
-            )
+            namespace["_speak_turn"](agent, "Check the time", SimpleNamespace(items=[]))
         )
 
         self.assertEqual(
