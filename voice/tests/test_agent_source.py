@@ -218,6 +218,119 @@ class AgentSourceContractTest(unittest.TestCase):
         ):
             self.assertNotIn(superseded, source)
 
+    def test_sms_intent_and_correction_detection_covers_initial_and_corrected_sayback(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        helpers = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"is_sms_request", "is_sms_followup", "is_sms_decline"}
+        ]
+        self.assertEqual({node.name for node in helpers}, {
+            "is_sms_request", "is_sms_followup", "is_sms_decline"
+        })
+        namespace = {"re": __import__("re")}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), str(agent_path), "exec"), namespace)
+        self.assertTrue(namespace["is_sms_request"]("Text Alex that I'll be there at six"))
+        self.assertTrue(namespace["is_sms_followup"]("Actually, change that to seven"))
+        self.assertTrue(namespace["is_sms_followup"]("Yes, send it"))
+        self.assertTrue(namespace["is_sms_decline"]("No, don't send it"))
+        self.assertFalse(namespace["is_sms_decline"]("No, I meant change that to seven"))
+        self.assertFalse(namespace["is_sms_request"]("What time is it?"))
+        self.assertFalse(namespace["is_sms_request"]("What did you hear in the text from Alex?"))
+        self.assertFalse(namespace["is_sms_request"]("What does the text say?"))
+        self.assertFalse(namespace["is_sms_followup"]("What time is it?"))
+
+    def test_sms_commentary_buffer_withholds_until_send_result_and_appends_atomically(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        buffer_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SmsCommentaryBuffer"
+        )
+        namespace = {"SEND_SMS_TOOL": "mcp__mentat__send_sms"}
+        exec(compile(ast.Module(body=[buffer_class], type_ignores=[]), str(agent_path), "exec"), namespace)
+        appended = []
+        buffer = namespace["SmsCommentaryBuffer"](appended.append)
+        buffer.add("Text to +1 202 555 0142: I'll be there at 6. Should I send it?")
+        self.assertEqual(appended, [])
+        buffer.tool_result("mcp__mentat__send_sms", is_error=False)
+        self.assertEqual(appended, [])
+        buffer.add(" Sent.")
+        buffer.finish()
+        self.assertEqual(
+            appended,
+            ["Text to +1 202 555 0142: I'll be there at 6. Should I send it? Sent."],
+        )
+
+    def test_pending_sms_sayback_is_appended_once_without_a_send_call(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        buffer_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SmsCommentaryBuffer"
+        )
+        namespace = {"SEND_SMS_TOOL": "mcp__mentat__send_sms"}
+        exec(compile(ast.Module(body=[buffer_class], type_ignores=[]), str(agent_path), "exec"), namespace)
+        appended = []
+        buffer = namespace["SmsCommentaryBuffer"](appended.append)
+        buffer.add("Text to +1 202 555 0142: I'll be there at 6. Should I send it?")
+        buffer.add(" Please confirm.")
+        self.assertEqual(appended, [])
+        buffer.finish()
+        buffer.finish()
+        self.assertEqual(
+            appended,
+            ["Text to +1 202 555 0142: I'll be there at 6. Should I send it? Please confirm."],
+        )
+
+    def test_pending_sayback_preserves_common_words_inside_the_message_body(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        buffer_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SmsCommentaryBuffer"
+        )
+        namespace = {"SEND_SMS_TOOL": "mcp__mentat__send_sms"}
+        exec(compile(ast.Module(body=[buffer_class], type_ignores=[]), str(agent_path), "exec"), namespace)
+        appended = []
+        buffer = namespace["SmsCommentaryBuffer"](appended.append)
+        sayback = (
+            "Text to +1 202 555 0142: I sent the report after sending the update. "
+            "Should I send it?"
+        )
+        buffer.add(sayback)
+        buffer.finish()
+        self.assertEqual(appended, [sayback])
+
+    def test_sms_commentary_buffer_discards_success_claim_when_send_fails(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        buffer_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SmsCommentaryBuffer"
+        )
+        namespace = {"SEND_SMS_TOOL": "mcp__mentat__send_sms"}
+        exec(compile(ast.Module(body=[buffer_class], type_ignores=[]), str(agent_path), "exec"), namespace)
+        appended = []
+        buffer = namespace["SmsCommentaryBuffer"](appended.append)
+        buffer.add("Sending it now. Okay, sent.")
+        buffer.tool_result("mcp__mentat__send_sms", is_error=True)
+        buffer.finish()
+        self.assertEqual(appended, [])
+
+    def test_sms_buffering_is_selective_and_keeps_non_sms_chunk_streaming(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        stream_backend = source.split("    async def _stream_backend(", 1)[1].split(
+            "\n\ndef log_turn_metrics", 1
+        )[0]
+        self.assertIn("SmsCommentaryBuffer", stream_backend)
+        self.assertIn("sms_buffer.add(item)", stream_backend)
+        self.assertIn("append_commentary(chunk)", stream_backend)
+        self.assertIn("sms_buffer.finish()", stream_backend)
+        self.assertIn("self._sms_consent and (is_sms_followup(question) or sms_declined)", stream_backend)
+        self.assertIn('item.name == SEND_SMS_TOOL', stream_backend)
+
     def test_each_delegation_logs_exactly_at_first_commentary_append(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         run_delegation = source.split("    async def _run_delegation(", 1)[1].split(

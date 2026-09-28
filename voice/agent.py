@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -56,6 +57,79 @@ CONSULT_FAILED = (
     "Mentat could not be reached, so there is no answer to that question. "
     "Tell Josh briefly and offer to try again."
 )
+SEND_SMS_TOOL = "mcp__mentat__send_sms"
+
+
+def is_sms_request(text: str) -> bool:
+    """Recognize an explicit request to send a text before backend speech starts."""
+    return bool(
+        re.search(r"\b(?:send|sending)\b.{0,60}\b(?:text|sms|message)\b", text, re.I)
+        or re.search(
+            r"^\s*(?:(?:please|can you|could you|would you)\s+)?"
+            r"(?:text|message)\s+(?!from\b|about\b|that\b|is\b|was\b)"
+            r"(?:to\s+)?[\w+][\w.'+-]*",
+            text,
+            re.I,
+        )
+        or re.search(r"\b(?:want|like|need)\s+to\s+(?:text|message)\b", text, re.I)
+    )
+
+
+def is_sms_followup(text: str) -> bool:
+    """Recognize short consent or correction turns for an outstanding text."""
+    return bool(
+        re.search(
+            r"^\s*(?:yes|yeah|yep|sure|okay|ok|send it|go ahead|that's right|correct)\b",
+            text,
+            re.I,
+        )
+        or re.search(
+            r"\b(?:actually|change|correct|edit|replace|revise|update|instead|make it|meant)\b",
+            text,
+            re.I,
+        )
+        or re.search(r"\b(?:wrong|not what i meant)\b", text, re.I)
+    )
+
+
+def is_sms_decline(text: str) -> bool:
+    """Recognize an explicit cancellation of the pending text."""
+    return bool(
+        re.search(r"^\s*(?:no|nope)(?:\s*[.!?]|\s*$)", text, re.I)
+        or re.search(
+            r"^\s*(?:no|nope)\s*,?\s*(?:don't send|do not send|cancel)\b", text, re.I
+        )
+        or re.search(r"\b(?:cancel|never mind|forget it)\b", text, re.I)
+    )
+
+
+class SmsCommentaryBuffer:
+    """Append a complete SMS delegation as one unit, after any send result."""
+
+    def __init__(self, append: Callable[[str], None]) -> None:
+        self._append = append
+        self._parts: list[str] = []
+        self._send_sms_seen = False
+        self._send_sms_succeeded = False
+        self._finished = False
+
+    def add(self, text: str) -> None:
+        self._parts.append(text)
+
+    def tool_result(self, name: str, *, is_error: bool) -> None:
+        if name == SEND_SMS_TOOL:
+            self._send_sms_seen = True
+            self._send_sms_succeeded = not is_error
+
+    def finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if self._send_sms_seen and not self._send_sms_succeeded:
+            return
+        text = "".join(self._parts)
+        if text:
+            self._append(text)
 
 
 def load_persona(path: Path = PERSONA_PATH) -> tuple[str, str]:
@@ -84,6 +158,7 @@ class FrontAgent(Agent):
         self._background = background
         self._ending_policy = ending_policy
         self._ending_changed = ending_changed
+        self._sms_consent = False
         self._delegations = DelegationRunner(self._run_delegation, self._on_delegation_error)
 
     async def on_enter(self) -> None:
@@ -150,14 +225,27 @@ class FrontAgent(Agent):
         *,
         append_commentary: Callable[[str], None],
     ) -> None:
+        question = delegation.pending_transcript
+        sms_mode = is_sms_request(question)
+        sms_declined = self._sms_consent and is_sms_decline(question)
+        if self._sms_consent and (is_sms_followup(question) or sms_declined):
+            sms_mode = True
+        elif self._sms_consent and not sms_mode:
+            self._sms_consent = False
+        if is_sms_request(question):
+            self._sms_consent = True
+        if sms_declined:
+            self._sms_consent = False
+
         envelope = consult_envelope(
             self._voice_card,
             summary="",
             last_turns=recent_turns(self.chat_ctx.items),
-            question=delegation.pending_transcript,
+            question=question,
         )
         turn = TurnStream()
         chunker = CommentaryChunker()
+        sms_buffer = SmsCommentaryBuffer(append_commentary) if sms_mode else None
         saw_text = False
         end_tool_succeeded = False
         async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
@@ -172,9 +260,16 @@ class FrontAgent(Agent):
                     for item in turn.feed(data):
                         if isinstance(item, str):
                             saw_text = True
-                            for chunk in chunker.feed(item):
-                                append_commentary(chunk)
+                            if sms_buffer is not None:
+                                sms_buffer.add(item)
+                            else:
+                                for chunk in chunker.feed(item):
+                                    append_commentary(chunk)
                         elif isinstance(item, ToolResult):
+                            if sms_buffer is not None:
+                                sms_buffer.tool_result(item.name, is_error=item.is_error)
+                            if item.name == SEND_SMS_TOOL:
+                                self._sms_consent = False
                             logger.info(
                                 "delegation %s: tool %s%s",
                                 delegation.id,
@@ -188,9 +283,12 @@ class FrontAgent(Agent):
                         elif isinstance(item, TurnFailure):
                             raise TurnError(item.message)
                         elif isinstance(item, TurnDone):
-                            for chunk in chunker.flush():
-                                saw_text = True
-                                append_commentary(chunk)
+                            if sms_buffer is not None:
+                                sms_buffer.finish()
+                            else:
+                                for chunk in chunker.flush():
+                                    saw_text = True
+                                    append_commentary(chunk)
                             done_seen = True
                             break
                     if done_seen:
