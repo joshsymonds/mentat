@@ -247,6 +247,55 @@ describe('buildOptions isolation invariants', () => {
     expect(voiceOptions.settingSources).toEqual([]);
     expect(voiceOptions.skills).toEqual([]);
     expect(voiceOptions.strictMcpConfig).toBe(true);
+    expect(voiceOptions.hooks?.PostToolUse).toHaveLength(1);
+    expect(voiceOptions.hooks?.PostToolUseFailure).toBeUndefined();
+    const postToolUse = voiceOptions.hooks?.PostToolUse?.[0]?.hooks[0];
+    if (postToolUse === undefined) throw new Error('voice end-tool hook not wired');
+    const ended = await postToolUse(
+      {
+        hook_event_name: 'PostToolUse',
+        session_id: 'voice-session',
+        transcript_path: '/fixture/session.jsonl',
+        cwd: '/fixture',
+        tool_name: 'mcp__mentat__end_conversation',
+        tool_input: { reason: 'done' },
+        tool_response: 'Conversation ended (done).',
+        tool_use_id: 'end-tool-use',
+      },
+      undefined,
+      { signal: new AbortController().signal },
+    );
+    expect(ended).toEqual({ continue: false, stopReason: 'Conversation ended.' });
+    const failed = await postToolUse(
+      {
+        hook_event_name: 'PostToolUse',
+        session_id: 'voice-session',
+        transcript_path: '/fixture/session.jsonl',
+        cwd: '/fixture',
+        tool_name: 'mcp__mentat__end_conversation',
+        tool_input: { reason: 'done' },
+        tool_response: { isError: true, content: 'Unable to end conversation.' },
+        tool_use_id: 'failed-end-tool-use',
+      },
+      undefined,
+      { signal: new AbortController().signal },
+    );
+    expect(failed).toEqual({ continue: true });
+    const continued = await postToolUse(
+      {
+        hook_event_name: 'PostToolUse',
+        session_id: 'voice-session',
+        transcript_path: '/fixture/session.jsonl',
+        cwd: '/fixture',
+        tool_name: 'mcp__mentat__set_timer',
+        tool_input: { seconds: 300 },
+        tool_response: 'Timer set for 300 seconds.',
+        tool_use_id: 'timer-tool-use',
+      },
+      undefined,
+      { signal: new AbortController().signal },
+    );
+    expect(continued).toEqual({ continue: true });
     const decision = await voiceOptions.canUseTool?.('tool_x', {}, {
       signal: new AbortController().signal,
       toolUseID: 'tool-use',
@@ -274,6 +323,7 @@ describe('buildOptions isolation invariants', () => {
       );
 
       expect(nonvoiceOptions.env).toEqual(expectedEnv);
+      expect(nonvoiceOptions.hooks).toBeUndefined();
       expect(nonvoiceOptions.mcpServers).toEqual({
         local: { type: 'stdio', command: '/bin/mcp' },
       });
@@ -411,6 +461,57 @@ describe('ClaudeCode turns', () => {
     const events = await collect(await backend.converse({ sessionId: 's1', text: 'hi' }));
     expect(events.some((e) => e.kind === 'textDelta')).toBe(true);
     expect(events.some((e) => e.kind === 'toolStart')).toBe(true);
+    expect(events.at(-1)?.kind).toBe('done');
+    expect(fake.calls).toBe(1);
+  });
+
+  it('replays the recorded two-call timer and end-conversation turn', async () => {
+    const lines = readFileSync('test/fixtures/voice-sol-tool-end.jsonl', 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line) as {
+        type?: string;
+        message?: { content?: { type?: string; name?: string }[] };
+        tool_use_result?: unknown;
+      });
+    const calls = lines.flatMap((line) =>
+      line.type === 'assistant'
+        ? (line.message?.content ?? [])
+            .filter((block) => block.type === 'tool_use')
+            .map((block) => block.name)
+        : [],
+    );
+    expect(calls).toEqual([
+      'mcp__voice_test__set_timer',
+      'mcp__voice_test__end_conversation',
+    ]);
+    const endCallIndex = lines.findIndex((line) =>
+      line.message?.content?.some(
+        (block) => block.type === 'tool_use' && block.name?.endsWith('__end_conversation'),
+      ),
+    );
+    const endResultIndex = lines.findIndex(
+      (line, index) => index > endCallIndex && line.type === 'user' && line.tool_use_result,
+    );
+    expect(endCallIndex).toBeGreaterThanOrEqual(0);
+    expect(endResultIndex).toBeGreaterThan(endCallIndex);
+    expect(lines[endResultIndex]?.tool_use_result).toEqual([
+      { type: 'text', text: 'Conversation ended (done).' },
+    ]);
+    const tail = lines.slice(endResultIndex + 1);
+    expect(tail.map((line) => line.type)).toEqual(['stream_event', 'stream_event', 'result']);
+    expect(tail.some((line) => line.type === 'assistant')).toBe(false);
+
+    const fake = fakeQuery(() => lines);
+    const backend = new ClaudeCode(
+      makeConfig({
+        queryFn: fake.fn,
+        voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
+      }),
+    );
+    const events = await collect(
+      await backend.converse({ sessionId: 'voice-recorded', text: 'set a timer', meta: { surface: 'voice' } }),
+    );
     expect(events.at(-1)?.kind).toBe('done');
     expect(fake.calls).toBe(1);
   });

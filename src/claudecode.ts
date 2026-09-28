@@ -236,6 +236,32 @@ export function buildOptions(
     ...(config.allowedTools !== undefined && { allowedTools: config.allowedTools }),
     ...(config.maxBudgetUsd !== undefined && { maxBudgetUsd: config.maxBudgetUsd }),
     ...(resumeUuid !== undefined && { resume: resumeUuid }),
+    ...(spawnMeta?.surface === 'voice'
+      ? {
+          hooks: {
+            PostToolUse: [
+              {
+                matcher: 'mcp__mentat__end_conversation',
+                hooks: [(input) => {
+                  const isToolError =
+                    input.hook_event_name === 'PostToolUse' &&
+                    typeof input.tool_response === 'object' &&
+                    input.tool_response !== null &&
+                    'isError' in input.tool_response &&
+                    input.tool_response.isError === true;
+                  return Promise.resolve(
+                    input.hook_event_name === 'PostToolUse' &&
+                    input.tool_name === 'mcp__mentat__end_conversation' &&
+                    !isToolError
+                      ? { continue: false, stopReason: 'Conversation ended.' }
+                      : { continue: true },
+                  );
+                }],
+              },
+            ],
+          },
+        }
+      : {}),
     canUseTool: async (toolName, input) => {
       const decision = await config.policy(toolName, input, getContext());
       return decision.behavior === 'allow'
