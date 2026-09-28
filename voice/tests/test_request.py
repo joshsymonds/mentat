@@ -152,9 +152,9 @@ class RequestTest(unittest.TestCase):
             [("user", "earlier"), ("assistant", "answer")],
             "What is on my calendar?",
         )
-        self.assertIn("spoken in its own words", envelope)
+        self.assertNotIn("spoken in its own words", envelope.lower())
         self.assertIn("keep facts, outcomes and uncertainty intact", envelope.lower())
-        self.assertNotIn("verbatim", envelope.lower())
+        self.assertIn("verbatim", envelope.lower())
         self.assertIn("a yes authorizes exactly that message once", envelope.lower())
         self.assertIn("send=true", envelope)
         self.assertIn("say the closing words", envelope.lower())
@@ -162,6 +162,26 @@ class RequestTest(unittest.TestCase):
         self.assertIn("say nothing after", envelope.lower())
         self.assertIn("user: earlier", envelope)
         self.assertIn("Question:\nWhat is on my calendar?", envelope)
+
+    def test_consult_envelope_requires_complete_sms_say_back_before_yes(self):
+        envelope = " ".join(consult_envelope("card", "", [], "Text this number").lower().split())
+        self.assertIn("say the recipient's full phone number with every digit", envelope)
+        self.assertIn("say the exact message verbatim without paraphrasing", envelope)
+        self.assertIn("ask an explicit yes-or-no question", envelope)
+        self.assertIn("wait for a yes in a later turn", envelope)
+
+    def test_consult_envelope_requires_corrected_sms_say_back_and_new_yes(self):
+        envelope = " ".join(consult_envelope("card", "", [], "Change the text").lower().split())
+        self.assertIn("if josh corrects the recipient or message, repeat the full phone number and corrected message verbatim", envelope)
+        self.assertIn("ask an explicit yes-or-no question again", envelope)
+        self.assertIn("the correction voids the previous yes", envelope)
+        self.assertIn("call send_sms with send=true exactly once", envelope)
+
+    def test_consult_envelope_never_claims_sms_delivery_before_success(self):
+        envelope = " ".join(consult_envelope("card", "", [], "Text this number").lower().split())
+        self.assertIn("while waiting for confirmation, do not say or imply that the text is sending, sent, or done", envelope)
+        self.assertIn("only say the text was sent after send_sms returns successfully", envelope)
+        self.assertIn("if send_sms fails, say it was not sent", envelope)
 
     def test_consult_turn_cap_and_persona_split(self):
         self.assertEqual(CONSULT_TURN_CHARS, 1500)

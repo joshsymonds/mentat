@@ -19,12 +19,19 @@ TURN_EFFORT = "low"
 TURN_MODEL = "chatgpt/sol-fast"
 
 CONSULT_FRAMING = (
-    "Your answer is streamed to the voice as it arrives and spoken in its own words. "
+    "Your answer is streamed to the voice as it arrives. "
     "Keep facts, outcomes and uncertainty intact, in concise spoken prose."
 )
 CONSULT_SMS_RULE = (
-    "Before sending a text, state the recipient and the full message and wait for a yes "
-    "in a later turn. A yes authorizes exactly that message once; then call send_sms with send=true."
+    "Before asking for authorization to send a text, say the recipient's full phone number "
+    "with every digit and say the exact message verbatim without paraphrasing; ask an explicit "
+    "yes-or-no question and wait for a yes in a later turn. If Josh corrects the recipient or "
+    "message, repeat the full phone number and corrected message verbatim, ask an explicit "
+    "yes-or-no question again, and wait for a new yes; the correction voids the previous yes. "
+    "A yes authorizes exactly that message once; then call send_sms with send=true exactly once. "
+    "While waiting for confirmation, do not say or imply that the text is sending, sent, or done. "
+    "Only say the text was sent after send_sms returns successfully; if send_sms fails, say it "
+    "was not sent."
 )
 CONSULT_ENDING_RULE = (
     "Has the intent been fulfilled of the conversation? If so, hang up. If plausibly not, stay. "
