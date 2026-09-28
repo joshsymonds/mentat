@@ -11,7 +11,9 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +46,74 @@ REMOTE_OPERATION_DEADLINE_SECONDS = 30.0
 ROOM_POLL_INTERVAL_SECONDS = 0.25
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
+SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
 DEFAULT_VOICE_MODEL = "chatgpt/sol-fast"
+
+
+def _retain_sms_audio(
+    evidence_dir: Path,
+    scenario: str,
+    room_name: str,
+    turn: int,
+    transcript: str,
+    pcm: bytes,
+    sample_rate: int,
+    channels: int,
+) -> None:
+    """Atomically retain one completed SMS turn outside the staged repository."""
+    if scenario not in SMS_AUDIO_SCENARIOS:
+        raise ValueError("audio retention is restricted to the SMS say-back scenarios")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", room_name) is None:
+        raise RuntimeError("SMS audio retention received an invalid room name")
+    if not isinstance(pcm, bytes) or not pcm or len(pcm) % (channels * 2):
+        raise RuntimeError("SMS audio retention received invalid PCM")
+
+    evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+        raise RuntimeError("SMS audio evidence directory is not a private directory")
+    os.chmod(evidence_dir, 0o700)
+    audio_dir = evidence_dir / "sms-audio"
+    audio_dir.mkdir(mode=0o700, exist_ok=True)
+    if audio_dir.is_symlink() or not audio_dir.is_dir():
+        raise RuntimeError("SMS audio evidence directory is not a private directory")
+    os.chmod(audio_dir, 0o700)
+
+    filename = f"{room_name}-turn-{turn:03d}.wav"
+    destination = audio_dir / filename
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=audio_dir, prefix=".audio-", suffix=".tmp", delete=False) as temporary:
+            temporary_name = temporary.name
+        with wave.open(temporary_name, "wb") as output:
+            output.setnchannels(channels)
+            output.setsampwidth(2)
+            output.setframerate(sample_rate)
+            output.writeframes(pcm)
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
+
+    metadata_path = audio_dir / "transcripts.jsonl"
+    metadata = json.dumps({
+        "scenario": scenario,
+        "room": room_name,
+        "turn": turn,
+        "transcript": transcript,
+        "filename": filename,
+    }, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+    descriptor = os.open(
+        metadata_path,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "a", encoding="utf-8") as output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write(metadata)
+        output.flush()
+        os.fsync(output.fileno())
 SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5", "claude-sonnet-5-5"})
 SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
@@ -372,6 +441,8 @@ async def capture_script(
     room_delete_deadline: float = ROOM_DELETE_DEADLINE_SECONDS,
     poll_interval: float = ROOM_POLL_INTERVAL_SECONDS,
     room_close_after: int | None = None,
+    retain_sms_audio_dir: Path | None = None,
+    retain_sms_audio_scenario: str | None = None,
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy."""
     if not raw_steps:
@@ -386,6 +457,10 @@ async def capture_script(
         or not 1 <= room_close_after <= len(raw_steps)
     ):
         raise ValueError("room_close_after must name a scripted turn or be None")
+    if (retain_sms_audio_dir is None) != (retain_sms_audio_scenario is None):
+        raise ValueError("SMS audio retention directory and scenario must be provided together")
+    if retain_sms_audio_scenario is not None and retain_sms_audio_scenario not in SMS_AUDIO_SCENARIOS:
+        raise ValueError("audio retention is restricted to the SMS say-back scenarios")
     steps = [caller.ScriptStep(*caller.parse_step(value)) for value in raw_steps]
 
     api_key = os.environ["LIVEKIT_API_KEY"]
@@ -599,50 +674,63 @@ async def capture_script(
             transcription_deadline = (
                 dependencies.monotonic() + ANSWER_TRANSCRIPTION_DEADLINE_SECONDS
             )
-            transcription_tasks = [
-                asyncio.create_task(
-                    dependencies.transcribe(
-                        dependencies.http, utterance_pcm, sample_rate, channels
+            try:
+                transcription_tasks = [
+                    asyncio.create_task(
+                        dependencies.transcribe(
+                            dependencies.http, utterance_pcm, sample_rate, channels
+                        )
                     )
-                )
-                for _utterance_start, _utterance_end, utterance_pcm in utterances
-            ]
-            remaining = transcription_deadline - dependencies.monotonic()
-            if remaining > 0:
-                done, pending = await asyncio.wait(
-                    transcription_tasks,
-                    timeout=remaining,
-                    return_when=asyncio.ALL_COMPLETED,
-                )
-            else:
-                done, pending = set(), set(transcription_tasks)
-            if pending:
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+                    for _utterance_start, _utterance_end, utterance_pcm in utterances
+                ]
+                remaining = transcription_deadline - dependencies.monotonic()
+                if remaining > 0:
+                    done, pending = await asyncio.wait(
+                        transcription_tasks,
+                        timeout=remaining,
+                        return_when=asyncio.ALL_COMPLETED,
+                    )
+                else:
+                    done, pending = set(), set(transcription_tasks)
+                if pending:
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
 
-            for utterance, task in zip(utterances, transcription_tasks, strict=True):
-                if task not in done:
-                    break
-                utterance_start, utterance_end, _utterance_pcm = utterance
-                utterance_segments = task.result()
-                if not isinstance(utterance_segments, list):
-                    raise RuntimeError("transcription returned invalid segments")
-                raw_segments.extend(utterance_segments)
-                texts = []
-                for segment in utterance_segments:
-                    if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
-                        raise RuntimeError("transcription segment has no text")
-                    text = segment["text"].strip()
+                for utterance, task in zip(utterances, transcription_tasks, strict=True):
+                    if task not in done:
+                        break
+                    utterance_start, utterance_end, _utterance_pcm = utterance
+                    utterance_segments = task.result()
+                    if not isinstance(utterance_segments, list):
+                        raise RuntimeError("transcription returned invalid segments")
+                    raw_segments.extend(utterance_segments)
+                    texts = []
+                    for segment in utterance_segments:
+                        if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+                            raise RuntimeError("transcription segment has no text")
+                        text = segment["text"].strip()
+                        if text:
+                            texts.append(text)
+                    text = " ".join(texts)
                     if text:
-                        texts.append(text)
-                text = " ".join(texts)
-                if text:
-                    segments.append({
-                        "start": utterance_start,
-                        "end": utterance_end,
-                        "text": text,
-                    })
+                        segments.append({
+                            "start": utterance_start,
+                            "end": utterance_end,
+                            "text": text,
+                        })
+            finally:
+                if retain_sms_audio_dir is not None and retain_sms_audio_scenario is not None:
+                    _retain_sms_audio(
+                        retain_sms_audio_dir,
+                        retain_sms_audio_scenario,
+                        room_name,
+                        index + 1,
+                        _trace_text(segments),
+                        answer_pcm,
+                        sample_rate,
+                        channels,
+                    )
             if pending:
                 raise PartialCaptureFailure(
                     traces,
@@ -1498,6 +1586,16 @@ def _voice_token(base_url: str) -> dict[str, Any]:
     return grant
 
 
+def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str]:
+    close_after = getattr(scenario, "room_close_after", None)
+    close_arg = "none" if close_after is None else str(close_after)
+    command = ["evals/runner.py", "--fake-phone", "--room-close-after", close_arg]
+    if getattr(scenario, "name", None) in SMS_AUDIO_SCENARIOS:
+        command.extend(("--retain-sms-audio", scenario.name))
+    command.extend((room, *raw_steps))
+    return command
+
+
 def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     """Run and strictly evaluate one scenario against the isolated DevStack."""
     raw_steps = _scenario_steps(scenario)
@@ -1514,10 +1612,7 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     grant = _voice_token(base_url)
     room = grant["room"]
     stack.start_worker(room)
-    close_arg = "none" if close_after is None else str(close_after)
-    command = [
-        "evals/runner.py", "--fake-phone", "--room-close-after", close_arg, room, *raw_steps
-    ]
+    command = _capture_command(scenario, room, raw_steps)
     try:
         capture = stack.run_voice(
             command,
@@ -1708,7 +1803,12 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
 
 
 async def _run_remote_capture_with_fake_phone(
-    room_name: str, raw_steps: list[str], *, room_close_after: int | None
+    room_name: str,
+    raw_steps: list[str],
+    *,
+    room_close_after: int | None,
+    retain_sms_audio_dir: Path | None = None,
+    retain_sms_audio_scenario: str | None = None,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
     log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
@@ -1729,7 +1829,13 @@ async def _run_remote_capture_with_fake_phone(
         await asyncio.sleep(0.2)
         if process.poll() is not None:
             raise RuntimeError("fake phone process exited before scripted capture")
-        return await run_remote_capture(room_name, raw_steps, room_close_after=room_close_after)
+        return await run_remote_capture(
+            room_name,
+            raw_steps,
+            room_close_after=room_close_after,
+            retain_sms_audio_dir=retain_sms_audio_dir,
+            retain_sms_audio_scenario=retain_sms_audio_scenario,
+        )
     finally:
         if process.poll() is None:
             process.terminate()
@@ -1741,7 +1847,12 @@ async def _run_remote_capture_with_fake_phone(
 
 
 async def run_remote_capture(
-    room_name: str, raw_steps: list[str], *, room_close_after: int | None = None
+    room_name: str,
+    raw_steps: list[str],
+    *,
+    room_close_after: int | None = None,
+    retain_sms_audio_dir: Path | None = None,
+    retain_sms_audio_scenario: str | None = None,
 ) -> list[dict[str, Any]]:
     import aiohttp
 
@@ -1751,6 +1862,8 @@ async def run_remote_capture(
             raw_steps,
             dependencies=_dependencies(http),
             room_close_after=room_close_after,
+            retain_sms_audio_dir=retain_sms_audio_dir,
+            retain_sms_audio_scenario=retain_sms_audio_scenario,
         )
 
 
@@ -1856,10 +1969,31 @@ def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if arguments and arguments[0] == "eval":
         return _run_local_eval(arguments[1:])
+    retain_sms_audio_scenario = None
+    if "--retain-sms-audio" in arguments:
+        flag_index = arguments.index("--retain-sms-audio")
+        if flag_index + 1 >= len(arguments) or arguments.count("--retain-sms-audio") != 1:
+            raise RuntimeError("--retain-sms-audio requires one SMS scenario name")
+        retain_sms_audio_scenario = arguments[flag_index + 1]
+        if retain_sms_audio_scenario not in SMS_AUDIO_SCENARIOS:
+            raise RuntimeError("audio retention is restricted to the SMS say-back scenarios")
+        arguments = arguments[:flag_index] + arguments[flag_index + 2:]
+        evidence_path = os.environ.get("MENTAT_EVAL_RETAINED_EVIDENCE_DIR")
+        if not evidence_path:
+            raise RuntimeError("private retained-evidence directory is unavailable")
+        retain_sms_audio_dir = Path(evidence_path)
+    else:
+        retain_sms_audio_dir = None
     room, steps, room_close_after = _parse_arguments(arguments)
     capture = _run_remote_capture_with_fake_phone if "--fake-phone" in arguments else run_remote_capture
+    capture_options = {"room_close_after": room_close_after}
+    if retain_sms_audio_scenario is not None:
+        capture_options.update({
+            "retain_sms_audio_dir": retain_sms_audio_dir,
+            "retain_sms_audio_scenario": retain_sms_audio_scenario,
+        })
     try:
-        traces = asyncio.run(capture(room, steps, room_close_after=room_close_after))
+        traces = asyncio.run(capture(room, steps, **capture_options))
     except PartialCaptureFailure as error:
         envelope = {"turns": error.turns, "failure": error.failure}
         print(json.dumps(envelope, separators=(",", ":")), flush=True)

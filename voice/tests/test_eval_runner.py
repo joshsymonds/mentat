@@ -582,6 +582,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_asr_deadline_is_named_partial_failure_with_turn_start_and_prefix(self):
         import json
+        import tempfile
+        import wave
 
         dependencies = self.dependencies_for_failure("other")
         levels = [0] * 55
@@ -615,16 +617,32 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         async def speech_end(_source):
             return time.monotonic()
 
-        with (
-            patch.dict(os.environ, TEST_VOICE_ENV),
-            patch.object(runner, "ANSWER_TRANSCRIPTION_DEADLINE_SECONDS", 0.1),
-            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
-        ):
-            with self.assertRaises(runner.PartialCaptureFailure) as caught:
-                await capture_script(
-                    "android-selected-room", ["Question@0::answer"],
-                    dependencies=dependencies, room_close_after=None,
-                )
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_dir = Path(temporary) / "retained-evidence"
+            with (
+                patch.dict(os.environ, TEST_VOICE_ENV),
+                patch.object(runner, "ANSWER_TRANSCRIPTION_DEADLINE_SECONDS", 0.1),
+                patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+            ):
+                with self.assertRaises(runner.PartialCaptureFailure) as caught:
+                    await capture_script(
+                        "android-selected-room", ["Question@0::answer"],
+                        dependencies=dependencies,
+                        room_close_after=None,
+                        retain_sms_audio_dir=evidence_dir,
+                        retain_sms_audio_scenario="sms-say-back-yes",
+                    )
+
+            audio_dir = evidence_dir / "sms-audio"
+            audio_path = audio_dir / "android-selected-room-turn-001.wav"
+            with wave.open(str(audio_path), "rb") as retained:
+                self.assertEqual(retained.getnchannels(), 1)
+                self.assertEqual(retained.getsampwidth(), 2)
+                self.assertEqual(retained.getframerate(), 24000)
+                self.assertEqual(retained.readframes(retained.getnframes()), pcm)
+            metadata = json.loads((audio_dir / "transcripts.jsonl").read_text())
+            self.assertEqual(metadata["filename"], audio_path.name)
+            self.assertEqual(metadata["transcript"], "completed")
 
         self.assertEqual(caught.exception.failure["turn"], 1)
         self.assertEqual(caught.exception.failure["message"], "answer transcription exceeded its deadline")
@@ -1175,6 +1193,185 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(segments=segments), self.assertRaises(RuntimeError):
                 runner._segment_start(segments)
+
+    async def test_sms_audio_retention_writes_complete_wav_and_private_transcript_metadata(self):
+        import json
+        import stat
+        import tempfile
+        import wave
+
+        dependencies = self.dependencies_for_failure("other")
+        pcm = pcm_windows(0, 0, 600, 600, 0, 0, 700, 700, sample_rate=48000, channels=2)
+
+        class StereoCapture:
+            async def start(self):
+                pass
+
+            async def result(self):
+                return pcm, 48000, 2, time.monotonic() + 0.1
+
+        dependencies = CaptureDependencies(
+            **{**dependencies.__dict__, "capture_factory": lambda *_args: StereoCapture()}
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            for scenario, turn_count in (
+                ("sms-say-back-yes", 2),
+                ("sms-correction-new-yes", 3),
+            ):
+                with self.subTest(scenario=scenario):
+                    evidence = Path(temporary) / scenario
+                    steps = [f"SMS line {turn}@0::answer" for turn in range(1, turn_count + 1)]
+                    with (
+                        patch.dict(os.environ, TEST_VOICE_ENV),
+                        patch.object(
+                            runner.caller,
+                            "_speech_end_after_playout",
+                            lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1),
+                        ),
+                    ):
+                        traces = await capture_script(
+                            "android-selected-room",
+                            steps,
+                            dependencies=dependencies,
+                            room_close_after=None,
+                            retain_sms_audio_dir=evidence,
+                            retain_sms_audio_scenario=scenario,
+                        )
+
+                    audio_dir = evidence / "sms-audio"
+                    metadata = audio_dir / "transcripts.jsonl"
+                    self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+                    self.assertEqual(stat.S_IMODE(audio_dir.stat().st_mode), 0o700)
+                    self.assertEqual(stat.S_IMODE(metadata.stat().st_mode), 0o600)
+                    records = [json.loads(line) for line in metadata.read_text().splitlines()]
+                    self.assertEqual(len(records), turn_count)
+                    for turn, (trace, record) in enumerate(zip(traces, records, strict=True), 1):
+                        audio = audio_dir / record["filename"]
+                        self.assertEqual(stat.S_IMODE(audio.stat().st_mode), 0o600)
+                        with wave.open(str(audio), "rb") as retained:
+                            self.assertEqual(retained.getnchannels(), 2)
+                            self.assertEqual(retained.getsampwidth(), 2)
+                            self.assertEqual(retained.getframerate(), 48000)
+                            self.assertEqual(retained.readframes(retained.getnframes()), pcm)
+                        self.assertEqual(record, {
+                            "scenario": scenario,
+                            "room": "android-selected-room",
+                            "turn": turn,
+                            "transcript": trace["transcript"],
+                            "filename": audio.name,
+                        })
+                        self.assertNotIn("audio_filename", trace)
+
+    async def test_sms_audio_survives_transcription_errors_and_empty_or_invalid_results(self):
+        import json
+        import tempfile
+        import wave
+
+        pcm = pcm_windows(0, 0, 600, 600, *([0] * 18))
+        for failure in ("exception", "empty", "invalid"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                dependencies = self.dependencies_for_failure("other")
+
+                async def transcribe(*_args):
+                    if failure == "exception":
+                        raise RuntimeError("transcription unavailable")
+                    if failure == "empty":
+                        return []
+                    return [{"start": 0.1, "end": 0.5}]
+
+                class Capture:
+                    async def start(self):
+                        pass
+
+                    async def result(self):
+                        return pcm, 24000, 1, time.monotonic() + 0.1
+
+                dependencies = CaptureDependencies(
+                    **{
+                        **dependencies.__dict__,
+                        "capture_factory": lambda *_args: Capture(),
+                        "transcribe": transcribe,
+                    }
+                )
+                evidence_dir = Path(temporary) / "retained-evidence"
+                with (
+                    patch.dict(os.environ, TEST_VOICE_ENV),
+                    patch.object(
+                        runner.caller,
+                        "_speech_end_after_playout",
+                        lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1),
+                    ),
+                ):
+                    with self.assertRaises((RuntimeError, runner.PartialCaptureFailure)):
+                        await capture_script(
+                            "android-selected-room",
+                            ["Question@0::answer"],
+                            dependencies=dependencies,
+                            room_close_after=None,
+                            retain_sms_audio_dir=evidence_dir,
+                            retain_sms_audio_scenario="sms-say-back-yes",
+                        )
+
+                audio_dir = evidence_dir / "sms-audio"
+                audio_path = audio_dir / "android-selected-room-turn-001.wav"
+                with wave.open(str(audio_path), "rb") as retained:
+                    self.assertEqual(retained.readframes(retained.getnframes()), pcm)
+                metadata = json.loads((audio_dir / "transcripts.jsonl").read_text())
+                self.assertEqual(metadata["filename"], audio_path.name)
+                self.assertEqual(metadata["transcript"], "")
+
+    async def test_partial_sms_capture_keeps_audio_for_completed_turns(self):
+        import json
+        import tempfile
+
+        dependencies = self.dependencies_for_failure("other")
+        valid_pcm = pcm_windows(0, 0, 600, 600, *([0] * 18))
+
+        class Capture:
+            calls = 0
+
+            async def start(self):
+                pass
+
+            async def result(self):
+                type(self).calls += 1
+                if self.calls == 2:
+                    return pcm_windows(*([0] * 24)), 24000, 1, time.monotonic() + 0.1
+                return valid_pcm, 24000, 1, time.monotonic() + 0.1
+
+        dependencies = CaptureDependencies(
+            **{**dependencies.__dict__, "capture_factory": lambda *_args: Capture()}
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "retained-evidence"
+            with (
+                patch.dict(os.environ, TEST_VOICE_ENV),
+                patch.object(
+                    runner.caller,
+                    "_speech_end_after_playout",
+                    lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1),
+                ),
+            ):
+                with self.assertRaises(runner.PartialCaptureFailure) as caught:
+                    await capture_script(
+                        "android-selected-room",
+                        ["Initial message@0::answer", "Confirmation@0::answer"],
+                        dependencies=dependencies,
+                        room_close_after=None,
+                        retain_sms_audio_dir=evidence,
+                        retain_sms_audio_scenario="sms-say-back-yes",
+                    )
+
+            self.assertEqual(len(caught.exception.turns), 1)
+            audio_dir = evidence / "sms-audio"
+            self.assertEqual(
+                {path.name for path in audio_dir.iterdir()},
+                {"android-selected-room-turn-001.wav", "transcripts.jsonl"},
+            )
+            record = json.loads((audio_dir / "transcripts.jsonl").read_text())
+            self.assertEqual(record["turn"], 1)
+            self.assertEqual(record["transcript"], caught.exception.turns[0]["transcript"])
 
     @staticmethod
     def dependencies_for_failure(failure):
@@ -2692,6 +2889,58 @@ class ScenarioObservationTests(unittest.TestCase):
                 "room-a",
                 [call],
             )
+
+    def test_only_the_two_sms_scenarios_request_private_audio_retention(self):
+        for scenario in SCENARIOS:
+            command = runner._capture_command(scenario, "safe-room", ["Question@0::answer"])
+            if scenario.name in {"sms-say-back-yes", "sms-correction-new-yes"}:
+                with self.subTest(scenario=scenario.name):
+                    self.assertEqual(
+                        command[command.index("--retain-sms-audio") + 1],
+                        scenario.name,
+                    )
+            else:
+                with self.subTest(scenario=scenario.name):
+                    self.assertNotIn("--retain-sms-audio", command)
+
+    def test_cli_passes_private_retention_only_for_named_sms_scenario(self):
+        import io
+        import json
+        import tempfile
+        from contextlib import redirect_stdout
+
+        calls = []
+
+        async def capture(room, steps, **options):
+            calls.append((room, steps, options))
+            return []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = io.StringIO()
+            with (
+                patch.dict(os.environ, {
+                    **TEST_VOICE_ENV,
+                    "MENTAT_EVAL_RETAINED_EVIDENCE_DIR": temporary,
+                }),
+                patch.object(runner, "run_remote_capture", capture),
+                redirect_stdout(output),
+            ):
+                result = runner.main([
+                    "--retain-sms-audio", "sms-say-back-yes",
+                    "android-selected-room", "Question@0::answer",
+                ])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [(
+            "android-selected-room",
+            ["Question@0::answer"],
+            {
+                "room_close_after": 1,
+                "retain_sms_audio_dir": Path(temporary),
+                "retain_sms_audio_scenario": "sms-say-back-yes",
+            },
+        )])
+        self.assertNotIn("filename", json.loads(output.getvalue()))
 
     def test_one_scenario_posts_token_runs_fake_capture_and_observes_turn_evidence(self):
         import http.server

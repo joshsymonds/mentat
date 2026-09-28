@@ -315,6 +315,7 @@ DEV_DIR=$1
 python3 - "$DEV_DIR" <<'PY'
 import os
 import pwd
+import re
 import sys
 import tarfile
 from pathlib import Path
@@ -331,6 +332,15 @@ with tarfile.open(archive, "w:gz") as output:
         for source in sorted(records.glob("*.jsonl")):
             if source.is_file() and not source.is_symlink():
                 output.add(source, arcname=f"records/{source.name}", recursive=False)
+    sms_audio = root / "voice/evals/retained-evidence/sms-audio"
+    if sms_audio.is_dir() and not sms_audio.is_symlink():
+        for source in sorted(sms_audio.iterdir()):
+            allowed = source.name == "transcripts.jsonl" or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3}\.wav",
+                source.name,
+            ) is not None
+            if allowed and source.is_file() and not source.is_symlink():
+                output.add(source, arcname=f"sms-audio/{source.name}", recursive=False)
 os.chmod(archive, 0o600)
 owner = pwd.getpwnam(os.environ["SUDO_USER"])
 os.chown(archive, owner.pw_uid, owner.pw_gid)
@@ -359,6 +369,7 @@ fi
 : > "$DEV_DIR/voice/evals/delegations.jsonl"
 chown nobody:nogroup "$DEV_DIR/voice/evals/delegations.jsonl"
 chmod 600 "$DEV_DIR/voice/evals/delegations.jsonl"
+install -d -o nobody -g nogroup -m 700 "$DEV_DIR/voice/evals/retained-evidence"
 python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" "$ROOM" <<'PY'
 import json
 import subprocess
@@ -442,6 +453,9 @@ voice_env.update({
     "HOME": str(DEV_DIR / "home/voice"),
     "XDG_CACHE_HOME": str(DEV_DIR / "home/voice/cache"),
     "MENTAT_VOICE_HTTP_PORT": HEALTH_PORT,
+    "MENTAT_EVAL_RETAINED_EVIDENCE_DIR": str(
+        DEV_DIR / "voice/evals/retained-evidence"
+    ),
 })
 secret_values = _secret_environment_values(voice_env) + [token]
 result = subprocess.run(
@@ -845,6 +859,14 @@ class DevStack:
                 for member in retained.getmembers():
                     name = member.name
                     allowed = name in {"agent.log", "voice.log", "voice/evals/delegations.jsonl"}
+                    if name == "sms-audio/transcripts.jsonl":
+                        allowed = True
+                    elif name.startswith("sms-audio/"):
+                        filename = name.removeprefix("sms-audio/")
+                        allowed = re.fullmatch(
+                            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3}\.wav",
+                            filename,
+                        ) is not None
                     if name.startswith("records/"):
                         filename = name.removeprefix("records/")
                         allowed = bool(filename) and Path(filename).name == filename and filename.endswith(".jsonl")
@@ -859,6 +881,9 @@ class DevStack:
                     os.chmod(destination, 0o600)
         finally:
             archive.unlink(missing_ok=True)
+        for directory in evidence_dir.rglob("*"):
+            if directory.is_dir() and not directory.is_symlink():
+                os.chmod(directory, 0o700)
 
     def _cleanup(self) -> None:
         try:

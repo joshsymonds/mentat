@@ -1167,9 +1167,19 @@ class DevStackTest(unittest.TestCase):
 
     def test_retained_archive_is_private_and_owned_by_the_scp_user(self):
         self.assertIn('os.environ["SUDO_USER"]', _RETAIN_EVIDENCE_SCRIPT)
+        self.assertIn(
+            'install -d -o nobody -g nogroup -m 700 "$DEV_DIR/voice/evals/retained-evidence"',
+            _START_WORKER_SCRIPT,
+        )
+        self.assertIn('"MENTAT_EVAL_RETAINED_EVIDENCE_DIR"', _RUN_VOICE_SCRIPT)
         with tempfile.TemporaryDirectory() as staging:
             root = Path(staging)
             (root / "agent.log").write_text("synthetic diagnostics\n")
+            sms_audio = root / "voice/evals/retained-evidence/sms-audio"
+            sms_audio.mkdir(parents=True)
+            (sms_audio / "room-turn-001.wav").write_bytes(b"RIFF synthetic wav")
+            (sms_audio / "transcripts.jsonl").write_text('{"transcript":"private"}\\n')
+            (sms_audio / "voice.env.json").write_text("VOICE_TOKEN=synthetic-secret\\n")
             subprocess.run(
                 ["bash", "-s", "--", str(root)],
                 input=_RETAIN_EVIDENCE_SCRIPT,
@@ -1182,7 +1192,10 @@ class DevStackTest(unittest.TestCase):
             self.assertEqual(archive.stat().st_uid, os.getuid())
             self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
             with tarfile.open(archive, "r:gz") as retained:
-                self.assertEqual(retained.getnames(), ["agent.log"])
+                self.assertEqual(
+                    retained.getnames(),
+                    ["agent.log", "sms-audio/room-turn-001.wav", "sms-audio/transcripts.jsonl"],
+                )
 
     def test_cleanup_retains_private_eval_evidence_without_environment_files(self):
         calls = []
@@ -1202,6 +1215,8 @@ class DevStackTest(unittest.TestCase):
                         ("voice.log", "voice diagnostics\\n"),
                         ("records/session.jsonl", "{}\\n"),
                         ("voice/evals/delegations.jsonl", "{}\\n"),
+                        ("sms-audio/room-turn-001.wav", "RIFF synthetic wav"),
+                        ("sms-audio/transcripts.jsonl", '{"turn":1,"transcript":"private"}\\n'),
                         ("voice.env.json", "VOICE_TOKEN=synthetic-secret\\n"),
                     ):
                         path = source / name
@@ -1210,7 +1225,8 @@ class DevStackTest(unittest.TestCase):
                     with tarfile.open(destination, "w:gz") as archive:
                         for name in (
                             "agent.log", "voice.log", "records/session.jsonl",
-                            "voice/evals/delegations.jsonl", "voice.env.json",
+                            "voice/evals/delegations.jsonl", "sms-audio/room-turn-001.wav",
+                            "sms-audio/transcripts.jsonl", "voice.env.json",
                         ):
                             archive.add(source / name, arcname=name)
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -1226,10 +1242,16 @@ class DevStackTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(retained.stat().st_mode), 0o700)
         self.assertEqual(
             {path.relative_to(retained).as_posix() for path in retained.rglob("*") if path.is_file()},
-            {"agent.log", "voice.log", "records/session.jsonl", "voice/evals/delegations.jsonl"},
+            {
+                "agent.log", "voice.log", "records/session.jsonl",
+                "voice/evals/delegations.jsonl", "sms-audio/room-turn-001.wav",
+                "sms-audio/transcripts.jsonl",
+            },
         )
         for path in retained.rglob("*"):
-            if path.is_file():
+            if path.is_dir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+            elif path.is_file():
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertFalse(any(".env" in path.name for path in retained.rglob("*")))
         retained_text = "".join(path.read_text() for path in retained.rglob("*") if path.is_file())
