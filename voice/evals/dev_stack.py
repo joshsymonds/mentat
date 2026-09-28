@@ -163,6 +163,7 @@ _SETUP_SCRIPT = r'''set -euo pipefail
 DEV_DIR=$1
 DEV_PORT=$2
 HEALTH_PORT=$3
+VOICE_MODEL=$4
 
 # Find the running production executables before stopping only the voice worker.
 MENTAT_PID=$(systemctl show mentatd --property=MainPID --value)
@@ -257,8 +258,9 @@ PY
 
 # Start only the candidate daemon; the worker waits for the room from the
 # token returned by this daemon's voice-token endpoint.
-python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<'PY'
+MENTAT_VOICE_MODEL="$VOICE_MODEL" python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<'PY'
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -271,6 +273,7 @@ dev_dir = Path(sys.argv[1])
 dev_port = int(sys.argv[2])
 node_bin = sys.argv[3]
 voice_python = sys.argv[4]
+voice_model = os.environ.get("MENTAT_VOICE_MODEL", "chatgpt/sol-fast")
 setpriv_path = shutil.which("setpriv")
 if setpriv_path is None:
     raise RuntimeError("setpriv executable is unavailable in the setup environment")
@@ -283,6 +286,7 @@ production_listen = source_env.get("MENTAT_LISTEN", "127.0.0.1:8484")
 production_port = int(production_listen.rsplit(":", 1)[1])
 
 env = {key: value for key, value in source_env.items() if key != "OPENAI_API_KEY"}
+env["MENTAT_VOICE_MODEL"] = voice_model
 if "MENTAT_MCP_CONFIG" in env:
     env["MENTAT_MCP_CONFIG"] = rewrite_mcp_config(env["MENTAT_MCP_CONFIG"], production_port, dev_port)
 env.update({
@@ -703,11 +707,13 @@ class DevStack:
         setup_script = _SETUP_SCRIPT.replace("__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE).replace(
             "__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE
         )
+        requested_model = os.environ.get("MENTAT_VOICE_MODEL", "chatgpt/sol-fast")
         self._remote(
             setup_script,
             self._remote_dir,
             str(self.dev_port),
             str(self.health_port),
+            requested_model,
         )
         self._restore_guard_armed = True
         self._tunnel = subprocess.Popen(

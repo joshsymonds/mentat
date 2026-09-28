@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -92,7 +93,7 @@ class DevStackTest(unittest.TestCase):
             if '"MENTAT_LISTEN"' in kwargs.get("input", "")
         )
         self.assertEqual(
-            setup_args[-2:],
+            setup_args[-3:-1],
             [str(selected_ports["dev_port"]), str(selected_ports["health_port"])],
         )
         self.assertIn('"MENTAT_LISTEN": f"127.0.0.1:{dev_port}"', daemon_setup)
@@ -188,6 +189,124 @@ class DevStackTest(unittest.TestCase):
         self.assertIn("systemd-run", setup_script)
         self.assertIn("systemctl stop mentat-voice", worker_script)
         self.assertIn("agent.pid", setup)
+
+    def test_candidate_daemon_uses_requested_model_over_production_environment(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.modeltest\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"dev_port": 49151, "health_port": 49152}), ""
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        requested_model = "claude-opus-5-5"
+        with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
+            with patch.dict(os.environ, {"MENTAT_VOICE_MODEL": requested_model}, clear=False):
+                with DevStack(checkout=CHECKOUT, opt_in=True, run=run):
+                    pass
+
+        setup_args, setup_kwargs = next(
+            (args, kwargs)
+            for args, kwargs in calls
+            if args[:2] == ["ssh", "ultraviolet"]
+            and '"MENTAT_STATE_PATH"' in kwargs.get("input", "")
+        )
+        self.assertEqual(setup_args[-1], requested_model)
+        setup_script = _SETUP_SCRIPT.replace(
+            "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
+        ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
+        setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
+        setup_body = setup_script.split(setup_header + "\n", 1)[1].split("\nPY\n", 1)[0]
+        setup_invocation = next(
+            line for line in setup_script.splitlines()
+            if 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY"' in line
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dev_dir = root / "stage"
+            (dev_dir / "mentat").mkdir(parents=True)
+            production_env = root / "production-mentat.env.json"
+            original_production = {
+                "PATH": "/usr/bin",
+                "MENTAT_VOICE_MODEL": "chatgpt/sol-fast",
+                "CAPTURE_ENV": str(root / "candidate-env.json"),
+            }
+            production_bytes = json.dumps(original_production).encode()
+            production_env.write_bytes(production_bytes)
+            setpriv = root / "setpriv"
+            setpriv.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os\n"
+                "with open(os.environ['CAPTURE_ENV'], 'w') as output:\n"
+                "    json.dump(dict(os.environ), output)\n"
+            )
+            setpriv.chmod(0o755)
+            setup_assignments = "\n".join(
+                line for line in setup_script.splitlines()[:6]
+                if line.startswith(("DEV_DIR=", "DEV_PORT=", "HEALTH_PORT=", "VOICE_MODEL="))
+            )
+            setup_shell = (
+                "set -euo pipefail\n"
+                + setup_assignments
+                + "\nNODE_BIN=/nix/bin/node\nVOICE_PY=/nix/bin/python\n"
+                + setup_invocation + "\n" + setup_body + "\nPY\n"
+            )
+
+            def run_candidate(model):
+                (dev_dir / "mentat.env.json").write_bytes(production_env.read_bytes())
+                captured_env = Path(original_production["CAPTURE_ENV"])
+                captured_env.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [
+                        "bash", "-c", setup_shell, "setup",
+                        str(dev_dir), "49151", "49152", model,
+                    ],
+                    env={
+                        **os.environ,
+                        "PATH": f"{root}:{os.environ['PATH']}",
+                        "MENTAT_VOICE_MODEL": "chatgpt/sol-fast",
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for _ in range(100):
+                    if captured_env.exists():
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(captured_env.is_file(), "candidate process did not capture its environment")
+                return json.loads(captured_env.read_text())
+
+            candidate_env = run_candidate(requested_model)
+            self.assertEqual(candidate_env["MENTAT_VOICE_MODEL"], requested_model)
+            self.assertEqual(production_env.read_bytes(), production_bytes)
+            self.assertEqual(json.loads(production_env.read_text()), original_production)
+
+            candidate_env = run_candidate("chatgpt/sol-fast")
+            self.assertEqual(candidate_env["MENTAT_VOICE_MODEL"], "chatgpt/sol-fast")
+            self.assertEqual(production_env.read_bytes(), production_bytes)
+
+        default_model = "chatgpt/sol-fast"
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MENTAT_VOICE_MODEL", None)
+            with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
+                with DevStack(checkout=CHECKOUT, opt_in=True, run=run):
+                    pass
+        default_setup_args, _ = next(
+            (args, kwargs)
+            for args, kwargs in reversed(calls)
+            if args[:2] == ["ssh", "ultraviolet"]
+            and '"MENTAT_STATE_PATH"' in kwargs.get("input", "")
+        )
+        self.assertEqual(default_setup_args[-1], default_model)
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_controlmaster_handoff_does_not_abort_a_live_forward(self, popen):
