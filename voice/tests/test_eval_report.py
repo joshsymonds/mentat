@@ -20,6 +20,8 @@ def turn(start=0.0, first_audio=2.0, confirmation=2.5, room_deleted=5.0, calls=N
         "speech_end": start,
         "speech_end_wall": start,
         "first_audio": first_audio,
+        "capture_started": start + 0.5,
+        "segments": [{"start": 1.0, "end": 1.2, "text": "assistant response"}],
         "command_received_at": first_audio,
         "answer_at": first_audio,
         "overlap": False,
@@ -125,6 +127,7 @@ class ScoringTests(unittest.TestCase):
             "command_receipt": 12.0,
             "answer": 2.0,
             "first_audio": 2.0,
+            "first_speech": 1.5,
             "confirmation": None,
             "room_deleted": None,
         })
@@ -226,6 +229,7 @@ class ScoringTests(unittest.TestCase):
             "command_receipt": 2.0,
             "answer": 2.0,
             "first_audio": 2.0,
+            "first_speech": 1.5,
             "confirmation": 2.5,
             "room_deleted": 5.0,
         })
@@ -428,6 +432,7 @@ class ScoringTests(unittest.TestCase):
         failures = " ".join(result["failures"])
         self.assertIn("send message run 1 turn 2", failures)
         self.assertIn("answer transcription exceeded its deadline", failures)
+        self.assertIn("first-speech evidence missing capture_started timestamp", failures)
         self.assertIn("send message run 1 turn 1", failures)
         self.assertIn("missing answer pattern 'Alice Keck Park'", failures)
         self.assertEqual(report["turns"][0]["model_call_count"], 1)
@@ -756,6 +761,8 @@ class ScoringTests(unittest.TestCase):
         turn_without_end = {
             "speech_end": 0.0,
             "first_audio": 2.0,
+            "capture_started": 0.5,
+            "segments": [{"start": 1.0, "end": 1.2, "text": "assistant response"}],
             "command_received_at": None,
             "answer_at": 2.0,
             "overlap": False,
@@ -811,6 +818,64 @@ class ScoringTests(unittest.TestCase):
         turn_report = result["cases"][0]["turns"][0]
         self.assertEqual(turn_report["latency_seconds"]["first_audio"], -0.5)
         self.assertEqual(result["cases"][0]["gates"][0]["command_receipt_p50_seconds"], 2.0)
+
+    def test_first_speech_gate_uses_first_nonempty_segment_after_capture_started(self):
+        observation = {"cases": [case()]}
+        expected_latency = 1.75
+        for run in observation["cases"][0]["runs"]:
+            scored_turn = run["turns"][0]
+            scored_turn["first_audio"] = scored_turn["speech_end"] + 0.1
+            scored_turn["capture_started"] = scored_turn["speech_end"] + 0.25
+            scored_turn["segments"] = [
+                {"start": 0.1, "end": 0.2, "text": "  "},
+                {"start": 1.5, "end": 1.8, "text": "First transcribed response."},
+                {"start": 2.0, "end": 2.2, "text": "Later response."},
+            ]
+
+        result = score_observations(observation)
+
+        self.assertTrue(result["passed"], result["failures"])
+        self.assertEqual(
+            result["cases"][0]["turns"][0]["latency_seconds"]["first_audio"],
+            0.1,
+        )
+        self.assertEqual(
+            result["cases"][0]["turns"][0]["latency_seconds"]["first_speech"],
+            expected_latency,
+        )
+        self.assertEqual(
+            result["cases"][0]["gates"][0]["first_speech_p50_seconds"],
+            expected_latency,
+        )
+
+    def test_first_speech_p50_over_two_seconds_fails(self):
+        observation = {"cases": [case()]}
+        for run in observation["cases"][0]["runs"]:
+            run["turns"][0]["capture_started"] = 0.0
+            run["turns"][0]["segments"] = [
+                {"start": 2.01, "end": 2.2, "text": "Late response."},
+            ]
+
+        result = score_observations(observation)
+
+        self.assertFalse(result["passed"])
+        self.assertIn("first-speech p50 2.01s", " ".join(result["failures"]))
+
+    def test_missing_first_speech_evidence_fails_closed(self):
+        for missing in ("segments", "capture_started"):
+            with self.subTest(missing=missing):
+                observation = {"cases": [case()]}
+                for run in observation["cases"][0]["runs"]:
+                    del run["turns"][0][missing]
+
+                result = score_observations(observation)
+
+                self.assertFalse(result["passed"])
+                self.assertIn("first-speech", " ".join(result["failures"]))
+                case_report = result["cases"][0]
+                self.assertEqual(len(case_report["turns"]), 10)
+                self.assertEqual(case_report["gates"][0]["command_receipt_p50_seconds"], 2.0)
+                self.assertIsNone(case_report["gates"][0]["first_speech_p50_seconds"])
 
     def test_missing_or_invalid_timestamps_fail_closed(self):
         for invalid in (None, float("nan"), -1):

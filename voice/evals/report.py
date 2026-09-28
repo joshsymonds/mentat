@@ -12,6 +12,7 @@ from typing import Any
 ACTION_P50_LIMIT_SECONDS = 3.5
 ACTION_P95_LIMIT_SECONDS = 5.0
 SEARCH_P50_LIMIT_SECONDS = 10.0
+FIRST_SPEECH_P50_LIMIT_SECONDS = 2.0
 CONFIRMATION_DEADLINE_SECONDS = 30.0
 HANGUP_DEADLINE_SECONDS = 60.0
 RUNS_REQUIRED = 10
@@ -171,6 +172,33 @@ def _score_turn(
         if command_latency < 0:
             problems.append(f"{label}: command receipt precedes speech_end_wall")
     first_audio_latency = first_audio - speech_end
+    first_speech_latency = None
+    capture_started = None
+    segments = None
+    if "capture_started" not in turn:
+        problems.append(f"{label}: missing first-speech capture_started timestamp")
+    else:
+        try:
+            capture_started = _timestamp(turn, "capture_started")
+        except ValueError as error:
+            problems.append(f"{label}: invalid first-speech capture_started timestamp: {error}")
+    if "segments" not in turn:
+        problems.append(f"{label}: missing first-speech transcript segments")
+    else:
+        try:
+            segments = _transcript_segments(turn["segments"])
+        except ValueError as error:
+            problems.append(f"{label}: invalid first-speech transcript segments: {error}")
+    if capture_started is not None and segments is not None:
+        first_speech = min(
+            (segment for segment in segments if segment["text"].strip()),
+            key=lambda segment: segment["start"],
+            default=None,
+        )
+        if first_speech is None:
+            problems.append(f"{label}: missing non-empty first-speech transcript segment")
+        else:
+            first_speech_latency = capture_started + first_speech["start"] - speech_end
     report = {
         "run": run_index + 1,
         "turn": turn_index + 1,
@@ -181,6 +209,7 @@ def _score_turn(
             "command_receipt": command_latency,
             "answer": answer_latency,
             "first_audio": first_audio_latency,
+            "first_speech": first_speech_latency,
             "confirmation": (
                 None if event_times["confirmation"] is None
                 else event_times["confirmation"] - speech_end
@@ -323,6 +352,17 @@ def score_observations(
                     f"{name} run {run_index + 1} turn {failure['turn']}: "
                     f"capture failed: {failure['message']}"
                 )
+                if failure.get("message") in {
+                    NO_ANSWER_FAILURE,
+                    "answer transcription exceeded its deadline",
+                }:
+                    missing_evidence = ["capture_started timestamp"]
+                    if not failure.get("segments"):
+                        missing_evidence.append("transcript segments")
+                    case_failures.append(
+                        f"{name} run {run_index + 1} turn {failure['turn']}: "
+                        "first-speech evidence missing " + " and ".join(missing_evidence)
+                    )
                 capture_failure = {
                     "run": run_index + 1,
                     "turn": failure["turn"],
@@ -444,6 +484,17 @@ def score_observations(
             p50 = nearest_rank(latencies, 0.50) if latencies else None
             p95 = nearest_rank(latencies, 0.95) if latencies else None
             audio_latencies = [turn["latency_seconds"]["first_audio"] for turn in turn_reports]
+            first_speech_latencies = [
+                turn["latency_seconds"]["first_speech"]
+                for turn in turn_reports
+                if isinstance(turn["latency_seconds"]["first_speech"], (int, float))
+                and not isinstance(turn["latency_seconds"]["first_speech"], bool)
+            ]
+            first_speech_p50 = (
+                nearest_rank(first_speech_latencies, 0.50)
+                if first_speech_latencies
+                else None
+            )
             gate = {
                 "turn": turn_index,
                 "kind": kind,
@@ -452,8 +503,17 @@ def score_observations(
                 f"{metric}_p95_seconds": p95,
                 "first_audio_p50_seconds": nearest_rank(audio_latencies, 0.50),
                 "first_audio_p95_seconds": nearest_rank(audio_latencies, 0.95),
+                "first_speech_p50_seconds": first_speech_p50,
             }
             gates.append(gate)
+            if (
+                first_speech_p50 is not None
+                and first_speech_p50 > FIRST_SPEECH_P50_LIMIT_SECONDS
+            ):
+                case_failures.append(
+                    f"{name} turn {turn_index}: first-speech p50 {first_speech_p50:g}s "
+                    f"exceeds {FIRST_SPEECH_P50_LIMIT_SECONDS:g}s"
+                )
             if kind == "action":
                 if p50 is not None and p50 > ACTION_P50_LIMIT_SECONDS:
                     case_failures.append(
