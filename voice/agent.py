@@ -123,6 +123,7 @@ class SmsCommentaryBuffer:
             return
         self._finished = True
         if self._send_sms_seen and not self._send_sms_succeeded:
+            self._append("I couldn't send that text. Please try again.")
             return
         text = "".join(self._parts)
         if text:

@@ -317,7 +317,7 @@ class AgentSourceContractTest(unittest.TestCase):
         buffer.finish()
         self.assertEqual(appended, [sayback])
 
-    def test_sms_commentary_buffer_discards_success_claim_when_send_fails(self):
+    def test_sms_commentary_buffer_reports_failed_send_truthfully_and_idempotently(self):
         agent_path = Path(__file__).resolve().parents[1] / "agent.py"
         tree = ast.parse(agent_path.read_text())
         buffer_class = next(
@@ -331,7 +331,9 @@ class AgentSourceContractTest(unittest.TestCase):
         buffer.add("Sending it now. Okay, sent.")
         buffer.tool_result("mcp__mentat__send_sms", is_error=True)
         buffer.finish()
-        self.assertEqual(appended, [])
+        buffer.finish()
+        self.assertEqual(appended, ["I couldn't send that text. Please try again."])
+        self.assertNotIn("sent", appended[0].lower())
 
     def test_sms_buffering_keeps_send_sayback_atomic_and_other_text_streaming(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
