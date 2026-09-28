@@ -18,6 +18,7 @@ RUNS_REQUIRED = 10
 EXPECTED_MODELS = {
     "sol": "chatgpt/sol-fast",
     "opus": "claude-opus-5-5",
+    "sonnet": "claude-sonnet-5-5",
 }
 SCENARIO_TURN_COUNTS = {scenario.name: len(scenario.turns) for scenario in SCENARIOS}
 
@@ -56,11 +57,11 @@ def _string_failures(value: Any, label: str) -> list[str]:
 def _model_matches(requested_model: str, observed_model: Any) -> bool:
     if requested_model == "chatgpt/sol-fast":
         return observed_model in (requested_model, "gpt-6-sol")
-    if requested_model == "claude-opus-5-5":
+    if requested_model in ("claude-opus-5-5", "claude-sonnet-5-5"):
         return (
             observed_model == requested_model
             or isinstance(observed_model, str)
-            and re.fullmatch(r"claude-opus-5-5-[0-9]{8}", observed_model) is not None
+            and re.fullmatch(re.escape(requested_model) + r"-[0-9]{8}", observed_model) is not None
         )
     return False
 
@@ -72,8 +73,10 @@ def _model_call_failures(call: Any, requested_model: str, label: str) -> list[st
     failures: list[str] = []
     required_fields = {
         "id", "requested_model", "observed_model", "service_tier",
-        "result_service_tier", "speed", "fast_mode_state", "failures",
+        "result_service_tier", "speed", "failures",
     }
+    if requested_model != "claude-sonnet-5-5":
+        required_fields.add("fast_mode_state")
     if not required_fields.issubset(call):
         failures.append(f"{label}: model-call provenance is incomplete")
     if not isinstance(call.get("id"), str) or not call["id"]:
@@ -85,13 +88,18 @@ def _model_call_failures(call: Any, requested_model: str, label: str) -> list[st
     if call.get("result_service_tier") != "standard":
         failures.append(f"{label}: result service tier is unproven or nonstandard")
 
-    if requested_model == "claude-opus-5-5":
+    if requested_model in ("claude-opus-5-5", "claude-sonnet-5-5"):
         if call.get("service_tier") != "standard":
             failures.append(f"{label}: message service tier is unproven or nonstandard")
         if call.get("speed") != "standard":
             failures.append(f"{label}: speed is unproven or nonstandard")
-        if call.get("fast_mode_state") != "off":
+        if requested_model == "claude-opus-5-5" and call.get("fast_mode_state") != "off":
             failures.append(f"{label}: fast mode is unproven or enabled")
+        if (
+            requested_model == "claude-sonnet-5-5"
+            and call.get("fast_mode_state") not in (None, "off")
+        ):
+            failures.append(f"{label}: fast mode is enabled")
     elif call.get("service_tier") not in (None, "standard"):
         failures.append(f"{label}: message service tier is nonstandard")
 
@@ -367,20 +375,41 @@ def _score_candidate(report: Any, candidate: str) -> tuple[dict[str, Any], set[t
     return result, action_signatures
 
 
-def compare_reports(sol_report: Any, opus_report: Any) -> dict[str, Any]:
-    """Compare score reports and choose a deployment candidate only if eligible."""
-    sol, sol_signatures = _score_candidate(sol_report, "sol")
-    opus, opus_signatures = _score_candidate(opus_report, "opus")
-    if sol["eligible"] and opus["eligible"] and sol_signatures != opus_signatures:
-        raise ValueError("Sol and Opus reports do not contain the same action cases and turns")
+def compare_reports(
+    sol_report: Any, opus_report: Any, sonnet_report: Any | None = None
+) -> dict[str, Any]:
+    """Compare two or three scored reports and select an eligible winner."""
+    scored = {
+        "sol": _score_candidate(sol_report, "sol"),
+        "opus": _score_candidate(opus_report, "opus"),
+    }
+    if sonnet_report is not None:
+        scored["sonnet"] = _score_candidate(sonnet_report, "sonnet")
 
-    candidates = {"sol": sol, "opus": opus}
-    eligible = [name for name, candidate in candidates.items() if candidate["eligible"]]
+    eligible_signatures = [
+        (name, signatures)
+        for name, (candidate, signatures) in scored.items()
+        if candidate["eligible"]
+    ]
+    if eligible_signatures:
+        expected_signatures = eligible_signatures[0][1]
+        for name, signatures in eligible_signatures[1:]:
+            if signatures != expected_signatures:
+                first_name = eligible_signatures[0][0]
+                raise ValueError(
+                    f"{first_name.title()} and {name.title()} reports do not contain "
+                    "the same action cases and turns"
+                )
+
+    candidates = {name: result[0] for name, result in scored.items()}
+    eligible = [
+        name for name, candidate in candidates.items() if candidate["eligible"]
+    ]
     if not eligible:
         return {
             "winner": None,
             "decision": "no_eligible_candidate",
-            "message": "No winner can be deployed because neither candidate is eligible.",
+            "message": "No winner can be deployed because no candidate is eligible.",
             "candidates": candidates,
         }
     if len(eligible) == 1:
@@ -392,34 +421,51 @@ def compare_reports(sol_report: Any, opus_report: Any) -> dict[str, Any]:
             "candidates": candidates,
         }
 
-    sol_p50 = sol["action_receipt_p50_seconds"]
-    opus_p50 = opus["action_receipt_p50_seconds"]
-    faster = min(sol_p50, opus_p50)
-    slower = max(sol_p50, opus_p50)
-    if slower <= faster * 1.1:
+    fastest = min(
+        eligible, key=lambda name: candidates[name]["action_receipt_p50_seconds"]
+    )
+    fastest_p50 = candidates[fastest]["action_receipt_p50_seconds"]
+    sol_eligible = candidates["sol"]["eligible"]
+    sol_p50 = candidates["sol"]["action_receipt_p50_seconds"]
+    if sol_eligible and sol_p50 <= fastest_p50 * 1.1:
         winner = "sol"
-        decision = "within_10_percent_tie"
-        message = "Action command-receipt p50s are within 10%; Sol wins the tie-break."
-    elif sol_p50 < opus_p50:
-        winner = "sol"
-        decision = "faster_action_receipt_p50"
-        message = "Sol has the faster action command-receipt p50."
+        decision = (
+            "within_10_percent_tie"
+            if fastest != "sol"
+            or any(
+                name != "sol"
+                and candidates[name]["action_receipt_p50_seconds"] <= sol_p50 * 1.1
+                for name in eligible
+            )
+            else "faster_action_receipt_p50"
+        )
+        message = (
+            "Action command-receipt p50s are within 10%; Sol wins the tie-break."
+            if decision == "within_10_percent_tie"
+            else "Sol has the faster action command-receipt p50."
+        )
     else:
-        winner = "opus"
+        winner = fastest
         decision = "faster_action_receipt_p50"
-        message = "Opus has the faster action command-receipt p50."
+        label = {"sol": "Sol", "opus": "Opus", "sonnet": "Sonnet"}[winner]
+        message = f"{label} has the fastest action command-receipt p50."
     return {"winner": winner, "decision": decision, "message": message, "candidates": candidates}
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if len(arguments) != 2:
-        print("usage: compare.py SOL_REPORT.json OPUS_REPORT.json", file=sys.stderr)
+    if len(arguments) not in (2, 3):
+        print(
+            "usage: compare.py SOL_REPORT.json OPUS_REPORT.json [SONNET_REPORT.json]",
+            file=sys.stderr,
+        )
         return 2
     try:
-        sol_report = json.loads(Path(arguments[0]).read_text(encoding="utf-8"))
-        opus_report = json.loads(Path(arguments[1]).read_text(encoding="utf-8"))
-        result = compare_reports(sol_report, opus_report)
+        reports = [
+            json.loads(Path(argument).read_text(encoding="utf-8"))
+            for argument in arguments
+        ]
+        result = compare_reports(*reports)
     except (OSError, json.JSONDecodeError, ValueError) as error:
         print(json.dumps({"error": str(error)}, sort_keys=True))
         return 2

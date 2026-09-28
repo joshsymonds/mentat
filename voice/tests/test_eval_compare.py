@@ -14,6 +14,7 @@ from evals.scenarios import SCENARIOS
 ROOT = Path(__file__).resolve().parents[2]
 SOL_MODEL = "chatgpt/sol-fast"
 OPUS_MODEL = "claude-opus-5-5"
+SONNET_MODEL = "claude-sonnet-5-5"
 
 
 def report(
@@ -26,7 +27,12 @@ def report(
     run_count=None,
 ):
     observed_runs = len(latencies) if run_count is None else run_count
-    observed_model = "gpt-6-sol" if requested_model == SOL_MODEL else OPUS_MODEL
+    observed_model = {
+        SOL_MODEL: "gpt-6-sol",
+        OPUS_MODEL: OPUS_MODEL,
+        SONNET_MODEL: SONNET_MODEL,
+    }[requested_model]
+    has_standard_speed = requested_model in (OPUS_MODEL, SONNET_MODEL)
     is_opus = requested_model == OPUS_MODEL
     calls = []
     for index in range(len(latencies)):
@@ -34,9 +40,9 @@ def report(
             "id": f"call-{index + 1}",
             "requested_model": requested_model,
             "observed_model": observed_model,
-            "service_tier": "standard" if is_opus else None,
+            "service_tier": "standard" if has_standard_speed else None,
             "result_service_tier": "standard",
-            "speed": "standard" if is_opus else None,
+            "speed": "standard" if has_standard_speed else None,
             "fast_mode_state": "off" if is_opus else None,
             "failures": [],
         })
@@ -84,6 +90,10 @@ def report(
 
 def opus_report(latencies, **kwargs):
     return report(latencies, requested_model=OPUS_MODEL, **kwargs)
+
+
+def sonnet_report(latencies, **kwargs):
+    return report(latencies, requested_model=SONNET_MODEL, **kwargs)
 
 
 class CompareTests(unittest.TestCase):
@@ -262,6 +272,94 @@ class CompareTests(unittest.TestCase):
         del missing["cases"][0]["turns"][0]["latency_seconds"]["command_receipt"]
         with self.assertRaises(ValueError):
             compare_reports(missing, opus_report([2.0] * 10))
+
+    def test_fastest_eligible_arm_wins_three_arm_comparison(self):
+        result = compare_reports(
+            report([1.0] * 10),
+            opus_report([1.4] * 10),
+            sonnet_report([0.8] * 10),
+        )
+
+        self.assertEqual(result["winner"], "sonnet")
+        self.assertEqual(result["decision"], "faster_action_receipt_p50")
+        self.assertTrue(result["candidates"]["sonnet"]["eligible"])
+
+    def test_sol_wins_when_within_ten_percent_of_fastest_eligible_arm(self):
+        result = compare_reports(
+            report([1.05] * 10),
+            opus_report([1.4] * 10),
+            sonnet_report([1.0] * 10),
+        )
+
+        self.assertEqual(result["winner"], "sol")
+        self.assertEqual(result["decision"], "within_10_percent_tie")
+
+    def test_sonnet_fastest_and_eligible_with_dated_model_alias(self):
+        sonnet = sonnet_report([0.8] * 10)
+        sonnet["cases"][0]["turns"][0]["model_provenance"]["model_calls"][0][
+            "observed_model"
+        ] = "claude-sonnet-5-5-20260928"
+        sonnet["cases"][0]["turns"][0]["model_provenance"]["model_calls"][0].pop(
+            "fast_mode_state"
+        )
+
+        result = compare_reports(report([1.0] * 10), opus_report([1.4] * 10), sonnet)
+
+        self.assertEqual(result["winner"], "sonnet")
+        self.assertTrue(result["candidates"]["sonnet"]["eligible"])
+
+    def test_sonnet_unproven_standard_speed_makes_arm_ineligible(self):
+        sonnet = sonnet_report([0.8] * 10)
+        call = sonnet["cases"][0]["turns"][0]["model_provenance"]["model_calls"][0]
+        call["service_tier"] = None
+        call["speed"] = None
+
+        result = compare_reports(report([1.0] * 10), opus_report([1.4] * 10), sonnet)
+
+        self.assertEqual(result["winner"], "sol")
+        self.assertFalse(result["candidates"]["sonnet"]["eligible"])
+        self.assertTrue(any("standard" in reason for reason in result["candidates"]["sonnet"]["reasons"]))
+
+    def test_no_eligible_arm_in_three_arm_comparison_has_no_winner(self):
+        result = compare_reports(
+            report([1.0] * 9),
+            opus_report([2.0] * 9),
+            sonnet_report([0.8] * 9),
+        )
+
+        self.assertIsNone(result["winner"])
+        self.assertEqual(result["decision"], "no_eligible_candidate")
+        self.assertFalse(any(candidate["eligible"] for candidate in result["candidates"].values()))
+
+    def test_cli_reads_three_json_reports_and_prints_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ("sol.json", "opus.json", "sonnet.json")]
+            reports = [report([1.0] * 10), opus_report([1.4] * 10), sonnet_report([0.8] * 10)]
+            for path, candidate_report in zip(paths, reports, strict=True):
+                path.write_text(json.dumps(candidate_report), encoding="utf-8")
+
+            completed = subprocess.run(
+                [sys.executable, str(ROOT / "voice" / "evals" / "compare.py"), *(str(path) for path in paths)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout)["winner"], "sonnet")
+
+    def test_cli_rejects_report_counts_other_than_two_or_three(self):
+        compare_script = str(ROOT / "voice" / "evals" / "compare.py")
+        for arguments in ([], ["one.json"], ["one.json", "two.json", "three.json", "four.json"]):
+            with self.subTest(arguments=arguments):
+                completed = subprocess.run(
+                    [sys.executable, compare_script, *arguments],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("usage:", completed.stderr)
 
     def test_cli_reads_two_json_reports_and_prints_decision(self):
         with tempfile.TemporaryDirectory() as directory:
