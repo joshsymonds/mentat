@@ -61,6 +61,8 @@ export interface ClaudeCodeConfig {
    * auto-download — the deploy pins the binary. */
   bin: string;
   model?: string;
+  /** Model fixed for voice children; defaults to the standard-speed Sol route. */
+  voiceModel?: string;
   effort?: Options['effort'];
   /** Replaces the CLI's system prompt when set. */
   systemPrompt?: string;
@@ -165,6 +167,8 @@ function effectiveDisallowedTools(config: ClaudeCodeConfig): string[] {
  */
 const SURFACE_SHAPE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const USER_SHAPE = /^[a-zA-Z0-9][a-zA-Z0-9_@.-]{0,63}$/;
+const DEFAULT_VOICE_MODEL = 'chatgpt/sol-fast';
+const OPUS_MODEL = 'claude-opus-5-5';
 
 function preloadMcpServers(servers: Options['mcpServers']): Options['mcpServers'] {
   if (servers === undefined) {
@@ -216,6 +220,10 @@ export function buildOptions(
   const mcpServers =
     voiceGateway !== undefined ? preloadMcpServers(config.mcpServers) : config.mcpServers;
   const surfaceLine = surfaceContextLine(spawnMeta);
+  const env = buildChildEnv(process.env, config.extraEnv ?? [], voiceGateway);
+  if (spawnMeta?.surface === 'voice' && config.model === OPUS_MODEL) {
+    env.CLAUDE_CODE_DISABLE_FAST_MODE = '1';
+  }
   const systemPrompt =
     config.systemPrompt !== undefined && surfaceLine !== undefined
       ? `${config.systemPrompt}\n\n${surfaceLine}`
@@ -226,7 +234,7 @@ export function buildOptions(
     strictMcpConfig: true,
     includePartialMessages: true,
     pathToClaudeCodeExecutable: config.bin,
-    env: buildChildEnv(process.env, config.extraEnv ?? [], voiceGateway),
+    env,
     disallowedTools: effectiveDisallowedTools(config),
     ...(config.model !== undefined && { model: config.model }),
     ...(config.effort !== undefined && { effort: config.effort }),
@@ -389,6 +397,7 @@ interface Session {
   /** The ACTIVE turn's identity context — set at turn start, cleared at turn
    * end, never carried across turns (authority is per-turn). */
   context: { current: TurnContext | null };
+  isVoice: boolean;
   recorder: Recorder;
   dead: boolean;
 }
@@ -474,14 +483,31 @@ export class ClaudeCode implements Backend {
     if (sessionId === '') {
       throw new Error('claudecode: pre-start requires a sessionId');
     }
-    this.sessionFor({
+    return this.ensureVoiceSession({
       sessionId,
       text: '',
       meta: { surface: 'voice', user: 'josh' },
       effort: 'low',
-      model: 'chatgpt/sol-fast',
+      model: this.config.voiceModel ?? DEFAULT_VOICE_MODEL,
     });
-    return Promise.resolve(true);
+  }
+
+  private async ensureVoiceSession(turn: Turn): Promise<boolean> {
+    for (;;) {
+      const session = this.sessionFor(turn);
+      const release = await session.mutex.acquire();
+      if (session.dead) {
+        release();
+        continue;
+      }
+      if (!session.isVoice) {
+        this.dropSession(turn.sessionId, session);
+        release();
+        continue;
+      }
+      release();
+      return true;
+    }
   }
 
   /** Acquires the session's turn slot and sends the turn into the child. */
@@ -491,6 +517,11 @@ export class ClaudeCode implements Backend {
     // The session may have died while this turn waited on the previous one;
     // respawn rather than reading a dead iterator.
     if (session.dead) {
+      release();
+      return this.startTurn(turn);
+    }
+    if (session.isVoice !== (turn.meta?.surface === 'voice')) {
+      this.dropSession(turn.sessionId, session);
       release();
       return this.startTurn(turn);
     }
@@ -650,13 +681,16 @@ export class ClaudeCode implements Backend {
     }
     const queue = new AsyncQueue<SDKUserMessage>();
     const context: Session['context'] = { current: null };
-    // The creating turn's effort/model win over the daemon defaults; both are
-    // SDK options fixed at spawn, so they live for the session. Its meta
-    // becomes the spawn-time surface context line.
+    // The creating turn's effort/model win over daemon defaults for non-voice
+    // sessions; voice children use their configured model or the voice default.
+    // These SDK options are fixed at spawn. The turn's meta also supplies the
+    // spawn-time surface context line.
+    const isVoice = turn.meta?.surface === 'voice';
     const config = {
       ...this.config,
       ...(turn.effort !== undefined && { effort: turn.effort }),
       ...(turn.model !== undefined && { model: turn.model }),
+      ...(isVoice && { model: this.config.voiceModel ?? DEFAULT_VOICE_MODEL }),
     };
     const options = buildOptions(
       config,
@@ -672,6 +706,7 @@ export class ClaudeCode implements Backend {
       translator: new Translator(),
       mutex: new Mutex(),
       context,
+      isVoice,
       recorder: makeRecorder(this.config.recordDir, sessionId, this.logger),
       dead: false,
     };
