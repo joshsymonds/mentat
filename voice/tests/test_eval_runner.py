@@ -2337,6 +2337,46 @@ class ScenarioObservationTests(unittest.TestCase):
                     10.0 + (len(texts) - 1) * 0.2,
                 )
 
+    def test_sms_readback_observed_message_prefixes_receive_answer_timestamps(self):
+        cases = (
+            (
+                "sms-say-back-yes",
+                1,
+                "I'll text +1-202-555-0142. The exact message is. I will be there at six. Should I send it?",
+            ),
+            (
+                "sms-say-back-yes",
+                1,
+                "I'll text +1-202-555-0142. Message. I will be there at six. Should I send it?",
+            ),
+            (
+                "sms-say-back-yes",
+                1,
+                "I'll text +1-202-555-0142. The message reads... I will be there at six. Should I send it?",
+            ),
+            (
+                "sms-correction-new-yes",
+                2,
+                "I'll text +1-202-555-0142. The exact message is, I will be there at 7. Should I send it?",
+            ),
+        )
+        for scenario_name, turn_index, transcript in cases:
+            with self.subTest(transcript=transcript):
+                scenario = next(s for s in SCENARIOS if s.name == scenario_name)
+                self.assertEqual(
+                    runner._answer_time(
+                        {
+                            "capture_started": 10.0,
+                            "speech_end": 10.0,
+                            "segments": [{"start": 0.25, "end": 2.0, "text": transcript}],
+                        },
+                        scenario.turns[turn_index - 1],
+                        scenario_name=scenario.name,
+                        turn_index=turn_index,
+                    ),
+                    10.25,
+                )
+
     def test_run17_exact_sms_correction_segments_get_answer_and_confirmation_timestamps(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
         trace = {

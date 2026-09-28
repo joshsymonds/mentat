@@ -293,6 +293,12 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
     body = re.sub(r"^saying\b\s*,?\s*", "", body, flags=re.IGNORECASE)
     body = re.sub(r"^(?:and\s+)?the message is[,:]?\s*", "", body, flags=re.IGNORECASE)
     body = re.sub(r"^it says[,:.]?\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(
+        r"^(?:the exact message is|the message reads|message)(?:\.{3}|[,:.]|\s+)\s*",
+        "",
+        body,
+        flags=re.IGNORECASE,
+    )
     _require(bool(body), f"{scenario_name}: turn {turn} has no complete SMS body say-back")
 
     prompt_end = match.end() + prompt.end()

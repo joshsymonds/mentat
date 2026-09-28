@@ -1983,6 +1983,78 @@ class ScenarioCorpusTests(unittest.TestCase):
         missing_digits = say_back.replace("plus one, two, zero, two. 5-5-5. 0142, it says. ", "")
         self.assertTrue(evaluate_scenario_prefix(scenario, [missing_digits, corrected], [], None))
 
+    def test_sms_readback_observed_message_prefixes_require_exact_recipient_body_and_confirmation(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        correction = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        cases = (
+            (
+                scenario,
+                "I'll text +1-202-555-0142. The exact message is. I will be there at six. Should I send it?",
+                1,
+                "I will be there at six.",
+            ),
+            (
+                scenario,
+                "I'll text +1-202-555-0142. Message. I will be there at six. Should I send it?",
+                1,
+                "I will be there at six.",
+            ),
+            (
+                scenario,
+                "I'll text +1-202-555-0142. The message reads... I will be there at six. Should I send it?",
+                1,
+                "I will be there at six.",
+            ),
+            (
+                correction,
+                "I'll text +1-202-555-0142. The exact message is, I will be there at 7. Should I send it?",
+                2,
+                "I will be there at seven.",
+            ),
+        )
+        for target, readback, turn, body in cases:
+            with self.subTest(readback=readback):
+                turns = (
+                    [readback, "Sent that message."]
+                    if turn == 1
+                    else [
+                        "I'll text +1-202-555-0142: I will be there at six. Should I send it?",
+                        readback,
+                        "Sent the corrected message.",
+                    ]
+                )
+                evaluate_scenario(
+                    target,
+                    turns,
+                    [{"turn": len(turns), "kind": "sms", "to": "+1-202-555-0142", "body": body}],
+                    room_closed_after=len(turns),
+                )
+
+        for wrong_number in ("+1-202-555-7000", "+1-202-555-8000"):
+            with self.subTest(wrong_number=wrong_number), self.assertRaisesRegex(
+                AssertionError, "no complete"
+            ):
+                evaluate_scenario(
+                    scenario,
+                    [
+                        f"I'll text {wrong_number}. The exact message is. I will be there at six. Should I send it?",
+                        "Sent that message.",
+                    ],
+                    [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+                    room_closed_after=2,
+                )
+
+        with self.assertRaisesRegex(AssertionError, "said back"):
+            evaluate_scenario(
+                scenario,
+                [
+                    "I'll text +1-202-555-0142. The exact message is. Please tell Alice I will be there at six. Should I send it?",
+                    "Sent that message.",
+                ],
+                [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+                room_closed_after=2,
+            )
+
     def test_run17_verbatim_correction_body_it_says_connector_is_accepted(self):
         transcript = " ".join(segment.strip() for segment in (
             " I've got the text ready to plus one, two, zero, two.",
