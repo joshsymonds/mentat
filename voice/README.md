@@ -1,11 +1,15 @@
 # Voice surface
 
-The voice worker joins a LiveKit room and runs GPT-Live-1 in client delegation
-mode. GPT-Live handles the conversation and hands backend requests to the
-worker. The worker streams each request to mentatd, then feeds the response
-back as commentary while it arrives. The daemon owns memory, systems, lookups,
-and actions. The worker runs on ultraviolet beside mentatd and reaches it over
-loopback.
+The voice worker joins a LiveKit room and runs a single cascade: Deepgram Flux
+transcribes each user turn, the worker posts it to mentatd, and Cartesia Sonic
+speaks the daemon's text stream verbatim as it arrives. There is no local LLM
+reply or second voice. Interruptions stop speech and close the in-flight backend
+response; an end-conversation result closes after the goodbye, while follow-ups
+keep the room open. RoomIO starts before the LiveKit connection so speech around
+the opening chime is captured, and the worker does not greet on connect.
+
+The daemon owns memory, systems, lookups, and actions. The worker runs beside
+mentatd and reaches it over loopback.
 
 ## Private context
 
@@ -26,8 +30,9 @@ lng = -122.3
 radius_m = 150
 ```
 
-Places shape the opening greeting. The phone sends its time zone, last-known
-location, and whether Android Auto has it in car mode with the token request;
+Places and phone state shape the per-call context without adding a greeting.
+The phone sends its time zone, last-known location, and whether Android Auto
+has it in car mode with the token request;
 mentatd stamps them on the token as participant attributes, and the worker
 turns them into a one-paragraph call context in that call's instructions.
 
@@ -38,10 +43,10 @@ environment in step 2.
 
 ## Testing branch code in a live room
 
-Audio changes need a real room. Run branch code against the production SFU and
-mentatd in a throwaway room without redeploying the worker. For this web-search
-change, run calls A-D below and compare each printed latency with the eight
-second target; the worker log records whether A, B and D used `web_search`.
+Audio changes need a real room. For this cascade, the four scripted calls
+below exercise the complete Flux → mentatd → Sonic path. Calls A, B, and D
+should use `web_search`; call C still reaches mentatd and should answer without
+searching. Compare each printed latency with the eight-second target.
 
 Use one shell session for the procedure. Install the cleanup trap before
 stopping production voice; it removes the dev process/files and starts
@@ -83,10 +88,10 @@ scp voice/assets/earcon.wav ultraviolet:$DEV_DIR/assets/
 
 ### 2. Launch the agent pinned to a dev room
 
-Load the production secrets, including `OPENAI_API_KEY`, from the environment
-file. Use loopback URLs, a distinct health port, a writable home, and a
-bounded timeout around the process. Set `DEV_PY` to the Python executable used
-by the production unit. Keep credentials out of command arguments.
+Load the LiveKit and mentatd credentials from the environment file. Use
+loopback URLs, a distinct health port, a writable home, and a bounded timeout
+around the process. Set `DEV_PY` to the Python executable used by the service.
+Keep credentials out of command arguments.
 
 ```sh
 DEV_ROOM=dev-myfeature-REV
@@ -137,7 +142,8 @@ events.
 Use `LINE@DELAY_SECONDS::ANSWER_REGEX` for each scripted prompt. Regexes are
 matched against timestamped Whisper segments; output reports the first match's
 start relative to the caller's speech end. These four calls exercise current
-lookup, price/source freshness, stable knowledge, and stale-summary caution:
+lookup, price/source freshness, a stable fact from mentatd, and stale-summary
+caution:
 
 ```sh
 ssh ultraviolet sudo env DEV_DIR="$DEV_DIR" DEV_ROOM="$DEV_ROOM" DEV_PY="$DEV_PY" bash -s <<'REMOTE'
@@ -153,9 +159,9 @@ REMOTE
 ```
 
 Compare A with PyPI, B with CoinGecko (record its currency and fetch time), C
-with Jane Austen and no delegation, and D with a live F1 results page or an
-explicit statement of uncertainty. Check `agent.log` for `web_search` on A, B,
-and D and for no delegation on C.
+with Jane Austen, and D with a live F1 results page or an explicit statement of
+uncertainty. All four calls go to mentatd; check `agent.log` for `web_search`
+on A, B, and D and no `web_search` on C.
 
 ### Gotchas
 

@@ -50,14 +50,10 @@ FRESHNESS_POLICY = (
     "date asked about. If sources conflict, are undated, or may be stale, state "
     "uncertainty rather than present an unverified summary as fact."
 )
-VOICE_DELEGATION = (
-    "Delegate current, local, niche, or otherwise uncertain factual questions "
-    "for backend lookup instead of guessing, including when a result may be stale "
-    "or sources disagree."
-)
-VOICE_STABLE = (
-    "For factual questions with stable common knowledge, respond directly rather "
-    "than delegating."
+VOICE_CASCADE = (
+    "Flux transcribes each user turn and mentatd handles every completed turn. "
+    "Sonic speaks only mentatd's streamed text, exactly as received, without "
+    "adding a greeting, acknowledgment, filler, or local answer."
 )
 
 COMPLETION_POLICY = (
@@ -84,6 +80,7 @@ class InstructionPolicyTest(unittest.TestCase):
     def setUpClass(cls):
         cls.prompt = (ROOT / "prompt.md").read_text()
         cls.persona = (VOICE_DIR / "persona.md").read_text()
+        cls.readme = (VOICE_DIR / "README.md").read_text()
         cls.instructions, marker, cls.voice_card = cls.persona.partition(VOICE_CARD_MARKER)
         if not marker:
             raise AssertionError("persona must retain the voice-card split marker")
@@ -110,9 +107,15 @@ class InstructionPolicyTest(unittest.TestCase):
             with self.subTest(clause=clause):
                 self.assert_policy_present(self.prompt, clause)
 
-    def test_voice_delegates_uncertain_facts_but_answers_stable_knowledge_directly(self):
-        self.assert_policy_present(self.instructions, VOICE_DELEGATION)
-        self.assert_policy_present(self.instructions, VOICE_STABLE)
+    def test_voice_persona_documents_the_verbatim_flux_mentat_sonic_cascade(self):
+        self.assert_policy_present(self.instructions, VOICE_CASCADE)
+
+    def test_readme_describes_all_turns_through_the_cascade_not_the_old_search_front(self):
+        normalized = " ".join(self.readme.lower().split())
+        self.assertIn("each user turn", normalized)
+        self.assertNotIn("web-search change", normalized)
+        self.assertNotIn("jane austen and no delegation", normalized)
+        self.assertNotIn("no delegation on c", normalized)
 
     def test_sms_waits_for_confirmation_and_relays_the_complete_sayback(self):
         self.assert_policy_present(self.instructions, SMS_PENDING_POLICY)

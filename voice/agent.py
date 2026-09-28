@@ -1,4 +1,4 @@
-"""LiveKit voice worker using GPT-Live client delegation and mentatd."""
+"""LiveKit voice worker streaming mentatd responses through Flux and Sonic."""
 
 from __future__ import annotations
 
@@ -8,10 +8,11 @@ import logging
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import aiohttp
 from livekit import agents
@@ -23,15 +24,14 @@ from livekit.agents import (
     JobContext,
     WorkerOptions,
     get_job_context,
+    inference,
 )
 from livekit.agents.voice import room_io
 from livekit.plugins import dtln, silero
-from livekit.plugins.openai.realtime import GPTLiveDelegation, GPTLiveModel
 
 from request import (
     END_CONVERSATION_TOOL,
     PRIVATE_CONTEXT_ENV,
-    DelegationRunner,
     EndingPolicy,
     PrivateContext,
     call_context,
@@ -43,20 +43,17 @@ from request import (
     turn_request,
     with_private_context,
 )
-from stream import CommentaryChunker, ToolResult, TurnDone, TurnError, TurnFailure, TurnStream
+from stream import ToolResult, TurnDone, TurnError, TurnFailure, TurnStream
 
 logger = logging.getLogger("mentat.voice")
 
 DEFAULT_MENTAT_URL = "http://127.0.0.1:8484"
-GPT_LIVE_VOICE = "meridian"
 TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_read=600)
+CONSULT_FAILED = "I couldn't complete that request with Mentat. Please try again."
 HERE = Path(__file__).parent
 PERSONA_PATH = HERE / "persona.md"
 EARCON_PATH = HERE / "assets" / "earcon.wav"
-CONSULT_FAILED = (
-    "Mentat could not be reached, so there is no answer to that question. "
-    "Tell Josh briefly and offer to try again."
-)
+TTS_VOICE = '47c38ca4-5f35-497b-b1a3-415245fb35e1'
 SEND_SMS_TOOL = "mcp__mentat__send_sms"
 
 
@@ -137,8 +134,25 @@ def load_persona(path: Path = PERSONA_PATH) -> tuple[str, str]:
     return split_persona(path.read_text())
 
 
+def write_turn_marker(room_name: str, turn_id: str) -> None:
+    """Write the opt-in private marker for a backend voice turn."""
+    marker_path = os.environ.get("MENTAT_EVAL_DELEGATION_LOG")
+    if not marker_path:
+        return
+    marker = json.dumps(
+        {"room": room_name, "id": turn_id, "created_at": time.time()},
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    try:
+        with Path(marker_path).open("a", encoding="utf-8") as marker_file:
+            marker_file.write(marker + "\n")
+    except OSError:
+        logger.exception("failed to write eval delegation marker")
+
+
 class FrontAgent(Agent):
-    """The GPT-Live voice that delegates every backend request."""
+    """A text-only front that streams every user turn through mentatd."""
 
     def __init__(
         self,
@@ -159,73 +173,35 @@ class FrontAgent(Agent):
         self._ending_policy = ending_policy
         self._ending_changed = ending_changed
         self._sms_consent = False
-        self._delegations = DelegationRunner(self._run_delegation, self._on_delegation_error)
 
-    async def on_enter(self) -> None:
-        self.duplex_session.on("delegation_created", self._on_delegation_created)
-
-    async def on_exit(self) -> None:
-        await self._delegations.close()
-
-    def _on_delegation_created(self, delegation: GPTLiveDelegation) -> None:
-        """A plugin read-loop callback that must hand work to an asyncio task."""
-        logger.info(
-            "delegation %s created: %r", delegation.id, delegation.pending_transcript[:200]
-        )
-        marker_path = os.environ.get("MENTAT_EVAL_DELEGATION_LOG")
-        if marker_path:
-            marker = json.dumps(
-                {
-                    "room": self._room_name,
-                    "id": delegation.id,
-                    "created_at": time.time(),
-                },
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-            try:
-                with Path(marker_path).open("a", encoding="utf-8") as marker_file:
-                    marker_file.write(marker + "\n")
-            except OSError:
-                logger.exception("failed to write eval delegation marker")
+    async def on_user_turn_completed(self, chat_ctx: Any, new_message: Any) -> None:
+        """Ask mentatd for this turn and speak its streamed text verbatim."""
+        question = str(getattr(new_message, "text_content", "")).strip()
+        if not question:
+            return
+        turn_id = uuid4().hex
         self._ending_policy.delegation_started()
         self._ending_changed()
         self._background.play(AudioConfig(str(EARCON_PATH)))
-        self._delegations.start(delegation)
-
-    def _on_delegation_error(self, delegation_id: str, error: BaseException) -> None:
-        logger.exception(
-            "delegation failed unexpectedly: %s (%s)",
-            delegation_id,
-            error,
-            exc_info=(type(error), error, error.__traceback__),
-        )
-
-    async def _run_delegation(self, delegation: GPTLiveDelegation) -> None:
-        commentary_logged = False
-
-        def append_commentary(text: str) -> None:
-            nonlocal commentary_logged
-            if not commentary_logged:
-                logger.info("delegation %s first commentary", delegation.id)
-                commentary_logged = True
-            self.duplex_session.append_commentary(text, delegation_id=delegation.id)
-
+        backend_text = self._backend_text(question, turn_id, chat_ctx)
+        speech_handle = self.session.say(backend_text, allow_interruptions=True)
         try:
-            await self._stream_backend(delegation, append_commentary=append_commentary)
+            await speech_handle.wait_for_playout()
         except asyncio.CancelledError:
+            speech_handle.interrupt()
             raise
-        except (TurnError, aiohttp.ClientError, TimeoutError) as error:
-            logger.warning("delegation failed: %s", error)
-            append_commentary(CONSULT_FAILED)
+        finally:
+            await backend_text.aclose()
+        if speech_handle.interrupted:
+            logger.info("delegation %s interrupted", turn_id)
+            return
+        speech_exception = speech_handle.exception()
+        if speech_exception is not None:
+            raise speech_exception
 
-    async def _stream_backend(
-        self,
-        delegation: GPTLiveDelegation,
-        *,
-        append_commentary: Callable[[str], None],
-    ) -> None:
-        question = delegation.pending_transcript
+    async def _backend_text(
+        self, question: str, turn_id: str, chat_ctx: Any
+    ) -> AsyncGenerator[str, None]:
         sms_mode = is_sms_request(question)
         sms_declined = self._sms_consent and is_sms_decline(question)
         if self._sms_consent and (is_sms_followup(question) or sms_declined):
@@ -240,76 +216,91 @@ class FrontAgent(Agent):
         envelope = consult_envelope(
             self._voice_card,
             summary="",
-            last_turns=recent_turns(self.chat_ctx.items),
+            last_turns=recent_turns(chat_ctx.items),
             question=question,
         )
+        write_turn_marker(self._room_name, turn_id)
         turn = TurnStream()
-        chunker = CommentaryChunker()
-        sms_buffer = SmsCommentaryBuffer(append_commentary) if sms_mode else None
+        pending_sms_text: list[str] = []
+        sms_buffer = SmsCommentaryBuffer(pending_sms_text.append) if sms_mode else None
+        commentary_logged = False
         saw_text = False
         end_tool_succeeded = False
-        async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
-            async with http.post(
-                f"{self._mentat_url}/v1/conversation",
-                json=turn_request(self._room_name, envelope),
-            ) as response:
-                if response.status != 200:
-                    raise TurnError(f"daemon answered HTTP {response.status}")
-                done_seen = False
-                async for data in response.content.iter_any():
-                    for item in turn.feed(data):
-                        if isinstance(item, str):
-                            saw_text = True
-                            if sms_buffer is not None:
-                                sms_buffer.add(item)
-                            else:
-                                for chunk in chunker.feed(item):
-                                    append_commentary(chunk)
-                        elif isinstance(item, ToolResult):
-                            if sms_buffer is not None:
-                                sms_buffer.tool_result(item.name, is_error=item.is_error)
-                            if item.name == SEND_SMS_TOOL:
-                                self._sms_consent = False
-                            logger.info(
-                                "delegation %s: tool %s%s",
-                                delegation.id,
-                                item.name,
-                                " failed" if item.is_error else "",
-                            )
-                            if item.name == END_CONVERSATION_TOOL and not item.is_error:
-                                end_tool_succeeded = True
-                            self._ending_policy.tool_result_seen(item.name, item.is_error)
-                            self._ending_changed()
-                        elif isinstance(item, TurnFailure):
-                            raise TurnError(item.message)
-                        elif isinstance(item, TurnDone):
-                            if sms_buffer is not None:
-                                sms_buffer.finish()
-                            else:
-                                for chunk in chunker.flush():
-                                    saw_text = True
-                                    append_commentary(chunk)
-                            done_seen = True
+
+        def log_first_commentary() -> None:
+            nonlocal commentary_logged
+            if not commentary_logged:
+                logger.info("delegation %s first commentary", turn_id)
+                commentary_logged = True
+
+        try:
+            async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+                async with http.post(
+                    f"{self._mentat_url}/v1/conversation",
+                    json=turn_request(self._room_name, envelope),
+                ) as response:
+                    if response.status != 200:
+                        raise TurnError(f"daemon answered HTTP {response.status}")
+                    done_seen = False
+                    async for data in response.content.iter_any():
+                        for item in turn.feed(data):
+                            if isinstance(item, str):
+                                saw_text = True
+                                if sms_buffer is not None:
+                                    sms_buffer.add(item)
+                                else:
+                                    log_first_commentary()
+                                    yield item
+                            elif isinstance(item, ToolResult):
+                                if sms_buffer is not None:
+                                    sms_buffer.tool_result(item.name, is_error=item.is_error)
+                                if item.name == SEND_SMS_TOOL:
+                                    self._sms_consent = False
+                                logger.info(
+                                    "delegation %s: tool %s%s",
+                                    turn_id,
+                                    item.name,
+                                    " failed" if item.is_error else "",
+                                )
+                                if item.name == END_CONVERSATION_TOOL and not item.is_error:
+                                    end_tool_succeeded = True
+                                self._ending_policy.tool_result_seen(item.name, item.is_error)
+                                self._ending_changed()
+                            elif isinstance(item, TurnFailure):
+                                raise TurnError(item.message)
+                            elif isinstance(item, TurnDone):
+                                if sms_buffer is not None:
+                                    sms_buffer.finish()
+                                    for text in pending_sms_text:
+                                        if text:
+                                            log_first_commentary()
+                                            yield text
+                                done_seen = True
+                                break
+                        if done_seen:
                             break
-                    if done_seen:
-                        break
-        if not turn.done:
-            raise TurnError("stream ended without done")
-        if not saw_text and not end_tool_succeeded:
-            raise TurnError("turn produced no commentary")
+            if not turn.done:
+                raise TurnError("stream ended without done")
+            if not saw_text and not end_tool_succeeded:
+                raise TurnError("turn produced no commentary")
+        except asyncio.CancelledError:
+            raise
+        except (TurnError, aiohttp.ClientError, TimeoutError) as error:
+            logger.warning("delegation %s failed: %s", turn_id, error)
+            yield CONSULT_FAILED
+            return
         self._ending_policy.turn_done(time.monotonic())
         logger.info(
             "delegation %s done: text=%s end_tool=%s; %s",
-            delegation.id,
+            turn_id,
             saw_text,
             end_tool_succeeded,
             self._ending_policy.describe(),
         )
         self._ending_changed()
 
-
 def log_turn_metrics(session: AgentSession) -> None:
-    """Log the duration reported by the GPT-Live realtime model."""
+    """Log the duration reported by the voice session."""
 
     @session.on("metrics_collected")
     def _on_metrics(event: Any) -> None:
@@ -333,10 +324,16 @@ def prewarm(proc: agents.JobProcess) -> None:
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    """Serve one room until GPT-Live or the close policy ends it."""
+    """Serve one room until mentatd or the close policy ends it."""
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
-        llm=GPTLiveModel(voice=GPT_LIVE_VOICE, delegation="client"),
+        stt=inference.STT("deepgram/flux-general"),
+        tts=inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE),
+        tts_text_transforms=None,
+        turn_handling={
+            "turn_detection": "stt",
+            "endpointing": {"min_delay": 0.0},
+        },
     )
     voice_room_io = room_io.RoomIO(
         agent_session=session,
@@ -365,8 +362,8 @@ async def entrypoint(ctx: JobContext) -> None:
     instructions, voice_card = load_persona()
     private: PrivateContext = ctx.proc.userdata["private"]
     instructions = with_private_context(instructions, private)
-    # The caller's token carries call context, which must be folded into the
-    # instructions before the GPT-Live session begins.
+    # The caller's token carries call context, which the voice agent keeps for
+    # the call before the first turn is handled.
     caller = await ctx.wait_for_participant()
     context = call_context(caller.attributes, private.places, datetime.now().astimezone())
     logger.info("%s (attributes: %s)", context, sorted(caller.attributes))
