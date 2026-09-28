@@ -1928,6 +1928,88 @@ class ScenarioCorpusTests(unittest.TestCase):
             evaluate_scenario_prefix(scenario, [husband_donor, *followups], [], None)
         )
 
+    def test_run17_verbatim_alice_sentence_break_and_william_myron_are_correct(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        turns = [
+            " ".join(segment.strip() for segment in (
+                " Looking it up.",
+                " Alice Keck Park.",
+                " anonymously bought the land and gave it to Santa Barbara for a public garden in 1975.",
+                " Her identity was revealed after she died two years later.",
+                " That's according to the Santa Barbara Historical Museum.",
+            )),
+            " ".join(segment.strip() for segment in (
+                " Checking.",
+                " Alice Keck Park was a Santa Barbara philanthropist and daughter of William Myron Keck, who founded",
+                " Superior Oil.",
+                " She gave the city the land for that garden without putting her name on it.",
+            )),
+        ]
+        self.assertEqual(evaluate_scenario_prefix(scenario, turns, [], None), [])
+
+        wrong_donor = turns[0].replace("anonymously bought", "her husband anonymously bought")
+        self.assertTrue(evaluate_scenario_prefix(scenario, [wrong_donor, turns[1]], [], None))
+
+    def test_run17_verbatim_sms_sayback_connectors_and_inherited_correction_recipient(self):
+        say_back = " ".join(segment.strip() for segment in (
+            " Okay.",
+            " I'll get ready to send that.",
+            " I've got the text ready to plus one, two, zero, two.",
+            " 5-5-5.",
+            " 0142, it says.",
+            " I will be there at 6.",
+            " Yes or no?",
+        ))
+        corrected = " ".join(segment.strip() for segment in (
+            " Okay.",
+            " I've updated it to say I will be there at 7.",
+            " Same number, yes or no?",
+        ))
+        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        self.assertEqual(evaluate_scenario_prefix(scenario, [say_back, corrected], [], None), [])
+
+        message_is = " ".join(segment.strip() for segment in (
+            " I've got the number as plus-one-two-zero-two-five-five-five.",
+            " 0142.",
+            " And the message is, I will be there at six.",
+            " Yes or no?",
+            " Should I send it?",
+        ))
+        sayback_scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        self.assertEqual(evaluate_scenario_prefix(sayback_scenario, [message_is], [], None), [])
+
+        wrong_body = corrected.replace("at 7", "at 6")
+        self.assertTrue(evaluate_scenario_prefix(scenario, [say_back, wrong_body], [], None))
+        missing_digits = say_back.replace("plus one, two, zero, two. 5-5-5. 0142, it says. ", "")
+        self.assertTrue(evaluate_scenario_prefix(scenario, [missing_digits, corrected], [], None))
+
+    def test_run17_verbatim_correction_body_it_says_connector_is_accepted(self):
+        transcript = " ".join(segment.strip() for segment in (
+            " I've got the text ready to plus one, two, zero, two.",
+            " 5-5-5.",
+            " 0142, it says.",
+            " I will be there at 6.",
+            " Yes or no?",
+        ))
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        self.assertEqual(evaluate_scenario_prefix(scenario, [transcript], [], None), [])
+
+    def test_run17_live_omissions_remain_failures(self):
+        alice = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        self.assertTrue(evaluate_scenario_prefix(alice, [
+            "I don't know offhand, but I'll find out. 不起 Dallas check. She bought that land and gave it to the city in 1975 to be used as a public garden."
+        ], [], None))
+
+        sms = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        self.assertTrue(evaluate_scenario_prefix(sms, [
+            "Okay, I'm on it. I'm just checking those digits. I have... I will be there at 6. Yes or no? Send it."
+        ], [], None))
+
+        correction = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        self.assertTrue(evaluate_scenario_prefix(correction, [
+            "k Let me just get a draft together. I've got the number and the text. I will be there at 6. K to send."
+        ], [], None))
+
 
 if __name__ == "__main__":
     unittest.main()

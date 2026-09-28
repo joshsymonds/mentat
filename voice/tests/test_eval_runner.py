@@ -2158,6 +2158,68 @@ class ScenarioObservationTests(unittest.TestCase):
         )
         self.assertEqual(runner._confirmation_time(trace), 11.600000023841858)
 
+    def test_run17_live_sms_yes_or_no_and_same_number_have_matching_timestamps(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        initial = {
+            "capture_started": 20.0,
+            "speech_end": 20.0,
+            "segments": [
+                {"start": 0.1, "end": 4.0, "text": " I've got the number as plus-one-two-zero-two-five-five-five."},
+                {"start": 0.2, "end": 1.0, "text": " 0142."},
+                {"start": 0.3, "end": 2.0, "text": " And the message is, I will be there at six."},
+                {"start": 0.7, "end": 0.8, "text": " Yes or no?"},
+                {"start": 0.8, "end": 0.8, "text": " Should I send it?"},
+            ],
+        }
+        correction = {
+            "capture_started": 30.0,
+            "speech_end": 30.0,
+            "segments": [
+                {"start": 0.1, "end": 1.0, "text": " Okay."},
+                {"start": 0.2, "end": 3.2, "text": " I've updated it to say I will be there at 7."},
+                {"start": 0.7, "end": 1.44, "text": " Same number, yes or no?"},
+            ],
+        }
+        self.assertEqual(
+            runner._answer_time(initial, scenario.turns[0], scenario_name=scenario.name, turn_index=1),
+            20.7,
+        )
+        self.assertEqual(runner._confirmation_time(initial), 20.8)
+        self.assertEqual(
+            runner._answer_time(correction, scenario.turns[1], scenario_name=scenario.name, turn_index=2),
+            30.7,
+        )
+        self.assertEqual(runner._confirmation_time(correction), 31.44)
+
+    def test_run17_live_alice_answer_timestamps_match_sentence_break_and_full_name(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        first = {
+            "capture_started": 40.0,
+            "speech_end": 40.0,
+            "segments": [
+                {"start": 0.1, "end": 0.84, "text": " Looking it up."},
+                {"start": 0.3, "end": 2.0, "text": " Alice Keck Park."},
+                {"start": 0.8, "end": 5.2, "text": " anonymously bought the land and gave it to Santa Barbara for a public garden in 1975."},
+            ],
+        }
+        second = {
+            "capture_started": 50.0,
+            "speech_end": 50.0,
+            "segments": [
+                {"start": 0.1, "end": 0.5, "text": " Checking."},
+                {"start": 0.5, "end": 5.86, "text": " Alice Keck Park was a Santa Barbara philanthropist and daughter of William Myron Keck, who founded"},
+                {"start": 0.7, "end": 6.86, "text": " Superior Oil."},
+            ],
+        }
+        self.assertEqual(
+            runner._answer_time(first, scenario.turns[0], scenario_name=scenario.name, turn_index=1),
+            40.8,
+        )
+        self.assertEqual(
+            runner._answer_time(second, scenario.turns[1], scenario_name=scenario.name, turn_index=2),
+            50.5,
+        )
+
     def test_confirmation_timestamp_recognizes_all_approved_prompt_literals(self):
         prompts = (
             "Should I send it?",

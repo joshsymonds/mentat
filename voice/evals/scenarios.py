@@ -36,6 +36,7 @@ _ALICE_DONOR_CLAIM = (
     r"\bAlice (?:Bertha )?Keck(?: Park)?\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck(?: Park)?\b.{0,100}\bshe\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck Park\b.{0,8}\bwho\s+(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice (?:Bertha )?Keck Park\b[.!?]\s+(?:anonymously\s+)?(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck Park,\s+a (?:local|Santa Barbara)\s+philanthropist[,.]?\s*who\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck Park\s+was\s+a Santa Barbara philanthropist\s+who\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\b(?:bought|purchased|donated|gave|gifted|given)\b.{0,80}\b(?:by|from)\s+Alice Keck\b|"
@@ -43,7 +44,7 @@ _ALICE_DONOR_CLAIM = (
 )
 SMS_CONFIRMATION_PATTERN = re.compile(
     r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|"
-    r"say the word|(?:just\s+)?say when(?:\s+and i'll send it)?|"
+    r"say the word|yes\s+or\s+no|(?:just\s+)?say when(?:\s+and i'll send it)?|"
     r"confirm,\s+and i'll send it|sound right|sound good|good to send)\b",
     re.IGNORECASE,
 )
@@ -167,7 +168,7 @@ SCENARIOS = (
         caller_lines=("Text +1-202-555-0142: I will be there at six.", "Yes."),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|texting|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
+                (r"\b(?:text|texting|send|message is|it says)\b", SMS_CONFIRMATION_PATTERN.pattern),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
@@ -185,12 +186,12 @@ SCENARIOS = (
         ),
         turns=(
             TurnExpectation(
-                (r"\b(?:text|texting|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
+                (r"\b(?:text|texting|send|message is|it says)\b", SMS_CONFIRMATION_PATTERN.pattern),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at six.",
             ),
             TurnExpectation(
-                (r"\b(?:text|texting|send)\b", SMS_CONFIRMATION_PATTERN.pattern),
+                (r"\b(?:text|texting|send|updated it to say|same number)\b", SMS_CONFIRMATION_PATTERN.pattern),
                 sms_recipient="+1-202-555-0142",
                 sms_body="I will be there at seven.",
             ),
@@ -218,7 +219,7 @@ SCENARIOS = (
                 ),
             ),
             TurnExpectation(
-                (r"(?:W\.?\s*M\.?\s*Keck|William\s+M\.?\s*Keck)", r"(?:father|daughter)"),
+                (r"(?:W\.?\s*M\.?\s*Keck|William\s+(?:M\.?|Myron)\s*Keck)", r"(?:father|daughter)"),
                 reject_patterns=(
                     r"\b(?:not|never|is not|isn't|was not|wasn't)\b.{0,80}\b(?:father|daughter|son|child|related)\b",
                 ),
@@ -290,6 +291,8 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
     body = " ".join(body.split()).strip(' \t,.:;–—-"“”')
     body = re.sub(r"^i'll say[,:.]?\s*", "", body, flags=re.IGNORECASE)
     body = re.sub(r"^saying\b\s*,?\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"^(?:and\s+)?the message is[,:]?\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"^it says[,:.]?\s*", "", body, flags=re.IGNORECASE)
     _require(bool(body), f"{scenario_name}: turn {turn} has no complete SMS body say-back")
 
     prompt_end = match.end() + prompt.end()
@@ -297,6 +300,31 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
     _require(
         re.search(r"\b(?:actually|correction|instead|rather|i meant|make that)\b", tail, re.IGNORECASE) is None,
         f"{scenario_name}: turn {turn} contradicts its SMS say-back after the confirmation prompt",
+    )
+    return body
+
+
+def _spoken_sms_correction_body(text: str, scenario_name: str, turn: int) -> str:
+    """Extract the revised body from a same-recipient correction read-back."""
+    prompt = SMS_CONFIRMATION_PATTERN.search(text)
+    _require(prompt is not None, f"{scenario_name}: turn {turn} has no SMS confirmation")
+    before_prompt = text[:prompt.start()]
+    _require(
+        re.search(r"\bsame number\b", before_prompt, re.IGNORECASE) is not None,
+        f"{scenario_name}: turn {turn} has no confirmed SMS recipient",
+    )
+    updated = re.search(r"\bupdated it to say\b", before_prompt, re.IGNORECASE)
+    same_number = re.search(r"\bsame number\b", before_prompt, re.IGNORECASE)
+    _require(
+        updated is not None and same_number is not None and updated.end() <= same_number.start(),
+        f"{scenario_name}: turn {turn} has no complete corrected SMS body",
+    )
+    body = before_prompt[updated.end():same_number.start()].strip(' \t,.:;–—-"“”')
+    _require(bool(body), f"{scenario_name}: turn {turn} has no complete corrected SMS body")
+    tail = text[prompt.end():]
+    _require(
+        re.search(r"\b(?:actually|correction|instead|rather|i meant|make that)\b", tail, re.IGNORECASE) is None,
+        f"{scenario_name}: turn {turn} contradicts its corrected SMS body after confirmation",
     )
     return body
 
@@ -519,13 +547,29 @@ def _scenario_failures(
                 f"{scenario.name}: turn {turn_number} must define both SMS recipient and body",
             ):
                 continue
+            inherited_correction = (
+                scenario.name == "sms-correction-new-yes"
+                and turn_number > 1
+                and bool(spoken_sms)
+                and _SPOKEN_SMS_RECIPIENT.search(text) is None
+                and re.search(r"\bsame number\b", text, re.IGNORECASE) is not None
+            )
             try:
-                body = _spoken_sms_body(text, expectation.sms_recipient, scenario.name, turn_number)
+                body = (
+                    _spoken_sms_correction_body(text, scenario.name, turn_number)
+                    if inherited_correction
+                    else _spoken_sms_body(text, expectation.sms_recipient, scenario.name, turn_number)
+                )
             except AssertionError as error:
                 fail(turn_number, str(error))
             else:
+                prior_recipient_matches = (
+                    not inherited_correction
+                    or spoken_sms[max(spoken_sms)][0] == expectation.sms_recipient
+                )
                 if require(
-                    _sms_body_tokens(body) == _sms_body_tokens(expectation.sms_body),
+                    prior_recipient_matches
+                    and _sms_body_tokens(body) == _sms_body_tokens(expectation.sms_body),
                     turn_number,
                     f"{scenario.name}: turn {turn_number} said back {body!r}, expected {expectation.sms_body!r}",
                 ):

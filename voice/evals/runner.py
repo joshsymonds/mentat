@@ -27,8 +27,10 @@ from evals.report import NO_ANSWER_FAILURE, score_observations
 from evals.scenarios import (
     SCENARIOS,
     SMS_CONFIRMATION_PATTERN,
+    _SPOKEN_SMS_RECIPIENT,
     _sms_body_tokens,
     _spoken_sms_body,
+    _spoken_sms_correction_body,
     _uncertain_without_alice_attribution,
 )
 
@@ -1022,11 +1024,21 @@ def _answer_time(
             if not isinstance(sms_recipient, str) or not isinstance(sms_body, str):
                 raise RuntimeError("answer expectation has an incomplete SMS say-back")
             try:
-                spoken_body = _spoken_sms_body(
-                    text,
-                    sms_recipient,
-                    scenario_name or "scenario",
-                    turn_index or 1,
+                spoken_body = (
+                    _spoken_sms_correction_body(
+                        text,
+                        scenario_name or "scenario",
+                        turn_index or 1,
+                    )
+                    if scenario_name == "sms-correction-new-yes"
+                    and turn_index == 2
+                    and _SPOKEN_SMS_RECIPIENT.search(text) is None
+                    else _spoken_sms_body(
+                        text,
+                        sms_recipient,
+                        scenario_name or "scenario",
+                        turn_index or 1,
+                    )
                 )
             except AssertionError:
                 continue
