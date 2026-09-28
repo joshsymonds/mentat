@@ -1175,6 +1175,50 @@ class ScenarioCorpusTests(unittest.TestCase):
                 room_closed_after=1,
             )
 
+    def test_live_timer_filler_is_not_a_duration_but_real_duration_stays_strict(self):
+        scenario = next(s for s in SCENARIOS if s.name == "timer-300-seconds")
+        command = {"turn": 1, "kind": "timer", "seconds": 300}
+        for filler in ("one sec", "one second"):
+            with self.subTest(filler=filler):
+                evaluate_scenario(
+                    scenario,
+                    turns=[f"Starting that now {filler}. Okay. Five minutes. and counting."],
+                    phone_commands=[command],
+                    room_closed_after=1,
+                )
+
+        for wrong_duration in ("Okay, one second timer is set.", "Okay, one sec timer is set."):
+            with self.subTest(wrong_duration=wrong_duration), self.assertRaisesRegex(
+                AssertionError, "spoken timer duration"
+            ):
+                evaluate_scenario(
+                    scenario,
+                    turns=[wrong_duration],
+                    phone_commands=[command],
+                    room_closed_after=1,
+                )
+
+        with self.assertRaisesRegex(AssertionError, "spoken timer duration"):
+            evaluate_scenario(
+                scenario,
+                turns=["Starting that now one second. Okay. Thirty minutes."],
+                phone_commands=[command],
+                room_closed_after=1,
+            )
+
+    def test_live_william_keck_name_is_accepted_but_unrelated_name_is_rejected(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        turns = [
+            "Alice Keck donated Alice Keck Park Memorial Garden in Santa Barbara.",
+            "She was a local philanthropist and the daughter of oilman William M. Keck.",
+            "Her wealth came from her father's Superior Oil fortune, which she inherited.",
+        ]
+        evaluate_scenario(scenario, turns=turns, phone_commands=[], room_closed_after=None)
+
+        turns[1] = "She was a local philanthropist and the daughter of oilman William M. Smith."
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(scenario, turns=turns, phone_commands=[], room_closed_after=None)
+
     def test_accepts_live_navigation_confirmation_only_for_exact_fake_target(self):
         scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
         turns = [

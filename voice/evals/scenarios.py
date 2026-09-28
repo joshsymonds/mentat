@@ -218,7 +218,7 @@ SCENARIOS = (
                 ),
             ),
             TurnExpectation(
-                (r"W\.?\s*M\.?\s*Keck", r"(?:father|daughter)"),
+                (r"(?:W\.?\s*M\.?\s*Keck|William\s+M\.?\s*Keck)", r"(?:father|daughter)"),
                 reject_patterns=(
                     r"\b(?:not|never|is not|isn't|was not|wasn't)\b.{0,80}\b(?:father|daughter|son|child|related)\b",
                 ),
@@ -329,6 +329,15 @@ _NUMBER_WORD_PATTERN = (
     r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
     r"(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?"
 )
+_TIMER_FILLER_PATTERN = re.compile(
+    r"\b(?:starting that now|sure|okay|alright),?\s+one\s+sec(?:ond)?\b(?=$|[.!?,;])",
+    re.IGNORECASE,
+)
+
+
+def _without_timer_fillers(text: str) -> str:
+    """Remove the brief live-observed acknowledgments before checking durations."""
+    return _TIMER_FILLER_PATTERN.sub(" ", text)
 
 
 def _spoken_number(value: str) -> int | None:
@@ -348,6 +357,7 @@ def _spoken_number(value: str) -> int | None:
 
 
 def _spoken_durations(text: str) -> list[int]:
+    text = _without_timer_fillers(text)
     durations = []
     pattern = re.compile(
         rf"\b(?P<value>{_NUMBER_WORD_PATTERN})[\s-]*"
@@ -544,10 +554,11 @@ def _scenario_failures(
             if isinstance(command_turn, int) and not isinstance(command_turn, bool) and 1 <= command_turn <= len(turns):
                 spoken = turns[command_turn - 1]
                 if actual.get("kind") == "timer":
+                    timer_text = _without_timer_fillers(spoken)
                     durations = _spoken_durations(spoken)
                     spoken_units = re.findall(
                         rf"\b{_DURATION_NUMBER_TOKEN_PATTERN}[\s-]*{_DURATION_UNIT_PATTERN}\b",
-                        spoken,
+                        timer_text,
                         re.IGNORECASE,
                     )
                     require(
