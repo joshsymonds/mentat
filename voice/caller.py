@@ -229,6 +229,9 @@ async def _tts(http: Any, text: str) -> bytes:
 
 
 async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) -> list[dict[str, Any]]:
+    if len(pcm) * 10 < sample_rate * channels * 2:
+        return []
+
     from aiohttp import FormData
 
     import io

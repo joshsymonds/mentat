@@ -152,6 +152,58 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TranscribeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_skips_40ms_pcm_before_wav_form_or_upload(self):
+        class Response:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def json(self):
+                return {"segments": []}
+
+        http = Mock()
+        http.post.return_value = Response()
+        form_data = Mock()
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=form_data)}):
+                segments = await caller._transcribe(http, b"\0\0" * 960, 24000, 1)
+        self.assertEqual(segments, [])
+        form_data.assert_not_called()
+        http.post.assert_not_called()
+
+    async def test_uploads_valid_duration_pcm_for_transcription(self):
+        class FormData:
+            def add_field(self, *_args, **_kwargs):
+                return None
+
+        class Response:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def json(self):
+                return {"segments": [{"text": "answer"}]}
+
+        http = Mock()
+        http.post.return_value = Response()
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=FormData)}):
+                segments = await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+        self.assertEqual(segments, [{"text": "answer"}])
+        http.post.assert_called_once()
+
+
 class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
     async def test_capture_starts_before_speech_and_preserves_early_frames(self):
         early = CaptureTests.frame(False)
