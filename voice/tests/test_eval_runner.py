@@ -64,7 +64,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         class Room:
             remote_participants = {
-                "agent": SimpleNamespace(kind=1, attributes={"lk.agent.state": "listening"})
+                "agent": SimpleNamespace()
             }
             local_participant = SimpleNamespace(
                 publish_track=lambda *_args, **_kwargs: asyncio.sleep(
@@ -207,13 +207,15 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(events.index("playout"), events.index("capture-result"))
         self.assertEqual(events[-1], "disconnect")
 
-    async def test_first_line_waits_for_worker_subscription_to_caller_microphone(self):
+    async def test_first_line_waits_for_subscription_and_fixed_settle_without_agent_metadata(self):
         dependencies = self.dependencies_for_failure("other")
         subscribed = asyncio.Event()
         wait_started = asyncio.Event()
+        settle_started = asyncio.Event()
+        release_settle = asyncio.Event()
+        settle_durations = []
         events = []
-        participant = SimpleNamespace(kind=1, attributes={"lk.agent.state": "starting"})
-        dependencies.rtc.Room.remote_participants = {"agent": participant}
+        dependencies.rtc.Room.remote_participants = {"agent": SimpleNamespace()}
 
         class Publication:
             async def wait_for_subscription(self):
@@ -233,6 +235,15 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             publish_track=lambda *_args, **_kwargs: asyncio.sleep(0, result=publication)
         )
         dependencies.rtc.AudioSource = lambda *_args: Source()
+
+        async def settle_sleep(seconds):
+            settle_durations.append(seconds)
+            settle_started.set()
+            await release_settle.wait()
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__, "sleep": settle_sleep,
+        })
 
         async def speech_end(source):
             await source.wait_for_playout()
@@ -255,15 +266,14 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(task.done())
                 self.assertEqual(events, [])
                 subscribed.set()
-                await asyncio.sleep(0.05)
+                await asyncio.wait_for(settle_started.wait(), timeout=0.05)
                 self.assertEqual(events, ["subscription-ready"])
-                listening_at = time.monotonic()
-                participant.attributes["lk.agent.state"] = "listening"
-                await asyncio.sleep(0.05)
-                self.assertEqual(events, ["subscription-ready"])
+                self.assertEqual(settle_durations, [3.0])
+                self.assertFalse(task.done())
+                release_settle.set()
                 await task
-                self.assertGreaterEqual(time.monotonic() - listening_at, 0.3)
             finally:
+                release_settle.set()
                 if not task.done():
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
@@ -297,37 +307,9 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 room_close_after=None,
             )
 
-    async def test_missing_listening_state_fails_by_name_before_scripted_frames(self):
+    async def test_settle_deadline_fails_by_name_before_scripted_frames_without_agent_metadata(self):
         dependencies = self.dependencies_for_failure("other")
-        participant = SimpleNamespace(kind=1, attributes={"lk.agent.state": "starting"})
-        dependencies.rtc.Room.remote_participants = {"agent": participant}
-        events = []
-
-        class Source:
-            async def capture_frame(self, _frame):
-                events.append("scripted-frame")
-
-            async def wait_for_playout(self):
-                pass
-
-        dependencies.rtc.AudioSource = lambda *_args: Source()
-        with (
-            patch.dict(os.environ, TEST_VOICE_ENV),
-            patch.object(runner, "PARTICIPANT_DEADLINE_SECONDS", 0.02),
-            self.assertRaisesRegex(runner.DeadlineExceeded, "agent listening state"),
-        ):
-            await capture_script(
-                "android-selected-room",
-                ["First question@0::answer"],
-                dependencies=dependencies,
-                room_close_after=None,
-            )
-        self.assertEqual(events, [])
-
-    async def test_listening_settle_deadline_fails_by_name_before_scripted_frames(self):
-        dependencies = self.dependencies_for_failure("other")
-        participant = SimpleNamespace(kind=1, attributes={"lk.agent.state": "starting"})
-        dependencies.rtc.Room.remote_participants = {"agent": participant}
+        dependencies.rtc.Room.remote_participants = {"agent": SimpleNamespace()}
         events = []
 
         class Source:
@@ -341,18 +323,17 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.dict(os.environ, TEST_VOICE_ENV),
             patch.object(runner, "PARTICIPANT_DEADLINE_SECONDS", 0.2),
+            self.assertRaisesRegex(
+                runner.DeadlineExceeded,
+                "caller microphone subscription settle exceeded its deadline",
+            ),
         ):
-            task = asyncio.create_task(capture_script(
+            await capture_script(
                 "android-selected-room",
                 ["First question@0::answer"],
                 dependencies=dependencies,
                 room_close_after=None,
-            ))
-            await asyncio.sleep(0.05)
-            self.assertFalse(task.done())
-            participant.attributes["lk.agent.state"] = "listening"
-            with self.assertRaisesRegex(runner.DeadlineExceeded, "agent listening settle"):
-                await task
+            )
         self.assertEqual(events, [])
 
     async def test_injected_endpoint_token_and_url_reach_room_connect_without_local_mint(self):
@@ -1640,7 +1621,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     def dependencies_for_failure(failure):
         class Room:
             remote_participants = {
-                "agent": SimpleNamespace(kind=1, attributes={"lk.agent.state": "listening"})
+                "agent": SimpleNamespace()
             }
             callbacks = {}
             local_participant = SimpleNamespace(

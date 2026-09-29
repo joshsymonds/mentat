@@ -12,10 +12,8 @@ from typing import Any
 RATE = 24000
 FRAME_SAMPLES = RATE // 100
 MAX_ANSWER_SECONDS = 30
-LISTENING_TIMEOUT_SECONDS = 15
-LISTENING_SETTLE_SECONDS = 0.3
-LISTENING_POLL_INTERVAL_SECONDS = 0.05
-AGENT_STATE_ATTRIBUTE = "lk.agent.state"
+READINESS_TIMEOUT_SECONDS = 15
+MICROPHONE_SETTLE_SECONDS = 3.0
 
 
 class WhisperTranscriptionError(RuntimeError):
@@ -28,16 +26,14 @@ class WhisperTranscriptionError(RuntimeError):
         super().__init__(f"Whisper transcription rejected clip (HTTP {status})")
 
 
-async def wait_for_listening(
+async def wait_for_microphone_ready(
     publication: Any,
-    participants: Any,
-    agent_kind: Any,
     *,
     deadline: float,
     monotonic: Any = time.monotonic,
     sleep: Any = asyncio.sleep,
 ) -> None:
-    """Wait for microphone subscription and agent listening state under one deadline."""
+    """Wait for microphone subscription and its fixed settle under one deadline."""
     remaining = deadline - monotonic()
     if remaining <= 0:
         raise TimeoutError("caller microphone subscription exceeded its deadline")
@@ -46,25 +42,15 @@ async def wait_for_listening(
     except TimeoutError as error:
         raise TimeoutError("caller microphone subscription exceeded its deadline") from error
 
-    while not any(
-        participant.kind == agent_kind
-        and participant.attributes.get(AGENT_STATE_ATTRIBUTE) == "listening"
-        for participant in participants()
-    ):
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise TimeoutError("agent listening state did not arrive before deadline")
-        await sleep(min(LISTENING_POLL_INTERVAL_SECONDS, remaining))
-
     remaining = deadline - monotonic()
-    if remaining < LISTENING_SETTLE_SECONDS:
-        raise TimeoutError("agent listening settle exceeded its deadline")
+    if remaining < MICROPHONE_SETTLE_SECONDS:
+        raise TimeoutError("caller microphone subscription settle exceeded its deadline")
     try:
-        await asyncio.wait_for(sleep(LISTENING_SETTLE_SECONDS), timeout=remaining)
+        await asyncio.wait_for(sleep(MICROPHONE_SETTLE_SECONDS), timeout=remaining)
     except TimeoutError as error:
-        raise TimeoutError("agent listening settle exceeded its deadline") from error
+        raise TimeoutError("caller microphone subscription settle exceeded its deadline") from error
     if monotonic() > deadline:
-        raise TimeoutError("agent listening settle exceeded its deadline")
+        raise TimeoutError("caller microphone subscription settle exceeded its deadline")
 
 
 @dataclass(frozen=True)
@@ -320,16 +306,11 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
         try:
             source = rtc.AudioSource(RATE, 1)
             track = rtc.LocalAudioTrack.create_audio_track("mic", source)
-            readiness_deadline = time.monotonic() + LISTENING_TIMEOUT_SECONDS
+            readiness_deadline = time.monotonic() + READINESS_TIMEOUT_SECONDS
             publication = await room.local_participant.publish_track(
                 track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
             )
-            await wait_for_listening(
-                publication,
-                lambda: room.remote_participants.values(),
-                rtc.ParticipantKind.PARTICIPANT_KIND_AGENT,
-                deadline=readiness_deadline,
-            )
+            await wait_for_microphone_ready(publication, deadline=readiness_deadline)
             print("caller connected", flush=True)
 
             async def push(pcm: bytes) -> None:

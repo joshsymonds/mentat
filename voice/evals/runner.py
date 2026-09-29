@@ -580,10 +580,8 @@ async def capture_script(
                 "voice worker join polling",
             )
         try:
-            await caller.wait_for_listening(
+            await caller.wait_for_microphone_ready(
                 publication,
-                lambda: room.remote_participants.values(),
-                dependencies.rtc.ParticipantKind.PARTICIPANT_KIND_AGENT,
                 deadline=participant_deadline,
                 monotonic=dependencies.monotonic,
                 sleep=dependencies.sleep,

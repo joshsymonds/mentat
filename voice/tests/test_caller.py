@@ -380,7 +380,7 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
         speech_started = asyncio.Event()
         output = []
         room = None
-        participant = SimpleNamespace(kind="agent", attributes={"lk.agent.state": "starting"})
+        participant = SimpleNamespace()
 
         class Publication:
             async def wait_for_subscription(self):
@@ -476,7 +476,7 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
             patch.object(caller, "ContinuousCapture", Capture),
             patch.object(caller, "_tts", tts),
             patch.object(caller, "_transcribe", transcribe or default_transcribe),
-            patch.object(caller, "LISTENING_TIMEOUT_SECONDS", subscription_timeout, create=True),
+            patch.object(caller, "READINESS_TIMEOUT_SECONDS", subscription_timeout),
             patch("builtins.print", side_effect=lambda *args, **_kwargs: output.append(" ".join(map(str, args)))),
             patch.dict(os.environ, {"LIVEKIT_API_KEY": "key", "LIVEKIT_API_SECRET": "secret"}),
             patch.dict(sys.modules, {
@@ -496,23 +496,19 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
 
         return task, subscribed, speech_started, output, room, participant, cleanup
 
-    async def test_listening_after_subscription_and_settle_gates_first_line(self):
-        task, subscribed, speech_started, output, room, participant, cleanup = await self.run_caller()
+    async def test_subscription_and_fixed_settle_gate_first_line_without_agent_metadata(self):
+        task, subscribed, speech_started, output, room, _participant, cleanup = await self.run_caller(4.0)
         try:
             await asyncio.sleep(0.02)
             self.assertFalse(speech_started.is_set())
             self.assertFalse(any(line.startswith("say:") for line in output))
             subscribed.set()
+            subscribed_at = time.monotonic()
             await asyncio.sleep(0.02)
             self.assertFalse(speech_started.is_set())
             self.assertFalse(any(line.startswith("say:") for line in output))
-            listening_at = time.monotonic()
-            participant.attributes["lk.agent.state"] = "listening"
-            await asyncio.sleep(0.05)
-            self.assertFalse(speech_started.is_set())
-            self.assertFalse(any(line.startswith("say:") for line in output))
-            await asyncio.wait_for(task, timeout=1)
-            self.assertGreaterEqual(time.monotonic() - listening_at, 0.3)
+            await asyncio.wait_for(task, timeout=4)
+            self.assertGreaterEqual(time.monotonic() - subscribed_at, 2.9)
             self.assertTrue(speech_started.is_set())
             self.assertTrue(any(line == "say: First line" for line in output))
             self.assertTrue(room.disconnected)
@@ -529,28 +525,25 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
                 raise caller.WhisperTranscriptionError(400)
             return [{"start": 0.0, "end": 0.2, "text": "answer"}]
 
-        task, subscribed, _speech_started, output, _room, participant, cleanup = await self.run_caller(
+        task, subscribed, _speech_started, output, _room, _participant, cleanup = await self.run_caller(
+            subscription_timeout=4.0,
             steps=["Rejected question@0::answer", "Later question@0::answer"],
             transcribe=transcribe,
         )
         subscribed.set()
-        participant.attributes["lk.agent.state"] = "listening"
         try:
-            await asyncio.wait_for(task, timeout=1)
+            await asyncio.wait_for(task, timeout=4)
             self.assertEqual(calls, 2)
             self.assertIn("transcription failure: Whisper transcription rejected clip (HTTP 400)", output)
             self.assertIn("say: Later question", output)
         finally:
             cleanup()
 
-    async def test_listening_settle_timeout_is_named_and_never_speaks(self):
-        task, subscribed, speech_started, output, room, participant, cleanup = await self.run_caller(0.2)
+    async def test_settle_timeout_is_named_and_never_speaks(self):
+        task, subscribed, speech_started, output, room, _participant, cleanup = await self.run_caller(2.9)
         subscribed.set()
         try:
-            await asyncio.sleep(0.05)
-            self.assertFalse(task.done())
-            participant.attributes["lk.agent.state"] = "listening"
-            with self.assertRaisesRegex(TimeoutError, "agent listening settle"):
+            with self.assertRaisesRegex(TimeoutError, "caller microphone subscription settle exceeded its deadline"):
                 await asyncio.wait_for(task, timeout=1)
             self.assertFalse(speech_started.is_set())
             self.assertFalse(any(line.startswith("say:") for line in output))
@@ -561,26 +554,13 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
     async def test_subscription_timeout_never_speaks_and_disconnects(self):
         task, _subscribed, speech_started, output, room, _participant, cleanup = await self.run_caller(0.02)
         try:
-            with self.assertRaises(TimeoutError):
+            with self.assertRaisesRegex(TimeoutError, "caller microphone subscription exceeded its deadline"):
                 await asyncio.wait_for(task, timeout=1)
             self.assertFalse(speech_started.is_set())
             self.assertFalse(any(line.startswith("say:") for line in output))
             self.assertTrue(room.disconnected)
         finally:
             cleanup()
-
-    async def test_listening_timeout_is_named_and_never_speaks(self):
-        task, subscribed, speech_started, output, room, _participant, cleanup = await self.run_caller(0.02)
-        subscribed.set()
-        try:
-            with self.assertRaisesRegex(TimeoutError, "agent listening state"):
-                await asyncio.wait_for(task, timeout=1)
-            self.assertFalse(speech_started.is_set())
-            self.assertFalse(any(line.startswith("say:") for line in output))
-            self.assertTrue(room.disconnected)
-        finally:
-            cleanup()
-
 
 class PublisherFilteringTests(unittest.TestCase):
     def test_agent_audio_selects_only_microphone_source(self):
