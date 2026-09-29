@@ -287,6 +287,7 @@ production_port = int(production_listen.rsplit(":", 1)[1])
 
 env = {key: value for key, value in source_env.items() if key != "OPENAI_API_KEY"}
 env["MENTAT_VOICE_MODEL"] = voice_model
+env["MENTAT_SESSION_TTL"] = "90s"
 if "MENTAT_MCP_CONFIG" in env:
     env["MENTAT_MCP_CONFIG"] = rewrite_mcp_config(env["MENTAT_MCP_CONFIG"], production_port, dev_port)
 env.update({

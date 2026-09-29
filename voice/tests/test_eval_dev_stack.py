@@ -287,6 +287,7 @@ class DevStackTest(unittest.TestCase):
 
             candidate_env = run_candidate(requested_model)
             self.assertEqual(candidate_env["MENTAT_VOICE_MODEL"], requested_model)
+            self.assertEqual(candidate_env["MENTAT_SESSION_TTL"], "90s")
             self.assertEqual(production_env.read_bytes(), production_bytes)
             self.assertEqual(json.loads(production_env.read_text()), original_production)
 
