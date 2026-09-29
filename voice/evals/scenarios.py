@@ -32,6 +32,14 @@ class Scenario:
     spoken_place_pattern: str | None = None
 
 
+_ALICE_FATHER_NAME = r"(?:W\.?\s*M\.?\s*Keck|William\s+(?:(?:M\.?|Myron)\s+)?Keck)"
+_ALICE_FATHER_CLAIM = (
+    rf"\b(?:her\s+)?(?:father|dad),?\s+{_ALICE_FATHER_NAME}\b|"
+    rf"\b(?:Alice (?:Bertha )?Keck(?: Park)?|she)\b[^\n.!?;]{{0,90}}"
+    rf"\b(?:the\s+)?daughter\s+of(?:\s+\w+){{0,2}}\s+{_ALICE_FATHER_NAME}\b|"
+    rf"\b(?:Alice (?:Bertha )?Keck(?: Park)?|she)\b[^\n.!?;]{{0,90}}"
+    rf"\b{_ALICE_FATHER_NAME}'s\s+daughter\b"
+)
 _ALICE_DONOR_CLAIM = (
     r"\bAlice (?:Bertha )?Keck(?: Park)?\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck(?: Park)?\b.{0,100}\bshe\s+(?:bought|purchased|donated|gave|gifted)\b|"
@@ -228,9 +236,10 @@ SCENARIOS = (
                 ),
             ),
             TurnExpectation(
-                (r"(?:W\.?\s*M\.?\s*Keck|William\s+(?:M\.?|Myron)\s*Keck)", r"(?:father|daughter)"),
+                (_ALICE_FATHER_CLAIM,),
                 reject_patterns=(
                     r"\b(?:not|never|is not|isn't|was not|wasn't)\b.{0,80}\b(?:father|daughter|son|child|related)\b",
+                    r"\b(?:not sure|don't know|do not know|can't say|cannot say|may have)\b.{0,80}\b(?:father|dad|daughter|son|child|related)\b",
                 ),
             ),
             TurnExpectation(

@@ -2474,6 +2474,50 @@ class ScenarioObservationTests(unittest.TestCase):
             )
         )
 
+    def test_alice_live_father_answers_receive_answer_timestamps(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        live_answers = (
+            "and donated it anonymously. Alice Keck Park was a Santa Barbara philanthropist and an heir to the superior oil fortune through her father, William Keck. Her aunt Carolyn had been married to the son of Albert Herter. Herter was the artist who built the El Mirasol estate on that site. That's likely why the property mattered to her. When she died, she left roughly $20 million to local agencies and causes. I don't have much on her personal life beyond that.",
+            "She was a Santa Barbara philanthropist from the Keck Oil family. Her dad, William Keck. founded Superior Oil, and her brother Howard later ran it. She was pretty private and lived quietly in town, but she gave generously to local causes, especially conservation, gardens, and animal welfare. The park's the big thing she's remembered for. Past that, the details of her personal life are thin, so I wouldn't.",
+        )
+        for answer in live_answers:
+            trace = {
+                "capture_started": 60.0,
+                "speech_end": 60.0,
+                "segments": [{"start": 0.4, "end": 12.0, "text": answer}],
+            }
+            with self.subTest(answer=answer):
+                self.assertEqual(
+                    runner._answer_time(
+                        trace,
+                        scenario.turns[1],
+                        scenario_name=scenario.name,
+                        turn_index=2,
+                    ),
+                    60.4,
+                )
+
+        for answer in (
+            "William Keck founded Superior Oil.",
+            "Alice Keck's dad was John Smith. William Keck founded Superior Oil.",
+            "William Keck was Alice Keck's brother, not her father.",
+            "I'm not sure whether William Keck was her father.",
+        ):
+            trace = {
+                "capture_started": 60.0,
+                "speech_end": 60.0,
+                "segments": [{"start": 0.4, "end": 12.0, "text": answer}],
+            }
+            with self.subTest(answer=answer):
+                self.assertIsNone(
+                    runner._answer_time(
+                        trace,
+                        scenario.turns[1],
+                        scenario_name=scenario.name,
+                        turn_index=2,
+                    )
+                )
+
     def test_run17_live_alice_answer_timestamps_match_sentence_break_and_full_name(self):
         scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
         first = {

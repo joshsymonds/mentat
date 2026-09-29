@@ -1930,6 +1930,36 @@ class ScenarioCorpusTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 self.assertTrue(evaluate_scenario_prefix(scenario, [answer, *followups], [], None))
 
+    def test_alice_live_father_answers_accept_only_named_family_relationships(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        first_turn = (
+            "Alice Keck Park was an oil heiress, daughter of Superior Oil founder William Keck. "
+            "In the mid-70s, the block was slated for a hotel, and she put up the money "
+            "for the city to buy it instead, on the condition it became a public park."
+        )
+        third_turn = "Her family's wealth came from Superior Oil."
+        live_answers = (
+            "and donated it anonymously. Alice Keck Park was a Santa Barbara philanthropist and an heir to the superior oil fortune through her father, William Keck. Her aunt Carolyn had been married to the son of Albert Herter. Herter was the artist who built the El Mirasol estate on that site. That's likely why the property mattered to her. When she died, she left roughly $20 million to local agencies and causes. I don't have much on her personal life beyond that.",
+            "She was a Santa Barbara philanthropist from the Keck Oil family. Her dad, William Keck. founded Superior Oil, and her brother Howard later ran it. She was pretty private and lived quietly in town, but she gave generously to local causes, especially conservation, gardens, and animal welfare. The park's the big thing she's remembered for. Past that, the details of her personal life are thin, so I wouldn't.",
+        )
+        for answer in live_answers:
+            with self.subTest(answer=answer):
+                self.assertEqual(
+                    evaluate_scenario_prefix(scenario, [first_turn, answer, third_turn], [], None),
+                    [],
+                )
+
+        for answer in (
+            "William Keck founded Superior Oil.",
+            "Alice Keck's dad was John Smith. William Keck founded Superior Oil.",
+            "William Keck was Alice Keck's brother, not her father.",
+            "I'm not sure whether William Keck was her father.",
+        ):
+            with self.subTest(answer=answer):
+                self.assertTrue(
+                    evaluate_scenario_prefix(scenario, [first_turn, answer, third_turn], [], None)
+                )
+
     def test_run17_exact_alice_segments_keep_donor_and_followup_truth_strict(self):
         scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
         segments = (
