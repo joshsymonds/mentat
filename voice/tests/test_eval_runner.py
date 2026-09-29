@@ -65,7 +65,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         class Room:
             remote_participants = {"agent": object()}
             local_participant = SimpleNamespace(
-                publish_track=lambda *_args, **_kwargs: asyncio.sleep(0)
+                publish_track=lambda *_args, **_kwargs: asyncio.sleep(
+                    0,
+                    result=SimpleNamespace(wait_for_subscription=lambda: asyncio.sleep(0)),
+                )
             )
 
             def on(self, event):
@@ -200,6 +203,87 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(events.index("capture-start"), events.index("speech-frame"))
         self.assertLess(events.index("playout"), events.index("capture-result"))
         self.assertEqual(events[-1], "disconnect")
+
+    async def test_first_line_waits_for_worker_subscription_to_caller_microphone(self):
+        dependencies = self.dependencies_for_failure("other")
+        subscribed = asyncio.Event()
+        wait_started = asyncio.Event()
+        events = []
+
+        class Publication:
+            async def wait_for_subscription(self):
+                wait_started.set()
+                await subscribed.wait()
+                events.append("subscription-ready")
+
+        class Source:
+            async def capture_frame(self, _frame):
+                events.append("speech-frame")
+
+            async def wait_for_playout(self):
+                pass
+
+        publication = Publication()
+        dependencies.rtc.Room.local_participant = SimpleNamespace(
+            publish_track=lambda *_args, **_kwargs: asyncio.sleep(0, result=publication)
+        )
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+
+        async def speech_end(source):
+            await source.wait_for_playout()
+            return time.monotonic()
+
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+        ):
+            task = asyncio.create_task(
+                capture_script(
+                    "android-selected-room",
+                    ["First question@0::answer"],
+                    dependencies=dependencies,
+                    room_close_after=None,
+                )
+            )
+            try:
+                await asyncio.wait_for(wait_started.wait(), timeout=0.05)
+                self.assertFalse(task.done())
+                self.assertEqual(events, [])
+                subscribed.set()
+                await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+        self.assertEqual(events, ["subscription-ready", "speech-frame"])
+
+    async def test_missing_worker_subscription_fails_within_participant_deadline(self):
+        dependencies = self.dependencies_for_failure("other")
+
+        class Publication:
+            async def wait_for_subscription(self):
+                await asyncio.Event().wait()
+
+        publication = Publication()
+        dependencies.rtc.Room.local_participant = SimpleNamespace(
+            publish_track=lambda *_args, **_kwargs: asyncio.sleep(0, result=publication)
+        )
+
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner, "PARTICIPANT_DEADLINE_SECONDS", 0.01),
+            self.assertRaisesRegex(
+                runner.DeadlineExceeded,
+                "caller microphone subscription exceeded its deadline",
+            ),
+        ):
+            await capture_script(
+                "android-selected-room",
+                ["First question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
 
     async def test_injected_endpoint_token_and_url_reach_room_connect_without_local_mint(self):
         dependencies = self.dependencies_for_failure("other")
@@ -1379,7 +1463,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             remote_participants = {"agent": object()}
             callbacks = {}
             local_participant = SimpleNamespace(
-                publish_track=lambda *_args, **_kwargs: asyncio.sleep(0)
+                publish_track=lambda *_args, **_kwargs: asyncio.sleep(
+                    0,
+                    result=SimpleNamespace(wait_for_subscription=lambda: asyncio.sleep(0)),
+                )
             )
 
             def on(self, event):

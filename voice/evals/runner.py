@@ -545,7 +545,7 @@ async def capture_script(
         )
         source = dependencies.rtc.AudioSource(RATE, 1)
         local_track = dependencies.rtc.LocalAudioTrack.create_audio_track("mic", source)
-        await _with_deadline(
+        publication = await _with_deadline(
             room.local_participant.publish_track(
                 local_track,
                 dependencies.rtc.TrackPublishOptions(
@@ -572,6 +572,11 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "voice worker join polling",
             )
+        await _with_deadline(
+            publication.wait_for_subscription(),
+            max(0.0, participant_deadline - dependencies.monotonic()),
+            "caller microphone subscription",
+        )
 
         async def push(pcm: bytes) -> None:
             for offset in range(0, len(pcm), FRAME_SAMPLES * 2):
