@@ -171,13 +171,45 @@ VOICE_PID=$(systemctl show mentat-voice --property=MainPID --value)
 test "$MENTAT_PID" -gt 0
 test "$VOICE_PID" -gt 0
 NODE_BIN=$(readlink -f "/proc/$MENTAT_PID/exe")
-# Keep the service's Nix Python environment wrapper; /proc/exe loses its site packages.
-IFS= read -r -d '' VOICE_PY < "/proc/$VOICE_PID/cmdline"
+VOICE_ENV_PATH=$(
+  nix build \
+    --impure \
+    --expr "let pkgs = import (builtins.getFlake \"nixpkgs\").outPath {}; in import $DEV_DIR/voice/voice-env.nix { inherit pkgs; }" \
+    --no-link \
+    --print-out-paths
+)
+case "$VOICE_ENV_PATH" in
+  /nix/store/*) ;;
+  *) echo "candidate voice environment build did not return one Nix store path" >&2; exit 1 ;;
+esac
+case "$VOICE_ENV_PATH" in
+  *$'\n'*) echo "candidate voice environment build returned multiple store paths" >&2; exit 1 ;;
+esac
+VOICE_PY="$VOICE_ENV_PATH/bin/python"
+test -x "$VOICE_PY"
 case "$VOICE_PY" in
   /*) test -x "$VOICE_PY" ;;
-  *) echo "voice Python executable must be an absolute path" >&2; exit 1 ;;
+  *) echo "candidate voice Python executable must be an absolute path" >&2; exit 1 ;;
 esac
-"$VOICE_PY" -c 'import aiohttp; from livekit import api, rtc'
+"$VOICE_PY" - <<'PY'
+import importlib
+
+for module in (
+    "aiohttp",
+    "livekit.api",
+    "livekit.rtc",
+    "livekit.plugins.dtln",
+    "livekit.plugins.elevenlabs",
+    "livekit.plugins.openai",
+    "livekit.plugins.silero",
+):
+    try:
+        importlib.import_module(module)
+    except ImportError as error:
+        raise SystemExit(
+            f"candidate voice environment missing required module {module}: {error}"
+        ) from error
+PY
 
 mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records"
 umask 077
@@ -682,6 +714,7 @@ class DevStack:
                 "scp", "-r",
                 *(str(self.checkout / "voice" / name) for name in voice_files),
                 str(self.checkout / "voice" / "evals" / "phone.py"),
+                str(self.checkout / "nix" / "voice-env.nix"),
                 f"{self.remote}:{self._remote_dir}/voice/",
             ],
             check=True,

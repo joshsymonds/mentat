@@ -656,47 +656,101 @@ class DevStackTest(unittest.TestCase):
                     self.assertNotIn(secret, error.stderr)
                     self.assertNotIn(secret, error.output)
 
-    def test_voice_python_keeps_package_wrapper_and_checks_caller_imports(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            underlying = root / "python3"
-            invocation = root / "invocation"
-            underlying.write_text(f"#!/bin/sh\nprintf '%s' \"$*\" > {shlex.quote(str(invocation))}\n")
-            underlying.chmod(0o755)
-            wrapper = root / "python-env"
-            wrapper.symlink_to(underlying)
-            proc_exe = root / "proc-exe"
-            proc_exe.symlink_to(underlying)
-            cmdline = root / "cmdline"
-            cmdline.write_bytes(os.fsencode(wrapper) + b"\0agent.py\0start\0")
+    def test_candidate_voice_environment_uses_host_nixpkgs_and_both_candidate_launches(self):
+        calls = []
 
-            capture = next(
-                line for line in _SETUP_SCRIPT.splitlines()
-                if "VOICE_PY" in line and "/proc/$VOICE_PID/" in line
-            )
-            capture = capture.replace('"/proc/$VOICE_PID/exe"', shlex.quote(str(proc_exe)))
-            capture = capture.replace('"/proc/$VOICE_PID/cmdline"', shlex.quote(str(cmdline)))
-            result = subprocess.run(
-                ["bash", "-euo", "pipefail", "-c", capture + '\nprintf "%s" "$VOICE_PY"'],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, str(wrapper))
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.voiceenv\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"dev_port": 49151, "health_port": 49152}), ""
+                )
+            if "MENTAT_VOICE_GRANT" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
+            return subprocess.CompletedProcess(args, 0, "", "")
 
-            import_check = next(
-                line for line in _SETUP_SCRIPT.splitlines()
-                if line.startswith('"$VOICE_PY" -c ') and "aiohttp" in line
-            )
-            check = subprocess.run(
-                ["bash", "-euo", "pipefail", "-c", f"VOICE_PY={shlex.quote(str(wrapper))}\n{import_check}"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(check.returncode, 0, check.stderr)
-            self.assertIn("import aiohttp", invocation.read_text())
+        with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
+            popen.return_value = unittest.mock.Mock(poll=lambda: None)
+            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+                stack.start_worker("candidate-env-room")
+                stack.run_voice(
+                    ["caller.py"], token="test-token", livekit_url="wss://lk.invalid"
+                )
+
+        scp_calls = [args for args, _ in calls if args and args[0] == "scp"]
+        self.assertTrue(any(str(CHECKOUT / "nix/voice-env.nix") in args for args in scp_calls))
+        setup_index, (setup_args, setup_script) = next(
+            (index, (args, kwargs["input"])) for index, (args, kwargs) in enumerate(calls)
+            if args[:2] == ["ssh", "ultraviolet"]
+            and '"MENTAT_LISTEN"' in kwargs.get("input", "")
+        )
+        self.assertIn('builtins.getFlake \\\"nixpkgs\\\"', setup_script)
+        self.assertIn("nix build \\\n    --impure", setup_script)
+        self.assertIn("/voice/voice-env.nix", setup_script)
+        self.assertIn('VOICE_PY="$VOICE_ENV_PATH/bin/python"', setup_script)
+        self.assertEqual(setup_args[-1], "chatgpt/sol-fast")
+        self.assertLess(
+            setup_script.index("candidate voice environment missing"),
+            setup_script.index("systemd-run"),
+        )
+        worker_index = next(
+            index for index, (_, kwargs) in enumerate(calls)
+            if "--room" in kwargs.get("input", "")
+        )
+        self.assertLess(setup_index, worker_index)
+        self.assertLess(
+            setup_script.index("candidate voice environment missing"),
+            setup_script.index("systemctl stop mentat-voice"),
+        )
+        for module in (
+            "livekit.plugins.dtln",
+            "livekit.plugins.elevenlabs",
+            "livekit.plugins.openai",
+            "livekit.plugins.silero",
+        ):
+            self.assertIn(module, setup_script)
+        self.assertIn('voice_python = sys.argv[4]', setup_script)
+        self.assertIn(
+            '(dev_dir / "voice-python.path").write_text(f"{voice_python}\\n")',
+            setup_script,
+        )
+        self.assertIn(
+            'voice_python = (dev_dir / "voice-python.path").read_text().strip()',
+            _START_WORKER_SCRIPT,
+        )
+        self.assertIn(
+            'voice_python = (DEV_DIR / "voice-python.path").read_text().strip()',
+            _RUN_VOICE_SCRIPT,
+        )
+
+    def test_candidate_voice_python_preflight_reports_the_missing_plugin_by_name(self):
+        preflight = _SETUP_SCRIPT.split('"$VOICE_PY" - <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
+        observed = []
+
+        def import_module(module):
+            observed.append(module)
+            if module == "livekit.plugins.openai":
+                raise ImportError("No module named livekit.plugins.openai")
+            return object()
+
+        with patch("importlib.import_module", side_effect=import_module):
+            with self.assertRaises(SystemExit) as failure:
+                exec(preflight, {})
+
+        self.assertEqual(
+            str(failure.exception),
+            "candidate voice environment missing required module livekit.plugins.openai: "
+            "No module named livekit.plugins.openai",
+        )
+        self.assertEqual(
+            observed,
+            ["aiohttp", "livekit.api", "livekit.rtc", "livekit.plugins.dtln",
+             "livekit.plugins.elevenlabs", "livekit.plugins.openai"],
+        )
 
     def test_setpriv_is_resolved_outside_service_path_for_all_launches(self):
         def python_block(script, header):
