@@ -14,12 +14,49 @@ from unittest.mock import Mock, patch
 
 
 class AgentSourceContractTest(unittest.TestCase):
-    def test_agent_uses_flux_turn_detection_and_sonic_without_gpt_live(self):
+    def test_agent_uses_openai_transcription_and_elevenlabs_http_stream_adapter(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
-        self.assertIn('inference.STT(\n            "deepgram/flux-general",', source)
-        self.assertIn('"turn_detection": "stt"', source)
-        self.assertIn('inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE)', source)
-        self.assertIn("TTS_VOICE =", source)
+        tree = ast.parse(source)
+        entrypoint = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "entrypoint"
+        )
+        session_call = next(
+            node for node in ast.walk(entrypoint)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "AgentSession"
+        )
+        stt = next(
+            keyword.value for keyword in session_call.keywords if keyword.arg == "stt"
+        )
+        expected_stt = ast.parse(
+            'openai.STT(model="gpt-live-transcribe", api_key=os.environ["OPENAI_API_KEY"], '
+            'vad=ctx.proc.userdata["vad"])',
+            mode="eval",
+        ).body
+        self.assertEqual(
+            ast.dump(stt, include_attributes=False),
+            ast.dump(expected_stt, include_attributes=False),
+        )
+        tts_call = next(
+            keyword.value for keyword in session_call.keywords if keyword.arg == "tts"
+        )
+        expected_tts = ast.parse(
+            'tts.StreamAdapter(tts=elevenlabs.TTS(model="eleven_v4_turbo", '
+            'api_key=os.environ["ELEVENLABS_API_KEY"], '
+            'voice_id=os.environ.get("MENTAT_VOICE_TTS_VOICE", TTS_VOICE)))',
+            mode="eval",
+        ).body
+        self.assertEqual(
+            ast.dump(tts_call, include_attributes=False),
+            ast.dump(expected_tts, include_attributes=False),
+        )
+        self.assertIn('TTS_VOICE = "21m00Tcm4TlvDq8ikWAM"', source)
+        self.assertIn("Rachel", (Path(__file__).resolve().parents[1] / "README.md").read_text())
+        self.assertIn("MENTAT_VOICE_TTS_VOICE", (Path(__file__).resolve().parents[1] / "README.md").read_text())
+        self.assertNotIn("inference.", source)
+        self.assertNotIn("websocket", source.lower())
         self.assertNotIn("tts_text_transforms=", source)
         self.assertIn("async def on_user_turn_completed(", source)
         self.assertNotIn("GPTLive", source)
@@ -1452,7 +1489,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertLess(backend.index("write_turn_marker("), backend.index("http.post("))
         self.assertNotIn("append_commentary", source)
 
-    def test_agent_configures_nonzero_flux_endpointing_grace(self):
+    def test_agent_configures_local_silero_vad_and_endpointing_grace(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         tree = ast.parse(source)
         entrypoint = next(
@@ -1465,23 +1502,20 @@ class AgentSourceContractTest(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "AgentSession"
         )
-        stt = next(
-            keyword.value for keyword in session_call.keywords
-            if keyword.arg == "stt"
+        vad = next(
+            keyword.value for keyword in session_call.keywords if keyword.arg == "vad"
         )
-        extra_kwargs = next(
-            keyword.value for keyword in stt.keywords
-            if keyword.arg == "extra_kwargs"
-        )
-        self.assertEqual(
-            ast.literal_eval(extra_kwargs),
-            {"eot_threshold": 0.85, "eot_timeout_ms": 8000},
-        )
+        self.assertEqual(ast.unparse(vad), "ctx.proc.userdata['vad']")
 
         turn_handling = next(
             keyword.value for keyword in session_call.keywords
             if keyword.arg == "turn_handling"
         )
+        turn_detection = next(
+            value for key, value in zip(turn_handling.keys, turn_handling.values)
+            if isinstance(key, ast.Constant) and key.value == "turn_detection"
+        )
+        self.assertEqual(ast.literal_eval(turn_detection), "vad")
         endpointing = next(
             value for key, value in zip(turn_handling.keys, turn_handling.values)
             if isinstance(key, ast.Constant) and key.value == "endpointing"

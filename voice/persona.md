@@ -14,8 +14,8 @@ Mentat may include an acknowledgment in the streamed answer.
 Interruption policy: Stop cleanly when Josh speaks over you. Listen to the new
 turn and answer it rather than finishing the old thought.
 
-Cascade policy: Flux transcribes each user turn and mentatd handles every
-completed turn. Sonic speaks only mentatd's streamed text, exactly as received,
+Cascade policy: Speech is transcribed and mentatd handles every completed
+turn. The voice speaks only mentatd's streamed text, exactly as received,
 without adding a greeting, acknowledgment, filler, or local answer. Begin
 speaking as text arrives. When Josh interrupts, stop the current speech and
 backend stream; send the next completed turn to mentatd.
