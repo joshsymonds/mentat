@@ -274,6 +274,151 @@ class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(speech_end, 4.0)
 
 
+class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def run_caller(self, subscription_timeout=1.0):
+        subscribed = asyncio.Event()
+        speech_started = asyncio.Event()
+        output = []
+        room = None
+
+        class Publication:
+            async def wait_for_subscription(self):
+                await subscribed.wait()
+
+        class AudioSource:
+            def __init__(self, *_args):
+                pass
+
+            async def capture_frame(self, frame):
+                if frame.data != b"\0\0" * frame.samples_per_channel:
+                    speech_started.set()
+
+            async def wait_for_playout(self):
+                return None
+
+        class LocalParticipant:
+            async def publish_track(self, *_args, **_kwargs):
+                return Publication()
+
+        class Room:
+            def __init__(self):
+                self.local_participant = LocalParticipant()
+                self.remote_participants = {"worker": object()}
+                self.handlers = {}
+                self.disconnected = False
+
+            def on(self, event):
+                return lambda callback: self.handlers.setdefault(event, callback)
+
+            async def connect(self, *_args):
+                return None
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        room = Room()
+
+        class ClientSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class AccessToken:
+            def __init__(self, *_args):
+                pass
+
+            def with_identity(self, *_args):
+                return self
+
+            def with_grants(self, *_args):
+                return self
+
+            def to_jwt(self):
+                return "token"
+
+        rtc = SimpleNamespace(
+            Room=lambda: room,
+            AudioSource=AudioSource,
+            LocalAudioTrack=SimpleNamespace(create_audio_track=lambda *_args: object()),
+            TrackPublishOptions=lambda **_kwargs: object(),
+            AudioFrame=lambda data, rate, channels, samples: SimpleNamespace(
+                data=data, sample_rate=rate, num_channels=channels, samples_per_channel=samples
+            ),
+            ParticipantKind=SimpleNamespace(PARTICIPANT_KIND_AGENT="agent"),
+            TrackKind=SimpleNamespace(KIND_AUDIO="audio"),
+            TrackSource=SimpleNamespace(SOURCE_MICROPHONE="microphone"),
+        )
+        api = SimpleNamespace(
+            AccessToken=AccessToken,
+            VideoGrants=lambda **_kwargs: object(),
+        )
+
+        class Capture:
+            def __init__(self, *_args):
+                pass
+
+            async def start(self):
+                return None
+
+            async def result(self):
+                return b"answer", 24000, 1, 0.0
+
+        async def tts(_http, _text):
+            return b"\1\0" * caller.FRAME_SAMPLES
+
+        async def transcribe(*_args):
+            return []
+
+        patchers = [
+            patch.object(caller, "ContinuousCapture", Capture),
+            patch.object(caller, "_tts", tts),
+            patch.object(caller, "_transcribe", transcribe),
+            patch.object(caller, "SUBSCRIPTION_TIMEOUT_SECONDS", subscription_timeout, create=True),
+            patch("builtins.print", side_effect=lambda *args, **_kwargs: output.append(" ".join(map(str, args)))),
+            patch.dict(os.environ, {"LIVEKIT_API_KEY": "key", "LIVEKIT_API_SECRET": "secret"}),
+            patch.dict(sys.modules, {
+                "aiohttp": SimpleNamespace(ClientSession=ClientSession),
+                "livekit": SimpleNamespace(api=api, rtc=rtc),
+            }),
+        ]
+        for patcher in patchers:
+            patcher.start()
+        task = asyncio.create_task(caller.run("room", ["First line@0::answer"]))
+
+        def cleanup():
+            for patcher in reversed(patchers):
+                patcher.stop()
+
+        return task, subscribed, speech_started, output, room, cleanup
+
+    async def test_waits_for_worker_microphone_subscription_before_first_line(self):
+        task, subscribed, speech_started, output, room, cleanup = await self.run_caller()
+        try:
+            await asyncio.sleep(0.02)
+            self.assertFalse(speech_started.is_set())
+            self.assertFalse(any(line.startswith("say:") for line in output))
+            subscribed.set()
+            await asyncio.wait_for(task, timeout=1)
+            self.assertTrue(speech_started.is_set())
+            self.assertTrue(any(line == "say: First line" for line in output))
+            self.assertTrue(room.disconnected)
+        finally:
+            cleanup()
+
+    async def test_subscription_timeout_never_speaks_and_disconnects(self):
+        task, _subscribed, speech_started, output, room, cleanup = await self.run_caller(0.02)
+        try:
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(task, timeout=1)
+            self.assertFalse(speech_started.is_set())
+            self.assertFalse(any(line.startswith("say:") for line in output))
+            self.assertTrue(room.disconnected)
+        finally:
+            cleanup()
+
+
 class PublisherFilteringTests(unittest.TestCase):
     def test_agent_audio_selects_only_microphone_source(self):
         publishers = [

@@ -12,6 +12,7 @@ from typing import Any
 RATE = 24000
 FRAME_SAMPLES = RATE // 100
 MAX_ANSWER_SECONDS = 30
+SUBSCRIPTION_TIMEOUT_SECONDS = 15
 
 
 @dataclass(frozen=True)
@@ -261,8 +262,11 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
         try:
             source = rtc.AudioSource(RATE, 1)
             track = rtc.LocalAudioTrack.create_audio_track("mic", source)
-            await room.local_participant.publish_track(
+            publication = await room.local_participant.publish_track(
                 track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+            )
+            await asyncio.wait_for(
+                publication.wait_for_subscription(), timeout=SUBSCRIPTION_TIMEOUT_SECONDS
             )
             print("caller connected", flush=True)
 
