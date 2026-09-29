@@ -369,6 +369,17 @@ let
     pythonImportsCheck = [ "livekit.plugins.openai.realtime" ];
   };
 
+  # The ElevenLabs plugin is pure Python and shares the pinned agent runtime.
+  # Its upstream wheel is py3-none-any, so it is compatible with this cp314 env.
+  livekit-plugins-elevenlabs = wheelPackage {
+    pname = "livekit-plugins-elevenlabs";
+    wheelName = "livekit_plugins_elevenlabs";
+    version = "1.8.1";
+    hash = "sha256-2HW1pViPU3ZZcgeDJOEtxsS49zHunhjF/PeTBV86w/o=";
+    dependencies = [ livekit-agents ];
+    pythonImportsCheck = [ "livekit.plugins.elevenlabs" ];
+  };
+
   # Self-hosted noise suppression (DTLN, MIT) run in-process on the agent's
   # inbound audio. LiveKit's own Krisp models need LiveKit Cloud transport,
   # which this SFU is not. The ~4MB ONNX weights ship inside the wheel.
@@ -395,6 +406,7 @@ assert pythonVersionOk;
   livekit-plugins-silero
   livekit-plugins-openai
   livekit-plugins-dtln
+  livekit-plugins-elevenlabs
 ])).overrideAttrs
   (old: {
     # Nix builds are sandboxed without network access, so loading the VAD here
@@ -408,9 +420,11 @@ assert pythonVersionOk;
       from importlib.resources import files
 
       import livekit.agents
-      from livekit.plugins import dtln, silero
+      from livekit.plugins import dtln, elevenlabs, silero
 
       assert livekit.agents.__version__.startswith("1.8."), livekit.agents.__version__
+      # The key is synthetic; constructing the plugin must not make a request.
+      elevenlabs.TTS(api_key="synthetic-test-key")
 
       onnx = Path(str(files("livekit.plugins.silero.resources") / "silero_vad.onnx")).resolve()
       assert onnx.is_file(), f"silero_vad.onnx missing: {onnx}"

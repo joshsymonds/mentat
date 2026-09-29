@@ -1,12 +1,18 @@
 # Voice surface
 
-The voice worker joins a LiveKit room and runs a single cascade: Deepgram Flux
-transcribes each user turn, the worker posts it to mentatd, and Cartesia Sonic
-speaks the daemon's text stream verbatim as it arrives. There is no local LLM
-reply or second voice. Interruptions stop speech and close the in-flight backend
-response; an end-conversation result closes after the goodbye, while follow-ups
-keep the room open. RoomIO starts before the LiveKit connection so speech around
-the opening chime is captured, and the worker does not greet on connect.
+The voice worker joins a LiveKit room and runs a single cascade: OpenAI live
+transcription with local Silero turn detection captures each user turn, the
+worker posts it to mentatd, and ElevenLabs v4 Turbo speaks the daemon's text
+stream verbatim as it arrives, using per-sentence HTTP synthesis. There is no
+local LLM reply or second voice. Interruptions stop speech and close the
+in-flight backend response; an end-conversation result closes after the
+goodbye, while follow-ups keep the room open. RoomIO starts before the LiveKit
+connection so speech around the opening chime is captured, and the worker does
+not greet on connect.
+
+The worker reads `OPENAI_API_KEY` and `ELEVENLABS_API_KEY` from its environment.
+`MENTAT_VOICE_TTS_VOICE` selects the ElevenLabs voice ID; when unset, it uses
+Rachel (`21m00Tcm4TlvDq8ikWAM`), an ElevenLabs premade voice.
 
 The daemon owns memory, systems, lookups, and actions. The worker runs beside
 mentatd and reaches it over loopback.
@@ -44,7 +50,8 @@ environment in step 2.
 ## Testing branch code in a live room
 
 Audio changes need a real room. For this cascade, the four scripted calls
-below exercise the complete Flux → mentatd → Sonic path. Calls A, B, and D
+below exercise the complete OpenAI transcription → mentatd → ElevenLabs path.
+Calls A, B, and D
 should use `web_search`; call C still reaches mentatd and should answer without
 searching. Compare each printed latency with the eight-second target.
 

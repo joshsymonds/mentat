@@ -1,4 +1,4 @@
-"""LiveKit voice worker streaming mentatd responses through Flux and Sonic."""
+"""LiveKit voice worker streaming mentatd responses through direct providers."""
 
 from __future__ import annotations
 
@@ -24,10 +24,10 @@ from livekit.agents import (
     JobContext,
     WorkerOptions,
     get_job_context,
-    inference,
+    tts,
 )
 from livekit.agents.voice import room_io
-from livekit.plugins import dtln, silero
+from livekit.plugins import dtln, elevenlabs, openai, silero
 
 from request import (
     END_CONVERSATION_TOOL,
@@ -54,7 +54,7 @@ CONSULT_FAILED = "I couldn't complete that request with Mentat. Please try again
 HERE = Path(__file__).parent
 PERSONA_PATH = HERE / "persona.md"
 EARCON_PATH = HERE / "assets" / "earcon.wav"
-TTS_VOICE = '47c38ca4-5f35-497b-b1a3-415245fb35e1'
+TTS_VOICE = "21m00Tcm4TlvDq8ikWAM"
 SEND_SMS_TOOL = "mcp__mentat__send_sms"
 
 
@@ -479,13 +479,20 @@ async def entrypoint(ctx: JobContext) -> None:
     """Serve one room until mentatd or the close policy ends it."""
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
-        stt=inference.STT(
-            "deepgram/flux-general",
-            extra_kwargs={"eot_threshold": 0.85, "eot_timeout_ms": 8000},
+        stt=openai.STT(
+            model="gpt-live-transcribe",
+            api_key=os.environ["OPENAI_API_KEY"],
+            vad=ctx.proc.userdata["vad"],
         ),
-        tts=inference.TTS("cartesia/sonic-3.6", voice=TTS_VOICE),
+        tts=tts.StreamAdapter(
+            tts=elevenlabs.TTS(
+                model="eleven_v4_turbo",
+                api_key=os.environ["ELEVENLABS_API_KEY"],
+                voice_id=os.environ.get("MENTAT_VOICE_TTS_VOICE", TTS_VOICE),
+            )
+        ),
         turn_handling={
-            "turn_detection": "stt",
+            "turn_detection": "vad",
             "endpointing": {"min_delay": 0.5},
         },
     )

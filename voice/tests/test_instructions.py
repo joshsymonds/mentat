@@ -51,8 +51,8 @@ FRESHNESS_POLICY = (
     "uncertainty rather than present an unverified summary as fact."
 )
 VOICE_CASCADE = (
-    "Flux transcribes each user turn and mentatd handles every completed turn. "
-    "Sonic speaks only mentatd's streamed text, exactly as received, without "
+    "Speech is transcribed and mentatd handles every completed turn. "
+    "The voice speaks only mentatd's streamed text, exactly as received, without "
     "adding a greeting, acknowledgment, filler, or local answer."
 )
 
@@ -107,8 +107,10 @@ class InstructionPolicyTest(unittest.TestCase):
             with self.subTest(clause=clause):
                 self.assert_policy_present(self.prompt, clause)
 
-    def test_voice_persona_documents_the_verbatim_flux_mentat_sonic_cascade(self):
+    def test_voice_persona_documents_the_verbatim_transcription_and_mentat_cascade(self):
         self.assert_policy_present(self.instructions, VOICE_CASCADE)
+        self.assertNotIn("Flux", self.instructions)
+        self.assertNotIn("Sonic", self.instructions)
 
     def test_readme_describes_all_turns_through_the_cascade_not_the_old_search_front(self):
         normalized = " ".join(self.readme.lower().split())
