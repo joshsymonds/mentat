@@ -18,6 +18,16 @@ LISTENING_POLL_INTERVAL_SECONDS = 0.05
 AGENT_STATE_ATTRIBUTE = "lk.agent.state"
 
 
+class WhisperTranscriptionError(RuntimeError):
+    """Whisper rejected one captured clip with an HTTP 4xx response."""
+
+    def __init__(self, status: int):
+        if not 400 <= status < 500:
+            raise ValueError("Whisper transcription failures must be HTTP 4xx responses")
+        self.status = status
+        super().__init__(f"Whisper transcription rejected clip (HTTP {status})")
+
+
 async def wait_for_listening(
     publication: Any,
     participants: Any,
@@ -252,6 +262,9 @@ async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) ->
         headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
         data=form,
     ) as response:
+        status = getattr(response, "status", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            raise WhisperTranscriptionError(status)
         response.raise_for_status()
         result = await response.json()
     return result.get("segments", [])
@@ -340,7 +353,11 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
                 await push(pcm)
                 speech_end = await _speech_end_after_playout(source)
                 answer_pcm, sample_rate, channels, capture_started = await capture.result()
-                segments = await _transcribe(http, answer_pcm, sample_rate, channels)
+                try:
+                    segments = await _transcribe(http, answer_pcm, sample_rate, channels)
+                except WhisperTranscriptionError as error:
+                    print(f"transcription failure: {error}", flush=True)
+                    continue
                 transcript = _segments_text(segments)
                 latency = first_matching_latency(segments, step.answer_pattern, speech_end, capture_started)
                 print(f"transcript: {transcript}", flush=True)

@@ -734,6 +734,115 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(traces[0]["transcript"], "part-0 part-1 part-2")
 
+    async def test_whisper_4xx_preserves_completed_turns_and_allows_later_run(self):
+        import json
+
+        dependencies = self.dependencies_for_failure("other")
+        levels = [0] * 65
+        for onset, level in zip((0, 20, 40), (600, 700, 800), strict=True):
+            levels[onset : onset + 5] = [level] * 5
+        pcm = pcm_windows(*levels)
+        utterance_indexes = {
+            utterance_pcm: index
+            for index, (_start, _end, utterance_pcm) in enumerate(
+                runner._pcm_utterances(pcm, 24000, 1)
+            )
+        }
+        self.assertEqual(len(utterance_indexes), 3)
+        fail = True
+        attempts = 0
+
+        class Capture:
+            async def start(self):
+                pass
+
+            async def result(self):
+                return pcm, 24000, 1, time.monotonic() + 0.1
+
+        async def transcribe(_http, utterance_pcm, _rate, _channels):
+            nonlocal attempts
+            attempts += 1
+            if fail and attempts == 5 and utterance_indexes[utterance_pcm] == 1:
+                raise runner.caller.WhisperTranscriptionError(429)
+            return [{"start": 0.0, "end": 0.2, "text": "completed"}]
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "capture_factory": lambda *_args: Capture(),
+            "transcribe": transcribe,
+        })
+        speech_end = lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1)
+        with patch.dict(os.environ, TEST_VOICE_ENV), patch.object(
+            runner.caller, "_speech_end_after_playout", speech_end
+        ):
+            with self.assertRaises(runner.PartialCaptureFailure) as caught:
+                await capture_script(
+                    "android-selected-room",
+                    ["First question@0::answer", "Rejected question@0::answer"],
+                    dependencies=dependencies,
+                    room_close_after=None,
+                )
+
+            self.assertEqual(len(caught.exception.turns), 1)
+            self.assertEqual(
+                caught.exception.turns[0]["transcript"],
+                "completed completed completed",
+            )
+            self.assertEqual(caught.exception.failure["turn"], 2)
+            self.assertEqual(
+                caught.exception.failure["message"],
+                "Whisper transcription rejected utterance 2 (HTTP 429)",
+            )
+            envelope = json.dumps({
+                "turns": caught.exception.turns,
+                "failure": caught.exception.failure,
+            })
+            self.assertEqual(
+                runner._capture_envelope(envelope, 2),
+                (caught.exception.turns, caught.exception.failure),
+            )
+
+            fail = False
+            traces = await capture_script(
+                "android-selected-room",
+                ["First question@0::answer", "Later question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+            self.assertEqual(len(traces), 2)
+
+    async def test_non_4xx_transcription_errors_still_surface(self):
+        dependencies = self.dependencies_for_failure("other")
+        pcm = pcm_windows(0, 0, 600, 600, *([0] * 18))
+
+        class Capture:
+            async def start(self):
+                pass
+
+            async def result(self):
+                return pcm, 24000, 1, time.monotonic() + 0.1
+
+        async def transcribe(*_args):
+            raise RuntimeError("Whisper HTTP 500")
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "capture_factory": lambda *_args: Capture(),
+            "transcribe": transcribe,
+        })
+        with patch.dict(os.environ, TEST_VOICE_ENV), patch.object(
+            runner.caller,
+            "_speech_end_after_playout",
+            lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Whisper HTTP 500"):
+                await capture_script(
+                    "android-selected-room",
+                    ["Question@0::answer"],
+                    dependencies=dependencies,
+                    room_close_after=None,
+                )
+
     async def test_asr_deadline_is_named_partial_failure_with_turn_start_and_prefix(self):
         import json
         import tempfile

@@ -118,6 +118,9 @@ SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5", "cla
 SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
 )
+WHISPER_HTTP_FAILURE_PATTERN = re.compile(
+    r"Whisper transcription rejected utterance [1-9][0-9]* \(HTTP 4[0-9]{2}\)"
+)
 PHONE_TOOL_KINDS = {
     "send_sms": "sms",
     "open_on_phone": "open",
@@ -147,6 +150,10 @@ def _scripted_tts_timeout_line(message: Any) -> int | None:
 
 def _is_scripted_tts_timeout(message: Any) -> bool:
     return _scripted_tts_timeout_line(message) is not None
+
+
+def _is_whisper_http_failure(message: Any) -> bool:
+    return isinstance(message, str) and WHISPER_HTTP_FAILURE_PATTERN.fullmatch(message) is not None
 
 
 class PartialCaptureFailure(RuntimeError):
@@ -677,6 +684,7 @@ async def capture_script(
             utterances = _pcm_utterances(answer_pcm, sample_rate, channels)
             raw_segments = []
             segments = []
+            transcription_failure: tuple[caller.WhisperTranscriptionError, int] | None = None
             if (
                 not math.isfinite(ANSWER_TRANSCRIPTION_DEADLINE_SECONDS)
                 or ANSWER_TRANSCRIPTION_DEADLINE_SECONDS <= 0
@@ -708,11 +716,18 @@ async def capture_script(
                         task.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
 
-                for utterance, task in zip(utterances, transcription_tasks, strict=True):
+                for utterance_ordinal, (utterance, task) in enumerate(
+                    zip(utterances, transcription_tasks, strict=True), start=1
+                ):
                     if task not in done:
                         break
                     utterance_start, utterance_end, _utterance_pcm = utterance
-                    utterance_segments = task.result()
+                    try:
+                        utterance_segments = task.result()
+                    except caller.WhisperTranscriptionError as error:
+                        if transcription_failure is None:
+                            transcription_failure = (error, utterance_ordinal)
+                        continue
                     if not isinstance(utterance_segments, list):
                         raise RuntimeError("transcription returned invalid segments")
                     raw_segments.extend(utterance_segments)
@@ -742,6 +757,15 @@ async def capture_script(
                         sample_rate,
                         channels,
                     )
+            if transcription_failure is not None:
+                error, utterance_ordinal = transcription_failure
+                raise PartialCaptureFailure(
+                    traces,
+                    index + 1,
+                    f"Whisper transcription rejected utterance {utterance_ordinal} "
+                    f"(HTTP {error.status})",
+                    speech_started_at=speech_started_at,
+                ) from error
             if pending:
                 raise PartialCaptureFailure(
                     traces,
@@ -1490,12 +1514,14 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
                 "room was deleted before all scripted lines were captured",
                 "room deletion was not observed before deadline",
             }
+            or _is_whisper_http_failure(failure.get("message"))
         )
         or (
             failure.get("message") in {
                 NO_ANSWER_FAILURE,
                 "answer transcription exceeded its deadline",
             }
+            or _is_whisper_http_failure(failure.get("message"))
         ) != ("speech_started_at" in failure)
         or (
             failure.get("message") == "room was deleted before all scripted lines were captured"

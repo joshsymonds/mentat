@@ -183,6 +183,8 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         class Response:
+            status = 200
+
             async def __aenter__(self):
                 return self
 
@@ -202,6 +204,51 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
                 segments = await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
         self.assertEqual(segments, [{"text": "answer"}])
         http.post.assert_called_once()
+
+    async def test_whisper_4xx_is_a_named_clip_failure_but_server_errors_surface(self):
+        class FormData:
+            def add_field(self, *_args, **_kwargs):
+                return None
+
+        for status in (400, 429):
+            class Response:
+                def __init__(self):
+                    self.status = status
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                def raise_for_status(self):
+                    raise RuntimeError(f"HTTP {status}")
+
+            http = Mock()
+            http.post.return_value = Response()
+            with self.subTest(status=status), patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+                with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=FormData)}):
+                    with self.assertRaisesRegex(RuntimeError, rf"Whisper transcription rejected clip \(HTTP {status}\)"):
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+
+        class ServerErrorResponse:
+            status = 500
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                raise RuntimeError("HTTP 500")
+
+        http = Mock()
+        http.post.return_value = ServerErrorResponse()
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=FormData)}):
+                with self.assertRaisesRegex(RuntimeError, "HTTP 500"):
+                    await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
 
 
 class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
@@ -328,7 +375,7 @@ class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
-    async def run_caller(self, subscription_timeout=1.0):
+    async def run_caller(self, subscription_timeout=1.0, steps=None, transcribe=None):
         subscribed = asyncio.Event()
         speech_started = asyncio.Event()
         output = []
@@ -422,13 +469,13 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
         async def tts(_http, _text):
             return b"\1\0" * caller.FRAME_SAMPLES
 
-        async def transcribe(*_args):
+        async def default_transcribe(*_args):
             return []
 
         patchers = [
             patch.object(caller, "ContinuousCapture", Capture),
             patch.object(caller, "_tts", tts),
-            patch.object(caller, "_transcribe", transcribe),
+            patch.object(caller, "_transcribe", transcribe or default_transcribe),
             patch.object(caller, "LISTENING_TIMEOUT_SECONDS", subscription_timeout, create=True),
             patch("builtins.print", side_effect=lambda *args, **_kwargs: output.append(" ".join(map(str, args)))),
             patch.dict(os.environ, {"LIVEKIT_API_KEY": "key", "LIVEKIT_API_SECRET": "secret"}),
@@ -439,7 +486,9 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
         ]
         for patcher in patchers:
             patcher.start()
-        task = asyncio.create_task(caller.run("room", ["First line@0::answer"]))
+        task = asyncio.create_task(caller.run(
+            "room", steps or ["First line@0::answer"]
+        ))
 
         def cleanup():
             for patcher in reversed(patchers):
@@ -467,6 +516,30 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(speech_started.is_set())
             self.assertTrue(any(line == "say: First line" for line in output))
             self.assertTrue(room.disconnected)
+        finally:
+            cleanup()
+
+    async def test_rejected_clip_does_not_stop_later_scripted_lines(self):
+        calls = 0
+
+        async def transcribe(*_args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise caller.WhisperTranscriptionError(400)
+            return [{"start": 0.0, "end": 0.2, "text": "answer"}]
+
+        task, subscribed, _speech_started, output, _room, participant, cleanup = await self.run_caller(
+            steps=["Rejected question@0::answer", "Later question@0::answer"],
+            transcribe=transcribe,
+        )
+        subscribed.set()
+        participant.attributes["lk.agent.state"] = "listening"
+        try:
+            await asyncio.wait_for(task, timeout=1)
+            self.assertEqual(calls, 2)
+            self.assertIn("transcription failure: Whisper transcription rejected clip (HTTP 400)", output)
+            self.assertIn("say: Later question", output)
         finally:
             cleanup()
 
