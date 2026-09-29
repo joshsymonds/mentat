@@ -2536,6 +2536,78 @@ class ScenarioObservationTests(unittest.TestCase):
                     10.25,
                 )
 
+    def test_sms_body_content_connectors_receive_runner_answer_timestamps(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        for body_clause in (
+            "The message would say, I will be there at six.",
+            "The exact message is. I will be there at six.",
+            "Message. I will be there at 6.",
+            "The message reads... I will be there at six.",
+            "Draft: I will be there at 6.",
+            "The words I plan to send are, I will be there at six.",
+            "Here is what I will send: I will be there at six.",
+            "For your approval, I will be there at six.",
+        ):
+            transcript = (
+                f"I'll text +1-202-555-0142. {body_clause} Should I send it?"
+            )
+            with self.subTest(body_clause=body_clause):
+                self.assertEqual(
+                    runner._answer_time(
+                        {
+                            "capture_started": 10.0,
+                            "speech_end": 10.0,
+                            "segments": [{"start": 0.25, "end": 2.0, "text": transcript}],
+                        },
+                        scenario.turns[0],
+                        scenario_name=scenario.name,
+                        turn_index=1,
+                    ),
+                    10.25,
+                )
+
+        for invalid_body in (
+            "The message would say, I will be there at seven.",
+            "The message would say, Please tell Alice I will be there at six.",
+            "Correction. I will be there at seven.",
+            "Please include this too. I will be there at six.",
+            "Send pizza instead. I will be there at six.",
+            "The message would say,",
+        ):
+            transcript = (
+                f"I'll text +1-202-555-0142. {invalid_body} Should I send it?"
+            )
+            with self.subTest(invalid_body=invalid_body):
+                self.assertIsNone(
+                    runner._answer_time(
+                        {
+                            "capture_started": 10.0,
+                            "speech_end": 10.0,
+                            "segments": [{"start": 0.25, "end": 2.0, "text": transcript}],
+                        },
+                        scenario.turns[0],
+                        scenario_name=scenario.name,
+                        turn_index=1,
+                    )
+                )
+
+    def test_correction_preamble_is_not_the_exact_body_answer(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        self.assertIsNone(runner._answer_time(
+            {
+                "capture_started": 10.0,
+                "speech_end": 10.0,
+                "segments": [{
+                    "start": 0.25,
+                    "end": 2.0,
+                    "text": "I'll text +1-202-555-0142. Correction. I will be there at seven. Should I send it?",
+                }],
+            },
+            scenario.turns[1],
+            scenario_name=scenario.name,
+            turn_index=2,
+        ))
+
     def test_run17_exact_sms_correction_segments_get_answer_and_confirmation_timestamps(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
         trace = {

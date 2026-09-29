@@ -265,7 +265,13 @@ def _require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -> str:
+def _spoken_sms_body(
+    text: str,
+    recipient: str,
+    expected_body: str,
+    scenario_name: str,
+    turn: int,
+) -> str:
     """Extract the complete message say-back before or after its recipient."""
     match = _SPOKEN_SMS_RECIPIENT.search(text)
     prompt = (
@@ -307,16 +313,7 @@ def _spoken_sms_body(text: str, recipient: str, scenario_name: str, turn: int) -
             flags=re.IGNORECASE,
         )
     body = " ".join(body.split()).strip(' \t,.:;–—-"“”')
-    body = re.sub(r"^i'll say[,:.]?\s*", "", body, flags=re.IGNORECASE)
-    body = re.sub(r"^saying\b\s*,?\s*", "", body, flags=re.IGNORECASE)
-    body = re.sub(r"^(?:and\s+)?the message is[,:]?\s*", "", body, flags=re.IGNORECASE)
-    body = re.sub(r"^it says[,:.]?\s*", "", body, flags=re.IGNORECASE)
-    body = re.sub(
-        r"^(?:the exact message is|the message reads|message)(?:\.{3}|[,:.]|\s+)\s*",
-        "",
-        body,
-        flags=re.IGNORECASE,
-    )
+    body = _spoken_sms_body_clause(body, expected_body)
     _require(bool(body), f"{scenario_name}: turn {turn} has no complete SMS body say-back")
 
     prompt_end = match.end() + prompt.end()
@@ -359,6 +356,50 @@ def _sms_body_tokens(body: str) -> tuple[str, ...]:
     normalized = re.sub(r"\bsix\b", "6", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\bseven\b", "7", normalized, flags=re.IGNORECASE)
     return tuple(re.findall(r"[a-z0-9]+", normalized.lower()))
+
+
+def _is_sms_body_introduction(prefix: str) -> bool:
+    tokens = _sms_body_tokens(prefix)
+    content_references = {"message", "text", "draft", "word", "words", "content", "it"}
+    introduction_actions = {"say", "says", "saying", "send", "text", "write", "read", "reads", "is", "are", "be"}
+    references = [index for index, token in enumerate(tokens) if token in content_references]
+    if not references:
+        return (
+            len(tokens) == 1 and tokens[0] in introduction_actions
+        ) or (
+            bool(tokens)
+            and tokens[0] in {"i", "we"}
+            and bool(set(tokens) & introduction_actions)
+        )
+
+    reference = references[0]
+    lead_in = {"the", "this", "that", "your", "exact", "corrected", "same", "okay", "ok", "sure", "so", "well", "and"}
+    if reference > 2 or any(token not in lead_in for token in tokens[:reference]):
+        return False
+    return bool(set(tokens[reference + 1:]) & introduction_actions) or all(
+        token in content_references | lead_in for token in tokens[reference:]
+    )
+
+
+def _spoken_sms_body_clause(body: str, expected_body: str) -> str:
+    """Select the exact expected body clause after optional message framing."""
+    expected_tokens = _sms_body_tokens(expected_body)
+    for token in re.finditer(r"[a-z0-9]+", body, re.IGNORECASE):
+        candidate = body[token.start():].strip(' \t,.:;–—-"“”')
+        if _sms_body_tokens(candidate) != expected_tokens:
+            continue
+        raw_prefix = body[:token.start()]
+        separators = list(re.finditer(r"[,:.!?;]", raw_prefix))
+        if separators and raw_prefix[separators[-1].end():].strip():
+            continue
+        prefix = raw_prefix.strip(' \t,.:;–—-"“”')
+        if not prefix:
+            return candidate
+        if "correction" in _sms_body_tokens(prefix):
+            continue
+        if raw_prefix.rstrip().endswith((",", ":")) or _is_sms_body_introduction(prefix):
+            return candidate
+    return body
 
 
 
@@ -582,7 +623,13 @@ def _scenario_failures(
                 body = (
                     _spoken_sms_correction_body(text, scenario.name, turn_number)
                     if inherited_correction
-                    else _spoken_sms_body(text, expectation.sms_recipient, scenario.name, turn_number)
+                    else _spoken_sms_body(
+                        text,
+                        expectation.sms_recipient,
+                        expectation.sms_body,
+                        scenario.name,
+                        turn_number,
+                    )
                 )
             except AssertionError as error:
                 fail(turn_number, str(error))

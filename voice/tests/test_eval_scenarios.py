@@ -2140,6 +2140,76 @@ class ScenarioCorpusTests(unittest.TestCase):
             "k Let me just get a draft together. I've got the number and the text. I will be there at 6. K to send."
         ], [], None))
 
+    def test_sms_sayback_scores_body_content_across_message_introductions(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        introductions = (
+            "The message would say, I will be there at six.",
+            "The exact message is. I will be there at six.",
+            "Message. I will be there at 6.",
+            "The message reads... I will be there at six.",
+            "Draft: I will be there at 6.",
+            "The words I plan to send are, I will be there at six.",
+            "Here is what I will send: I will be there at six.",
+            "For your approval, I will be there at six.",
+        )
+        for body_clause in introductions:
+            with self.subTest(body_clause=body_clause):
+                evaluate_scenario(
+                    scenario,
+                    [
+                        f"I'll text +1-202-555-0142. {body_clause} Should I send it?",
+                        "Sent that message.",
+                    ],
+                    [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+                    room_closed_after=2,
+                )
+
+        invalid_clauses = (
+            "The message would say, I will be there at seven.",
+            "The message would say, Please tell Alice I will be there at six.",
+            "Correction. I will be there at seven.",
+            "Please include this too. I will be there at six.",
+            "Send pizza instead. I will be there at six.",
+            "The message would say,",
+        )
+        for body_clause in invalid_clauses:
+            with self.subTest(body_clause=body_clause), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    scenario,
+                    [
+                        f"I'll text +1-202-555-0142. {body_clause} Should I send it?",
+                        "Sent that message.",
+                    ],
+                    [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+                    room_closed_after=2,
+                )
+
+    def test_corrected_sms_body_cannot_include_correction_as_message_text(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        failures = evaluate_scenario_prefix(
+            scenario,
+            [
+                "I'll text +1-202-555-0142: I will be there at six. Should I send it?",
+                "I'll text +1-202-555-0142. Correction. I will be there at seven. Should I send it?",
+            ],
+            [],
+            None,
+        )
+        self.assertTrue(any(failure.turn == 2 and "said back" in failure.message for failure in failures))
+
+    def test_sms_content_requires_complete_recipient_independent_of_introduction(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        with self.assertRaisesRegex(AssertionError, "no complete"):
+            evaluate_scenario(
+                scenario,
+                [
+                    "I'll text +1-202-555-0199. The message would say, I will be there at six. Should I send it?",
+                    "Sent that message.",
+                ],
+                [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+                room_closed_after=2,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

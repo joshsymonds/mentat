@@ -1327,6 +1327,7 @@ def _answer_time(
                     else _spoken_sms_body(
                         text,
                         sms_recipient,
+                        sms_body,
                         scenario_name or "scenario",
                         turn_index or 1,
                     )
