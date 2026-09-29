@@ -63,7 +63,9 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 clock.now += 0.2
 
         class Room:
-            remote_participants = {"agent": object()}
+            remote_participants = {
+                "agent": SimpleNamespace(kind=1, attributes={"lk.agent.state": "listening"})
+            }
             local_participant = SimpleNamespace(
                 publish_track=lambda *_args, **_kwargs: asyncio.sleep(
                     0,
@@ -150,6 +152,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             LocalAudioTrack=LocalAudioTrack,
             TrackPublishOptions=lambda **_kwargs: object(),
             TrackSource=SimpleNamespace(SOURCE_MICROPHONE=1),
+            ParticipantKind=SimpleNamespace(PARTICIPANT_KIND_AGENT=1),
         )
 
         async def tts(_http, text):
@@ -209,6 +212,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         subscribed = asyncio.Event()
         wait_started = asyncio.Event()
         events = []
+        participant = SimpleNamespace(kind=1, attributes={"lk.agent.state": "starting"})
+        dependencies.rtc.Room.remote_participants = {"agent": participant}
 
         class Publication:
             async def wait_for_subscription(self):
@@ -250,7 +255,14 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(task.done())
                 self.assertEqual(events, [])
                 subscribed.set()
+                await asyncio.sleep(0.05)
+                self.assertEqual(events, ["subscription-ready"])
+                listening_at = time.monotonic()
+                participant.attributes["lk.agent.state"] = "listening"
+                await asyncio.sleep(0.05)
+                self.assertEqual(events, ["subscription-ready"])
                 await task
+                self.assertGreaterEqual(time.monotonic() - listening_at, 0.3)
             finally:
                 if not task.done():
                     task.cancel()
@@ -284,6 +296,64 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 dependencies=dependencies,
                 room_close_after=None,
             )
+
+    async def test_missing_listening_state_fails_by_name_before_scripted_frames(self):
+        dependencies = self.dependencies_for_failure("other")
+        participant = SimpleNamespace(kind=1, attributes={"lk.agent.state": "starting"})
+        dependencies.rtc.Room.remote_participants = {"agent": participant}
+        events = []
+
+        class Source:
+            async def capture_frame(self, _frame):
+                events.append("scripted-frame")
+
+            async def wait_for_playout(self):
+                pass
+
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner, "PARTICIPANT_DEADLINE_SECONDS", 0.02),
+            self.assertRaisesRegex(runner.DeadlineExceeded, "agent listening state"),
+        ):
+            await capture_script(
+                "android-selected-room",
+                ["First question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            )
+        self.assertEqual(events, [])
+
+    async def test_listening_settle_deadline_fails_by_name_before_scripted_frames(self):
+        dependencies = self.dependencies_for_failure("other")
+        participant = SimpleNamespace(kind=1, attributes={"lk.agent.state": "starting"})
+        dependencies.rtc.Room.remote_participants = {"agent": participant}
+        events = []
+
+        class Source:
+            async def capture_frame(self, _frame):
+                events.append("scripted-frame")
+
+            async def wait_for_playout(self):
+                pass
+
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner, "PARTICIPANT_DEADLINE_SECONDS", 0.2),
+        ):
+            task = asyncio.create_task(capture_script(
+                "android-selected-room",
+                ["First question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+            ))
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done())
+            participant.attributes["lk.agent.state"] = "listening"
+            with self.assertRaisesRegex(runner.DeadlineExceeded, "agent listening settle"):
+                await task
+        self.assertEqual(events, [])
 
     async def test_injected_endpoint_token_and_url_reach_room_connect_without_local_mint(self):
         dependencies = self.dependencies_for_failure("other")
@@ -1460,7 +1530,9 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def dependencies_for_failure(failure):
         class Room:
-            remote_participants = {"agent": object()}
+            remote_participants = {
+                "agent": SimpleNamespace(kind=1, attributes={"lk.agent.state": "listening"})
+            }
             callbacks = {}
             local_participant = SimpleNamespace(
                 publish_track=lambda *_args, **_kwargs: asyncio.sleep(

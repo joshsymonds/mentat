@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -280,6 +281,7 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
         speech_started = asyncio.Event()
         output = []
         room = None
+        participant = SimpleNamespace(kind="agent", attributes={"lk.agent.state": "starting"})
 
         class Publication:
             async def wait_for_subscription(self):
@@ -303,7 +305,7 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
         class Room:
             def __init__(self):
                 self.local_participant = LocalParticipant()
-                self.remote_participants = {"worker": object()}
+                self.remote_participants = {"worker": participant}
                 self.handlers = {}
                 self.disconnected = False
 
@@ -375,7 +377,7 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
             patch.object(caller, "ContinuousCapture", Capture),
             patch.object(caller, "_tts", tts),
             patch.object(caller, "_transcribe", transcribe),
-            patch.object(caller, "SUBSCRIPTION_TIMEOUT_SECONDS", subscription_timeout, create=True),
+            patch.object(caller, "LISTENING_TIMEOUT_SECONDS", subscription_timeout, create=True),
             patch("builtins.print", side_effect=lambda *args, **_kwargs: output.append(" ".join(map(str, args)))),
             patch.dict(os.environ, {"LIVEKIT_API_KEY": "key", "LIVEKIT_API_SECRET": "secret"}),
             patch.dict(sys.modules, {
@@ -391,26 +393,62 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
             for patcher in reversed(patchers):
                 patcher.stop()
 
-        return task, subscribed, speech_started, output, room, cleanup
+        return task, subscribed, speech_started, output, room, participant, cleanup
 
-    async def test_waits_for_worker_microphone_subscription_before_first_line(self):
-        task, subscribed, speech_started, output, room, cleanup = await self.run_caller()
+    async def test_listening_after_subscription_and_settle_gates_first_line(self):
+        task, subscribed, speech_started, output, room, participant, cleanup = await self.run_caller()
         try:
             await asyncio.sleep(0.02)
             self.assertFalse(speech_started.is_set())
             self.assertFalse(any(line.startswith("say:") for line in output))
             subscribed.set()
+            await asyncio.sleep(0.02)
+            self.assertFalse(speech_started.is_set())
+            self.assertFalse(any(line.startswith("say:") for line in output))
+            listening_at = time.monotonic()
+            participant.attributes["lk.agent.state"] = "listening"
+            await asyncio.sleep(0.05)
+            self.assertFalse(speech_started.is_set())
+            self.assertFalse(any(line.startswith("say:") for line in output))
             await asyncio.wait_for(task, timeout=1)
+            self.assertGreaterEqual(time.monotonic() - listening_at, 0.3)
             self.assertTrue(speech_started.is_set())
             self.assertTrue(any(line == "say: First line" for line in output))
             self.assertTrue(room.disconnected)
         finally:
             cleanup()
 
+    async def test_listening_settle_timeout_is_named_and_never_speaks(self):
+        task, subscribed, speech_started, output, room, participant, cleanup = await self.run_caller(0.2)
+        subscribed.set()
+        try:
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done())
+            participant.attributes["lk.agent.state"] = "listening"
+            with self.assertRaisesRegex(TimeoutError, "agent listening settle"):
+                await asyncio.wait_for(task, timeout=1)
+            self.assertFalse(speech_started.is_set())
+            self.assertFalse(any(line.startswith("say:") for line in output))
+            self.assertTrue(room.disconnected)
+        finally:
+            cleanup()
+
     async def test_subscription_timeout_never_speaks_and_disconnects(self):
-        task, _subscribed, speech_started, output, room, cleanup = await self.run_caller(0.02)
+        task, _subscribed, speech_started, output, room, _participant, cleanup = await self.run_caller(0.02)
         try:
             with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(task, timeout=1)
+            self.assertFalse(speech_started.is_set())
+            self.assertFalse(any(line.startswith("say:") for line in output))
+            self.assertTrue(room.disconnected)
+        finally:
+            cleanup()
+
+    async def test_listening_timeout_is_named_and_never_speaks(self):
+        task, subscribed, speech_started, output, room, _participant, cleanup = await self.run_caller(0.02)
+        subscribed.set()
+        try:
+            with self.assertRaisesRegex(TimeoutError, "agent listening state"):
                 await asyncio.wait_for(task, timeout=1)
             self.assertFalse(speech_started.is_set())
             self.assertFalse(any(line.startswith("say:") for line in output))

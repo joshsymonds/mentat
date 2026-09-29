@@ -572,11 +572,17 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "voice worker join polling",
             )
-        await _with_deadline(
-            publication.wait_for_subscription(),
-            max(0.0, participant_deadline - dependencies.monotonic()),
-            "caller microphone subscription",
-        )
+        try:
+            await caller.wait_for_listening(
+                publication,
+                lambda: room.remote_participants.values(),
+                dependencies.rtc.ParticipantKind.PARTICIPANT_KIND_AGENT,
+                deadline=participant_deadline,
+                monotonic=dependencies.monotonic,
+                sleep=dependencies.sleep,
+            )
+        except TimeoutError as error:
+            raise DeadlineExceeded(str(error)) from error
 
         async def push(pcm: bytes) -> None:
             for offset in range(0, len(pcm), FRAME_SAMPLES * 2):

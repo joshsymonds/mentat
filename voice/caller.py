@@ -12,7 +12,49 @@ from typing import Any
 RATE = 24000
 FRAME_SAMPLES = RATE // 100
 MAX_ANSWER_SECONDS = 30
-SUBSCRIPTION_TIMEOUT_SECONDS = 15
+LISTENING_TIMEOUT_SECONDS = 15
+LISTENING_SETTLE_SECONDS = 0.3
+LISTENING_POLL_INTERVAL_SECONDS = 0.05
+AGENT_STATE_ATTRIBUTE = "lk.agent.state"
+
+
+async def wait_for_listening(
+    publication: Any,
+    participants: Any,
+    agent_kind: Any,
+    *,
+    deadline: float,
+    monotonic: Any = time.monotonic,
+    sleep: Any = asyncio.sleep,
+) -> None:
+    """Wait for microphone subscription and agent listening state under one deadline."""
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("caller microphone subscription exceeded its deadline")
+    try:
+        await asyncio.wait_for(publication.wait_for_subscription(), timeout=remaining)
+    except TimeoutError as error:
+        raise TimeoutError("caller microphone subscription exceeded its deadline") from error
+
+    while not any(
+        participant.kind == agent_kind
+        and participant.attributes.get(AGENT_STATE_ATTRIBUTE) == "listening"
+        for participant in participants()
+    ):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("agent listening state did not arrive before deadline")
+        await sleep(min(LISTENING_POLL_INTERVAL_SECONDS, remaining))
+
+    remaining = deadline - monotonic()
+    if remaining < LISTENING_SETTLE_SECONDS:
+        raise TimeoutError("agent listening settle exceeded its deadline")
+    try:
+        await asyncio.wait_for(sleep(LISTENING_SETTLE_SECONDS), timeout=remaining)
+    except TimeoutError as error:
+        raise TimeoutError("agent listening settle exceeded its deadline") from error
+    if monotonic() > deadline:
+        raise TimeoutError("agent listening settle exceeded its deadline")
 
 
 @dataclass(frozen=True)
@@ -262,11 +304,15 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
         try:
             source = rtc.AudioSource(RATE, 1)
             track = rtc.LocalAudioTrack.create_audio_track("mic", source)
+            readiness_deadline = time.monotonic() + LISTENING_TIMEOUT_SECONDS
             publication = await room.local_participant.publish_track(
                 track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
             )
-            await asyncio.wait_for(
-                publication.wait_for_subscription(), timeout=SUBSCRIPTION_TIMEOUT_SECONDS
+            await wait_for_listening(
+                publication,
+                lambda: room.remote_participants.values(),
+                rtc.ParticipantKind.PARTICIPANT_KIND_AGENT,
+                deadline=readiness_deadline,
             )
             print("caller connected", flush=True)
 
@@ -282,8 +328,6 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
                 while time.monotonic() < deadline:
                     await source.capture_frame(rtc.AudioFrame(silence, RATE, 1, FRAME_SAMPLES))
 
-            while not room.remote_participants:
-                await quiet(0.2)
             for step, pcm in audio:
                 await quiet(step.delay)
                 print(f"say: {step.line}", flush=True)
