@@ -1960,6 +1960,155 @@ class ScenarioCorpusTests(unittest.TestCase):
                     evaluate_scenario_prefix(scenario, [first_turn, answer, third_turn], [], None)
                 )
 
+    def test_bakeoff_alice_correct_live_attribution_variants(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        first_turn = (
+            "Alice Keck Park was an oil heiress, daughter of Superior Oil founder William Keck. "
+            "In the mid-70s, the block was slated for a hotel, and she put up the money "
+            "for the city to buy it instead, on the condition it became a public park."
+        )
+        third_turn = "Her family's wealth came from Superior Oil."
+        exact_live_cases = (
+            (
+                "Sol run 1 turn 3",
+                3,
+                "I'll check whether her wealth came from the family oil business or another source. "
+                "It was family oil money. Her father.",
+            ),
+            (
+                "Sol run 3 turn 1",
+                1,
+                "I'll check the garden's history so I don't guess at the name. If you mean the Santa Barbara Garden, "
+                "it's named for Alice Keck Park. She owned the land and gave it to the city for a public garden. "
+                "It was named in her honor. That's how Visit California and the Cultural Landscape Foundation describe it.",
+            ),
+            (
+                "Sol run 6 turn 2",
+                2,
+                "I'll look up a bit more about her. beyond the excellent last name. She was Alice Keck Park. "
+                "Daughter of oil entrepreneur, William M. Keck. and a Santa Barbara philanthropist. "
+                "According to the Santa Barbara Historical Museum, she anonymously bought the land in 1975. "
+                "and gave it to the city for a public park. Hooray!",
+            ),
+            (
+                "Sol run 9 turn 2",
+                2,
+                "I'll check a little more about her life. beyond the park donation. Alice Keckpark was the daughter of "
+                "William Myron Keck. who founded Superior Oil in 1975. she quietly bought the Santa Barbara property "
+                "and donated it to the city for a public garden. Her identity as the donor came out.",
+            ),
+            (
+                "Sonnet run 2 turn 1",
+                1,
+                "Let me look that up real quick. I'm guessing discarded is the Alice Keck Park Memorial Garden in "
+                "Santa Barbara. since that's the one that fits. It's named for Alice Keck Park. the daughter of superior "
+                "oil founder, William K. She donated the land to the city. reportedly anonymously. and the city dedicated "
+                "the garden in 19-",
+            ),
+            (
+                "Sonnet run 5 turn 1",
+                1,
+                "Let me check on that real quick. I'm assuming you mean the Alice Keck Park Memorial Garden in Santa "
+                "Barbara. It's named for Alice Keck Park. an heiress to the superior oil fortune. She was the donor who "
+                "made the park possible. It was dedicated in spring 1980. after her death. and named in her honor by her "
+                "co-trustee, Reginald Folletti, and another.",
+            ),
+            (
+                "Sonnet run 6 turn 1",
+                1,
+                "I'm guessing you mean the Alice Keck Park Memorial Garden in Santa Barbara. As I remember it... "
+                "Alice Keck Park was a local philanthropist who bought the property and gave it to the city. and the "
+                "garden was named in her memory. I'm going from memory, so I'm not sure of the exact dates or details. "
+                "If you mean a different garden, tell me where it is.",
+            ),
+            (
+                "Sonnet run 7 turn 2",
+                2,
+                "or two years later. Alice Keckpark was a Santa Barbara philanthropist and an heir to the superior oil "
+                "fortune. Her father was the company's founder. William Keck. She had a family tie to the site too. "
+                "Her Aunt Caroline had been married to the son of Albert Herder. the artist who built the El Mirasol. "
+                "When she died, she left about $20 million to local causes. That's what I found. And I didn't dig into it.",
+            ),
+            (
+                "Sonnet run 8 turn 3",
+                3,
+                "Let me check that properly. oil. She was the daughter of William M. Keck, who founded Superior Oil. "
+                "and she inherited the money from him. That also corrects what I said earlier. She bought the property "
+                "anonymously in 1975. not the early 70s. It was a mansion-turned-hotel site. and she gave it to the city "
+                "as a garden. Her name.",
+            ),
+            (
+                "Sonnet run 9 turn 1",
+                1,
+                "Let me check on that real quick. I'm assuming you mean the Alice Keck Park Memorial Garden in Santa "
+                "Barbara. It's named for Alice Keck Park. who paid for it. In 1975... An anonymous donor bought the city "
+                "block and gave it to the city for a park. The city dedicated it in spring.",
+            ),
+            (
+                "Sonnet run 9 turn 2",
+                2,
+                "after she died. Quick look for that. She was Alice Keck Park. Born in 1918. and she died in 1977 at 59. "
+                "Her father was William Keck. the oil entrepreneur behind Superior Oil. So she came from serious money. "
+                "She bought the land in 1975 and kept it anonymous. Her name came out.",
+            ),
+            (
+                "Sonnet run 10 turn 3",
+                3,
+                "Let me look that up. Oil. Sources say she was the daughter of William Myron Keck. who founded Superior "
+                "Oil Company. not his niece, as I said earlier. I got that wrong. Her fortune was mostly superior oil "
+                "stock. She died in 1977. and left her whole estate to four local institutions. The New York Times",
+            ),
+        )
+        for label, target_turn, transcript in exact_live_cases:
+            turns = [first_turn, "Alice Keck Park was W. M. Keck's daughter.", third_turn]
+            turns[target_turn - 1] = transcript
+            with self.subTest(case=label):
+                self.assertEqual(evaluate_scenario_prefix(scenario, turns, [], None), [])
+
+    def test_bakeoff_alice_wrong_or_uncertain_answers_still_fail(self):
+        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
+        first_turn = (
+            "Alice Keck Park was an oil heiress, daughter of Superior Oil founder William Keck. "
+            "In the mid-70s, the block was slated for a hotel, and she put up the money "
+            "for the city to buy it instead, on the condition it became a public park."
+        )
+        third_turn = "Her family's wealth came from Superior Oil."
+        wrong_or_uncertain = (
+            (
+                "It's named for Alice Keck Park. Her husband bought the old hotel lot and gave it to the city.",
+                "Alice Keck Park was W. M. Keck's daughter.",
+                third_turn,
+            ),
+            (
+                "Alice Keck Park was a local philanthropist who bought the property and gave it to the city.",
+                "Honestly, I only know the outline. She was part of the Keck family and I'm fuzzy on her exact relation to the founder, so I don't want to guess.",
+                third_turn,
+            ),
+            (
+                "Alice Keck Park was a Santa Barbara philanthropist.",
+                "She was a philanthropist and her uncle, W. M. Keck, founded Superior Oil.",
+                "Sources say she was William Myron Keck's niece, and that the family's money came from somewhere else.",
+            ),
+            (
+                "Alice Keck Park was an oil heiress and the donor who made the park possible.",
+                "Alice Keck Park was the daughter of William Keck, who founded Superior Oil.",
+                "I can't say whether she inherited wealth from the Superior Oil fortune.",
+            ),
+            (
+                first_turn,
+                "Alice Keck Park was W. M. Keck's daughter.",
+                "Her wealth was not family oil money.",
+            ),
+            (
+                first_turn,
+                "Her father was not William Keck.",
+                third_turn,
+            ),
+        )
+        for turns in wrong_or_uncertain:
+            with self.subTest(turns=turns):
+                self.assertTrue(evaluate_scenario_prefix(scenario, list(turns), [], None))
+
     def test_run17_exact_alice_segments_keep_donor_and_followup_truth_strict(self):
         scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
         segments = (
