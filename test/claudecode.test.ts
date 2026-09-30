@@ -988,6 +988,257 @@ describe('policy seam', () => {
   });
 });
 
+const END_CONVERSATION = 'mcp__mentat__end_conversation';
+const SPEAK_FIRST =
+  'Speak your answer to the caller first. Call end_conversation by itself only after your final spoken answer; other tool results from this step have not been spoken yet.';
+const VOICE_META = { surface: 'voice', user: 'josh' };
+
+function blockStartMsg(block: Record<string, unknown>): unknown {
+  return {
+    type: 'stream_event',
+    event: { type: 'content_block_start', index: 0, content_block: block },
+  };
+}
+
+function textStartMsg(): unknown {
+  return blockStartMsg({ type: 'text', text: '' });
+}
+
+function toolStartMsg(id: string, name: string): unknown {
+  return blockStartMsg({ type: 'tool_use', id, name, input: {} });
+}
+
+function toolResultMsg(toolUseId: string): unknown {
+  return {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'ok' }],
+    },
+    parent_tool_use_id: null,
+  };
+}
+
+function canUseToolOf(fake: FakeQuery): NonNullable<Options['canUseTool']> {
+  const canUseTool = fake.optionsSeen[0]?.canUseTool;
+  if (canUseTool === undefined) throw new Error('canUseTool not wired');
+  return canUseTool;
+}
+
+/**
+ * Runs one turn, asking for the end_conversation decision before the turn's
+ * stream is consumed — the SDK can ask while the consumer lags behind it.
+ */
+async function decideEndDuringTurn(
+  backend: ClaudeCode,
+  fake: FakeQuery,
+  toolUseID: string,
+  meta: Record<string, string> = VOICE_META,
+): Promise<unknown> {
+  const stream = await backend.converse({ sessionId: 'voice-session', text: 'hi', meta });
+  const decision = canUseToolOf(fake)(END_CONVERSATION, { reason: 'done' }, {
+    signal: new AbortController().signal,
+    toolUseID,
+  });
+  await collect(stream);
+  return decision;
+}
+
+describe('voice end_conversation gate', () => {
+  it.each([
+    {
+      name: '[text, end_conversation]',
+      script: [textStartMsg(), textDeltaMsg('Done.'), toolStartMsg('end', END_CONVERSATION)],
+      expected: { behavior: 'allow', updatedInput: { reason: 'done' } },
+    },
+    {
+      name: '[set_timer] then result then [text, end_conversation]',
+      script: [
+        toolStartMsg('timer', 'mcp__mentat__set_timer'),
+        toolResultMsg('timer'),
+        textStartMsg(),
+        textDeltaMsg('Timer set.'),
+        toolStartMsg('end', END_CONVERSATION),
+      ],
+      expected: { behavior: 'allow', updatedInput: { reason: 'done' } },
+    },
+    {
+      name: '[web_search, end_conversation] in one message',
+      script: [
+        toolStartMsg('search', 'mcp__shimmer__web_search'),
+        toolStartMsg('end', END_CONVERSATION),
+      ],
+      expected: { behavior: 'deny', message: SPEAK_FIRST },
+    },
+    {
+      name: '[set_timer] then result then [end_conversation] with no text',
+      script: [
+        toolStartMsg('timer', 'mcp__mentat__set_timer'),
+        toolResultMsg('timer'),
+        toolStartMsg('end', END_CONVERSATION),
+      ],
+      expected: { behavior: 'deny', message: SPEAK_FIRST },
+    },
+    {
+      name: '[text, web_search, end_conversation]',
+      script: [
+        textStartMsg(),
+        textDeltaMsg('Let me check.'),
+        toolStartMsg('search', 'mcp__shimmer__web_search'),
+        toolStartMsg('end', END_CONVERSATION),
+      ],
+      expected: { behavior: 'deny', message: SPEAK_FIRST },
+    },
+  ])('decides $name', async ({ script, expected }) => {
+    const fake = fakeQuery(() => [...script, resultMsg('voice-uuid', 'ok')]);
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn }));
+    expect(await decideEndDuringTurn(backend, fake, 'end')).toEqual(expected);
+  });
+
+  it('decides from the end_conversation block position when asked after it streamed', async () => {
+    const fake = fakeQuery(() => [
+      toolStartMsg('search', 'mcp__shimmer__web_search'),
+      toolStartMsg('end', END_CONVERSATION),
+      textStartMsg(),
+      textDeltaMsg('later'),
+      resultMsg('voice-uuid', 'ok'),
+    ]);
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn }));
+    const stream = await backend.converse({ sessionId: 'voice-session', text: 'hi', meta: VOICE_META });
+    const iterator = stream[Symbol.asyncIterator]();
+    expect((await iterator.next()).value).toEqual({ kind: 'textDelta', text: 'later' });
+    const decision = await canUseToolOf(fake)(END_CONVERSATION, { reason: 'done' }, {
+      signal: new AbortController().signal,
+      toolUseID: 'end',
+    });
+    expect(decision).toEqual({ behavior: 'deny', message: SPEAK_FIRST });
+    while (!(await iterator.next()).done) {
+      // drain
+    }
+  });
+
+  it('leaves non-voice surfaces unchanged and never waits on them', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = fakeQuery(() => [
+        toolStartMsg('search', 'mcp__shimmer__web_search'),
+        toolStartMsg('end', END_CONVERSATION),
+        resultMsg('signal-uuid', 'ok'),
+      ]);
+      const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn }));
+      expect(await decideEndDuringTurn(backend, fake, 'end', { surface: 'signal' })).toEqual({
+        behavior: 'deny',
+        message: 'mcp__mentat__end_conversation is only allowed on the voice surface; received signal',
+      });
+
+      const stream = await backend.converse({
+        sessionId: 'voice-session',
+        text: 'again',
+        meta: { surface: 'signal' },
+      });
+      let settled = false;
+      const decision = canUseToolOf(fake)(END_CONVERSATION, { reason: 'done' }, {
+        signal: new AbortController().signal,
+        toolUseID: 'never-streamed',
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(true);
+      expect((await decision).behavior).toBe('deny');
+      await collect(stream);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails open with a warning when the end_conversation block is never observed', async () => {
+    vi.useFakeTimers();
+    try {
+      const warnings: { message: string; fields?: Record<string, unknown> }[] = [];
+      const logger = {
+        ...nullLogger,
+        warn: (message: string, fields?: Record<string, unknown>) => {
+          warnings.push({ message, ...(fields !== undefined && { fields }) });
+        },
+      };
+      const fake = fakeQuery(() => [resultMsg('voice-uuid', 'ok')]);
+      const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn, logger }));
+      const stream = await backend.converse({ sessionId: 'voice-session', text: 'hi', meta: VOICE_META });
+      const canUseTool = canUseToolOf(fake);
+
+      let otherSettled = false;
+      void canUseTool('mcp__shimmer__web_search', {}, {
+        signal: new AbortController().signal,
+        toolUseID: 'search-never-streamed',
+      }).then(() => {
+        otherSettled = true;
+      });
+      let endSettled = false;
+      const decision = canUseTool(END_CONVERSATION, { reason: 'done' }, {
+        signal: new AbortController().signal,
+        toolUseID: 'end-never-streamed',
+      }).then((result) => {
+        endSettled = true;
+        return result;
+      });
+      await collect(stream);
+
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(otherSettled).toBe(true);
+      expect(endSettled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await decision).toEqual({ behavior: 'allow', updatedInput: { reason: 'done' } });
+      expect(warnings).toEqual([
+        {
+          message: 'claudecode: end_conversation tool_use not observed, allowing',
+          fields: {
+            session_id: 'voice-session',
+            tool_use_id: 'end-never-streamed',
+            timeout_ms: 2_000,
+          },
+        },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not carry a tool_use from one turn into the next', async () => {
+    const fake = fakeQuery((turn) =>
+      turn === 0
+        ? [toolStartMsg('search-0', 'mcp__shimmer__web_search'), resultMsg('voice-uuid', 'ok')]
+        : [toolStartMsg('end-1', END_CONVERSATION), resultMsg('voice-uuid', 'ok')],
+    );
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn }));
+    await collect(await backend.converse({ sessionId: 'voice-session', text: 'one', meta: VOICE_META }));
+    expect(await decideEndDuringTurn(backend, fake, 'end-1')).toEqual({
+      behavior: 'allow',
+      updatedInput: { reason: 'done' },
+    });
+  });
+
+  it('allows end_conversation after text in the turn following a tool_use', async () => {
+    const fake = fakeQuery((turn) =>
+      turn === 0
+        ? [toolStartMsg('search-0', 'mcp__shimmer__web_search'), resultMsg('voice-uuid', 'ok')]
+        : [
+            textStartMsg(),
+            textDeltaMsg('Goodbye.'),
+            toolStartMsg('end-1', END_CONVERSATION),
+            resultMsg('voice-uuid', 'ok'),
+          ],
+    );
+    const backend = new ClaudeCode(makeConfig({ queryFn: fake.fn }));
+    await collect(await backend.converse({ sessionId: 'voice-session', text: 'one', meta: VOICE_META }));
+    expect(await decideEndDuringTurn(backend, fake, 'end-1')).toEqual({
+      behavior: 'allow',
+      updatedInput: { reason: 'done' },
+    });
+  });
+});
+
 describe('record mode', () => {
   it('captures the exact message stream, neutralizing path traversal', async () => {
     const lines = readFileSync('test/fixtures/turn-with-tool.jsonl', 'utf8')

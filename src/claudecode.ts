@@ -9,10 +9,11 @@ import { join } from 'node:path';
 import process from 'node:process';
 
 import { query, type Options, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 
 import { AtCapacityError, type Backend, type Event, type Turn } from './backend.ts';
 import type { Logger } from './log.ts';
-import type { PolicyFn, TurnContext } from './policy.ts';
+import type { CallContext, PolicyFn, TurnContext } from './policy.ts';
 import { Translator } from './translate.ts';
 
 /**
@@ -45,6 +46,12 @@ const ABANDON_DRAIN_LIMIT = 1000;
  * turn is still counted active.
  */
 const ABANDON_TIMEOUT_MS = 10_000;
+
+/**
+ * How long a voice end_conversation permission check waits for the session's
+ * stream to reach that tool_use block before allowing the call anyway.
+ */
+const END_CONVERSATION_OBSERVE_TIMEOUT_MS = 2_000;
 
 /** The slice of the SDK's query() the backend consumes — injectable in tests. */
 interface QueryHandle extends AsyncIterable<unknown> {
@@ -209,12 +216,17 @@ function surfaceContextLine(meta: Record<string, string> | undefined): string | 
  * Only an operator-configured prompt is extended — supplying systemPrompt to
  * the SDK replaces its default, so a daemon without one must not gain a
  * prompt consisting solely of the surface line.
+ *
+ * callContextFor resolves what the session's stream showed before a tool_use
+ * id; voice end_conversation checks wait on it so the policy can refuse a
+ * hang-up that would skip speaking an earlier tool's result.
  */
 export function buildOptions(
   config: ClaudeCodeConfig,
   getContext: () => TurnContext,
   resumeUuid?: string,
   spawnMeta?: Record<string, string>,
+  callContextFor?: (toolUseID: string) => Promise<CallContext | undefined>,
 ): Options {
   const voiceGateway = spawnMeta?.surface === 'voice' ? config.voiceGateway : undefined;
   const mcpServers =
@@ -270,8 +282,14 @@ export function buildOptions(
           },
         }
       : {}),
-    canUseTool: async (toolName, input) => {
-      const decision = await config.policy(toolName, input, getContext());
+    canUseTool: async (toolName, input, { toolUseID }) => {
+      // Read before any wait: the decision belongs to the turn that asked.
+      const context = getContext();
+      const call =
+        toolName === 'mcp__mentat__end_conversation' && context.meta.surface === 'voice'
+          ? await callContextFor?.(toolUseID)
+          : undefined;
+      const decision = await config.policy(toolName, input, context, call);
       return decision.behavior === 'allow'
         ? { behavior: 'allow', updatedInput: decision.updatedInput }
         : { behavior: 'deny', message: decision.message };
@@ -330,6 +348,72 @@ class Mutex {
       release = resolve;
     });
     return prev.then(() => release);
+  }
+}
+
+const contentBlockStartSchema = z.looseObject({
+  type: z.literal('stream_event'),
+  event: z.looseObject({
+    type: z.literal('content_block_start'),
+    content_block: z.looseObject({ type: z.string(), id: z.string().optional() }),
+  }),
+});
+
+/**
+ * The turn's content blocks in stream order, reduced to one fact per tool_use:
+ * whether another tool_use started after the model's last text block. Each
+ * fact is fixed when its block starts, so a permission check asked before or
+ * after the consumer reaches that block gets the same answer.
+ */
+class ToolUseOrder {
+  private toolSinceText = false;
+  /** tool_use id → whether another tool_use preceded it since the last text. */
+  private readonly followsTool = new Map<string, boolean>();
+  private readonly waiters = new Map<string, (followsTool: boolean) => void>();
+
+  /** Turn start: nothing from an earlier turn counts against this one. */
+  reset(): void {
+    this.toolSinceText = false;
+    this.followsTool.clear();
+  }
+
+  observe(message: unknown): void {
+    const parsed = contentBlockStartSchema.safeParse(message);
+    if (!parsed.success) {
+      return;
+    }
+    const block = parsed.data.event.content_block;
+    if (block.type === 'text') {
+      this.toolSinceText = false;
+      return;
+    }
+    if (block.type !== 'tool_use' || block.id === undefined) {
+      return;
+    }
+    const followsTool = this.toolSinceText;
+    this.toolSinceText = true;
+    this.followsTool.set(block.id, followsTool);
+    this.waiters.get(block.id)?.(followsTool);
+  }
+
+  /** The fact for toolUseID once its block is observed; undefined if it
+   * isn't observed within timeoutMs. */
+  wait(toolUseID: string, timeoutMs: number): Promise<boolean | undefined> {
+    const seen = this.followsTool.get(toolUseID);
+    if (seen !== undefined) {
+      return Promise.resolve(seen);
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.waiters.delete(toolUseID);
+        resolve(undefined);
+      }, timeoutMs);
+      this.waiters.set(toolUseID, (followsTool) => {
+        clearTimeout(timer);
+        this.waiters.delete(toolUseID);
+        resolve(followsTool);
+      });
+    });
   }
 }
 
@@ -397,6 +481,8 @@ interface Session {
   /** The ACTIVE turn's identity context — set at turn start, cleared at turn
    * end, never carried across turns (authority is per-turn). */
   context: { current: TurnContext | null };
+  /** Reset at each turn start with the context; fed from the stream. */
+  toolUses: ToolUseOrder;
   recorder: Recorder;
   dead: boolean;
 }
@@ -512,6 +598,7 @@ export class ClaudeCode implements Backend {
       return this.startTurn(turn);
     }
     session.context.current = { sessionId: turn.sessionId, meta: turn.meta ?? {} };
+    session.toolUses.reset();
     session.queue.push(userMessage(turn.text));
     return { session, release };
   }
@@ -557,6 +644,7 @@ export class ClaudeCode implements Backend {
         }
         messagesRead += 1;
         session.recorder.write(next.value);
+        session.toolUses.observe(next.value);
         for (const event of this.translateAndLog(sessionId, session, next.value)) {
           if (event.kind === 'done') {
             sawDone = true;
@@ -610,6 +698,7 @@ export class ClaudeCode implements Backend {
           break;
         }
         session.recorder.write(next.value);
+        session.toolUses.observe(next.value);
         const events = this.translateAndLog(sessionId, session, next.value);
         if (events.some((event) => event.kind === 'done')) {
           this.logger.warn('claudecode: turn abandoned, session interrupted', {
@@ -678,11 +767,27 @@ export class ClaudeCode implements Backend {
       ...(turn.model !== undefined && { model: turn.model }),
       ...(isVoice && { model: this.config.voiceModel ?? DEFAULT_VOICE_MODEL }),
     };
+    const toolUses = new ToolUseOrder();
     const options = buildOptions(
       config,
       () => context.current ?? { sessionId, meta: {} },
       this.resumable.get(sessionId),
       turn.meta,
+      async (toolUseID) => {
+        const followsUnspokenTool = await toolUses.wait(
+          toolUseID,
+          END_CONVERSATION_OBSERVE_TIMEOUT_MS,
+        );
+        if (followsUnspokenTool === undefined) {
+          this.logger.warn('claudecode: end_conversation tool_use not observed, allowing', {
+            session_id: sessionId,
+            tool_use_id: toolUseID,
+            timeout_ms: END_CONVERSATION_OBSERVE_TIMEOUT_MS,
+          });
+          return undefined;
+        }
+        return { followsUnspokenTool };
+      },
     );
     const handle = this.queryFn({ prompt: queue, options });
     const session: Session = {
@@ -692,6 +797,7 @@ export class ClaudeCode implements Backend {
       translator: new Translator(),
       mutex: new Mutex(),
       context,
+      toolUses,
       recorder: makeRecorder(this.config.recordDir, sessionId, this.logger),
       dead: false,
     };

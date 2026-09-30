@@ -12,6 +12,16 @@ export interface TurnContext {
   meta: Record<string, string>;
 }
 
+/**
+ * What the session's own stream showed before this call. Supplied only where
+ * a check needs it (voice end_conversation); undefined everywhere else.
+ */
+export interface CallContext {
+  /** Another tool_use started after the model's last text block this turn,
+   * so its result has not been spoken to the caller yet. */
+  followsUnspokenTool: boolean;
+}
+
 type PolicyDecision =
   | { behavior: 'allow'; updatedInput: Record<string, unknown> }
   | { behavior: 'deny'; message: string };
@@ -20,6 +30,7 @@ export type PolicyFn = (
   toolName: string,
   input: Record<string, unknown>,
   context: TurnContext,
+  call?: CallContext,
 ) => PolicyDecision | Promise<PolicyDecision>;
 
 /**
@@ -28,13 +39,14 @@ export type PolicyFn = (
  * Tighten by replacing the PolicyFn, not by editing call sites.
  */
 export function allowAllPolicy(logger: Logger): PolicyFn {
-  return (toolName, input, context) => {
+  return (toolName, input, context, call) => {
     const surface = context.meta.surface ?? '';
     const user = context.meta.user ?? '';
     if (toolName === 'mcp__mentat__end_conversation' && surface !== 'voice') {
       logger.info('permission decision', {
         tool: toolName,
         decision: 'deny',
+        reason: 'non-voice surface',
         session_id: context.sessionId,
         surface,
         user,
@@ -42,6 +54,21 @@ export function allowAllPolicy(logger: Logger): PolicyFn {
       return {
         behavior: 'deny',
         message: `mcp__mentat__end_conversation is only allowed on the voice surface; received ${surface || 'unknown'}`,
+      };
+    }
+    if (toolName === 'mcp__mentat__end_conversation' && call?.followsUnspokenTool === true) {
+      logger.info('permission decision', {
+        tool: toolName,
+        decision: 'deny',
+        reason: 'unspoken tool result',
+        session_id: context.sessionId,
+        surface,
+        user,
+      });
+      return {
+        behavior: 'deny',
+        message:
+          'Speak your answer to the caller first. Call end_conversation by itself only after your final spoken answer; other tool results from this step have not been spoken yet.',
       };
     }
     logger.info('permission decision', {
