@@ -656,6 +656,83 @@ class DevStackTest(unittest.TestCase):
                     self.assertNotIn(secret, error.stderr)
                     self.assertNotIn(secret, error.output)
 
+    def test_candidate_voice_environment_is_gc_rooted_until_cleanup(self):
+        setup_script = _SETUP_SCRIPT
+        cleanup_script = setup_script.split("cat > \"$DEV_DIR/cleanup.sh\" <<'CLEANUP'\n", 1)[1].split(
+            "\nCLEANUP\n", 1
+        )[0]
+
+        self.assertIn('--out-link "$DEV_DIR/voice-env-root"', setup_script)
+        self.assertIn("--print-out-paths", setup_script)
+        self.assertIn('  /nix/store/*) ;;', setup_script)
+        self.assertIn('test -x "$VOICE_PY"', setup_script)
+        self.assertIn('VOICE_PY="$VOICE_ENV_PATH/bin/python"', setup_script)
+        self.assertIn('rm -f -- "$DEV_DIR/voice-env-root"', cleanup_script)
+        self.assertLess(
+            cleanup_script.index('rm -f -- "$DEV_DIR/voice-env-root"'),
+            cleanup_script.index('rm -rf -- "$DEV_DIR"'),
+        )
+        self.assertIn("systemctl start mentat-voice", cleanup_script)
+        self.assertIn("systemctl stop mentat-voice", cleanup_script)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            systemctl_log = root / "systemctl.log"
+            systemctl = bin_dir / "systemctl"
+            systemctl.write_text(
+                "#!/bin/sh\n"
+                'if [ "$2" = mentat-voice ]; then\n'
+                '  if [ -L "$DEV_DIR/voice-env-root" ]; then state=root-present; else state=root-missing; fi\n'
+                '  printf "%s %s %s\\n" "$1" "$2" "$state" >> "$SYSTEMCTL_LOG"\n'
+                'else\n'
+                '  printf "%s\\n" "$*" >> "$SYSTEMCTL_LOG"\n'
+                'fi\n'
+            )
+            systemctl.chmod(0o700)
+            bash_env = root / "bash-env"
+            bash_env.write_text(
+                "kill() {\n"
+                '  printf "%s\\n" "$*" >> "$KILL_LOG"\n'
+                '  if [ "$1" = -0 ]; then return 1; fi\n'
+                "  return 0\n"
+                "}\n"
+            )
+
+            for action in ("start", "stop"):
+                dev_dir = root / f"dev-stack-{action}"
+                dev_dir.mkdir()
+                root_link = dev_dir / "voice-env-root"
+                root_link.symlink_to("/nix/store/candidate")
+                (dev_dir / "restore-action").write_text(f"{action}\n")
+                (dev_dir / "restore-unit").write_text("mentat-eval-restore-test\n")
+                (dev_dir / "agent.pid").write_text("12345\n")
+                (dev_dir / "voice.pid").write_text("12346\n")
+                cleanup_path = dev_dir / "cleanup.sh"
+                cleanup_path.write_text(cleanup_script)
+                result = subprocess.run(
+                    ["bash", os.fspath(cleanup_path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env={
+                        **os.environ,
+                        "DEV_DIR": os.fspath(dev_dir),
+                        "SYSTEMCTL_LOG": os.fspath(systemctl_log),
+                        "KILL_LOG": os.fspath(root / "kill.log"),
+                        "BASH_ENV": os.fspath(bash_env),
+                        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                    },
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = systemctl_log.read_text() if systemctl_log.exists() else ""
+                self.assertIn(f"{action} mentat-voice root-present", calls)
+                self.assertIn("-TERM -- -12345", (root / "kill.log").read_text())
+                self.assertFalse(dev_dir.exists())
+                self.assertFalse(root_link.is_symlink())
+
     def test_candidate_voice_environment_uses_host_nixpkgs_and_both_candidate_launches(self):
         calls = []
 
