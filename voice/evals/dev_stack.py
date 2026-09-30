@@ -202,6 +202,7 @@ for module in (
     "livekit.plugins.elevenlabs",
     "livekit.plugins.openai",
     "livekit.plugins.silero",
+    "livekit.plugins.turn_detector",
 ):
     try:
         importlib.import_module(module)
