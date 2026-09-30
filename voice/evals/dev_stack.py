@@ -375,6 +375,29 @@ with tarfile.open(archive, "w:gz") as output:
             ) is not None
             if allowed and source.is_file() and not source.is_symlink():
                 output.add(source, arcname=f"sms-audio/{source.name}", recursive=False)
+    input_audio = root / "voice/evals/retained-evidence/input-audio"
+    if input_audio.is_dir() and not input_audio.is_symlink():
+        sources = {
+            source.name: source
+            for source in input_audio.iterdir()
+            if source.is_file()
+            and not source.is_symlink()
+            and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3}\.wav",
+                source.name,
+            ) is not None
+        }
+        for wav_name in sorted(sources):
+            source = sources[wav_name]
+            output.add(source, arcname=f"input-audio/{wav_name}", recursive=False)
+            transcript_name = f"{wav_name[:-4]}.txt"
+            transcript = input_audio / transcript_name
+            if transcript.is_file() and not transcript.is_symlink():
+                output.add(
+                    transcript,
+                    arcname=f"input-audio/{transcript_name}",
+                    recursive=False,
+                )
 os.chmod(archive, 0o600)
 owner = pwd.getpwnam(os.environ["SUDO_USER"])
 os.chown(archive, owner.pw_uid, owner.pw_gid)
@@ -403,7 +426,7 @@ fi
 : > "$DEV_DIR/voice/evals/delegations.jsonl"
 chown nobody:nogroup "$DEV_DIR/voice/evals/delegations.jsonl"
 chmod 600 "$DEV_DIR/voice/evals/delegations.jsonl"
-install -d -o nobody -g nogroup -m 700 "$DEV_DIR/voice/evals/retained-evidence"
+install -d -o nobody -g nogroup -m 700 "$DEV_DIR/voice/evals/retained-evidence/input-audio"
 python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" "$ROOM" <<'PY'
 import json
 import subprocess
@@ -424,6 +447,9 @@ voice_env.update({
     "XDG_CACHE_HOME": str(dev_dir / "home/voice/cache"),
     "MENTAT_VOICE_HTTP_PORT": str(health_port),
     "MENTAT_EVAL_DELEGATION_LOG": str(dev_dir / "voice/evals/delegations.jsonl"),
+    "MENTAT_VOICE_INPUT_RECORD_DIR": str(
+        dev_dir / "voice/evals/retained-evidence/input-audio"
+    ),
 })
 voice_log = (dev_dir / "voice.log").open("ab", buffering=0)
 voice = subprocess.Popen(
@@ -891,7 +917,18 @@ class DevStack:
             import tarfile
 
             with tarfile.open(archive, "r:gz") as retained:
-                for member in retained.getmembers():
+                members = retained.getmembers()
+                input_audio_wavs = {
+                    member.name.removeprefix("input-audio/")
+                    for member in members
+                    if member.name.startswith("input-audio/")
+                    and re.fullmatch(
+                        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3}\.wav",
+                        member.name.removeprefix("input-audio/"),
+                    ) is not None
+                    and member.isfile()
+                }
+                for member in members:
                     name = member.name
                     allowed = name in {"agent.log", "voice.log", "voice/evals/delegations.jsonl"}
                     if name == "sms-audio/transcripts.jsonl":
@@ -902,6 +939,16 @@ class DevStack:
                             r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3}\.wav",
                             filename,
                         ) is not None
+                    if name.startswith("input-audio/"):
+                        filename = name.removeprefix("input-audio/")
+                        wav_name = filename if filename.endswith(".wav") else f"{filename[:-4]}.wav"
+                        allowed = (
+                            re.fullmatch(
+                                r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3}\.(?:wav|txt)",
+                                filename,
+                            ) is not None
+                            and (filename.endswith(".wav") or wav_name in input_audio_wavs)
+                        )
                     if name.startswith("records/"):
                         filename = name.removeprefix("records/")
                         allowed = bool(filename) and Path(filename).name == filename and filename.endswith(".jsonl")

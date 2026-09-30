@@ -1566,16 +1566,120 @@ class AgentSourceContractTest(unittest.TestCase):
             keyword.value for keyword in session_call.keywords
             if keyword.arg == "turn_handling"
         )
-        turn_detection = next(
-            value for key, value in zip(turn_handling.keys, turn_handling.values)
-            if isinstance(key, ast.Constant) and key.value == "turn_detection"
+        self.assertEqual(
+            ast.unparse(turn_handling),
+            "{'turn_detection': turn_detector.MultilingualModel(), "
+            "'endpointing': {'min_delay': 0.5, 'max_delay': 3.0}}",
         )
-        self.assertEqual(ast.unparse(turn_detection), "turn_detector.MultilingualModel()")
-        self.assertFalse(any(
-            isinstance(key, ast.Constant) and key.value == "endpointing"
-            for key in turn_handling.keys
-        ))
         self.assertIn("from livekit.plugins import dtln, elevenlabs, openai, silero, turn_detector", source)
+
+    def test_input_audio_recording_is_opt_in_committed_and_keeps_real_stt_frames(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        recorder = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "InputAudioRecorder"
+        )
+        namespace = {
+            "os": os,
+            "Path": Path,
+            "wave": __import__("wave"),
+            "re": re,
+            "Any": object,
+            "logger": Mock(),
+        }
+        exec(compile(ast.Module(body=[recorder], type_ignores=[]), str(agent_path), "exec"), namespace)
+        frame = SimpleNamespace(
+            data=bytearray(b"\x01\x00\xfe\xff"),
+            sample_rate=16000,
+            num_channels=1,
+            samples_per_channel=2,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(os.environ, {}, clear=True):
+                disabled = namespace["InputAudioRecorder"]("eval-room")
+                disabled.capture(frame)
+                disabled.commit("ignored")
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+            with patch.dict(os.environ, {"MENTAT_VOICE_INPUT_RECORD_DIR": temporary}, clear=True):
+                active = namespace["InputAudioRecorder"]("eval-room", temporary)
+                active.begin()
+                active.capture(frame)
+                active.capture(frame)
+                self.assertEqual(list(Path(temporary).iterdir()), [])
+                active.commit("first final transcript")
+                # A later STT input segment discards uncommitted prior frames.
+                active.capture(frame)
+                active.begin()
+                active.capture(frame)
+                active.commit("second final transcript")
+                # An unfinished capture is never published as a turn.
+                active.begin()
+                active.capture(frame)
+                restarted = namespace["InputAudioRecorder"]("eval-room", temporary)
+                restarted.begin()
+                restarted.capture(frame)
+                restarted.commit("after worker restart")
+
+            wavs = sorted(Path(temporary).glob("*.wav"))
+            self.assertEqual([path.name for path in wavs], [
+                "eval-room-turn-001.wav",
+                "eval-room-turn-002.wav",
+                "eval-room-turn-003.wav",
+            ])
+            expected_audio = {
+                "eval-room-turn-001.wav": bytes(frame.data) * 2,
+                "eval-room-turn-002.wav": bytes(frame.data),
+                "eval-room-turn-003.wav": bytes(frame.data),
+            }
+            for path in wavs:
+                with namespace["wave"].open(str(path), "rb") as audio:
+                    self.assertEqual(audio.getnchannels(), 1)
+                    self.assertEqual(audio.getsampwidth(), 2)
+                    self.assertEqual(audio.getframerate(), 16000)
+                    self.assertEqual(audio.readframes(audio.getnframes()), expected_audio[path.name])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            transcripts = sorted(Path(temporary).glob("*.txt"))
+            self.assertEqual(
+                [path.read_text() for path in transcripts],
+                [
+                    "first final transcript",
+                    "second final transcript",
+                    "after worker restart",
+                ],
+            )
+            self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in transcripts))
+
+    def test_front_agent_records_frames_before_stt_and_commits_final_text(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        tree = ast.parse(source)
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        stt_node = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.FunctionDef) and node.name == "stt_node"
+        )
+        callback = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "on_user_turn_completed"
+        )
+        stt_source = ast.unparse(stt_node)
+        self.assertIn("self._input_audio.capture", stt_source)
+        self.assertLess(stt_source.index("capture(frame)"), stt_source.index("yield frame"))
+        self.assertIn("return super().stt_node(audio, model_settings)", stt_source)
+        self.assertIn("return super().stt_node(recorded_audio(), model_settings)", stt_source)
+        self.assertIn("input_audio.commit(question)", ast.unparse(callback))
+        self.assertIn("text_content", ast.unparse(callback))
+        init = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        self.assertIn("if input_audio_dir else None", ast.unparse(init))
+        self.assertNotIn("user_input_transcribed", source)
 
 
 if __name__ == "__main__":
