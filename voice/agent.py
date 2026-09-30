@@ -497,6 +497,7 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
         turn_handling={
             "turn_detection": turn_detector.MultilingualModel(),
+            "endpointing": {"min_delay": 0.5, "max_delay": 3.0},
         },
     )
     voice_room_io = room_io.RoomIO(

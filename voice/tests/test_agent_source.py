@@ -1566,15 +1566,11 @@ class AgentSourceContractTest(unittest.TestCase):
             keyword.value for keyword in session_call.keywords
             if keyword.arg == "turn_handling"
         )
-        turn_detection = next(
-            value for key, value in zip(turn_handling.keys, turn_handling.values)
-            if isinstance(key, ast.Constant) and key.value == "turn_detection"
+        self.assertEqual(
+            ast.unparse(turn_handling),
+            "{'turn_detection': turn_detector.MultilingualModel(), "
+            "'endpointing': {'min_delay': 0.5, 'max_delay': 3.0}}",
         )
-        self.assertEqual(ast.unparse(turn_detection), "turn_detector.MultilingualModel()")
-        self.assertFalse(any(
-            isinstance(key, ast.Constant) and key.value == "endpointing"
-            for key in turn_handling.keys
-        ))
         self.assertIn("from livekit.plugins import dtln, elevenlabs, openai, silero, turn_detector", source)
 
 
