@@ -1879,6 +1879,99 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             sleep=asyncio.sleep,
         )
 
+    async def test_caller_audio_retention_records_exact_render_and_actual_push(self):
+        import json
+        import stat
+        import tempfile
+
+        dependencies = self.dependencies_for_failure("other")
+        rendered = b"\x01\x00" * 63_365
+        pushed = []
+
+        class Source:
+            async def capture_frame(self, frame):
+                pushed.append(frame)
+
+            async def wait_for_playout(self):
+                return None
+
+        dependencies.rtc.AudioFrame = lambda pcm, rate, channels, samples: SimpleNamespace(
+            pcm=pcm, sample_rate=rate, channels=channels, samples=samples
+        )
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": lambda *_args: asyncio.sleep(
+                0, result=runner.caller.TTSResponse(rendered, 200, len(rendered))
+            ),
+        })
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, TEST_VOICE_ENV):
+            evidence = Path(temporary)
+            traces = await capture_script(
+                "android-selected-room", ["Exact caller words@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+                retain_caller_audio_dir=evidence,
+            )
+            audio_dir = evidence / "caller-audio"
+            stem = "android-selected-room-turn-001"
+            metadata_path = audio_dir / f"{stem}.json"
+            record = json.loads(metadata_path.read_text())
+            self.assertEqual((audio_dir / f"{stem}-rendered.pcm").read_bytes(), rendered)
+            self.assertEqual(
+                (audio_dir / f"{stem}-pushed.pcm").read_bytes(),
+                b"".join(frame.pcm for frame in pushed),
+            )
+            self.assertEqual(record, {
+                "turn": 1,
+                "line": "Exact caller words",
+                "tts_http_status": 200,
+                "tts_response_bytes": len(rendered),
+                "pushed_frames": len(pushed),
+                "pushed_samples": 63_365,
+                "rendered_filename": f"{stem}-rendered.pcm",
+                "pushed_filename": f"{stem}-pushed.pcm",
+            })
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(audio_dir.stat().st_mode), 0o700)
+            self.assertEqual(record["pushed_frames"], len(pushed))
+            self.assertEqual(record["pushed_samples"], sum(frame.samples for frame in pushed))
+            for path in audio_dir.iterdir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(traces[0]["line"], "Exact caller words")
+
+    async def test_short_preflight_render_is_retained_with_zero_push_metrics(self):
+        import json
+        import tempfile
+
+        dependencies = self.dependencies_for_failure("other")
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": lambda *_args: asyncio.sleep(
+                0, result=runner.caller.TTSResponse(b"\x01\x00", 200, 2)
+            ),
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.dict(os.environ, TEST_VOICE_ENV),
+                self.assertRaises(runner.PartialCaptureFailure),
+            ):
+                await capture_script(
+                    "private-room", ["Long scripted line@0::answer"],
+                    dependencies=dependencies, room_close_after=None,
+                    retain_caller_audio_dir=Path(temporary),
+                )
+
+            audio_dir = Path(temporary) / "caller-audio"
+            stem = "private-room-turn-001"
+            record = json.loads((audio_dir / f"{stem}.json").read_text())
+            self.assertEqual((audio_dir / f"{stem}-rendered.pcm").read_bytes(), b"\x01\x00")
+            self.assertEqual((audio_dir / f"{stem}-pushed.pcm").read_bytes(), b"")
+            self.assertEqual(record["line"], "Long scripted line")
+            self.assertEqual(record["tts_http_status"], 200)
+            self.assertEqual(record["tts_response_bytes"], 2)
+            self.assertEqual(record["pushed_frames"], 0)
+            self.assertEqual(record["pushed_samples"], 0)
+
 
 class LocalEvalTests(unittest.TestCase):
     def test_expected_hangup_timeout_emits_failed_report_and_nonzero_exit(self):
@@ -3548,6 +3641,7 @@ class ScenarioObservationTests(unittest.TestCase):
     def test_only_the_two_sms_scenarios_request_private_audio_retention(self):
         for scenario in SCENARIOS:
             command = runner._capture_command(scenario, "safe-room", ["Question@0::answer"])
+            self.assertIn("--retain-caller-audio", command)
             if scenario.name in {"sms-say-back-yes", "sms-correction-new-yes"}:
                 with self.subTest(scenario=scenario.name):
                     self.assertEqual(
@@ -3581,7 +3675,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 redirect_stdout(output),
             ):
                 result = runner.main([
-                    "--retain-sms-audio", "sms-say-back-yes",
+                    "--retain-caller-audio", "--retain-sms-audio", "sms-say-back-yes",
                     "android-selected-room", "Question@0::answer",
                 ])
 
@@ -3593,6 +3687,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 "room_close_after": 1,
                 "retain_sms_audio_dir": Path(temporary),
                 "retain_sms_audio_scenario": "sms-say-back-yes",
+                "retain_caller_audio_dir": Path(temporary),
             },
         )])
         self.assertNotIn("filename", json.loads(output.getvalue()))

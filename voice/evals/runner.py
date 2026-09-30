@@ -115,6 +115,68 @@ def _retain_sms_audio(
         output.write(metadata)
         output.flush()
         os.fsync(output.fileno())
+
+
+def _atomic_private_write(destination: Path, content: bytes) -> None:
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, prefix=".caller-", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
+
+
+def _retain_caller_audio(
+    evidence_dir: Path,
+    room_name: str,
+    turn: int,
+    line: str,
+    speech: caller.TTSResponse,
+    pushed_pcm: bytes,
+    pushed_frames: int,
+    pushed_samples: int,
+) -> None:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", room_name) is None:
+        raise RuntimeError("caller audio retention received an invalid room name")
+    if not isinstance(speech.pcm, bytes) or not isinstance(pushed_pcm, bytes):
+        raise RuntimeError("caller audio retention received invalid PCM")
+    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+        raise RuntimeError("caller audio evidence directory is not a private directory")
+    if evidence_dir.stat().st_mode & 0o077:
+        raise RuntimeError("caller audio evidence directory is not a private directory")
+    audio_dir = evidence_dir / "caller-audio"
+    audio_dir.mkdir(mode=0o700, exist_ok=True)
+    if audio_dir.is_symlink() or not audio_dir.is_dir():
+        raise RuntimeError("caller audio evidence directory is not a private directory")
+    os.chmod(audio_dir, 0o700)
+
+    stem = f"{room_name}-turn-{turn:03d}"
+    rendered_filename = f"{stem}-rendered.pcm"
+    pushed_filename = f"{stem}-pushed.pcm"
+    _atomic_private_write(audio_dir / rendered_filename, speech.pcm)
+    _atomic_private_write(audio_dir / pushed_filename, pushed_pcm)
+    metadata = json.dumps({
+        "turn": turn,
+        "line": line,
+        "tts_http_status": speech.http_status,
+        "tts_response_bytes": speech.response_bytes,
+        "pushed_frames": pushed_frames,
+        "pushed_samples": pushed_samples,
+        "rendered_filename": rendered_filename,
+        "pushed_filename": pushed_filename,
+    }, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    _atomic_private_write(audio_dir / f"{stem}.json", metadata)
+
+
 SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5", "claude-sonnet-5-5"})
 SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
@@ -467,6 +529,7 @@ async def capture_script(
     room_close_after: int | None = None,
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
+    retain_caller_audio_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy."""
     if not raw_steps:
@@ -498,10 +561,10 @@ async def capture_script(
     if parsed_livekit_url.scheme not in ("ws", "wss") or parsed_livekit_url.hostname is None:
         raise RuntimeError("endpoint-issued LiveKit URL is missing or invalid")
 
-    synthesized: list[bytes] = []
+    synthesized: list[caller.TTSResponse] = []
     for index, step in enumerate(steps):
         try:
-            pcm = await _with_deadline(
+            speech = await _with_deadline(
                 dependencies.tts(dependencies.http, step.line),
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "scripted speech synthesis",
@@ -510,7 +573,7 @@ async def capture_script(
             if str(error) != "scripted speech synthesis exceeded its deadline":
                 raise
             try:
-                pcm = await _with_deadline(
+                speech = await _with_deadline(
                     dependencies.tts(dependencies.http, step.line),
                     REMOTE_OPERATION_DEADLINE_SECONDS,
                     "scripted speech synthesis",
@@ -523,6 +586,24 @@ async def capture_script(
                     1,
                     f"scripted speech synthesis for line {index + 1} exceeded its deadline",
                 ) from retry_error
+        if isinstance(speech, bytes):
+            speech = caller.TTSResponse(speech, None, len(speech))
+        if not isinstance(speech, caller.TTSResponse):
+            raise PartialCaptureFailure(
+                [], 1, f"scripted speech sample count mismatch for line {index + 1}"
+            )
+        pcm = speech.pcm
+        if retain_caller_audio_dir is not None and isinstance(pcm, bytes):
+            _retain_caller_audio(
+                retain_caller_audio_dir,
+                room_name,
+                index + 1,
+                step.line,
+                speech,
+                b"",
+                0,
+                0,
+            )
         if not isinstance(pcm, bytes) or len(pcm) % 2:
             raise PartialCaptureFailure(
                 [], 1, f"scripted speech sample count mismatch for line {index + 1}"
@@ -533,7 +614,7 @@ async def capture_script(
             raise PartialCaptureFailure(
                 [], 1, f"scripted speech synthesis for line {index + 1} rendered too few samples"
             )
-        synthesized.append(pcm)
+        synthesized.append(speech)
 
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
@@ -616,20 +697,40 @@ async def capture_script(
         except TimeoutError as error:
             raise DeadlineExceeded(str(error)) from error
 
-        async def push(pcm: bytes, line_number: int) -> None:
+        async def push(
+            speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int
+        ) -> None:
+            pcm = speech.pcm
             rendered_samples = len(pcm) // 2
+            pushed_pcm = bytearray()
+            pushed_frames = 0
             pushed_samples = 0
-            for offset in range(0, len(pcm), FRAME_SAMPLES * 2):
-                chunk = pcm[offset : offset + FRAME_SAMPLES * 2]
-                frame_samples = len(chunk) // 2
-                await _with_deadline(
-                    source.capture_frame(
-                        dependencies.rtc.AudioFrame(chunk, RATE, 1, frame_samples)
-                    ),
-                    REMOTE_OPERATION_DEADLINE_SECONDS,
-                    "LiveKit speech audio playout",
-                )
-                pushed_samples += frame_samples
+            try:
+                for offset in range(0, len(pcm), FRAME_SAMPLES * 2):
+                    chunk = pcm[offset : offset + FRAME_SAMPLES * 2]
+                    frame_samples = len(chunk) // 2
+                    await _with_deadline(
+                        source.capture_frame(
+                            dependencies.rtc.AudioFrame(chunk, RATE, 1, frame_samples)
+                        ),
+                        REMOTE_OPERATION_DEADLINE_SECONDS,
+                        "LiveKit speech audio playout",
+                    )
+                    pushed_pcm.extend(chunk)
+                    pushed_frames += 1
+                    pushed_samples += frame_samples
+            finally:
+                if retain_caller_audio_dir is not None:
+                    _retain_caller_audio(
+                        retain_caller_audio_dir,
+                        room_name,
+                        line_number,
+                        step.line,
+                        speech,
+                        bytes(pushed_pcm),
+                        pushed_frames,
+                        pushed_samples,
+                    )
             if pushed_samples != rendered_samples:
                 raise PartialCaptureFailure(
                     traces,
@@ -655,7 +756,7 @@ async def capture_script(
                     "silence timing",
                 )
 
-        for index, (step, pcm) in enumerate(zip(steps, synthesized, strict=True)):
+        for index, (step, speech) in enumerate(zip(steps, synthesized, strict=True)):
             await quiet(step.delay)
             capture_end = asyncio.Event()
             capture = dependencies.capture_factory(answer_tracks, capture_end)
@@ -665,7 +766,7 @@ async def capture_script(
                 "continuous answer capture start",
             )
             speech_started_at = time.time()
-            await push(pcm, index + 1)
+            await push(speech, step, index + 1)
             speech_end = _finite_timestamp(
                 await _with_deadline(
                     caller._speech_end_after_playout(source),
@@ -1709,7 +1810,10 @@ def _voice_token(base_url: str) -> dict[str, Any]:
 def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str]:
     close_after = getattr(scenario, "room_close_after", None)
     close_arg = "none" if close_after is None else str(close_after)
-    command = ["evals/runner.py", "--fake-phone", "--room-close-after", close_arg]
+    command = [
+        "evals/runner.py", "--fake-phone", "--retain-caller-audio",
+        "--room-close-after", close_arg,
+    ]
     if getattr(scenario, "name", None) in SMS_AUDIO_SCENARIOS:
         command.extend(("--retain-sms-audio", scenario.name))
     command.extend((room, *raw_steps))
@@ -1929,6 +2033,7 @@ async def _run_remote_capture_with_fake_phone(
     room_close_after: int | None,
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
+    retain_caller_audio_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
     log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
@@ -1955,6 +2060,7 @@ async def _run_remote_capture_with_fake_phone(
             room_close_after=room_close_after,
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
+            retain_caller_audio_dir=retain_caller_audio_dir,
         )
     finally:
         if process.poll() is None:
@@ -1973,6 +2079,7 @@ async def run_remote_capture(
     room_close_after: int | None = None,
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
+    retain_caller_audio_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     import aiohttp
 
@@ -1984,6 +2091,7 @@ async def run_remote_capture(
             room_close_after=room_close_after,
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
+            retain_caller_audio_dir=retain_caller_audio_dir,
         )
 
 
@@ -2089,6 +2197,17 @@ def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if arguments and arguments[0] == "eval":
         return _run_local_eval(arguments[1:])
+    retain_caller_audio = "--retain-caller-audio" in arguments
+    if arguments.count("--retain-caller-audio") > 1:
+        raise RuntimeError("--retain-caller-audio may be specified only once")
+    if retain_caller_audio:
+        arguments.remove("--retain-caller-audio")
+        evidence_path = os.environ.get("MENTAT_EVAL_RETAINED_EVIDENCE_DIR")
+        if not evidence_path:
+            raise RuntimeError("private retained-evidence directory is unavailable")
+        retain_caller_audio_dir = Path(evidence_path)
+    else:
+        retain_caller_audio_dir = None
     retain_sms_audio_scenario = None
     if "--retain-sms-audio" in arguments:
         flag_index = arguments.index("--retain-sms-audio")
@@ -2112,6 +2231,8 @@ def main(argv: list[str] | None = None) -> int:
             "retain_sms_audio_dir": retain_sms_audio_dir,
             "retain_sms_audio_scenario": retain_sms_audio_scenario,
         })
+    if retain_caller_audio:
+        capture_options["retain_caller_audio_dir"] = retain_caller_audio_dir
     try:
         traces = asyncio.run(capture(room, steps, **capture_options))
     except PartialCaptureFailure as error:

@@ -23,6 +23,13 @@ READINESS_TIMEOUT_SECONDS = 15
 MICROPHONE_SETTLE_SECONDS = 3.0
 
 
+@dataclass(frozen=True)
+class TTSResponse:
+    pcm: bytes
+    http_status: int | None
+    response_bytes: int
+
+
 class WhisperTranscriptionError(RuntimeError):
     """Whisper rejected one captured clip with an HTTP 4xx response."""
 
@@ -295,14 +302,15 @@ async def _speech_end_after_playout(source: Any) -> float:
     return time.monotonic()
 
 
-async def _tts(http: Any, text: str) -> bytes:
+async def _tts(http: Any, text: str) -> TTSResponse:
     async with http.post(
         "https://api.openai.com/v1/audio/speech",
         headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
         json={"model": "gpt-4o-mini-tts", "voice": "ash", "input": text, "response_format": "pcm"},
     ) as response:
+        pcm = await response.read()
         response.raise_for_status()
-        return await response.read()
+        return TTSResponse(pcm, response.status, len(pcm))
 
 
 async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) -> list[dict[str, Any]]:
@@ -406,7 +414,8 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
                 while time.monotonic() < deadline:
                     await source.capture_frame(rtc.AudioFrame(silence, RATE, 1, FRAME_SAMPLES))
 
-            for step, pcm in audio:
+            for step, speech in audio:
+                pcm = speech.pcm if isinstance(speech, TTSResponse) else speech
                 await quiet(step.delay)
                 print(f"say: {step.line}", flush=True)
                 capture_end = asyncio.Event()
