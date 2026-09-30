@@ -275,7 +275,88 @@ class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pcm, early.data + later.data)
         self.assertIsInstance(capture_started, float)
 
-    async def test_capture_returns_frames_when_stream_hangs_at_finite_window(self):
+    async def test_long_answer_finishes_on_silence_and_persistent_track_serves_next_turn(self):
+        voice = CaptureTests.frame(False)
+        silence = CaptureTests.frame(True)
+        track = SimpleNamespace(turn=0)
+        answers = [
+            [voice] * 2 + [silence] * 50 + [voice] * 310 + [silence] * 210,
+            [voice] * 2 + [silence] * 210,
+        ]
+
+        class PersistentTrackStream:
+            def __init__(self, _track):
+                self.frames = iter(answers[track.turn])
+                track.turn += 1
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    frame = next(self.frames)
+                except StopIteration:
+                    await asyncio.Future()
+                await asyncio.sleep(caller._frame_duration(frame) / 100)
+                return SimpleNamespace(frame=frame)
+
+            async def aclose(self):
+                return None
+
+        queue = asyncio.Queue()
+        queue.put_nowait(track)
+        with patch.object(caller, "MAX_ANSWER_SECONDS", 0.3):
+            with patch.object(caller, "MAX_CAPTURE_SECONDS", 3):
+                with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=PersistentTrackStream))}):
+                    first, _, _, _ = await asyncio.wait_for(_capture_answer(queue), timeout=4)
+                    self.assertIs(queue.get_nowait(), track)
+                    queue.put_nowait(track)
+                    second, _, _, _ = await asyncio.wait_for(_capture_answer(queue), timeout=4)
+        first_voice_and_gap = b"".join(frame.data for frame in answers[0][:362])
+        second_voice = b"".join(frame.data for frame in answers[1][:2])
+        self.assertTrue(first.startswith(first_voice_and_gap))
+        self.assertTrue(second.startswith(second_voice))
+        trailing_silence_bytes = int(caller.ANSWER_END_SILENCE_SECONDS * 1000 * 2)
+        self.assertGreaterEqual(len(first), len(first_voice_and_gap) + trailing_silence_bytes)
+        self.assertGreaterEqual(len(second), len(second_voice) + trailing_silence_bytes)
+        self.assertEqual(track.turn, 2)
+
+    async def test_capture_waits_through_simulated_15_second_ack_search_gap(self):
+        acknowledgement = CaptureTests.frame(False)
+        answer = CaptureTests.frame(False)
+        answer.data = b"\x00\x02" * 100
+        silence = CaptureTests.frame(True)
+        clock = SimpleNamespace(seconds=0.0)
+        frames = [acknowledgement] * 2 + [silence] * 150 + [answer] * 2 + [silence] * 210
+
+        class TimedPersistentTrack:
+            def __init__(self, _track):
+                self.frames = iter(frames)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    frame = next(self.frames)
+                except StopIteration:
+                    await asyncio.Future()
+                clock.seconds += caller._frame_duration(frame)
+                return SimpleNamespace(frame=frame)
+
+            async def aclose(self):
+                return None
+
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        with patch.object(caller, "MAX_ANSWER_SECONDS", 1):
+            with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=TimedPersistentTrack))}):
+                pcm, _, _, _ = await asyncio.wait_for(_capture_answer(queue), timeout=2)
+        answer_pcm = answer.data * 2
+        self.assertIn(answer_pcm, pcm)
+        self.assertGreaterEqual(clock.seconds, 35.0)
+
+    async def test_capture_fails_when_stream_hangs_at_finite_window(self):
         frame = CaptureTests.frame(False)
 
         class HangingAfterFrameStream:
@@ -296,11 +377,71 @@ class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         queue = asyncio.Queue()
         queue.put_nowait(object())
-        with patch.object(caller, "MAX_ANSWER_SECONDS", 0.01):
+        with patch.object(caller, "MAX_CAPTURE_SECONDS", 0.01):
             with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=HangingAfterFrameStream))}):
-                pcm, rate, channels, _ = await asyncio.wait_for(_capture_answer(queue), timeout=0.2)
+                with self.assertRaisesRegex(RuntimeError, "agent audio capture exceeded its deadline"):
+                    await asyncio.wait_for(_capture_answer(queue), timeout=0.2)
+
+    async def test_capture_extends_past_initial_window_for_recent_speech(self):
+        first = CaptureTests.frame(False)
+        final = CaptureTests.frame(False)
+
+        class DelayedFinalSpeech:
+            def __init__(self, track):
+                self.frames = iter([first, final])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    frame = next(self.frames)
+                except StopIteration:
+                    await asyncio.Future()
+                if frame is final:
+                    await asyncio.sleep(0.08)
+                return SimpleNamespace(frame=frame)
+
+            async def aclose(self):
+                return None
+
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        with patch.object(caller, "MAX_ANSWER_SECONDS", 0.05):
+            with patch.object(caller, "MAX_CAPTURE_SECONDS", 1):
+                with patch.object(caller, "ANSWER_END_SILENCE_SECONDS", 0.1):
+                    with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=DelayedFinalSpeech))}):
+                        pcm, _, _, _ = await asyncio.wait_for(_capture_answer(queue), timeout=0.5)
+        self.assertEqual(pcm, first.data + final.data)
+
+    async def test_capture_finishes_after_silence_when_persistent_track_stops_emitting_frames(self):
+        frame = CaptureTests.frame(False)
+
+        class SilentPersistentTrack:
+            def __init__(self, track):
+                self.emitted = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.emitted:
+                    self.emitted = True
+                    return SimpleNamespace(frame=frame)
+                await asyncio.Future()
+
+            async def aclose(self):
+                return None
+
+        queue = asyncio.Queue()
+        track = object()
+        queue.put_nowait(track)
+        with patch.object(caller, "MAX_ANSWER_SECONDS", 0.05):
+            with patch.object(caller, "ANSWER_END_SILENCE_SECONDS", 0.01):
+                with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=SilentPersistentTrack))}):
+                    pcm, _, _, _ = await asyncio.wait_for(_capture_answer(queue), timeout=0.2)
         self.assertEqual(pcm, frame.data)
-        self.assertEqual((rate, channels), (1000, 1))
+        self.assertIs(queue.get_nowait(), track)
 
     async def test_capture_returns_frames_promptly_when_agent_audio_ends(self):
         frame = CaptureTests.frame(False)
@@ -393,7 +534,7 @@ class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         queue = asyncio.Queue()
         queue.put_nowait(object())
-        with patch.object(caller, "MAX_ANSWER_SECONDS", 0.01):
+        with patch.object(caller, "ANSWER_START_TIMEOUT_SECONDS", 0.01):
             with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=HangingStream))}):
                 with self.assertRaisesRegex(RuntimeError, "no frames"):
                     await asyncio.wait_for(_capture_answer(queue), timeout=0.2)

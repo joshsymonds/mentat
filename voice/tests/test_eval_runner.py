@@ -49,6 +49,12 @@ class Clock:
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capture_deadline_covers_extended_answer_window(self):
+        self.assertGreaterEqual(
+            runner.ANSWER_CAPTURE_DEADLINE_SECONDS,
+            runner.caller.MAX_CAPTURE_SECONDS + 30.0,
+        )
+
     async def test_multi_turn_trace_captures_before_speech_and_observes_room_deletion(self):
         clock = Clock()
         events = []
