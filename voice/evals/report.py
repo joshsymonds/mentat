@@ -25,9 +25,9 @@ PARTIAL_CAPTURE_MESSAGES = {
     "room deletion was not observed before deadline",
 }
 SCRIPTED_TTS_PREFLIGHT_FAILURE_PATTERN = re.compile(
-    r"scripted speech synthesis for line ([1-9][0-9]*) "
-    r"(?:exceeded its deadline|rendered too few samples)"
+    r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
     r"|scripted speech sample count mismatch for line ([1-9][0-9]*)"
+    r"|scripted speech content verification failed for line ([1-9][0-9]*)"
 )
 
 

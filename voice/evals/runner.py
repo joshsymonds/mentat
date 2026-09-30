@@ -33,6 +33,7 @@ from evals.scenarios import (
     _sms_body_tokens,
     _spoken_sms_body,
     _spoken_sms_correction_body,
+    _spoken_number,
     _uncertain_without_alice_attribution,
 )
 
@@ -182,9 +183,26 @@ SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
 )
 SCRIPTED_TTS_RENDER_FAILURE_PATTERN = re.compile(
-    r"scripted speech (?:synthesis for line ([1-9][0-9]*) rendered too few samples"
-    r"|sample count mismatch for line ([1-9][0-9]*))"
+    r"scripted speech sample count mismatch for line ([1-9][0-9]*)"
 )
+SCRIPTED_CONTENT_FAILURE_PATTERN = re.compile(
+    r"scripted speech content verification failed for line ([1-9][0-9]*)"
+)
+CONTENT_STOP_WORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in",
+    "is", "it", "of", "on", "or", "the", "to", "was", "were", "will", "with",
+})
+NUMBER_WORDS = {
+    "zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3",
+    "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8",
+    "nine": "9",
+}
+SPOKEN_NUMBER_WORDS = frozenset({
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+    "sixty", "seventy", "eighty", "ninety",
+})
 WHISPER_HTTP_FAILURE_PATTERN = re.compile(
     r"Whisper transcription rejected utterance [1-9][0-9]* \(HTTP 4[0-9]{2}\)"
 )
@@ -221,10 +239,13 @@ def _scripted_tts_failure_line(message: Any) -> int | None:
         return timeout_line
     if not isinstance(message, str):
         return None
+    content_match = SCRIPTED_CONTENT_FAILURE_PATTERN.fullmatch(message)
+    if content_match is not None:
+        return int(content_match.group(1))
     match = SCRIPTED_TTS_RENDER_FAILURE_PATTERN.fullmatch(message)
     if match is None:
         return None
-    return int(match.group(1) or match.group(2))
+    return int(match.group(1))
 
 
 def _is_scripted_tts_timeout(message: Any) -> bool:
@@ -473,6 +494,179 @@ def _trace_text(segments: list[dict[str, Any]]) -> str:
     return " ".join(str(segment.get("text", "")).strip() for segment in segments).strip()
 
 
+def _content_tokens(text: str) -> list[str]:
+    normalized = re.sub(
+        r"(?<![a-z])([ap])\s*\.?\s*m\.?(?![a-z])",
+        lambda match: f"{match.group(1).lower()}m",
+        text,
+        flags=re.IGNORECASE,
+    )
+    expanded = re.sub(r"\bi'll\b", "i will", normalized, flags=re.IGNORECASE)
+    matches = list(re.finditer(r"[a-z0-9]+", expanded.lower()))
+    tokens = [match.group() for match in matches]
+    result = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.isdigit() and token not in SPOKEN_NUMBER_WORDS and token != "oh":
+            result.append(token)
+            index += 1
+            continue
+        end = index + 1
+        while end < len(tokens):
+            next_token = tokens[end]
+            separator = expanded[matches[end - 1].end():matches[end].start()]
+            if (
+                not re.fullmatch(r"[\s+().,/-]*", separator)
+                or not (
+                    next_token.isdigit()
+                    or next_token in SPOKEN_NUMBER_WORDS
+                    or next_token == "oh"
+                )
+            ):
+                break
+            end += 1
+        number_run = tokens[index:end]
+        if all(part.isdigit() for part in number_run):
+            result.append("".join(number_run))
+        elif all(part in NUMBER_WORDS or part.isdigit() for part in number_run):
+            result.append("".join(NUMBER_WORDS.get(part, part) for part in number_run))
+        elif all(part in SPOKEN_NUMBER_WORDS for part in number_run):
+            number = _spoken_number(" ".join(number_run))
+            result.append(str(number) if number is not None else " ".join(number_run))
+        else:
+            result.extend(NUMBER_WORDS.get(part, part) for part in number_run)
+        index = end
+    return result
+
+
+def _collapsed_phone_digits(text: str) -> str:
+    without_phone_fillers = re.sub(r"\b(?:plus|dash)\b", " ", text, flags=re.IGNORECASE)
+    return "".join(
+        token for token in _content_tokens(without_phone_fillers) if token.isdigit()
+    )
+
+
+def _one_edit_apart(left: str, right: str) -> bool:
+    if abs(len(left) - len(right)) > 1:
+        return False
+    left_index = right_index = edits = 0
+    while left_index < len(left) and right_index < len(right):
+        if left[left_index] == right[right_index]:
+            left_index += 1
+            right_index += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(left) > len(right):
+            left_index += 1
+        elif len(right) > len(left):
+            right_index += 1
+        else:
+            left_index += 1
+            right_index += 1
+    edits += (len(left) - left_index) + (len(right) - right_index)
+    return edits <= 1
+
+
+def _words_equivalent(expected: str, observed: str) -> bool:
+    expected_word = expected[:-1] if len(expected) > 3 and expected.endswith("s") else expected
+    observed_word = observed[:-1] if len(observed) > 3 and observed.endswith("s") else observed
+    if expected_word == observed_word:
+        return True
+    return (
+        max(len(expected_word), len(observed_word)) >= 4
+        and _one_edit_apart(expected_word, observed_word)
+    )
+
+
+def _matched_word_count(expected: list[str], observed: list[str]) -> int:
+    remaining = list(observed)
+    unmatched = []
+    matched = 0
+    for expected_word in expected:
+        exact_index = next(
+            (
+                index for index, observed_word in enumerate(remaining)
+                if _words_equivalent(expected_word, observed_word)
+                and (
+                    expected_word == observed_word
+                    or (
+                        expected_word.endswith("s")
+                        and len(expected_word) > 3
+                        and expected_word[:-1] == observed_word
+                    )
+                    or (
+                        observed_word.endswith("s")
+                        and len(observed_word) > 3
+                        and observed_word[:-1] == expected_word
+                    )
+                )
+            ),
+            None,
+        )
+        if exact_index is None:
+            unmatched.append(expected_word)
+        else:
+            remaining.pop(exact_index)
+            matched += 1
+    for expected_word in unmatched:
+        fuzzy_index = next(
+            (
+                index for index, observed_word in enumerate(remaining)
+                if _words_equivalent(expected_word, observed_word)
+            ),
+            None,
+        )
+        if fuzzy_index is not None:
+            remaining.pop(fuzzy_index)
+            matched += 1
+    return matched
+
+
+def _rendered_content_matches(line: str, segments: Any) -> bool:
+    if not isinstance(segments, list):
+        return False
+    transcript_parts = []
+    for segment in segments:
+        if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+            return False
+        transcript_parts.append(segment["text"])
+    transcript = " ".join(transcript_parts)
+    observed = _content_tokens(transcript)
+    expected = _content_tokens(line)
+    sms_prefix = re.match(r"^(?:text\b.*?|correction)\s*:", line, re.IGNORECASE)
+    phone_match = re.match(
+        r"^\s*text\s+(?P<number>\+?[0-9\s().,/-]+)\s*:",
+        line,
+        re.IGNORECASE,
+    )
+    if phone_match is not None:
+        expected_phone = re.sub(r"\D", "", phone_match.group("number"))
+        transcript_digits = _collapsed_phone_digits(transcript)
+        if not expected_phone or expected_phone not in transcript_digits:
+            return False
+    else:
+        content_words = [token for token in expected if token not in CONTENT_STOP_WORDS]
+        observed_words = [token for token in observed if token not in CONTENT_STOP_WORDS]
+        matched_words = _matched_word_count(content_words, observed_words)
+        if (
+            not content_words
+            or matched_words / len(content_words) < 0.75
+            or _matched_word_count([content_words[-1]], observed_words) != 1
+        ):
+            return False
+
+    if sms_prefix is not None:
+        body = line[sms_prefix.end():]
+        expected_body = _content_tokens(body)
+        for token in set(expected_body):
+            if observed.count(token) < expected_body.count(token):
+                return False
+    return True
+
+
 async def _room_exists(
     api_client: Any, api: Any, room_name: str, *, timeout: float = REMOTE_OPERATION_DEADLINE_SECONDS
 ) -> bool:
@@ -608,11 +802,21 @@ async def capture_script(
             raise PartialCaptureFailure(
                 [], 1, f"scripted speech sample count mismatch for line {index + 1}"
             )
-        rendered_samples = len(pcm) // 2
-        required_samples = math.ceil(len(step.line) * 0.12 * RATE)
-        if rendered_samples < required_samples:
+        try:
+            rendered_segments = await _with_deadline(
+                dependencies.transcribe(dependencies.http, pcm, RATE, 1),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "scripted speech content transcription",
+            )
+        except Exception as error:
             raise PartialCaptureFailure(
-                [], 1, f"scripted speech synthesis for line {index + 1} rendered too few samples"
+                [], 1,
+                f"scripted speech content verification failed for line {index + 1}",
+            ) from error
+        if not _rendered_content_matches(step.line, rendered_segments):
+            raise PartialCaptureFailure(
+                [], 1,
+                f"scripted speech content verification failed for line {index + 1}",
             )
         synthesized.append(speech)
 
