@@ -119,6 +119,10 @@ SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5", "cla
 SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
 )
+SCRIPTED_TTS_RENDER_FAILURE_PATTERN = re.compile(
+    r"scripted speech (?:synthesis for line ([1-9][0-9]*) rendered too few samples"
+    r"|sample count mismatch for line ([1-9][0-9]*))"
+)
 WHISPER_HTTP_FAILURE_PATTERN = re.compile(
     r"Whisper transcription rejected utterance [1-9][0-9]* \(HTTP 4[0-9]{2}\)"
 )
@@ -147,6 +151,18 @@ def _scripted_tts_timeout_line(message: Any) -> int | None:
         return None
     match = SCRIPTED_TTS_TIMEOUT_PATTERN.fullmatch(message)
     return int(match.group(1)) if match is not None else None
+
+
+def _scripted_tts_failure_line(message: Any) -> int | None:
+    timeout_line = _scripted_tts_timeout_line(message)
+    if timeout_line is not None:
+        return timeout_line
+    if not isinstance(message, str):
+        return None
+    match = SCRIPTED_TTS_RENDER_FAILURE_PATTERN.fullmatch(message)
+    if match is None:
+        return None
+    return int(match.group(1) or match.group(2))
 
 
 def _is_scripted_tts_timeout(message: Any) -> bool:
@@ -507,6 +523,16 @@ async def capture_script(
                     1,
                     f"scripted speech synthesis for line {index + 1} exceeded its deadline",
                 ) from retry_error
+        if not isinstance(pcm, bytes) or len(pcm) % 2:
+            raise PartialCaptureFailure(
+                [], 1, f"scripted speech sample count mismatch for line {index + 1}"
+            )
+        rendered_samples = len(pcm) // 2
+        required_samples = math.ceil(len(step.line) * 0.12 * RATE)
+        if rendered_samples < required_samples:
+            raise PartialCaptureFailure(
+                [], 1, f"scripted speech synthesis for line {index + 1} rendered too few samples"
+            )
         synthesized.append(pcm)
 
     room = dependencies.rtc.Room()
@@ -590,15 +616,25 @@ async def capture_script(
         except TimeoutError as error:
             raise DeadlineExceeded(str(error)) from error
 
-        async def push(pcm: bytes) -> None:
+        async def push(pcm: bytes, line_number: int) -> None:
+            rendered_samples = len(pcm) // 2
+            pushed_samples = 0
             for offset in range(0, len(pcm), FRAME_SAMPLES * 2):
-                chunk = pcm[offset : offset + FRAME_SAMPLES * 2].ljust(FRAME_SAMPLES * 2, b"\0")
+                chunk = pcm[offset : offset + FRAME_SAMPLES * 2]
+                frame_samples = len(chunk) // 2
                 await _with_deadline(
                     source.capture_frame(
-                        dependencies.rtc.AudioFrame(chunk, RATE, 1, FRAME_SAMPLES)
+                        dependencies.rtc.AudioFrame(chunk, RATE, 1, frame_samples)
                     ),
                     REMOTE_OPERATION_DEADLINE_SECONDS,
                     "LiveKit speech audio playout",
+                )
+                pushed_samples += frame_samples
+            if pushed_samples != rendered_samples:
+                raise PartialCaptureFailure(
+                    traces,
+                    line_number,
+                    f"scripted speech sample count mismatch for line {line_number}",
                 )
 
         silence = bytes(FRAME_SAMPLES * 2)
@@ -629,7 +665,7 @@ async def capture_script(
                 "continuous answer capture start",
             )
             speech_started_at = time.time()
-            await push(pcm)
+            await push(pcm, index + 1)
             speech_end = _finite_timestamp(
                 await _with_deadline(
                     caller._speech_end_after_playout(source),
@@ -1516,7 +1552,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         {"turn", "message", "speech_started_at"},
         {"turn", "message", "speech_started_at", "segments"},
     )
-    preflight_tts_line = _scripted_tts_timeout_line(
+    preflight_tts_line = _scripted_tts_failure_line(
         failure.get("message") if isinstance(failure, dict) else None
     )
     preflight_tts_failure = (
@@ -1603,7 +1639,7 @@ def _is_preflight_tts_capture_failure(
         not traces
         and isinstance(failure, dict)
         and failure.get("turn") == 1
-        and _is_scripted_tts_timeout(failure.get("message"))
+        and _scripted_tts_failure_line(failure.get("message")) is not None
         and "speech_started_at" not in failure
     )
 
@@ -2081,11 +2117,7 @@ def main(argv: list[str] | None = None) -> int:
     except PartialCaptureFailure as error:
         envelope = {"turns": error.turns, "failure": error.failure}
         print(json.dumps(envelope, separators=(",", ":")), flush=True)
-        return int(
-            not error.turns
-            and error.failure.get("turn") == 1
-            and _is_scripted_tts_timeout(error.failure.get("message"))
-        )
+        return int(_is_preflight_tts_capture_failure(error.turns, error.failure))
     print(json.dumps({"turns": traces}, separators=(",", ":")), flush=True)
     return 0
 

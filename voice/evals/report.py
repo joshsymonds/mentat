@@ -24,15 +24,17 @@ PARTIAL_CAPTURE_MESSAGES = {
     NO_ANSWER_FAILURE,
     "room deletion was not observed before deadline",
 }
-SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
-    r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
+SCRIPTED_TTS_PREFLIGHT_FAILURE_PATTERN = re.compile(
+    r"scripted speech synthesis for line ([1-9][0-9]*) "
+    r"(?:exceeded its deadline|rendered too few samples)"
+    r"|scripted speech sample count mismatch for line ([1-9][0-9]*)"
 )
 
 
-def _is_scripted_tts_timeout(message: Any) -> bool:
+def _is_scripted_tts_preflight_failure(message: Any) -> bool:
     return (
         isinstance(message, str)
-        and SCRIPTED_TTS_TIMEOUT_PATTERN.fullmatch(message) is not None
+        and SCRIPTED_TTS_PREFLIGHT_FAILURE_PATTERN.fullmatch(message) is not None
     )
 
 
@@ -275,7 +277,7 @@ def score_observations(
                 failure = run["failure"]
                 preflight_tts_failure = (
                     isinstance(failure, dict)
-                    and _is_scripted_tts_timeout(failure.get("message"))
+                    and _is_scripted_tts_preflight_failure(failure.get("message"))
                 )
                 failure_fields = (
                     {"turn", "message"},
@@ -348,10 +350,16 @@ def score_observations(
                         f"{name} run {run_index + 1}: invalid partial capture failure metadata"
                     )
                     continue
-                case_failures.append(
-                    f"{name} run {run_index + 1} turn {failure['turn']}: "
-                    f"capture failed: {failure['message']}"
-                )
+                if preflight_tts_failure:
+                    case_failures.append(
+                        f"{name} run {run_index + 1} turn {failure['turn']}: "
+                        f"eval infrastructure failure: {failure['message']}"
+                    )
+                else:
+                    case_failures.append(
+                        f"{name} run {run_index + 1} turn {failure['turn']}: "
+                        f"capture failed: {failure['message']}"
+                    )
                 if failure.get("message") in {
                     NO_ANSWER_FAILURE,
                     "answer transcription exceeded its deadline",

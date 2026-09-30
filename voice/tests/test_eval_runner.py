@@ -33,6 +33,12 @@ def pcm_windows(*levels, sample_rate=24000, channels=1):
     return struct.pack(f"<{len(values)}h", *values)
 
 
+def rendered_pcm(text, seconds_per_character=0.2):
+    """Return deterministic mono PCM with a realistic duration for a scripted line."""
+    samples = int(len(text) * seconds_per_character * runner.RATE)
+    return bytes(samples * 2)
+
+
 class Clock:
     def __init__(self):
         self.now = 10.0
@@ -164,7 +170,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         async def tts(_http, text):
             events.append(f"tts:{text}")
-            return b"\x00\x00"
+            return rendered_pcm(text)
 
         async def transcribe(_http, pcm, _rate, _channels):
             self.assertEqual(pcm, pcm_windows(600, 600))
@@ -285,7 +291,11 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
-        self.assertEqual(events, ["subscription-ready", "speech-frame"])
+        samples = len(rendered_pcm("First question")) // 2
+        self.assertEqual(events[0], "subscription-ready")
+        self.assertEqual(events[1:], ["speech-frame"] * (
+            (samples + runner.FRAME_SAMPLES - 1) // runner.FRAME_SAMPLES
+        ))
 
     async def test_missing_worker_subscription_fails_within_participant_deadline(self):
         dependencies = self.dependencies_for_failure("other")
@@ -554,7 +564,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             attempts[text] = attempts.get(text, 0) + 1
             if text == "First" and attempts[text] == 1:
                 raise runner.DeadlineExceeded("scripted speech synthesis exceeded its deadline")
-            return b"\\x00\\x00"
+            return rendered_pcm(text)
 
         dependencies = CaptureDependencies(
             **{**dependencies.__dict__, "rtc": SimpleNamespace(**{
@@ -571,6 +581,98 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(attempts, {"First": 2, "Second": 1})
         self.assertLess(max(i for i, value in enumerate(events) if value.startswith("tts:")), events.index("connect"))
+
+    async def test_short_sms_render_is_named_infrastructure_failure_and_known_render_passes(self):
+        line = "Text +1-202-555-0142: I will be there at six."
+        self.assertEqual(len(line), 45)
+        connections = []
+        dependencies = self.dependencies_for_failure("other")
+        dependencies.rtc.Room.connect = lambda *_args, **_kwargs: asyncio.sleep(
+            0, result=connections.append(True)
+        )
+        for seconds in (5.0, 7.7):
+            async def tts(_http, text, duration=seconds):
+                self.assertEqual(text, line)
+                return bytes(int(duration * runner.RATE) * 2)
+
+            dependencies = CaptureDependencies(**{**dependencies.__dict__, "tts": tts})
+            with patch.dict(os.environ, TEST_VOICE_ENV):
+                if seconds == 5.0:
+                    with self.assertRaises(runner.PartialCaptureFailure) as caught:
+                        await capture_script(
+                            "android-selected-room",
+                            [f"{line}@0::answer"],
+                            dependencies=dependencies,
+                            room_close_after=None,
+                        )
+                    self.assertEqual(caught.exception.failure, {
+                        "turn": 1,
+                        "message": "scripted speech synthesis for line 1 rendered too few samples",
+                    })
+                    self.assertTrue(
+                        runner._is_preflight_tts_capture_failure([], caught.exception.failure)
+                    )
+                    parsed = runner._capture_envelope(
+                        json.dumps({"turns": [], "failure": caught.exception.failure}), 1
+                    )
+                    self.assertEqual(parsed, ([], caught.exception.failure))
+                    self.assertEqual(connections, [])
+                else:
+                    await capture_script(
+                        "android-selected-room",
+                        [f"{line}@0::answer"],
+                        dependencies=dependencies,
+                        room_close_after=None,
+                    )
+        self.assertEqual(connections, [True])
+
+    async def test_push_preserves_rendered_sample_count_for_full_and_partial_frames(self):
+        dependencies = self.dependencies_for_failure("other")
+        rendered_samples = 23_041
+        rendered = bytes(rendered_samples * 2)
+        pushed = []
+        dependencies.rtc.AudioFrame = lambda pcm, rate, channels, samples: SimpleNamespace(
+            pcm=pcm, sample_rate=rate, channels=channels, samples=samples
+        )
+        dependencies.rtc.AudioSource = lambda *_args: SimpleNamespace(
+            capture_frame=lambda frame: asyncio.sleep(0, result=pushed.append(frame)),
+            wait_for_playout=lambda: asyncio.sleep(0),
+        )
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": lambda *_args: asyncio.sleep(0, result=rendered),
+        })
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            await capture_script(
+                "android-selected-room", ["Question@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+            )
+        self.assertEqual(b"".join(frame.pcm for frame in pushed), rendered)
+        self.assertEqual(sum(frame.samples for frame in pushed), rendered_samples)
+        self.assertEqual(
+            [frame.samples for frame in pushed],
+            [runner.FRAME_SAMPLES] * (rendered_samples // runner.FRAME_SAMPLES)
+            + [rendered_samples % runner.FRAME_SAMPLES],
+        )
+
+    async def test_odd_render_sample_mismatch_fails_with_line_name(self):
+        dependencies = self.dependencies_for_failure("other")
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": lambda *_args: asyncio.sleep(0, result=bytes([0])),
+        })
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            self.assertRaises(runner.PartialCaptureFailure) as caught,
+        ):
+            await capture_script(
+                "android-selected-room", ["Question@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+            )
+        self.assertEqual(caught.exception.failure, {
+            "turn": 1,
+            "message": "scripted speech sample count mismatch for line 1",
+        })
 
     async def test_preflight_tts_failures_on_every_line_use_strict_turn_one_envelopes(self):
         import io
@@ -592,7 +694,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                         raise runner.DeadlineExceeded(
                             "scripted speech synthesis exceeded its deadline"
                         )
-                    return b"\\x00\\x00"
+                    return rendered_pcm(text)
 
                 dependencies = CaptureDependencies(
                     **{**dependencies.__dict__, "tts": tts}
@@ -1282,12 +1384,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     calls = 0
 
-                    async def tts(_http, _text):
+                    async def tts(_http, text):
                         nonlocal calls
                         calls += 1
                         if calls >= 2:
                             await asyncio.sleep(1)
-                        return b"\\x00\\x00"
+                        return rendered_pcm(text)
 
                     dependencies = CaptureDependencies(
                         **{**dependencies.__dict__, "tts": tts}
@@ -1770,7 +1872,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             ),
             rtc=rtc,
             http=object(),
-            tts=lambda *_args: asyncio.sleep(0, result=b"\x00\x00"),
+            tts=lambda _http, text: asyncio.sleep(0, result=rendered_pcm(text)),
             transcribe=transcribe,
             capture_factory=Capture,
             monotonic=time.monotonic,
@@ -3011,6 +3113,79 @@ class ScenarioObservationTests(unittest.TestCase):
                     "turn": 1,
                     "message": failure["message"],
                 }])
+
+    def test_short_render_envelope_is_reported_as_eval_infrastructure_failure(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from subprocess import CompletedProcess
+
+        from evals.dev_stack import RemoteCommandError
+
+        scenario = SCENARIOS[0]
+        grant = {
+            "token": "header.payload.signature",
+            "room": "room-short-render",
+            "url": "wss://livekit.invalid",
+            "expires_at": "2026-09-26T22:00:00Z",
+        }
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, **_kwargs):
+                raise RemoteCommandError(
+                    1,
+                    command,
+                    output=json.dumps({
+                        "turns": [],
+                        "failure": {
+                            "turn": 1,
+                            "message": (
+                                "scripted speech synthesis for line 1 rendered too few samples"
+                            ),
+                        },
+                    }),
+                    stderr="short synthetic render",
+                )
+
+            def run_remote(self, command):
+                if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
+                    return CompletedProcess(command, 0, "", "")
+                raise AssertionError(f"unexpected remote artifact read: {command!r}")
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "DevStack", return_value=Stack()),
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "_requested_voice_model", return_value="test-model"),
+            patch.object(runner, "_voice_token", return_value=grant),
+            redirect_stdout(output),
+        ):
+            exit_code = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report["passed"])
+        self.assertTrue(any(
+            "eval infrastructure failure" in failure.lower()
+            and "line 1" in failure
+            for failure in report["failures"]
+        ))
+        self.assertFalse(any(
+            "rendered too few samples" in product_failure.get("message", "")
+            for case in report["cases"]
+            for product_failure in case.get("product_failures", [])
+        ))
 
     def test_first_turn_tts_failure_keeps_named_observation_without_sdk_record(self):
         import json
