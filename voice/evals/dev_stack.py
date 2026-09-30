@@ -426,6 +426,7 @@ fi
 : > "$DEV_DIR/voice/evals/delegations.jsonl"
 chown nobody:nogroup "$DEV_DIR/voice/evals/delegations.jsonl"
 chmod 600 "$DEV_DIR/voice/evals/delegations.jsonl"
+install -d -o nobody -g nogroup -m 700 "$DEV_DIR/voice/evals/retained-evidence"
 install -d -o nobody -g nogroup -m 700 "$DEV_DIR/voice/evals/retained-evidence/input-audio"
 python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" "$ROOM" <<'PY'
 import json

@@ -1231,8 +1231,17 @@ class DevStackTest(unittest.TestCase):
         )
         self.assertIn(
             'install -d -o nobody -g nogroup -m 700 '
+            '"$DEV_DIR/voice/evals/retained-evidence"',
+            _START_WORKER_SCRIPT,
+        )
+        self.assertIn(
+            'install -d -o nobody -g nogroup -m 700 '
             '"$DEV_DIR/voice/evals/retained-evidence/input-audio"',
             _START_WORKER_SCRIPT,
+        )
+        self.assertLess(
+            _START_WORKER_SCRIPT.index('"$DEV_DIR/voice/evals/retained-evidence"'),
+            _START_WORKER_SCRIPT.index('"$DEV_DIR/voice/evals/retained-evidence/input-audio"'),
         )
         self.assertNotIn("MENTAT_VOICE_INPUT_RECORD_DIR", _SETUP_SCRIPT)
         self.assertNotIn("MENTAT_VOICE_INPUT_RECORD_DIR", _RUN_VOICE_SCRIPT)

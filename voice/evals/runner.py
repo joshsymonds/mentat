@@ -71,7 +71,8 @@ def _retain_sms_audio(
     evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if evidence_dir.is_symlink() or not evidence_dir.is_dir():
         raise RuntimeError("SMS audio evidence directory is not a private directory")
-    os.chmod(evidence_dir, 0o700)
+    if evidence_dir.stat().st_mode & 0o077:
+        raise RuntimeError("SMS audio evidence directory is not a private directory")
     audio_dir = evidence_dir / "sms-audio"
     audio_dir.mkdir(mode=0o700, exist_ok=True)
     if audio_dir.is_symlink() or not audio_dir.is_dir():
