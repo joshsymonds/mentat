@@ -575,6 +575,35 @@ class ScoringTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("invalid partial product failure metadata", " ".join(result["failures"]))
 
+    def test_report_includes_retry_counts_for_completed_and_failed_lines(self):
+        completed = turn()
+        completed.update({"script_line": 1, "tts_retry_count": 2})
+        message = "scripted speech content verification failed for line 2"
+        result = score_observations({
+            "cases": [{
+                "name": "caller-lines",
+                "runs": [
+                    {"turns": [completed]},
+                    {
+                        "turns": [],
+                        "failure": {
+                            "turn": 1,
+                            "message": message,
+                            "line": 2,
+                            "retry_count": 1,
+                        },
+                        "product_failures": [],
+                    },
+                ],
+            }],
+        }, required_runs=2)
+
+        self.assertEqual(result["cases"][0]["line_retry_counts"], [
+            {"run": 1, "line": 1, "retry_count": 2},
+            {"run": 2, "line": 2, "retry_count": 1},
+        ])
+        self.assertIn("eval infrastructure failure", " ".join(result["failures"]))
+
     def test_preflight_render_content_failure_is_line_indexed_infrastructure_failure(self):
         message = "scripted speech content verification failed for line 2"
         result = score_observations({

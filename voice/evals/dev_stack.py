@@ -404,7 +404,7 @@ with tarfile.open(archive, "w:gz") as output:
         groups = {}
         for source in caller_audio.iterdir():
             match = re.fullmatch(
-                r"([A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3})"
+                r"([A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3}(?:-attempt-[0-9]{2})?)"
                 r"(?:-(?:rendered|pushed)\.pcm|\.json)",
                 source.name,
             )
@@ -960,7 +960,7 @@ class DevStack:
                         continue
                     filename = member.name.removeprefix("caller-audio/")
                     match = re.fullmatch(
-                        r"([A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3})"
+                        r"([A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3}(?:-attempt-[0-9]{2})?)"
                         r"(?:-(?:rendered|pushed)\.pcm|\.json)",
                         filename,
                     )
