@@ -942,11 +942,26 @@ def _attribute_model_calls(
         for marker in all_delegations
         if start_boundary is not None and marker["created_at"] >= start_boundary
     ]
-    if len(delegations) != len(recorded_turns):
+    aligned_turns = []
+    for recorded in recorded_turns:
+        if not isinstance(recorded, dict):
+            raise RuntimeError("recorded SDK result has invalid model-call evidence")
+        skipped_results = recorded.get("skipped_execution_errors_before", 0)
+        if (
+            isinstance(skipped_results, bool)
+            or not isinstance(skipped_results, int)
+            or skipped_results < 0
+        ):
+            raise RuntimeError("recorded SDK result has invalid skipped-result evidence")
+        aligned_turns.extend([None] * skipped_results)
+        aligned_turns.append(recorded)
+    if len(delegations) != len(aligned_turns):
         raise RuntimeError("delegation and SDK result counts differ")
 
-    for delegation, recorded in zip(delegations, recorded_turns, strict=True):
+    for delegation, recorded in zip(delegations, aligned_turns, strict=True):
         created_at = delegation["created_at"]
+        if recorded is None:
+            recorded = {"model_calls": [], "phone_tools": []}
         if created_at in starts:
             raise RuntimeError("ambiguous delegation timestamp coincides with caller speech start")
         model_calls = recorded.get("model_calls") if isinstance(recorded, dict) else None
@@ -1009,6 +1024,8 @@ def _attribute_model_calls(
 def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     turns: list[dict[str, Any]] = []
     current: list[dict[str, Any]] = []
+    skipped_since_success = 0
+    skipped_total = 0
     for message_index, message in enumerate(messages):
         current.append(message)
         if message.get("type") != "result":
@@ -1046,7 +1063,12 @@ def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         raise RuntimeError("recorded tool use has invalid name or arguments")
                     tool_kind = PHONE_TOOL_KINDS.get(name.rsplit("__", 1)[-1])
                     if tool_kind is not None:
-                        tools.append({"turn": len(turns) + 1, "name": name, "kind": tool_kind, "input": arguments})
+                        tools.append({
+                            "turn": len(turns) + skipped_total + 1,
+                            "name": name,
+                            "kind": tool_kind,
+                            "input": arguments,
+                        })
         if not calls:
             later_model_call_result = False
             later_result_has_start = False
@@ -1065,6 +1087,8 @@ def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             break
                         later_result_has_start = False
             if later_model_call_result:
+                skipped_since_success += 1
+                skipped_total += 1
                 current = []
                 continue
             raise RuntimeError("recorded assistant result has no message_start model-call evidence")
@@ -1075,7 +1099,11 @@ def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             call["result_service_tier"] = result_usage.get("service_tier")
             if "fast_mode_state" in message:
                 call["fast_mode_state"] = message["fast_mode_state"]
-        turns.append({"model_calls": calls, "phone_tools": tools})
+        recorded = {"model_calls": calls, "phone_tools": tools}
+        if skipped_since_success:
+            recorded["skipped_execution_errors_before"] = skipped_since_success
+            skipped_since_success = 0
+        turns.append(recorded)
         current = []
     if any(
         item.get("type") in ("assistant", "user")

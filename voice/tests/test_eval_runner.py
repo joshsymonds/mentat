@@ -1,6 +1,7 @@
 """Offline tests for remote scripted caller capture."""
 
 import asyncio
+import json
 import os
 import struct
 import sys
@@ -3969,6 +3970,65 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["turns"][0]["latency_seconds"]["first_audio"], 1.0)
         self.assertEqual(report["cases"][0]["turns"][0]["model_call_count"], 1)
 
+
+    def test_cancelled_delegation_pairs_with_skipped_execution_error_result(self):
+        messages = []
+        for message_id in ("msg-1", "msg-2"):
+            messages.extend([
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "message_start",
+                        "message": {"id": message_id, "model": "claude-opus-5"},
+                    },
+                },
+                {"type": "result"},
+            ])
+        messages.extend([
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "Synthetic cancelled delegation.",
+            },
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {"id": "msg-4", "model": "claude-opus-5"},
+                },
+            },
+            {"type": "result"},
+        ])
+        recorded_turns = runner._recorded_turns(messages)
+        traces = [
+            {"turn": index, "speech_started_at": float(100 + 2 * (index - 1))}
+            for index in range(1, 5)
+        ]
+        markers = "".join(
+            json.dumps({
+                "room": "room-a",
+                "id": f"d{index}",
+                "created_at": float(100 + 2 * (index - 1)) + 0.5,
+            }) + "\n"
+            for index in range(1, 5)
+        )
+
+        runner._attribute_model_calls(traces, markers, "room-a", recorded_turns)
+
+        self.assertEqual(
+            [[call["id"] for call in trace["model_calls"]] for trace in traces],
+            [["msg-1"], ["msg-2"], [], ["msg-4"]],
+        )
+        with self.assertRaisesRegex(RuntimeError, "delegation and SDK result counts differ"):
+            runner._attribute_model_calls(
+                traces,
+                markers + json.dumps({
+                    "room": "room-a", "id": "d5", "created_at": 108.5,
+                }) + "\n",
+                "room-a",
+                recorded_turns,
+            )
 
     def test_recorded_turns_skip_aborted_call_free_result_and_keep_completed_turns(self):
         messages = [
