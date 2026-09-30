@@ -335,6 +335,48 @@ class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
                 pcm, _, _, _ = await asyncio.wait_for(capture, timeout=0.2)
         self.assertEqual(pcm, frame.data)
 
+    async def test_capture_drains_buffered_frames_after_agent_audio_ends(self):
+        first = CaptureTests.frame(False)
+        trailing = CaptureTests.frame(False)
+        ended = asyncio.Event()
+        read_started = asyncio.Event()
+        trailing_ready = asyncio.Event()
+
+        class BufferedTrailingStream:
+            def __init__(self, track):
+                self.frames = iter([first])
+                self.trailing_delivered = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return SimpleNamespace(frame=next(self.frames))
+                except StopIteration:
+                    if not self.trailing_delivered:
+                        read_started.set()
+                        await trailing_ready.wait()
+                        self.trailing_delivered = True
+                        return SimpleNamespace(frame=trailing)
+                    await asyncio.Future()
+
+            async def aclose(self):
+                return None
+
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        with patch.object(caller, "MAX_ANSWER_SECONDS", 5):
+            with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=SimpleNamespace(AudioStream=BufferedTrailingStream))}):
+                capture = asyncio.create_task(_capture_answer(queue, ended))
+                await asyncio.wait_for(read_started.wait(), timeout=0.2)
+                ended.set()
+                await asyncio.sleep(0.01)
+                # The frame is already buffered in the stream; let its pending read deliver it.
+                trailing_ready.set()
+                pcm, _, _, _ = await asyncio.wait_for(capture, timeout=0.2)
+        self.assertEqual(pcm, first.data + trailing.data)
+
     async def test_capture_fails_finitely_when_no_frames_arrive(self):
         class HangingStream:
             def __init__(self, track):

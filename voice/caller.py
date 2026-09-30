@@ -12,6 +12,7 @@ from typing import Any
 RATE = 24000
 FRAME_SAMPLES = RATE // 100
 MAX_ANSWER_SECONDS = 30
+END_DRAIN_SECONDS = 0.1
 READINESS_TIMEOUT_SECONDS = 15
 MICROPHONE_SETTLE_SECONDS = 3.0
 
@@ -159,18 +160,34 @@ async def _capture_answer(
                     event = await asyncio.wait_for(audio_stream.__anext__(), timeout=remaining)
                 else:
                     next_task = asyncio.create_task(audio_stream.__anext__())
-                    ended_task = asyncio.create_task(ended.wait())
-                    done, pending = await asyncio.wait(
-                        (next_task, ended_task),
-                        timeout=remaining,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    if next_task not in done:
-                        break
-                    event = next_task.result()
+                    if ended.is_set():
+                        try:
+                            event = await asyncio.wait_for(next_task, timeout=min(remaining, END_DRAIN_SECONDS))
+                        except TimeoutError:
+                            break
+                    else:
+                        ended_task = asyncio.create_task(ended.wait())
+                        done, pending = await asyncio.wait(
+                            (next_task, ended_task),
+                            timeout=remaining,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if next_task in done:
+                            ended_task.cancel()
+                            await asyncio.gather(ended_task, return_exceptions=True)
+                            event = next_task.result()
+                        elif ended_task in done:
+                            try:
+                                event = await asyncio.wait_for(next_task, timeout=END_DRAIN_SECONDS)
+                            except TimeoutError:
+                                next_task.cancel()
+                                await asyncio.gather(next_task, return_exceptions=True)
+                                break
+                        else:
+                            for task in pending:
+                                task.cancel()
+                            await asyncio.gather(*pending, return_exceptions=True)
+                            break
             except (TimeoutError, StopAsyncIteration):
                 break
             last_frame = event.frame
