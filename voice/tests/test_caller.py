@@ -153,6 +153,31 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TranscribeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tts_returns_exact_pcm_and_http_response_metadata(self):
+        class Response:
+            status = 206
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def read(self):
+                return b"\x01\x00\x02\x00"
+
+        http = Mock()
+        http.post.return_value = Response()
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            result = await caller._tts(http, "synthetic line")
+
+        self.assertEqual(result.pcm, b"\x01\x00\x02\x00")
+        self.assertEqual(result.http_status, 206)
+        self.assertEqual(result.response_bytes, 4)
+
     async def test_skips_40ms_pcm_before_wav_form_or_upload(self):
         class Response:
             async def __aenter__(self):

@@ -399,6 +399,30 @@ with tarfile.open(archive, "w:gz") as output:
                     arcname=f"input-audio/{transcript_name}",
                     recursive=False,
                 )
+    caller_audio = root / "voice/evals/retained-evidence/caller-audio"
+    if caller_audio.is_dir() and not caller_audio.is_symlink():
+        groups = {}
+        for source in caller_audio.iterdir():
+            match = re.fullmatch(
+                r"([A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3})"
+                r"(?:-(?:rendered|pushed)\.pcm|\.json)",
+                source.name,
+            )
+            if match is not None and source.is_file() and not source.is_symlink():
+                groups.setdefault(match.group(1), set()).add(source.name)
+        for stem, names in sorted(groups.items()):
+            expected = {
+                f"{stem}-rendered.pcm",
+                f"{stem}-pushed.pcm",
+                f"{stem}.json",
+            }
+            if names == expected:
+                for name in sorted(expected):
+                    output.add(
+                        caller_audio / name,
+                        arcname=f"caller-audio/{name}",
+                        recursive=False,
+                    )
 os.chmod(archive, 0o600)
 owner = pwd.getpwnam(os.environ["SUDO_USER"])
 os.chown(archive, owner.pw_uid, owner.pw_gid)
@@ -930,6 +954,27 @@ class DevStack:
                     ) is not None
                     and member.isfile()
                 }
+                caller_audio_groups = {}
+                for member in members:
+                    if not member.name.startswith("caller-audio/") or not member.isfile():
+                        continue
+                    filename = member.name.removeprefix("caller-audio/")
+                    match = re.fullmatch(
+                        r"([A-Za-z0-9][A-Za-z0-9_.-]{0,127}-turn-[0-9]{3})"
+                        r"(?:-(?:rendered|pushed)\.pcm|\.json)",
+                        filename,
+                    )
+                    if match is not None:
+                        caller_audio_groups.setdefault(match.group(1), set()).add(filename)
+                caller_audio_names = set()
+                for stem, names in caller_audio_groups.items():
+                    expected = {
+                        f"{stem}-rendered.pcm",
+                        f"{stem}-pushed.pcm",
+                        f"{stem}.json",
+                    }
+                    if names == expected:
+                        caller_audio_names.update(f"caller-audio/{name}" for name in expected)
                 for member in members:
                     name = member.name
                     allowed = name in {"agent.log", "voice.log", "voice/evals/delegations.jsonl"}
@@ -951,6 +996,8 @@ class DevStack:
                             ) is not None
                             and (filename.endswith(".wav") or wav_name in input_audio_wavs)
                         )
+                    if name.startswith("caller-audio/"):
+                        allowed = name in caller_audio_names
                     if name.startswith("records/"):
                         filename = name.removeprefix("records/")
                         allowed = bool(filename) and Path(filename).name == filename and filename.endswith(".jsonl")

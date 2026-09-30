@@ -33,6 +33,7 @@ from evals.scenarios import (
     _sms_body_tokens,
     _spoken_sms_body,
     _spoken_sms_correction_body,
+    _spoken_number,
     _uncertain_without_alice_attribution,
 )
 
@@ -115,10 +116,93 @@ def _retain_sms_audio(
         output.write(metadata)
         output.flush()
         os.fsync(output.fileno())
+
+
+def _atomic_private_write(destination: Path, content: bytes) -> None:
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, prefix=".caller-", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
+
+
+def _retain_caller_audio(
+    evidence_dir: Path,
+    room_name: str,
+    turn: int,
+    line: str,
+    speech: caller.TTSResponse,
+    pushed_pcm: bytes,
+    pushed_frames: int,
+    pushed_samples: int,
+) -> None:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", room_name) is None:
+        raise RuntimeError("caller audio retention received an invalid room name")
+    if not isinstance(speech.pcm, bytes) or not isinstance(pushed_pcm, bytes):
+        raise RuntimeError("caller audio retention received invalid PCM")
+    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+        raise RuntimeError("caller audio evidence directory is not a private directory")
+    if evidence_dir.stat().st_mode & 0o077:
+        raise RuntimeError("caller audio evidence directory is not a private directory")
+    audio_dir = evidence_dir / "caller-audio"
+    audio_dir.mkdir(mode=0o700, exist_ok=True)
+    if audio_dir.is_symlink() or not audio_dir.is_dir():
+        raise RuntimeError("caller audio evidence directory is not a private directory")
+    os.chmod(audio_dir, 0o700)
+
+    stem = f"{room_name}-turn-{turn:03d}"
+    rendered_filename = f"{stem}-rendered.pcm"
+    pushed_filename = f"{stem}-pushed.pcm"
+    _atomic_private_write(audio_dir / rendered_filename, speech.pcm)
+    _atomic_private_write(audio_dir / pushed_filename, pushed_pcm)
+    metadata = json.dumps({
+        "turn": turn,
+        "line": line,
+        "tts_http_status": speech.http_status,
+        "tts_response_bytes": speech.response_bytes,
+        "pushed_frames": pushed_frames,
+        "pushed_samples": pushed_samples,
+        "rendered_filename": rendered_filename,
+        "pushed_filename": pushed_filename,
+    }, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    _atomic_private_write(audio_dir / f"{stem}.json", metadata)
+
+
 SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5", "claude-sonnet-5-5"})
 SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
 )
+SCRIPTED_TTS_RENDER_FAILURE_PATTERN = re.compile(
+    r"scripted speech sample count mismatch for line ([1-9][0-9]*)"
+)
+SCRIPTED_CONTENT_FAILURE_PATTERN = re.compile(
+    r"scripted speech content verification failed for line ([1-9][0-9]*)"
+)
+CONTENT_STOP_WORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in",
+    "is", "it", "of", "on", "or", "the", "to", "was", "were", "will", "with",
+})
+NUMBER_WORDS = {
+    "zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3",
+    "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8",
+    "nine": "9",
+}
+SPOKEN_NUMBER_WORDS = frozenset({
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+    "sixty", "seventy", "eighty", "ninety",
+})
 WHISPER_HTTP_FAILURE_PATTERN = re.compile(
     r"Whisper transcription rejected utterance [1-9][0-9]* \(HTTP 4[0-9]{2}\)"
 )
@@ -147,6 +231,21 @@ def _scripted_tts_timeout_line(message: Any) -> int | None:
         return None
     match = SCRIPTED_TTS_TIMEOUT_PATTERN.fullmatch(message)
     return int(match.group(1)) if match is not None else None
+
+
+def _scripted_tts_failure_line(message: Any) -> int | None:
+    timeout_line = _scripted_tts_timeout_line(message)
+    if timeout_line is not None:
+        return timeout_line
+    if not isinstance(message, str):
+        return None
+    content_match = SCRIPTED_CONTENT_FAILURE_PATTERN.fullmatch(message)
+    if content_match is not None:
+        return int(content_match.group(1))
+    match = SCRIPTED_TTS_RENDER_FAILURE_PATTERN.fullmatch(message)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _is_scripted_tts_timeout(message: Any) -> bool:
@@ -395,6 +494,179 @@ def _trace_text(segments: list[dict[str, Any]]) -> str:
     return " ".join(str(segment.get("text", "")).strip() for segment in segments).strip()
 
 
+def _content_tokens(text: str) -> list[str]:
+    normalized = re.sub(
+        r"(?<![a-z])([ap])\s*\.?\s*m\.?(?![a-z])",
+        lambda match: f"{match.group(1).lower()}m",
+        text,
+        flags=re.IGNORECASE,
+    )
+    expanded = re.sub(r"\bi'll\b", "i will", normalized, flags=re.IGNORECASE)
+    matches = list(re.finditer(r"[a-z0-9]+", expanded.lower()))
+    tokens = [match.group() for match in matches]
+    result = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.isdigit() and token not in SPOKEN_NUMBER_WORDS and token != "oh":
+            result.append(token)
+            index += 1
+            continue
+        end = index + 1
+        while end < len(tokens):
+            next_token = tokens[end]
+            separator = expanded[matches[end - 1].end():matches[end].start()]
+            if (
+                not re.fullmatch(r"[\s+().,/-]*", separator)
+                or not (
+                    next_token.isdigit()
+                    or next_token in SPOKEN_NUMBER_WORDS
+                    or next_token == "oh"
+                )
+            ):
+                break
+            end += 1
+        number_run = tokens[index:end]
+        if all(part.isdigit() for part in number_run):
+            result.append("".join(number_run))
+        elif all(part in NUMBER_WORDS or part.isdigit() for part in number_run):
+            result.append("".join(NUMBER_WORDS.get(part, part) for part in number_run))
+        elif all(part in SPOKEN_NUMBER_WORDS for part in number_run):
+            number = _spoken_number(" ".join(number_run))
+            result.append(str(number) if number is not None else " ".join(number_run))
+        else:
+            result.extend(NUMBER_WORDS.get(part, part) for part in number_run)
+        index = end
+    return result
+
+
+def _collapsed_phone_digits(text: str) -> str:
+    without_phone_fillers = re.sub(r"\b(?:plus|dash)\b", " ", text, flags=re.IGNORECASE)
+    return "".join(
+        token for token in _content_tokens(without_phone_fillers) if token.isdigit()
+    )
+
+
+def _one_edit_apart(left: str, right: str) -> bool:
+    if abs(len(left) - len(right)) > 1:
+        return False
+    left_index = right_index = edits = 0
+    while left_index < len(left) and right_index < len(right):
+        if left[left_index] == right[right_index]:
+            left_index += 1
+            right_index += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(left) > len(right):
+            left_index += 1
+        elif len(right) > len(left):
+            right_index += 1
+        else:
+            left_index += 1
+            right_index += 1
+    edits += (len(left) - left_index) + (len(right) - right_index)
+    return edits <= 1
+
+
+def _words_equivalent(expected: str, observed: str) -> bool:
+    expected_word = expected[:-1] if len(expected) > 3 and expected.endswith("s") else expected
+    observed_word = observed[:-1] if len(observed) > 3 and observed.endswith("s") else observed
+    if expected_word == observed_word:
+        return True
+    return (
+        max(len(expected_word), len(observed_word)) >= 4
+        and _one_edit_apart(expected_word, observed_word)
+    )
+
+
+def _matched_word_count(expected: list[str], observed: list[str]) -> int:
+    remaining = list(observed)
+    unmatched = []
+    matched = 0
+    for expected_word in expected:
+        exact_index = next(
+            (
+                index for index, observed_word in enumerate(remaining)
+                if _words_equivalent(expected_word, observed_word)
+                and (
+                    expected_word == observed_word
+                    or (
+                        expected_word.endswith("s")
+                        and len(expected_word) > 3
+                        and expected_word[:-1] == observed_word
+                    )
+                    or (
+                        observed_word.endswith("s")
+                        and len(observed_word) > 3
+                        and observed_word[:-1] == expected_word
+                    )
+                )
+            ),
+            None,
+        )
+        if exact_index is None:
+            unmatched.append(expected_word)
+        else:
+            remaining.pop(exact_index)
+            matched += 1
+    for expected_word in unmatched:
+        fuzzy_index = next(
+            (
+                index for index, observed_word in enumerate(remaining)
+                if _words_equivalent(expected_word, observed_word)
+            ),
+            None,
+        )
+        if fuzzy_index is not None:
+            remaining.pop(fuzzy_index)
+            matched += 1
+    return matched
+
+
+def _rendered_content_matches(line: str, segments: Any) -> bool:
+    if not isinstance(segments, list):
+        return False
+    transcript_parts = []
+    for segment in segments:
+        if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+            return False
+        transcript_parts.append(segment["text"])
+    transcript = " ".join(transcript_parts)
+    observed = _content_tokens(transcript)
+    expected = _content_tokens(line)
+    sms_prefix = re.match(r"^(?:text\b.*?|correction)\s*:", line, re.IGNORECASE)
+    phone_match = re.match(
+        r"^\s*text\s+(?P<number>\+?[0-9\s().,/-]+)\s*:",
+        line,
+        re.IGNORECASE,
+    )
+    if phone_match is not None:
+        expected_phone = re.sub(r"\D", "", phone_match.group("number"))
+        transcript_digits = _collapsed_phone_digits(transcript)
+        if not expected_phone or expected_phone not in transcript_digits:
+            return False
+    else:
+        content_words = [token for token in expected if token not in CONTENT_STOP_WORDS]
+        observed_words = [token for token in observed if token not in CONTENT_STOP_WORDS]
+        matched_words = _matched_word_count(content_words, observed_words)
+        if (
+            not content_words
+            or matched_words / len(content_words) < 0.75
+            or _matched_word_count([content_words[-1]], observed_words) != 1
+        ):
+            return False
+
+    if sms_prefix is not None:
+        body = line[sms_prefix.end():]
+        expected_body = _content_tokens(body)
+        for token in set(expected_body):
+            if observed.count(token) < expected_body.count(token):
+                return False
+    return True
+
+
 async def _room_exists(
     api_client: Any, api: Any, room_name: str, *, timeout: float = REMOTE_OPERATION_DEADLINE_SECONDS
 ) -> bool:
@@ -451,6 +723,7 @@ async def capture_script(
     room_close_after: int | None = None,
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
+    retain_caller_audio_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy."""
     if not raw_steps:
@@ -482,10 +755,10 @@ async def capture_script(
     if parsed_livekit_url.scheme not in ("ws", "wss") or parsed_livekit_url.hostname is None:
         raise RuntimeError("endpoint-issued LiveKit URL is missing or invalid")
 
-    synthesized: list[bytes] = []
+    synthesized: list[caller.TTSResponse] = []
     for index, step in enumerate(steps):
         try:
-            pcm = await _with_deadline(
+            speech = await _with_deadline(
                 dependencies.tts(dependencies.http, step.line),
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "scripted speech synthesis",
@@ -494,7 +767,7 @@ async def capture_script(
             if str(error) != "scripted speech synthesis exceeded its deadline":
                 raise
             try:
-                pcm = await _with_deadline(
+                speech = await _with_deadline(
                     dependencies.tts(dependencies.http, step.line),
                     REMOTE_OPERATION_DEADLINE_SECONDS,
                     "scripted speech synthesis",
@@ -507,7 +780,45 @@ async def capture_script(
                     1,
                     f"scripted speech synthesis for line {index + 1} exceeded its deadline",
                 ) from retry_error
-        synthesized.append(pcm)
+        if isinstance(speech, bytes):
+            speech = caller.TTSResponse(speech, None, len(speech))
+        if not isinstance(speech, caller.TTSResponse):
+            raise PartialCaptureFailure(
+                [], 1, f"scripted speech sample count mismatch for line {index + 1}"
+            )
+        pcm = speech.pcm
+        if retain_caller_audio_dir is not None and isinstance(pcm, bytes):
+            _retain_caller_audio(
+                retain_caller_audio_dir,
+                room_name,
+                index + 1,
+                step.line,
+                speech,
+                b"",
+                0,
+                0,
+            )
+        if not isinstance(pcm, bytes) or len(pcm) % 2:
+            raise PartialCaptureFailure(
+                [], 1, f"scripted speech sample count mismatch for line {index + 1}"
+            )
+        try:
+            rendered_segments = await _with_deadline(
+                dependencies.transcribe(dependencies.http, pcm, RATE, 1),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "scripted speech content transcription",
+            )
+        except Exception as error:
+            raise PartialCaptureFailure(
+                [], 1,
+                f"scripted speech content verification failed for line {index + 1}",
+            ) from error
+        if not _rendered_content_matches(step.line, rendered_segments):
+            raise PartialCaptureFailure(
+                [], 1,
+                f"scripted speech content verification failed for line {index + 1}",
+            )
+        synthesized.append(speech)
 
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
@@ -590,15 +901,45 @@ async def capture_script(
         except TimeoutError as error:
             raise DeadlineExceeded(str(error)) from error
 
-        async def push(pcm: bytes) -> None:
-            for offset in range(0, len(pcm), FRAME_SAMPLES * 2):
-                chunk = pcm[offset : offset + FRAME_SAMPLES * 2].ljust(FRAME_SAMPLES * 2, b"\0")
-                await _with_deadline(
-                    source.capture_frame(
-                        dependencies.rtc.AudioFrame(chunk, RATE, 1, FRAME_SAMPLES)
-                    ),
-                    REMOTE_OPERATION_DEADLINE_SECONDS,
-                    "LiveKit speech audio playout",
+        async def push(
+            speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int
+        ) -> None:
+            pcm = speech.pcm
+            rendered_samples = len(pcm) // 2
+            pushed_pcm = bytearray()
+            pushed_frames = 0
+            pushed_samples = 0
+            try:
+                for offset in range(0, len(pcm), FRAME_SAMPLES * 2):
+                    chunk = pcm[offset : offset + FRAME_SAMPLES * 2]
+                    frame_samples = len(chunk) // 2
+                    await _with_deadline(
+                        source.capture_frame(
+                            dependencies.rtc.AudioFrame(chunk, RATE, 1, frame_samples)
+                        ),
+                        REMOTE_OPERATION_DEADLINE_SECONDS,
+                        "LiveKit speech audio playout",
+                    )
+                    pushed_pcm.extend(chunk)
+                    pushed_frames += 1
+                    pushed_samples += frame_samples
+            finally:
+                if retain_caller_audio_dir is not None:
+                    _retain_caller_audio(
+                        retain_caller_audio_dir,
+                        room_name,
+                        line_number,
+                        step.line,
+                        speech,
+                        bytes(pushed_pcm),
+                        pushed_frames,
+                        pushed_samples,
+                    )
+            if pushed_samples != rendered_samples:
+                raise PartialCaptureFailure(
+                    traces,
+                    line_number,
+                    f"scripted speech sample count mismatch for line {line_number}",
                 )
 
         silence = bytes(FRAME_SAMPLES * 2)
@@ -619,7 +960,7 @@ async def capture_script(
                     "silence timing",
                 )
 
-        for index, (step, pcm) in enumerate(zip(steps, synthesized, strict=True)):
+        for index, (step, speech) in enumerate(zip(steps, synthesized, strict=True)):
             await quiet(step.delay)
             capture_end = asyncio.Event()
             capture = dependencies.capture_factory(answer_tracks, capture_end)
@@ -629,7 +970,7 @@ async def capture_script(
                 "continuous answer capture start",
             )
             speech_started_at = time.time()
-            await push(pcm)
+            await push(speech, step, index + 1)
             speech_end = _finite_timestamp(
                 await _with_deadline(
                     caller._speech_end_after_playout(source),
@@ -1516,7 +1857,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         {"turn", "message", "speech_started_at"},
         {"turn", "message", "speech_started_at", "segments"},
     )
-    preflight_tts_line = _scripted_tts_timeout_line(
+    preflight_tts_line = _scripted_tts_failure_line(
         failure.get("message") if isinstance(failure, dict) else None
     )
     preflight_tts_failure = (
@@ -1603,7 +1944,7 @@ def _is_preflight_tts_capture_failure(
         not traces
         and isinstance(failure, dict)
         and failure.get("turn") == 1
-        and _is_scripted_tts_timeout(failure.get("message"))
+        and _scripted_tts_failure_line(failure.get("message")) is not None
         and "speech_started_at" not in failure
     )
 
@@ -1673,7 +2014,10 @@ def _voice_token(base_url: str) -> dict[str, Any]:
 def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str]:
     close_after = getattr(scenario, "room_close_after", None)
     close_arg = "none" if close_after is None else str(close_after)
-    command = ["evals/runner.py", "--fake-phone", "--room-close-after", close_arg]
+    command = [
+        "evals/runner.py", "--fake-phone", "--retain-caller-audio",
+        "--room-close-after", close_arg,
+    ]
     if getattr(scenario, "name", None) in SMS_AUDIO_SCENARIOS:
         command.extend(("--retain-sms-audio", scenario.name))
     command.extend((room, *raw_steps))
@@ -1893,6 +2237,7 @@ async def _run_remote_capture_with_fake_phone(
     room_close_after: int | None,
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
+    retain_caller_audio_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
     log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
@@ -1919,6 +2264,7 @@ async def _run_remote_capture_with_fake_phone(
             room_close_after=room_close_after,
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
+            retain_caller_audio_dir=retain_caller_audio_dir,
         )
     finally:
         if process.poll() is None:
@@ -1937,6 +2283,7 @@ async def run_remote_capture(
     room_close_after: int | None = None,
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
+    retain_caller_audio_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     import aiohttp
 
@@ -1948,6 +2295,7 @@ async def run_remote_capture(
             room_close_after=room_close_after,
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
+            retain_caller_audio_dir=retain_caller_audio_dir,
         )
 
 
@@ -2053,6 +2401,17 @@ def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if arguments and arguments[0] == "eval":
         return _run_local_eval(arguments[1:])
+    retain_caller_audio = "--retain-caller-audio" in arguments
+    if arguments.count("--retain-caller-audio") > 1:
+        raise RuntimeError("--retain-caller-audio may be specified only once")
+    if retain_caller_audio:
+        arguments.remove("--retain-caller-audio")
+        evidence_path = os.environ.get("MENTAT_EVAL_RETAINED_EVIDENCE_DIR")
+        if not evidence_path:
+            raise RuntimeError("private retained-evidence directory is unavailable")
+        retain_caller_audio_dir = Path(evidence_path)
+    else:
+        retain_caller_audio_dir = None
     retain_sms_audio_scenario = None
     if "--retain-sms-audio" in arguments:
         flag_index = arguments.index("--retain-sms-audio")
@@ -2076,16 +2435,14 @@ def main(argv: list[str] | None = None) -> int:
             "retain_sms_audio_dir": retain_sms_audio_dir,
             "retain_sms_audio_scenario": retain_sms_audio_scenario,
         })
+    if retain_caller_audio:
+        capture_options["retain_caller_audio_dir"] = retain_caller_audio_dir
     try:
         traces = asyncio.run(capture(room, steps, **capture_options))
     except PartialCaptureFailure as error:
         envelope = {"turns": error.turns, "failure": error.failure}
         print(json.dumps(envelope, separators=(",", ":")), flush=True)
-        return int(
-            not error.turns
-            and error.failure.get("turn") == 1
-            and _is_scripted_tts_timeout(error.failure.get("message"))
-        )
+        return int(_is_preflight_tts_capture_failure(error.turns, error.failure))
     print(json.dumps({"turns": traces}, separators=(",", ":")), flush=True)
     return 0
 

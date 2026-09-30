@@ -575,6 +575,58 @@ class ScoringTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("invalid partial product failure metadata", " ".join(result["failures"]))
 
+    def test_preflight_render_content_failure_is_line_indexed_infrastructure_failure(self):
+        message = "scripted speech content verification failed for line 2"
+        result = score_observations({
+            "cases": [{
+                "name": "sms-say-back-yes",
+                "runs": [{
+                    "turns": [],
+                    "failure": {"turn": 1, "message": message},
+                    "product_failures": [],
+                }],
+            }]
+        }, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["cases"][0]["capture_failures"], [{
+            "run": 1, "turn": 1, "message": message,
+        }])
+        failures = " ".join(result["failures"])
+        self.assertIn("eval infrastructure failure", failures)
+        self.assertNotIn("invalid partial capture failure metadata", failures)
+        self.assertNotIn("product failure", failures)
+
+    def test_preflight_sample_and_content_failures_are_infrastructure_failures(self):
+        messages = (
+            "scripted speech sample count mismatch for line 1",
+            "scripted speech content verification failed for line 1",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                result = score_observations({
+                    "cases": [{
+                        "name": "sms-say-back-yes",
+                        "runs": [{
+                            "turns": [],
+                            "failure": {"turn": 1, "message": message},
+                            "product_failures": [],
+                        }],
+                    }]
+                }, required_runs=1)
+
+                self.assertFalse(result["passed"])
+                case_report = result["cases"][0]
+                self.assertEqual(case_report["capture_failures"], [{
+                    "run": 1,
+                    "turn": 1,
+                    "message": message,
+                }])
+                failures = " ".join(result["failures"])
+                self.assertIn("eval infrastructure failure", failures)
+                self.assertNotIn("invalid partial capture failure metadata", failures)
+                self.assertNotIn("product failure", failures)
+
     def test_first_turn_capture_failure_is_named_with_no_completed_turns(self):
         observation = {
             "cases": [{

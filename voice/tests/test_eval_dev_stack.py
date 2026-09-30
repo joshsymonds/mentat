@@ -1357,6 +1357,37 @@ class DevStackTest(unittest.TestCase):
                     ],
                 )
 
+    def test_caller_audio_archive_allowlists_complete_line_groups_only(self):
+        with tempfile.TemporaryDirectory() as staging:
+            root = Path(staging)
+            audio = root / "voice/evals/retained-evidence/caller-audio"
+            audio.mkdir(parents=True)
+            stem = "room-turn-001"
+            (audio / f"{stem}-rendered.pcm").write_bytes(b"exact render")
+            (audio / f"{stem}-pushed.pcm").write_bytes(b"actual push")
+            (audio / f"{stem}.json").write_text('{"line":"private caller words"}')
+            (audio / "orphan-turn-002.json").write_text("orphan")
+            (audio / "voice.env.json").write_text("VOICE_TOKEN=synthetic-secret")
+            outside = root / "outside.pcm"
+            outside.write_bytes(b"outside")
+            (audio / "linked-turn-003-rendered.pcm").symlink_to(outside)
+
+            subprocess.run(
+                ["bash", "-s", "--", str(root)],
+                input=_RETAIN_EVIDENCE_SCRIPT,
+                text=True,
+                check=True,
+                capture_output=True,
+                env={**os.environ, "SUDO_USER": pwd.getpwuid(os.getuid()).pw_name},
+            )
+
+            with tarfile.open(root / "retained-evidence.tar.gz", "r:gz") as retained:
+                self.assertEqual(retained.getnames(), [
+                    "caller-audio/room-turn-001-pushed.pcm",
+                    "caller-audio/room-turn-001-rendered.pcm",
+                    "caller-audio/room-turn-001.json",
+                ])
+
     def test_retained_archive_is_private_and_owned_by_the_scp_user(self):
         self.assertIn('os.environ["SUDO_USER"]', _RETAIN_EVIDENCE_SCRIPT)
         self.assertIn(
@@ -1412,6 +1443,11 @@ class DevStackTest(unittest.TestCase):
                         ("sms-audio/transcripts.jsonl", '{"turn":1,"transcript":"private"}\\n'),
                         ("input-audio/room-turn-001.wav", "RIFF input wav"),
                         ("input-audio/room-turn-001.txt", "private caller transcript\\n"),
+                        ("caller-audio/room-turn-001-rendered.pcm", "exact render"),
+                        ("caller-audio/room-turn-001-pushed.pcm", "actual push"),
+                        ("caller-audio/room-turn-001.json", '{"line":"private caller words"}'),
+                        ("caller-audio/orphan-turn-002.json", "orphan metadata"),
+                        ("caller-audio/room-turn-004-rendered.pcm", "unpaired audio"),
                         ("input-audio/orphan-turn-002.txt", "orphan transcript\\n"),
                         ("input-audio/room-turn-001.json", "private metadata\\n"),
                         ("voice.env.json", "VOICE_TOKEN=synthetic-secret\\n"),
@@ -1428,6 +1464,11 @@ class DevStackTest(unittest.TestCase):
                             "sms-audio/transcripts.jsonl", "input-audio/room-turn-001.wav",
                             "input-audio/room-turn-001.txt", "input-audio/orphan-turn-002.txt",
                             "input-audio/room-turn-001.json", "input-audio/linked-turn-003.wav",
+                            "caller-audio/room-turn-001-rendered.pcm",
+                            "caller-audio/room-turn-001-pushed.pcm",
+                            "caller-audio/room-turn-001.json",
+                            "caller-audio/orphan-turn-002.json",
+                            "caller-audio/room-turn-004-rendered.pcm",
                             "voice.env.json",
                         ):
                             archive.add(source / name, arcname=name)
@@ -1448,7 +1489,8 @@ class DevStackTest(unittest.TestCase):
                 "agent.log", "voice.log", "records/session.jsonl",
                 "voice/evals/delegations.jsonl", "sms-audio/room-turn-001.wav",
                 "sms-audio/transcripts.jsonl", "input-audio/room-turn-001.wav",
-                "input-audio/room-turn-001.txt",
+                "input-audio/room-turn-001.txt", "caller-audio/room-turn-001-rendered.pcm",
+                "caller-audio/room-turn-001-pushed.pcm", "caller-audio/room-turn-001.json",
             },
         )
         for path in retained.rglob("*"):

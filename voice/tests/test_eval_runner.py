@@ -1,6 +1,7 @@
 """Offline tests for remote scripted caller capture."""
 
 import asyncio
+import hashlib
 import json
 import os
 import struct
@@ -31,6 +32,27 @@ def pcm_windows(*levels, sample_rate=24000, channels=1):
     samples_per_window = sample_rate // 50 * channels
     values = [level for level in levels for _ in range(samples_per_window)]
     return struct.pack(f"<{len(values)}h", *values)
+
+
+RENDERED_PCM_TEXT = {}
+
+
+def rendered_pcm(text, seconds_per_character=0.2):
+    """Return deterministic mono PCM with a realistic duration for a scripted line."""
+    samples = int(len(text) * seconds_per_character * runner.RATE)
+    marker = int.from_bytes(hashlib.sha256(text.encode()).digest()[:2], "little") % 30000 + 1
+    pcm = struct.pack("<h", marker) * samples
+    RENDERED_PCM_TEXT[pcm] = text
+    return pcm
+
+
+def rendered_aware_transcriber(transcribe):
+    async def wrapped(http, pcm, sample_rate, channels):
+        if pcm in RENDERED_PCM_TEXT:
+            return [{"start": 0.0, "end": 1.0, "text": RENDERED_PCM_TEXT[pcm]}]
+        return await transcribe(http, pcm, sample_rate, channels)
+
+    return wrapped
 
 
 class Clock:
@@ -164,7 +186,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         async def tts(_http, text):
             events.append(f"tts:{text}")
-            return b"\x00\x00"
+            return rendered_pcm(text)
 
         async def transcribe(_http, pcm, _rate, _channels):
             self.assertEqual(pcm, pcm_windows(600, 600))
@@ -175,7 +197,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             rtc=rtc,
             http=object(),
             tts=tts,
-            transcribe=transcribe,
+            transcribe=rendered_aware_transcriber(transcribe),
             capture_factory=ContinuousCapture,
             monotonic=clock.monotonic,
             wall_time=clock.wall_time,
@@ -285,7 +307,11 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
-        self.assertEqual(events, ["subscription-ready", "speech-frame"])
+        samples = len(rendered_pcm("First question")) // 2
+        self.assertEqual(events[0], "subscription-ready")
+        self.assertEqual(events[1:], ["speech-frame"] * (
+            (samples + runner.FRAME_SAMPLES - 1) // runner.FRAME_SAMPLES
+        ))
 
     async def test_missing_worker_subscription_fails_within_participant_deadline(self):
         dependencies = self.dependencies_for_failure("other")
@@ -505,7 +531,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             **{
                 **dependencies.__dict__,
                 "capture_factory": lambda *_args: LongCapture(),
-                "transcribe": transcribe,
+                "transcribe": rendered_aware_transcriber(transcribe),
             }
         )
 
@@ -554,7 +580,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             attempts[text] = attempts.get(text, 0) + 1
             if text == "First" and attempts[text] == 1:
                 raise runner.DeadlineExceeded("scripted speech synthesis exceeded its deadline")
-            return b"\\x00\\x00"
+            return rendered_pcm(text)
 
         dependencies = CaptureDependencies(
             **{**dependencies.__dict__, "rtc": SimpleNamespace(**{
@@ -571,6 +597,260 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(attempts, {"First": 2, "Second": 1})
         self.assertLess(max(i for i, value in enumerate(events) if value.startswith("tts:")), events.index("connect"))
+
+    async def test_rendered_script_content_is_transcribed_before_connect_and_checks_sms_body(self):
+        line = "Text +1-202-555-0142: I will be there at six."
+        pcm = bytes(runner.RATE * 2)  # Same one-second rendering in both cases.
+        connections = []
+        dependencies = self.dependencies_for_failure("other")
+        dependencies.rtc.Room.connect = lambda *_args, **_kwargs: asyncio.sleep(
+            0, result=connections.append(True)
+        )
+        transcripts = iter((
+            "Text plus one two zero two five five five zero one four two. I will be there at.",
+            "answer",
+        ))
+
+        async def transcribe(_http, _audio, _rate, _channels):
+            return [{"start": 0.0, "end": 1.0, "text": next(transcripts)}]
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": lambda *_args: asyncio.sleep(0, result=pcm),
+            "transcribe": rendered_aware_transcriber(transcribe),
+        })
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            self.assertRaises(runner.PartialCaptureFailure) as caught,
+        ):
+            await capture_script(
+                "android-selected-room", [f"{line}@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+            )
+        self.assertEqual(caught.exception.failure, {
+            "turn": 1,
+            "message": "scripted speech content verification failed for line 1",
+        })
+        self.assertTrue(runner._is_preflight_tts_capture_failure([], caught.exception.failure))
+        self.assertEqual(connections, [])
+
+        transcripts = iter((
+            "Text plus 1 202 555 0142: I will be there at 6.",
+            "answer",
+        ))
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "transcribe": rendered_aware_transcriber(transcribe),
+        })
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            await capture_script(
+                "android-selected-room", [f"{line}@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+            )
+        self.assertEqual(connections, [True])
+
+        transcripts = iter((
+            "Text plus one two zero two five five five zero one four two. "
+            "I will be there at six.",
+            "answer",
+        ))
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            await capture_script(
+                "android-selected-room", [f"{line}@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+            )
+        self.assertEqual(connections, [True, True])
+
+        transcripts = iter((
+            "Text plus one 202 five five five zero 1 four 2. I will be there at six.",
+            "answer",
+        ))
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            await capture_script(
+                "android-selected-room", [f"{line}@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+            )
+        self.assertEqual(connections, [True, True, True])
+
+        transcripts = iter((
+            "Text plus 1 two zero two five five five zero one four two. "
+            "I will be there at six.",
+            "answer",
+        ))
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            await capture_script(
+                "android-selected-room", [f"{line}@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+            )
+        self.assertEqual(connections, [True, True, True, True])
+
+    def test_rendered_content_accepts_evaluation_transcription_variants(self):
+        sms_line = "Text +1-202-555-0142: I will be there at six."
+        accepted = (
+            (
+                "Why is this garden named for Alice Keck?",
+                "Why is this garden named for Alice Kek?",
+            ),
+            (
+                "Why is this garden named for Alice Keck?",
+                "Why is this garden named for Alice Keck?",
+            ),
+            (
+                "Set a timer for five minutes.",
+                "Set a timer for five-minute.",
+            ),
+            (
+                "Set a timer for five minutes.",
+                "Start a timer for five minutes.",
+            ),
+            (
+                "Set a timer for five minutes.",
+                "Set a timer for five minutes.",
+            ),
+            (
+                "Find Alice Keck Park Memorial Garden in Santa Barbara.",
+                "Find Alice Kek Park Memorial Garden in Santa Barbara.",
+            ),
+            (
+                "Find Alice Keck Park Memorial Garden in Santa Barbara.",
+                "Find Alice Keck Park Memorial Garden in Santa Barbara.",
+            ),
+            (
+                "Navigate to Alice Keck Park Memorial Garden.",
+                "Navigate to Alice Keck Park Memorial Gardens.",
+            ),
+            (
+                "Navigate to Alice Keck Park Memorial Garden.",
+                "Navigate to Alice Keck Park Memorial Garden.",
+            ),
+            (
+                sms_line,
+                "Tax plus one two zero two five five five dash oh one four two. "
+                "I will be there at six.",
+            ),
+            (
+                sms_line,
+                "Plus one two zero two five five five dash oh one four two. "
+                "I will be there at six.",
+            ),
+            (sms_line, sms_line),
+            (
+                sms_line,
+                "Text +12025550142. I will be there at 6:00.",
+            ),
+        )
+        for expected, transcript in accepted:
+            with self.subTest(expected=expected, transcript=transcript):
+                self.assertTrue(
+                    runner._rendered_content_matches(
+                        expected, [{"text": transcript}]
+                    )
+                )
+
+        self.assertFalse(
+            runner._rendered_content_matches(
+                sms_line,
+                [{
+                    "text": (
+                        "Text plus one two zero two five five five zero one four two."
+                    )
+                }],
+            )
+        )
+        for expected, unrelated in (
+            ("Yes.", "No."),
+            ("Set a timer for five minutes.", "Set a timer for five."),
+            ("Set a timer for five minutes.", "Bananas pancakes oranges grapes apples."),
+            (
+                "Why is this garden named for Alice Keck?",
+                "Bananas pancakes oranges grapes apples.",
+            ),
+            (
+                sms_line,
+                "Text +1-202-555-0142: I will be where at six.",
+            ),
+        ):
+            with self.subTest(expected=expected, unrelated=unrelated):
+                self.assertFalse(
+                    runner._rendered_content_matches(
+                        expected, [{"text": unrelated}]
+                    )
+                )
+
+    async def test_naturally_short_yes_and_timer_renderings_pass_content_check(self):
+        for line, transcript, duration in (
+            ("Yes.", "Yes.", 0.18),
+            ("Set a timer for five minutes.", "Set a timer for 5 minutes.", 0.45),
+            ("Set an alarm for 7 a.m.", "Set an alarm for 7 AM.", 0.45),
+        ):
+            with self.subTest(line=line):
+                dependencies = self.dependencies_for_failure("other")
+                pcm = bytes(int(duration * runner.RATE) * 2)
+                transcriptions = iter((transcript, "answer"))
+
+                async def transcribe(_http, _audio, _rate, _channels):
+                    return [{"start": 0.0, "end": duration, "text": next(transcriptions)}]
+
+                dependencies = CaptureDependencies(**{
+                    **dependencies.__dict__,
+                    "tts": lambda *_args: asyncio.sleep(0, result=pcm),
+                    "transcribe": rendered_aware_transcriber(transcribe),
+                })
+                with patch.dict(os.environ, TEST_VOICE_ENV):
+                    traces = await capture_script(
+                        "android-selected-room", [f"{line}@0::answer"],
+                        dependencies=dependencies, room_close_after=None,
+                    )
+                self.assertEqual(len(traces), 1)
+
+    async def test_push_preserves_rendered_sample_count_for_full_and_partial_frames(self):
+        dependencies = self.dependencies_for_failure("other")
+        rendered_samples = 23_041
+        rendered = bytes(rendered_samples * 2)
+        RENDERED_PCM_TEXT[rendered] = "Question"
+        pushed = []
+        dependencies.rtc.AudioFrame = lambda pcm, rate, channels, samples: SimpleNamespace(
+            pcm=pcm, sample_rate=rate, channels=channels, samples=samples
+        )
+        dependencies.rtc.AudioSource = lambda *_args: SimpleNamespace(
+            capture_frame=lambda frame: asyncio.sleep(0, result=pushed.append(frame)),
+            wait_for_playout=lambda: asyncio.sleep(0),
+        )
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": lambda *_args: asyncio.sleep(0, result=rendered),
+        })
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            await capture_script(
+                "android-selected-room", ["Question@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+            )
+        self.assertEqual(b"".join(frame.pcm for frame in pushed), rendered)
+        self.assertEqual(sum(frame.samples for frame in pushed), rendered_samples)
+        self.assertEqual(
+            [frame.samples for frame in pushed],
+            [runner.FRAME_SAMPLES] * (rendered_samples // runner.FRAME_SAMPLES)
+            + [rendered_samples % runner.FRAME_SAMPLES],
+        )
+
+    async def test_odd_render_sample_mismatch_fails_with_line_name(self):
+        dependencies = self.dependencies_for_failure("other")
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": lambda *_args: asyncio.sleep(0, result=bytes([0])),
+        })
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            self.assertRaises(runner.PartialCaptureFailure) as caught,
+        ):
+            await capture_script(
+                "android-selected-room", ["Question@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+            )
+        self.assertEqual(caught.exception.failure, {
+            "turn": 1,
+            "message": "scripted speech sample count mismatch for line 1",
+        })
 
     async def test_preflight_tts_failures_on_every_line_use_strict_turn_one_envelopes(self):
         import io
@@ -592,7 +872,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                         raise runner.DeadlineExceeded(
                             "scripted speech synthesis exceeded its deadline"
                         )
-                    return b"\\x00\\x00"
+                    return rendered_pcm(text)
 
                 dependencies = CaptureDependencies(
                     **{**dependencies.__dict__, "tts": tts}
@@ -706,7 +986,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return [{"start": 0.0, "end": 0.2, "text": f"part-{index}"}]
 
         dependencies = CaptureDependencies(
-            **{**dependencies.__dict__, "capture_factory": lambda *_args: LongCapture(), "transcribe": transcribe}
+            **{**dependencies.__dict__, "capture_factory": lambda *_args: LongCapture(), "transcribe": rendered_aware_transcriber(transcribe)}
         )
         async def speech_end(_source):
             return time.monotonic()
@@ -757,7 +1037,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         dependencies = CaptureDependencies(**{
             **dependencies.__dict__,
             "capture_factory": lambda *_args: Capture(),
-            "transcribe": transcribe,
+            "transcribe": rendered_aware_transcriber(transcribe),
         })
         speech_end = lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1)
         with patch.dict(os.environ, TEST_VOICE_ENV), patch.object(
@@ -816,7 +1096,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         dependencies = CaptureDependencies(**{
             **dependencies.__dict__,
             "capture_factory": lambda *_args: Capture(),
-            "transcribe": transcribe,
+            "transcribe": rendered_aware_transcriber(transcribe),
         })
         with patch.dict(os.environ, TEST_VOICE_ENV), patch.object(
             runner.caller,
@@ -863,7 +1143,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return [{"start": 0.0, "end": 0.2, "text": "completed"}]
 
         dependencies = CaptureDependencies(
-            **{**dependencies.__dict__, "capture_factory": lambda *_args: LongCapture(), "transcribe": transcribe}
+            **{**dependencies.__dict__, "capture_factory": lambda *_args: LongCapture(), "transcribe": rendered_aware_transcriber(transcribe)}
         )
         async def speech_end(_source):
             return time.monotonic()
@@ -931,7 +1211,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             **{
                 **dependencies.__dict__,
                 "capture_factory": lambda *_args: LongCapture(),
-                "transcribe": transcribe,
+                "transcribe": rendered_aware_transcriber(transcribe),
             }
         )
 
@@ -1010,7 +1290,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             **{
                 **dependencies.__dict__,
                 "capture_factory": EarlyCapture,
-                "transcribe": transcribe,
+                "transcribe": rendered_aware_transcriber(transcribe),
             }
         )
 
@@ -1075,7 +1355,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return raw_segments
 
         dependencies = CaptureDependencies(
-            **{**dependencies.__dict__, "transcribe": transcribe}
+            **{**dependencies.__dict__, "transcribe": rendered_aware_transcriber(transcribe)}
         )
         with patch.dict(os.environ, TEST_VOICE_ENV):
             traces = await capture_script(
@@ -1116,7 +1396,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return raw_segments
 
         dependencies = CaptureDependencies(
-            **{**dependencies.__dict__, "transcribe": transcribe}
+            **{**dependencies.__dict__, "transcribe": rendered_aware_transcriber(transcribe)}
         )
         with (
             patch.dict(os.environ, TEST_VOICE_ENV),
@@ -1192,7 +1472,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             **{
                 **dependencies.__dict__,
                 "capture_factory": EarlyOnlyCapture,
-                "transcribe": transcribe,
+                "transcribe": rendered_aware_transcriber(transcribe),
             }
         )
 
@@ -1266,7 +1546,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     dependencies = CaptureDependencies(
                         **{
                             **dependencies.__dict__,
-                            "transcribe": transcribe,
+                            "transcribe": rendered_aware_transcriber(transcribe),
                             "capture_factory": Capture,
                         }
                     )
@@ -1282,12 +1562,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     calls = 0
 
-                    async def tts(_http, _text):
+                    async def tts(_http, text):
                         nonlocal calls
                         calls += 1
                         if calls >= 2:
                             await asyncio.sleep(1)
-                        return b"\\x00\\x00"
+                        return rendered_pcm(text)
 
                     dependencies = CaptureDependencies(
                         **{**dependencies.__dict__, "tts": tts}
@@ -1577,7 +1857,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     **{
                         **dependencies.__dict__,
                         "capture_factory": lambda *_args: Capture(),
-                        "transcribe": transcribe,
+                        "transcribe": rendered_aware_transcriber(transcribe),
                     }
                 )
                 evidence_dir = Path(temporary) / "retained-evidence"
@@ -1752,7 +2032,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             "Her family's wealth came from Superior Oil.",
         ))
 
-        async def transcribe(*_args):
+        async def transcribe(_http, pcm, _rate, _channels):
+            if pcm in RENDERED_PCM_TEXT:
+                text = RENDERED_PCM_TEXT[pcm]
+                return [{"start": 0.0, "end": 1.0, "text": text}]
             if failure == "transcript":
                 return []
             if failure == "alice":
@@ -1770,12 +2053,106 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             ),
             rtc=rtc,
             http=object(),
-            tts=lambda *_args: asyncio.sleep(0, result=b"\x00\x00"),
-            transcribe=transcribe,
+            tts=lambda _http, text: asyncio.sleep(0, result=rendered_pcm(text)),
+            transcribe=rendered_aware_transcriber(transcribe),
             capture_factory=Capture,
             monotonic=time.monotonic,
             sleep=asyncio.sleep,
         )
+
+    async def test_caller_audio_retention_records_exact_render_and_actual_push(self):
+        import json
+        import stat
+        import tempfile
+
+        dependencies = self.dependencies_for_failure("other")
+        rendered = b"\x01\x00" * 63_365
+        RENDERED_PCM_TEXT[rendered] = "Exact caller words"
+        pushed = []
+
+        class Source:
+            async def capture_frame(self, frame):
+                pushed.append(frame)
+
+            async def wait_for_playout(self):
+                return None
+
+        dependencies.rtc.AudioFrame = lambda pcm, rate, channels, samples: SimpleNamespace(
+            pcm=pcm, sample_rate=rate, channels=channels, samples=samples
+        )
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": lambda *_args: asyncio.sleep(
+                0, result=runner.caller.TTSResponse(rendered, 200, len(rendered))
+            ),
+        })
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, TEST_VOICE_ENV):
+            evidence = Path(temporary)
+            traces = await capture_script(
+                "android-selected-room", ["Exact caller words@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+                retain_caller_audio_dir=evidence,
+            )
+            audio_dir = evidence / "caller-audio"
+            stem = "android-selected-room-turn-001"
+            metadata_path = audio_dir / f"{stem}.json"
+            record = json.loads(metadata_path.read_text())
+            self.assertEqual((audio_dir / f"{stem}-rendered.pcm").read_bytes(), rendered)
+            self.assertEqual(
+                (audio_dir / f"{stem}-pushed.pcm").read_bytes(),
+                b"".join(frame.pcm for frame in pushed),
+            )
+            self.assertEqual(record, {
+                "turn": 1,
+                "line": "Exact caller words",
+                "tts_http_status": 200,
+                "tts_response_bytes": len(rendered),
+                "pushed_frames": len(pushed),
+                "pushed_samples": 63_365,
+                "rendered_filename": f"{stem}-rendered.pcm",
+                "pushed_filename": f"{stem}-pushed.pcm",
+            })
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(audio_dir.stat().st_mode), 0o700)
+            self.assertEqual(record["pushed_frames"], len(pushed))
+            self.assertEqual(record["pushed_samples"], sum(frame.samples for frame in pushed))
+            for path in audio_dir.iterdir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(traces[0]["line"], "Exact caller words")
+
+    async def test_short_preflight_render_is_retained_with_zero_push_metrics(self):
+        import json
+        import tempfile
+
+        dependencies = self.dependencies_for_failure("other")
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": lambda *_args: asyncio.sleep(
+                0, result=runner.caller.TTSResponse(b"\x01\x00", 200, 2)
+            ),
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.dict(os.environ, TEST_VOICE_ENV),
+                self.assertRaises(runner.PartialCaptureFailure),
+            ):
+                await capture_script(
+                    "private-room", ["Long scripted line@0::answer"],
+                    dependencies=dependencies, room_close_after=None,
+                    retain_caller_audio_dir=Path(temporary),
+                )
+
+            audio_dir = Path(temporary) / "caller-audio"
+            stem = "private-room-turn-001"
+            record = json.loads((audio_dir / f"{stem}.json").read_text())
+            self.assertEqual((audio_dir / f"{stem}-rendered.pcm").read_bytes(), b"\x01\x00")
+            self.assertEqual((audio_dir / f"{stem}-pushed.pcm").read_bytes(), b"")
+            self.assertEqual(record["line"], "Long scripted line")
+            self.assertEqual(record["tts_http_status"], 200)
+            self.assertEqual(record["tts_response_bytes"], 2)
+            self.assertEqual(record["pushed_frames"], 0)
+            self.assertEqual(record["pushed_samples"], 0)
 
 
 class LocalEvalTests(unittest.TestCase):
@@ -3012,6 +3389,79 @@ class ScenarioObservationTests(unittest.TestCase):
                     "message": failure["message"],
                 }])
 
+    def test_render_content_envelope_is_reported_as_eval_infrastructure_failure(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from subprocess import CompletedProcess
+
+        from evals.dev_stack import RemoteCommandError
+
+        scenario = SCENARIOS[0]
+        grant = {
+            "token": "header.payload.signature",
+            "room": "room-short-render",
+            "url": "wss://livekit.invalid",
+            "expires_at": "2026-09-26T22:00:00Z",
+        }
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, **_kwargs):
+                raise RemoteCommandError(
+                    1,
+                    command,
+                    output=json.dumps({
+                        "turns": [],
+                        "failure": {
+                            "turn": 1,
+                            "message": (
+                                "scripted speech content verification failed for line 1"
+                            ),
+                        },
+                    }),
+                    stderr="short synthetic render",
+                )
+
+            def run_remote(self, command):
+                if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
+                    return CompletedProcess(command, 0, "", "")
+                raise AssertionError(f"unexpected remote artifact read: {command!r}")
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "DevStack", return_value=Stack()),
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "_requested_voice_model", return_value="test-model"),
+            patch.object(runner, "_voice_token", return_value=grant),
+            redirect_stdout(output),
+        ):
+            exit_code = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report["passed"])
+        self.assertTrue(any(
+            "eval infrastructure failure" in failure.lower()
+            and "line 1" in failure
+            for failure in report["failures"]
+        ))
+        self.assertFalse(any(
+            "content verification failed" in product_failure.get("message", "")
+            for case in report["cases"]
+            for product_failure in case.get("product_failures", [])
+        ))
+
     def test_first_turn_tts_failure_keeps_named_observation_without_sdk_record(self):
         import json
         from subprocess import CompletedProcess
@@ -3373,6 +3823,7 @@ class ScenarioObservationTests(unittest.TestCase):
     def test_only_the_two_sms_scenarios_request_private_audio_retention(self):
         for scenario in SCENARIOS:
             command = runner._capture_command(scenario, "safe-room", ["Question@0::answer"])
+            self.assertIn("--retain-caller-audio", command)
             if scenario.name in {"sms-say-back-yes", "sms-correction-new-yes"}:
                 with self.subTest(scenario=scenario.name):
                     self.assertEqual(
@@ -3406,7 +3857,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 redirect_stdout(output),
             ):
                 result = runner.main([
-                    "--retain-sms-audio", "sms-say-back-yes",
+                    "--retain-caller-audio", "--retain-sms-audio", "sms-say-back-yes",
                     "android-selected-room", "Question@0::answer",
                 ])
 
@@ -3418,6 +3869,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 "room_close_after": 1,
                 "retain_sms_audio_dir": Path(temporary),
                 "retain_sms_audio_scenario": "sms-say-back-yes",
+                "retain_caller_audio_dir": Path(temporary),
             },
         )])
         self.assertNotIn("filename", json.loads(output.getvalue()))
