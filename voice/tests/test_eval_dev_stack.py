@@ -1222,10 +1222,60 @@ class DevStackTest(unittest.TestCase):
             ["capture attempt one", "capture attempt two"],
         )
 
+    def test_candidate_worker_alone_receives_private_input_audio_directory(self):
+        self.assertIn(
+            '"MENTAT_VOICE_INPUT_RECORD_DIR": str(\n'
+            '        dev_dir / "voice/evals/retained-evidence/input-audio"\n'
+            '    )',
+            _START_WORKER_SCRIPT,
+        )
+        self.assertIn(
+            'install -d -o nobody -g nogroup -m 700 '
+            '"$DEV_DIR/voice/evals/retained-evidence/input-audio"',
+            _START_WORKER_SCRIPT,
+        )
+        self.assertNotIn("MENTAT_VOICE_INPUT_RECORD_DIR", _SETUP_SCRIPT)
+        self.assertNotIn("MENTAT_VOICE_INPUT_RECORD_DIR", _RUN_VOICE_SCRIPT)
+
+    def test_input_audio_retention_allowlists_wav_and_matching_transcript_sidecars(self):
+        with tempfile.TemporaryDirectory() as staging:
+            root = Path(staging)
+            audio = root / "voice/evals/retained-evidence/input-audio"
+            audio.mkdir(parents=True)
+            (audio / "room-turn-001.wav").write_bytes(b"RIFF synthetic wav")
+            (audio / "room-turn-001.txt").write_text("synthetic transcript\\n")
+            (audio / "room-turn-002.wav").write_bytes(b"RIFF second wav")
+            (audio / "room-turn-003.txt").write_text("orphan transcript\\n")
+            (audio / "room-turn-001.json").write_text("private metadata\\n")
+            (audio / "voice.env.json").write_text("VOICE_TOKEN=synthetic-secret\\n")
+            outside = root / "outside.wav"
+            outside.write_bytes(b"not in input-audio")
+            (audio / "room-turn-004.wav").symlink_to(outside)
+
+            subprocess.run(
+                ["bash", "-s", "--", str(root)],
+                input=_RETAIN_EVIDENCE_SCRIPT,
+                text=True,
+                check=True,
+                capture_output=True,
+                env={**os.environ, "SUDO_USER": pwd.getpwuid(os.getuid()).pw_name},
+            )
+
+            with tarfile.open(root / "retained-evidence.tar.gz", "r:gz") as retained:
+                self.assertEqual(
+                    retained.getnames(),
+                    [
+                        "input-audio/room-turn-001.wav",
+                        "input-audio/room-turn-001.txt",
+                        "input-audio/room-turn-002.wav",
+                    ],
+                )
+
     def test_retained_archive_is_private_and_owned_by_the_scp_user(self):
         self.assertIn('os.environ["SUDO_USER"]', _RETAIN_EVIDENCE_SCRIPT)
         self.assertIn(
-            'install -d -o nobody -g nogroup -m 700 "$DEV_DIR/voice/evals/retained-evidence"',
+            'install -d -o nobody -g nogroup -m 700 '
+            '"$DEV_DIR/voice/evals/retained-evidence/input-audio"',
             _START_WORKER_SCRIPT,
         )
         self.assertIn('"MENTAT_EVAL_RETAINED_EVIDENCE_DIR"', _RUN_VOICE_SCRIPT)
@@ -1274,16 +1324,25 @@ class DevStackTest(unittest.TestCase):
                         ("voice/evals/delegations.jsonl", "{}\\n"),
                         ("sms-audio/room-turn-001.wav", "RIFF synthetic wav"),
                         ("sms-audio/transcripts.jsonl", '{"turn":1,"transcript":"private"}\\n'),
+                        ("input-audio/room-turn-001.wav", "RIFF input wav"),
+                        ("input-audio/room-turn-001.txt", "private caller transcript\\n"),
+                        ("input-audio/orphan-turn-002.txt", "orphan transcript\\n"),
+                        ("input-audio/room-turn-001.json", "private metadata\\n"),
                         ("voice.env.json", "VOICE_TOKEN=synthetic-secret\\n"),
                     ):
                         path = source / name
                         path.parent.mkdir(parents=True, exist_ok=True)
                         path.write_text(content)
+                    symlink = source / "input-audio/linked-turn-003.wav"
+                    symlink.symlink_to(source / "input-audio/room-turn-001.wav")
                     with tarfile.open(destination, "w:gz") as archive:
                         for name in (
                             "agent.log", "voice.log", "records/session.jsonl",
                             "voice/evals/delegations.jsonl", "sms-audio/room-turn-001.wav",
-                            "sms-audio/transcripts.jsonl", "voice.env.json",
+                            "sms-audio/transcripts.jsonl", "input-audio/room-turn-001.wav",
+                            "input-audio/room-turn-001.txt", "input-audio/orphan-turn-002.txt",
+                            "input-audio/room-turn-001.json", "input-audio/linked-turn-003.wav",
+                            "voice.env.json",
                         ):
                             archive.add(source / name, arcname=name)
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -1302,7 +1361,8 @@ class DevStackTest(unittest.TestCase):
             {
                 "agent.log", "voice.log", "records/session.jsonl",
                 "voice/evals/delegations.jsonl", "sms-audio/room-turn-001.wav",
-                "sms-audio/transcripts.jsonl",
+                "sms-audio/transcripts.jsonl", "input-audio/room-turn-001.wav",
+                "input-audio/room-turn-001.txt",
             },
         )
         for path in retained.rglob("*"):
