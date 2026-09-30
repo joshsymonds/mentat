@@ -661,10 +661,12 @@ class AgentSourceContractTest(unittest.TestCase):
 
         error_line = b'{"kind":"error","message":"daemon failure"}\n'
         text_line = b'{"kind":"text_delta","text":"Partial answer."}\n'
+        done_line = b'{"kind":"done"}\n'
         cases = (
             (503, [], [namespace["CONSULT_FAILED"]]),
             (200, [error_line], [namespace["CONSULT_FAILED"]]),
             (200, [text_line], ["Partial answer.", namespace["CONSULT_FAILED"]]),
+            (200, [done_line], [namespace["CONSULT_FAILED"]]),
         )
         for status, chunks, expected in cases:
             with self.subTest(status=status, chunks=chunks):
@@ -1038,6 +1040,51 @@ class AgentSourceContractTest(unittest.TestCase):
 
         asyncio.run(interrupt_while_backend_open())
         self.assertTrue(session.handle.interrupted)
+        self.assertTrue(backend_closed.is_set())
+
+    def test_completed_empty_backend_stream_ends_without_stop_async_iteration(self):
+        from collections.abc import AsyncGenerator
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        method = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_speak_turn"
+        )
+        backend_closed = asyncio.Event()
+
+        async def backend_text(_question, _turn_id, _chat_ctx):
+            try:
+                if False:
+                    yield "unreachable"
+            finally:
+                backend_closed.set()
+
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "uuid4": lambda: SimpleNamespace(hex="turn-id"),
+            "AudioConfig": lambda *_args, **_kwargs: object(),
+            "EARCON_PATH": Path("earcon.wav"),
+            "logger": Mock(),
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _ending_policy=SimpleNamespace(delegation_started=Mock()),
+            _ending_changed=Mock(),
+            _background=SimpleNamespace(play=Mock()),
+            _backend_text=backend_text,
+            session=SimpleNamespace(say=Mock(side_effect=AssertionError("no speech expected"))),
+        )
+
+        asyncio.run(
+            namespace["_speak_turn"](agent, "Tell me now", SimpleNamespace(items=[]))
+        )
         self.assertTrue(backend_closed.is_set())
 
     def test_speech_interrupt_during_segment_flush_returns_without_cancelling_turn(self):
@@ -1489,7 +1536,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertLess(backend.index("write_turn_marker("), backend.index("http.post("))
         self.assertNotIn("append_commentary", source)
 
-    def test_agent_configures_local_silero_vad_and_endpointing_grace(self):
+    def test_agent_uses_local_semantic_turn_detection_and_keeps_vad(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         tree = ast.parse(source)
         entrypoint = next(
@@ -1507,6 +1554,14 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         self.assertEqual(ast.unparse(vad), "ctx.proc.userdata['vad']")
 
+        stt = next(
+            keyword.value for keyword in session_call.keywords if keyword.arg == "stt"
+        )
+        stt_vad = next(
+            keyword.value for keyword in stt.keywords if keyword.arg == "vad"
+        )
+        self.assertEqual(ast.unparse(stt_vad), "ctx.proc.userdata['vad']")
+
         turn_handling = next(
             keyword.value for keyword in session_call.keywords
             if keyword.arg == "turn_handling"
@@ -1515,16 +1570,12 @@ class AgentSourceContractTest(unittest.TestCase):
             value for key, value in zip(turn_handling.keys, turn_handling.values)
             if isinstance(key, ast.Constant) and key.value == "turn_detection"
         )
-        self.assertEqual(ast.literal_eval(turn_detection), "vad")
-        endpointing = next(
-            value for key, value in zip(turn_handling.keys, turn_handling.values)
-            if isinstance(key, ast.Constant) and key.value == "endpointing"
-        )
-        min_delay = ast.literal_eval(next(
-            value for key, value in zip(endpointing.keys, endpointing.values)
-            if isinstance(key, ast.Constant) and key.value == "min_delay"
+        self.assertEqual(ast.unparse(turn_detection), "turn_detector.MultilingualModel()")
+        self.assertFalse(any(
+            isinstance(key, ast.Constant) and key.value == "endpointing"
+            for key in turn_handling.keys
         ))
-        self.assertEqual(min_delay, 0.5)
+        self.assertIn("from livekit.plugins import dtln, elevenlabs, openai, silero, turn_detector", source)
 
 
 if __name__ == "__main__":

@@ -710,6 +710,7 @@ class DevStackTest(unittest.TestCase):
             "livekit.plugins.dtln",
             "livekit.plugins.elevenlabs",
             "livekit.plugins.openai",
+            "livekit.plugins.turn_detector",
             "livekit.plugins.silero",
         ):
             self.assertIn(module, setup_script)
@@ -733,8 +734,8 @@ class DevStackTest(unittest.TestCase):
 
         def import_module(module):
             observed.append(module)
-            if module == "livekit.plugins.openai":
-                raise ImportError("No module named livekit.plugins.openai")
+            if module == "livekit.plugins.turn_detector":
+                raise ImportError("No module named livekit.plugins.turn_detector")
             return object()
 
         with patch("importlib.import_module", side_effect=import_module):
@@ -743,13 +744,14 @@ class DevStackTest(unittest.TestCase):
 
         self.assertEqual(
             str(failure.exception),
-            "candidate voice environment missing required module livekit.plugins.openai: "
-            "No module named livekit.plugins.openai",
+            "candidate voice environment missing required module livekit.plugins.turn_detector: "
+            "No module named livekit.plugins.turn_detector",
         )
         self.assertEqual(
             observed,
             ["aiohttp", "livekit.api", "livekit.rtc", "livekit.plugins.dtln",
-             "livekit.plugins.elevenlabs", "livekit.plugins.openai"],
+             "livekit.plugins.elevenlabs", "livekit.plugins.openai",
+             "livekit.plugins.silero", "livekit.plugins.turn_detector"],
         )
 
     def test_setpriv_is_resolved_outside_service_path_for_all_launches(self):

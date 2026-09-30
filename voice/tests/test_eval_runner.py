@@ -3935,6 +3935,59 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertEqual(report["cases"][0]["turns"][0]["model_call_count"], 1)
 
 
+    def test_recorded_turns_skip_aborted_call_free_result_and_keep_completed_turns(self):
+        messages = [
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "Synthetic aborted turn.",
+            },
+        ]
+        for index in range(1, 4):
+            messages.extend([
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "message_start",
+                        "message": {
+                            "id": f"msg-{index}",
+                            "model": "claude-opus-5-5",
+                            "usage": {"service_tier": "standard"},
+                        },
+                    },
+                },
+                {
+                    "type": "result",
+                    "usage": {"speed": "standard", "service_tier": "standard"},
+                },
+            ])
+
+        recorded = runner._recorded_turns(messages)
+
+        self.assertEqual(
+            [turn["model_calls"][0]["id"] for turn in recorded],
+            ["msg-1", "msg-2", "msg-3"],
+        )
+
+    def test_recorded_turns_still_reject_successful_result_without_model_start(self):
+        with self.assertRaisesRegex(RuntimeError, "no message_start model-call evidence"):
+            runner._recorded_turns([{"type": "result", "usage": {"service_tier": "standard"}}])
+        with self.assertRaisesRegex(RuntimeError, "no message_start model-call evidence"):
+            runner._recorded_turns([{
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": False,
+            }])
+
+    def test_recorded_turns_reject_trailing_call_free_execution_error(self):
+        with self.assertRaisesRegex(RuntimeError, "no message_start model-call evidence"):
+            runner._recorded_turns([{
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+            }])
+
     def test_recorded_turns_capture_model_and_standard_speed_service_evidence(self):
         messages = [
             {

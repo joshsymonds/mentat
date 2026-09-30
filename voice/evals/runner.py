@@ -1008,7 +1008,7 @@ def _attribute_model_calls(
 def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     turns: list[dict[str, Any]] = []
     current: list[dict[str, Any]] = []
-    for message in messages:
+    for message_index, message in enumerate(messages):
         current.append(message)
         if message.get("type") != "result":
             continue
@@ -1047,6 +1047,25 @@ def _recorded_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if tool_kind is not None:
                         tools.append({"turn": len(turns) + 1, "name": name, "kind": tool_kind, "input": arguments})
         if not calls:
+            later_model_call_result = False
+            later_result_has_start = False
+            if (
+                message.get("subtype") == "error_during_execution"
+                and message.get("is_error") is True
+            ):
+                for later in messages[message_index + 1:]:
+                    if later.get("type") == "stream_event":
+                        event = later.get("event")
+                        if isinstance(event, dict) and event.get("type") == "message_start":
+                            later_result_has_start = True
+                    if later.get("type") == "result":
+                        if later_result_has_start:
+                            later_model_call_result = True
+                            break
+                        later_result_has_start = False
+            if later_model_call_result:
+                current = []
+                continue
             raise RuntimeError("recorded assistant result has no message_start model-call evidence")
         result_usage = message.get("usage")
         result_usage = result_usage if isinstance(result_usage, dict) else {}

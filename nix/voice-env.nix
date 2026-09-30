@@ -14,6 +14,33 @@
 let
   py = pkgs.python3Packages;
 
+  turnDetectorModelRevision = "v0.4.1-intl";
+  turnDetectorModelCommit = "87e35fcb1e60a569bea70346191c4886ea92e281";
+  turnDetectorModelFile = name: hash: pkgs.fetchurl {
+    url = "https://huggingface.co/livekit/turn-detector/resolve/${turnDetectorModelRevision}/${name}";
+    inherit hash;
+  };
+  turnDetectorModelFiles = [
+    { name = "added_tokens.json"; hash = "sha256-WLVLvjb8dS95okonHvZqCggwBUtN+tlL3nV9hRloBgs="; }
+    { name = "config.json"; hash = "sha256-zhc5WaBK9+CjIZz5fucMxGNflycu6IXo/IVb3mASx4c="; }
+    { name = "languages.json"; hash = "sha256-BaFuEeQoIXMzHb8UBiQEjlgacnukXDYb7TXjAUrWgYc="; }
+    { name = "merges.txt"; hash = "sha256-iDHk8aBERxNA98CoPXvXEwaluGfpX9hw900MUwipBNU="; }
+    { name = "onnx/model_q8.onnx"; hash = "sha256-vSwwd2iCE4odlaB/rdwTdW/ho1vvYyNQXxEk/KNJvJw="; }
+    { name = "special_tokens_map.json"; hash = "sha256-doYudlJmuFqpRZdn4zy68Tlw8yeg6I0cZYRsLd06Hs0="; }
+    { name = "tokenizer.json"; hash = "sha256-nFrgDmAriGDL14S6gqiqFOj+7OxpLnB2WQ0BTXt/2vo="; }
+    { name = "tokenizer_config.json"; hash = "sha256-g99shhBsfzMplbPEVrxqQkzEbuNIv04K4bVBDGP0OT8="; }
+    { name = "vocab.json"; hash = "sha256-yhDX6fs+0YV13R4neiV5wW0QjjLydDloSvoOELFECRA="; }
+  ];
+  turnDetectorModel = pkgs.runCommand "livekit-turn-detector-model-${turnDetectorModelRevision}" { } ''
+    cache="$out/hub/models--livekit--turn-detector"
+    snapshot="$cache/snapshots/${turnDetectorModelCommit}"
+    mkdir -p "$snapshot" "$cache/refs"
+    printf '%s' "${turnDetectorModelCommit}" > "$cache/refs/${turnDetectorModelRevision}"
+    ${builtins.concatStringsSep "\n" (map (asset: ''
+      install -D "${turnDetectorModelFile asset.name asset.hash}" "$snapshot/${asset.name}"
+    '') turnDetectorModelFiles)}
+  '';
+
   # Two of the wheels below are cp314 ABI-tagged. Nothing downstream would
   # explain a bare ImportError if nixpkgs' default interpreter moved, so say it
   # here instead.
@@ -369,6 +396,20 @@ let
     pythonImportsCheck = [ "livekit.plugins.openai.realtime" ];
   };
 
+  livekit-plugins-turn-detector = wheelPackage {
+    pname = "livekit-plugins-turn-detector";
+    wheelName = "livekit_plugins_turn_detector";
+    version = "1.8.1";
+    hash = "sha256-358qOnFoZZt6nrvkLtTzAdU9+WUfckAzT6BiwAOX47c=";
+    dependencies = [
+      livekit-agents
+      py.jinja2
+      py.onnxruntime
+      py.transformers
+    ];
+    pythonImportsCheck = [ "livekit.plugins.turn_detector" ];
+  };
+
   # The ElevenLabs plugin is pure Python and shares the pinned agent runtime.
   # Its upstream wheel is py3-none-any, so it is compatible with this cp314 env.
   livekit-plugins-elevenlabs = wheelPackage {
@@ -407,6 +448,7 @@ assert pythonVersionOk;
   livekit-plugins-openai
   livekit-plugins-dtln
   livekit-plugins-elevenlabs
+  livekit-plugins-turn-detector
 ])).overrideAttrs
   (old: {
     # Nix builds are sandboxed without network access, so loading the VAD here
@@ -415,14 +457,33 @@ assert pythonVersionOk;
     # hang on the deploy host, with no route to the network to recover.
     postBuild = (old.postBuild or "") + ''
       echo "checking the voice env resolves offline..."
-      $out/bin/python - <<'PY'
-      from pathlib import Path
+      mv "$out/bin/python3.14" "$out/bin/python3.14.unwrapped"
+      cat > "$out/bin/python3.14" <<'SH'
+      #!/bin/sh
+      export HF_HUB_CACHE="''${HF_HUB_CACHE:-${turnDetectorModel}/hub}"
+      exec "$(dirname "$0")/python3.14.unwrapped" "$@"
+      SH
+      chmod +x "$out/bin/python3.14"
+      HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $out/bin/python - <<'PY'
+      import json
       from importlib.resources import files
+      from pathlib import Path
 
       import livekit.agents
+      from huggingface_hub import hf_hub_download
       from livekit.plugins import dtln, elevenlabs, silero
+      from livekit.plugins.turn_detector.multilingual import _EUORunnerMultilingual
 
       assert livekit.agents.__version__.startswith("1.8."), livekit.agents.__version__
+      detector = _EUORunnerMultilingual()
+      detector.initialize()
+      assert detector._session is not None
+      assert detector._tokenizer is not None
+      languages = hf_hub_download(
+          "livekit/turn-detector", "languages.json", revision="${turnDetectorModelRevision}",
+          local_files_only=True,
+      )
+      assert json.loads(Path(languages).read_text())
       # The key is synthetic; constructing the plugin must not make a request.
       elevenlabs.TTS(api_key="synthetic-test-key")
 
