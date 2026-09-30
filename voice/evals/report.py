@@ -268,6 +268,7 @@ def score_observations(
             case_failures.append(f"{name}: expected {required_runs} runs, found {len(runs)}")
         turns: list[dict[str, Any]] = []
         capture_failures: list[dict[str, Any]] = []
+        line_retry_counts: list[dict[str, int]] = []
         for run_index, run in enumerate(runs):
             if not isinstance(run, dict) or not isinstance(run.get("turns"), list):
                 case_failures.append(f"{name} run {run_index + 1}: missing turn observations")
@@ -283,6 +284,7 @@ def score_observations(
                     {"turn", "message"},
                     {"turn", "message", "speech_started_at"},
                     {"turn", "message", "speech_started_at", "segments"},
+                    {"turn", "message", "line", "retry_count"},
                 )
                 try:
                     valid_failure = (
@@ -331,6 +333,19 @@ def score_observations(
                             }
                         )
                     )
+                    if valid_failure and ("line" in failure or "retry_count" in failure):
+                        line = failure.get("line")
+                        retry_count = failure.get("retry_count")
+                        if (
+                            not preflight_tts_failure
+                            or isinstance(line, bool)
+                            or not isinstance(line, int)
+                            or line < 1
+                            or isinstance(retry_count, bool)
+                            or not isinstance(retry_count, int)
+                            or not 0 <= retry_count <= 2
+                        ):
+                            valid_failure = False
                     if valid_failure and "segments" in failure:
                         _transcript_segments(failure["segments"])
                     if valid_failure and "speech_started_at" in failure:
@@ -378,6 +393,14 @@ def score_observations(
                 }
                 if "segments" in failure:
                     capture_failure["segments"] = _transcript_segments(failure["segments"])
+                if "line" in failure:
+                    capture_failure["line"] = failure["line"]
+                    capture_failure["retry_count"] = failure["retry_count"]
+                    line_retry_counts.append({
+                        "run": run_index + 1,
+                        "line": failure["line"],
+                        "retry_count": failure["retry_count"],
+                    })
                 capture_failures.append(capture_failure)
                 product_failures = run.get("product_failures")
                 if not isinstance(product_failures, list):
@@ -460,6 +483,30 @@ def score_observations(
                             f"{name} run {run_index + 1} turn {product_turn}: "
                             f"product failure: {product_failure['message']}"
                         )
+            for raw_turn in run["turns"]:
+                if not isinstance(raw_turn, dict):
+                    continue
+                if "script_line" not in raw_turn and "tts_retry_count" not in raw_turn:
+                    continue
+                script_line = raw_turn.get("script_line")
+                retry_count = raw_turn.get("tts_retry_count")
+                if (
+                    isinstance(script_line, bool)
+                    or not isinstance(script_line, int)
+                    or script_line < 1
+                    or isinstance(retry_count, bool)
+                    or not isinstance(retry_count, int)
+                    or not 0 <= retry_count <= 2
+                ):
+                    case_failures.append(
+                        f"{name} run {run_index + 1}: invalid caller-line retry metadata"
+                    )
+                    continue
+                line_retry_counts.append({
+                    "run": run_index + 1,
+                    "line": script_line,
+                    "retry_count": retry_count,
+                })
             if not run["turns"]:
                 if not valid_failure:
                     case_failures.append(f"{name} run {run_index + 1}: missing turn observations")
@@ -550,6 +597,9 @@ def score_observations(
             "turns": turns,
             "gates": gates,
             "capture_failures": capture_failures,
+            "line_retry_counts": sorted(
+                line_retry_counts, key=lambda item: (item["run"], item["line"])
+            ),
             "failures": case_failures,
         }
         reports.append(report)

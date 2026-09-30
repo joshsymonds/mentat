@@ -1388,6 +1388,42 @@ class DevStackTest(unittest.TestCase):
                     "caller-audio/room-turn-001.json",
                 ])
 
+    def test_caller_audio_archive_preserves_complete_attempt_groups_only(self):
+        with tempfile.TemporaryDirectory() as staging:
+            root = Path(staging)
+            audio = root / "voice/evals/retained-evidence/caller-audio"
+            audio.mkdir(parents=True)
+            complete_stems = (
+                "room-turn-001-attempt-01",
+                "room-turn-002-attempt-01",
+                "room-turn-002-attempt-02",
+            )
+            for stem in complete_stems:
+                (audio / f"{stem}-rendered.pcm").write_bytes(b"render")
+                (audio / f"{stem}-pushed.pcm").write_bytes(b"push")
+                (audio / f"{stem}.json").write_text("{}")
+            (audio / "malformed-turn-003-attempt-1-rendered.pcm").write_bytes(b"bad")
+            incomplete = "incomplete-turn-004-attempt-01"
+            (audio / f"{incomplete}-rendered.pcm").write_bytes(b"render")
+            (audio / f"{incomplete}-pushed.pcm").write_bytes(b"push")
+
+            subprocess.run(
+                ["bash", "-s", "--", str(root)],
+                input=_RETAIN_EVIDENCE_SCRIPT,
+                text=True,
+                check=True,
+                capture_output=True,
+                env={**os.environ, "SUDO_USER": pwd.getpwuid(os.getuid()).pw_name},
+            )
+
+            expected = sorted(
+                f"caller-audio/{stem}{suffix}"
+                for stem in complete_stems
+                for suffix in ("-pushed.pcm", "-rendered.pcm", ".json")
+            )
+            with tarfile.open(root / "retained-evidence.tar.gz", "r:gz") as retained:
+                self.assertEqual(retained.getnames(), expected)
+
     def test_retained_archive_is_private_and_owned_by_the_scp_user(self):
         self.assertIn('os.environ["SUDO_USER"]', _RETAIN_EVIDENCE_SCRIPT)
         self.assertIn(
@@ -1446,6 +1482,18 @@ class DevStackTest(unittest.TestCase):
                         ("caller-audio/room-turn-001-rendered.pcm", "exact render"),
                         ("caller-audio/room-turn-001-pushed.pcm", "actual push"),
                         ("caller-audio/room-turn-001.json", '{"line":"private caller words"}'),
+                        ("caller-audio/room-turn-005-attempt-01-rendered.pcm", "render 5-1"),
+                        ("caller-audio/room-turn-005-attempt-01-pushed.pcm", "push 5-1"),
+                        ("caller-audio/room-turn-005-attempt-01.json", "metadata 5-1"),
+                        ("caller-audio/room-turn-006-attempt-01-rendered.pcm", "render 6-1"),
+                        ("caller-audio/room-turn-006-attempt-01-pushed.pcm", "push 6-1"),
+                        ("caller-audio/room-turn-006-attempt-01.json", "metadata 6-1"),
+                        ("caller-audio/room-turn-006-attempt-02-rendered.pcm", "render 6-2"),
+                        ("caller-audio/room-turn-006-attempt-02-pushed.pcm", "push 6-2"),
+                        ("caller-audio/room-turn-006-attempt-02.json", "metadata 6-2"),
+                        ("caller-audio/room-turn-007-attempt-1-rendered.pcm", "malformed"),
+                        ("caller-audio/room-turn-008-attempt-01-rendered.pcm", "incomplete render"),
+                        ("caller-audio/room-turn-008-attempt-01-pushed.pcm", "incomplete push"),
                         ("caller-audio/orphan-turn-002.json", "orphan metadata"),
                         ("caller-audio/room-turn-004-rendered.pcm", "unpaired audio"),
                         ("input-audio/orphan-turn-002.txt", "orphan transcript\\n"),
@@ -1467,6 +1515,18 @@ class DevStackTest(unittest.TestCase):
                             "caller-audio/room-turn-001-rendered.pcm",
                             "caller-audio/room-turn-001-pushed.pcm",
                             "caller-audio/room-turn-001.json",
+                            "caller-audio/room-turn-005-attempt-01-rendered.pcm",
+                            "caller-audio/room-turn-005-attempt-01-pushed.pcm",
+                            "caller-audio/room-turn-005-attempt-01.json",
+                            "caller-audio/room-turn-006-attempt-01-rendered.pcm",
+                            "caller-audio/room-turn-006-attempt-01-pushed.pcm",
+                            "caller-audio/room-turn-006-attempt-01.json",
+                            "caller-audio/room-turn-006-attempt-02-rendered.pcm",
+                            "caller-audio/room-turn-006-attempt-02-pushed.pcm",
+                            "caller-audio/room-turn-006-attempt-02.json",
+                            "caller-audio/room-turn-007-attempt-1-rendered.pcm",
+                            "caller-audio/room-turn-008-attempt-01-rendered.pcm",
+                            "caller-audio/room-turn-008-attempt-01-pushed.pcm",
                             "caller-audio/orphan-turn-002.json",
                             "caller-audio/room-turn-004-rendered.pcm",
                             "voice.env.json",
@@ -1491,6 +1551,15 @@ class DevStackTest(unittest.TestCase):
                 "sms-audio/transcripts.jsonl", "input-audio/room-turn-001.wav",
                 "input-audio/room-turn-001.txt", "caller-audio/room-turn-001-rendered.pcm",
                 "caller-audio/room-turn-001-pushed.pcm", "caller-audio/room-turn-001.json",
+                "caller-audio/room-turn-005-attempt-01-rendered.pcm",
+                "caller-audio/room-turn-005-attempt-01-pushed.pcm",
+                "caller-audio/room-turn-005-attempt-01.json",
+                "caller-audio/room-turn-006-attempt-01-rendered.pcm",
+                "caller-audio/room-turn-006-attempt-01-pushed.pcm",
+                "caller-audio/room-turn-006-attempt-01.json",
+                "caller-audio/room-turn-006-attempt-02-rendered.pcm",
+                "caller-audio/room-turn-006-attempt-02-pushed.pcm",
+                "caller-audio/room-turn-006-attempt-02.json",
             },
         )
         for path in retained.rglob("*"):

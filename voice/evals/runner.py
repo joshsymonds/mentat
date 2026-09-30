@@ -145,6 +145,9 @@ def _retain_caller_audio(
     pushed_pcm: bytes,
     pushed_frames: int,
     pushed_samples: int,
+    *,
+    attempt: int = 1,
+    content_check_passed: bool | None = None,
 ) -> None:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", room_name) is None:
         raise RuntimeError("caller audio retention received an invalid room name")
@@ -160,7 +163,9 @@ def _retain_caller_audio(
         raise RuntimeError("caller audio evidence directory is not a private directory")
     os.chmod(audio_dir, 0o700)
 
-    stem = f"{room_name}-turn-{turn:03d}"
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise RuntimeError("caller audio retention received an invalid attempt")
+    stem = f"{room_name}-turn-{turn:03d}-attempt-{attempt:02d}"
     rendered_filename = f"{stem}-rendered.pcm"
     pushed_filename = f"{stem}-pushed.pcm"
     _atomic_private_write(audio_dir / rendered_filename, speech.pcm)
@@ -168,6 +173,8 @@ def _retain_caller_audio(
     metadata = json.dumps({
         "turn": turn,
         "line": line,
+        "attempt": attempt,
+        "content_check_passed": content_check_passed,
         "tts_http_status": speech.http_status,
         "tts_response_bytes": speech.response_bytes,
         "pushed_frames": pushed_frames,
@@ -266,6 +273,9 @@ class PartialCaptureFailure(RuntimeError):
         message: str,
         speech_started_at: float | None = None,
         segments: list[dict[str, Any]] | None = None,
+        *,
+        line: int | None = None,
+        retry_count: int | None = None,
     ):
         super().__init__(message)
         self.turns = turns
@@ -274,6 +284,10 @@ class PartialCaptureFailure(RuntimeError):
             self.failure["speech_started_at"] = speech_started_at
         if segments is not None:
             self.failure["segments"] = segments
+        if line is not None:
+            self.failure["line"] = line
+        if retry_count is not None:
+            self.failure["retry_count"] = retry_count
 
 
 @dataclass(frozen=True)
@@ -755,70 +769,113 @@ async def capture_script(
     if parsed_livekit_url.scheme not in ("ws", "wss") or parsed_livekit_url.hostname is None:
         raise RuntimeError("endpoint-issued LiveKit URL is missing or invalid")
 
-    synthesized: list[caller.TTSResponse] = []
+    synthesized: list[tuple[caller.TTSResponse, int, int]] = []
     for index, step in enumerate(steps):
-        try:
-            speech = await _with_deadline(
-                dependencies.tts(dependencies.http, step.line),
-                REMOTE_OPERATION_DEADLINE_SECONDS,
-                "scripted speech synthesis",
-            )
-        except DeadlineExceeded as error:
-            if str(error) != "scripted speech synthesis exceeded its deadline":
-                raise
+        attempts = 0
+        while attempts < 3:
             try:
+                attempts += 1
                 speech = await _with_deadline(
                     dependencies.tts(dependencies.http, step.line),
                     REMOTE_OPERATION_DEADLINE_SECONDS,
                     "scripted speech synthesis",
                 )
-            except DeadlineExceeded as retry_error:
-                if str(retry_error) != "scripted speech synthesis exceeded its deadline":
+            except DeadlineExceeded as error:
+                if str(error) != "scripted speech synthesis exceeded its deadline":
                     raise
+                try:
+                    if attempts >= 3:
+                        raise error
+                    attempts += 1
+                    speech = await _with_deadline(
+                        dependencies.tts(dependencies.http, step.line),
+                        REMOTE_OPERATION_DEADLINE_SECONDS,
+                        "scripted speech synthesis",
+                    )
+                except DeadlineExceeded as retry_error:
+                    if str(retry_error) != "scripted speech synthesis exceeded its deadline":
+                        raise
+                    raise PartialCaptureFailure(
+                        [],
+                        1,
+                        f"scripted speech synthesis for line {index + 1} exceeded its deadline",
+                        line=index + 1,
+                        retry_count=attempts - 1,
+                    ) from retry_error
+            if isinstance(speech, bytes):
+                speech = caller.TTSResponse(speech, None, len(speech))
+            if not isinstance(speech, caller.TTSResponse):
                 raise PartialCaptureFailure(
-                    [],
-                    1,
-                    f"scripted speech synthesis for line {index + 1} exceeded its deadline",
-                ) from retry_error
-        if isinstance(speech, bytes):
-            speech = caller.TTSResponse(speech, None, len(speech))
-        if not isinstance(speech, caller.TTSResponse):
-            raise PartialCaptureFailure(
-                [], 1, f"scripted speech sample count mismatch for line {index + 1}"
-            )
-        pcm = speech.pcm
-        if retain_caller_audio_dir is not None and isinstance(pcm, bytes):
-            _retain_caller_audio(
-                retain_caller_audio_dir,
-                room_name,
-                index + 1,
-                step.line,
-                speech,
-                b"",
-                0,
-                0,
-            )
-        if not isinstance(pcm, bytes) or len(pcm) % 2:
-            raise PartialCaptureFailure(
-                [], 1, f"scripted speech sample count mismatch for line {index + 1}"
-            )
-        try:
-            rendered_segments = await _with_deadline(
-                dependencies.transcribe(dependencies.http, pcm, RATE, 1),
-                REMOTE_OPERATION_DEADLINE_SECONDS,
-                "scripted speech content transcription",
-            )
-        except Exception as error:
-            raise PartialCaptureFailure(
-                [], 1,
-                f"scripted speech content verification failed for line {index + 1}",
-            ) from error
-        if not _rendered_content_matches(step.line, rendered_segments):
-            raise PartialCaptureFailure(
-                [], 1,
-                f"scripted speech content verification failed for line {index + 1}",
-            )
-        synthesized.append(speech)
+                    [], 1, f"scripted speech sample count mismatch for line {index + 1}",
+                    line=index + 1, retry_count=attempts - 1,
+                )
+            pcm = speech.pcm
+            if isinstance(pcm, bytes) and retain_caller_audio_dir is not None:
+                _retain_caller_audio(
+                    retain_caller_audio_dir,
+                    room_name,
+                    index + 1,
+                    step.line,
+                    speech,
+                    b"",
+                    0,
+                    0,
+                    attempt=attempts,
+                    content_check_passed=None,
+                )
+            if not isinstance(pcm, bytes) or len(pcm) % 2:
+                raise PartialCaptureFailure(
+                    [], 1, f"scripted speech sample count mismatch for line {index + 1}",
+                    line=index + 1, retry_count=attempts - 1,
+                )
+            try:
+                rendered_segments = await _with_deadline(
+                    dependencies.transcribe(dependencies.http, pcm, RATE, 1),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "scripted speech content transcription",
+                )
+            except Exception as error:
+                if retain_caller_audio_dir is not None:
+                    _retain_caller_audio(
+                        retain_caller_audio_dir,
+                        room_name,
+                        index + 1,
+                        step.line,
+                        speech,
+                        b"",
+                        0,
+                        0,
+                        attempt=attempts,
+                        content_check_passed=False,
+                    )
+                raise PartialCaptureFailure(
+                    [], 1,
+                    f"scripted speech content verification failed for line {index + 1}",
+                    line=index + 1, retry_count=attempts - 1,
+                ) from error
+            content_matches = _rendered_content_matches(step.line, rendered_segments)
+            if retain_caller_audio_dir is not None:
+                _retain_caller_audio(
+                    retain_caller_audio_dir,
+                    room_name,
+                    index + 1,
+                    step.line,
+                    speech,
+                    b"",
+                    0,
+                    0,
+                    attempt=attempts,
+                    content_check_passed=content_matches,
+                )
+            if content_matches:
+                synthesized.append((speech, attempts - 1, attempts))
+                break
+            if attempts >= 3:
+                raise PartialCaptureFailure(
+                    [], 1,
+                    f"scripted speech content verification failed for line {index + 1}",
+                    line=index + 1, retry_count=attempts - 1,
+                )
 
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
@@ -902,7 +959,8 @@ async def capture_script(
             raise DeadlineExceeded(str(error)) from error
 
         async def push(
-            speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int
+            speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
+            attempt: int,
         ) -> None:
             pcm = speech.pcm
             rendered_samples = len(pcm) // 2
@@ -934,6 +992,8 @@ async def capture_script(
                         bytes(pushed_pcm),
                         pushed_frames,
                         pushed_samples,
+                        attempt=attempt,
+                        content_check_passed=True,
                     )
             if pushed_samples != rendered_samples:
                 raise PartialCaptureFailure(
@@ -960,7 +1020,8 @@ async def capture_script(
                     "silence timing",
                 )
 
-        for index, (step, speech) in enumerate(zip(steps, synthesized, strict=True)):
+        for index, (step, rendered) in enumerate(zip(steps, synthesized, strict=True)):
+            speech, retry_count, attempt = rendered
             await quiet(step.delay)
             capture_end = asyncio.Event()
             capture = dependencies.capture_factory(answer_tracks, capture_end)
@@ -970,7 +1031,7 @@ async def capture_script(
                 "continuous answer capture start",
             )
             speech_started_at = time.time()
-            await push(speech, step, index + 1)
+            await push(speech, step, index + 1, attempt)
             speech_end = _finite_timestamp(
                 await _with_deadline(
                     caller._speech_end_after_playout(source),
@@ -1127,6 +1188,8 @@ async def capture_script(
                 "turn": index + 1,
                 "room": room_name,
                 "line": step.line,
+                "script_line": index + 1,
+                "tts_retry_count": retry_count,
                 "transcript": transcript,
                 "speech_started_at": speech_started_at,
                 "speech_end": speech_end,
@@ -1856,6 +1919,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         {"turn", "message"},
         {"turn", "message", "speech_started_at"},
         {"turn", "message", "speech_started_at", "segments"},
+        {"turn", "message", "line", "retry_count"},
     )
     preflight_tts_line = _scripted_tts_failure_line(
         failure.get("message") if isinstance(failure, dict) else None
@@ -1916,6 +1980,19 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         )
     ):
         raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
+    if "line" in failure or "retry_count" in failure:
+        line = failure.get("line")
+        retry_count = failure.get("retry_count")
+        if (
+            not preflight_tts_failure
+            or isinstance(line, bool)
+            or not isinstance(line, int)
+            or not 1 <= line <= expected_turns
+            or isinstance(retry_count, bool)
+            or not isinstance(retry_count, int)
+            or not 0 <= retry_count <= 2
+        ):
+            raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
     if "segments" in failure and (
         failure.get("message") not in {
             NO_ANSWER_FAILURE,

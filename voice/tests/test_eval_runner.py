@@ -598,6 +598,115 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, {"First": 2, "Second": 1})
         self.assertLess(max(i for i, value in enumerate(events) if value.startswith("tts:")), events.index("connect"))
 
+    async def test_truncated_render_retries_and_retains_each_attempt_privately(self):
+        import json
+        import tempfile
+
+        dependencies = self.dependencies_for_failure("other")
+        renders = [
+            runner.caller.TTSResponse(b"\x01\x00" * 12_000, 206, 24_000),
+            runner.caller.TTSResponse(b"\x02\x00" * 24_000, 200, 48_000),
+        ]
+        pushed = []
+
+        class Source:
+            async def capture_frame(self, frame):
+                pushed.append(frame.pcm)
+
+            async def wait_for_playout(self):
+                return None
+
+        dependencies.rtc.AudioFrame = lambda pcm, *_args: SimpleNamespace(pcm=pcm)
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+        attempts = 0
+
+        async def tts(*_args):
+            nonlocal attempts
+            response = renders[attempts]
+            attempts += 1
+            return response
+
+        async def transcribe(_http, pcm, _rate, _channels):
+            text = "Exact caller words" if pcm == renders[1].pcm else "Exact caller"
+            return [{"start": 0.0, "end": 1.0, "text": text}]
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "tts": tts,
+            "transcribe": transcribe,
+        })
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, TEST_VOICE_ENV):
+            traces = await capture_script(
+                "android-selected-room", ["Exact caller words@0::answer"],
+                dependencies=dependencies, room_close_after=None,
+                retain_caller_audio_dir=Path(temporary),
+            )
+            audio_dir = Path(temporary) / "caller-audio"
+            first = "android-selected-room-turn-001-attempt-01"
+            second = "android-selected-room-turn-001-attempt-02"
+            first_record = json.loads((audio_dir / f"{first}.json").read_text())
+            second_record = json.loads((audio_dir / f"{second}.json").read_text())
+            self.assertEqual((audio_dir / f"{first}-rendered.pcm").read_bytes(), renders[0].pcm)
+            self.assertEqual((audio_dir / f"{second}-rendered.pcm").read_bytes(), renders[1].pcm)
+            self.assertEqual(first_record["content_check_passed"], False)
+            self.assertEqual(second_record["content_check_passed"], True)
+            self.assertEqual(first_record["tts_http_status"], 206)
+            self.assertEqual(first_record["tts_response_bytes"], 24_000)
+            self.assertEqual(second_record["tts_http_status"], 200)
+            self.assertEqual(second_record["tts_response_bytes"], 48_000)
+            self.assertEqual(b"".join(pushed), renders[1].pcm)
+            self.assertEqual(traces[0]["tts_retry_count"], 1)
+            self.assertEqual(attempts, 2)
+
+    async def test_three_truncated_renders_fail_with_named_content_infrastructure_error(self):
+        import json
+        import tempfile
+
+        dependencies = self.dependencies_for_failure("other")
+        attempts = 0
+
+        async def tts(*_args):
+            nonlocal attempts
+            attempts += 1
+            pcm = bytes([attempts, 0]) * 12_000
+            return runner.caller.TTSResponse(pcm, 200 + attempts, len(pcm))
+
+        async def transcribe(*_args):
+            return [{"start": 0.0, "end": 1.0, "text": "Exact caller"}]
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__, "tts": tts, "transcribe": transcribe,
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.dict(os.environ, TEST_VOICE_ENV),
+                self.assertRaises(runner.PartialCaptureFailure) as caught,
+            ):
+                await capture_script(
+                    "retry-room", ["Exact caller words@0::answer"],
+                    dependencies=dependencies, room_close_after=None,
+                    retain_caller_audio_dir=Path(temporary),
+                )
+            audio_dir = Path(temporary) / "caller-audio"
+            retained = []
+            for attempt in range(1, 4):
+                stem = f"retry-room-turn-001-attempt-{attempt:02d}"
+                record = json.loads((audio_dir / f"{stem}.json").read_text())
+                pcm = (audio_dir / f"{stem}-rendered.pcm").read_bytes()
+                self.assertEqual(record["attempt"], attempt)
+                self.assertFalse(record["content_check_passed"])
+                self.assertEqual(record["tts_http_status"], 200 + attempt)
+                self.assertEqual(record["tts_response_bytes"], 24_000)
+                self.assertEqual(record["pushed_frames"], 0)
+                self.assertEqual(record["pushed_samples"], 0)
+                retained.append(pcm)
+            self.assertEqual(len(set(retained)), 3)
+
+        self.assertEqual(attempts, 3)
+        self.assertEqual(caught.exception.failure["message"],
+                         "scripted speech content verification failed for line 1")
+        self.assertEqual(caught.exception.failure["retry_count"], 2)
+
     async def test_rendered_script_content_is_transcribed_before_connect_and_checks_sms_body(self):
         line = "Text +1-202-555-0142: I will be there at six."
         pcm = bytes(runner.RATE * 2)  # Same one-second rendering in both cases.
@@ -630,6 +739,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.failure, {
             "turn": 1,
             "message": "scripted speech content verification failed for line 1",
+            "line": 1,
+            "retry_count": 2,
         })
         self.assertTrue(runner._is_preflight_tts_capture_failure([], caught.exception.failure))
         self.assertEqual(connections, [])
@@ -850,6 +961,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.failure, {
             "turn": 1,
             "message": "scripted speech sample count mismatch for line 1",
+            "line": 1,
+            "retry_count": 0,
         })
 
     async def test_preflight_tts_failures_on_every_line_use_strict_turn_one_envelopes(self):
@@ -906,6 +1019,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                         f"scripted speech synthesis for line {failed_line} "
                         "exceeded its deadline"
                     ),
+                    "line": failed_line,
+                    "retry_count": 1,
                 })
                 parsed = runner._capture_envelope(captured_stdout, len(lines))
                 self.assertEqual(parsed, ([], envelope["failure"]))
@@ -925,6 +1040,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     "run": 1,
                     "turn": 1,
                     "message": envelope["failure"]["message"],
+                    "line": failed_line,
+                    "retry_count": 1,
                 }])
 
     async def test_exhausted_preflight_tts_timeout_is_partial_failure_before_join(self):
@@ -956,6 +1073,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.failure, {
             "turn": 1,
             "message": "scripted speech synthesis for line 1 exceeded its deadline",
+            "line": 1,
+            "retry_count": 1,
         })
         self.assertEqual(connects, [])
 
@@ -2095,7 +2214,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 retain_caller_audio_dir=evidence,
             )
             audio_dir = evidence / "caller-audio"
-            stem = "android-selected-room-turn-001"
+            stem = "android-selected-room-turn-001-attempt-01"
             metadata_path = audio_dir / f"{stem}.json"
             record = json.loads(metadata_path.read_text())
             self.assertEqual((audio_dir / f"{stem}-rendered.pcm").read_bytes(), rendered)
@@ -2106,6 +2225,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record, {
                 "turn": 1,
                 "line": "Exact caller words",
+                "attempt": 1,
+                "content_check_passed": True,
                 "tts_http_status": 200,
                 "tts_response_bytes": len(rendered),
                 "pushed_frames": len(pushed),
@@ -2120,6 +2241,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             for path in audio_dir.iterdir():
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(traces[0]["line"], "Exact caller words")
+            self.assertEqual(traces[0]["tts_retry_count"], 0)
 
     async def test_short_preflight_render_is_retained_with_zero_push_metrics(self):
         import json
@@ -2144,11 +2266,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             audio_dir = Path(temporary) / "caller-audio"
-            stem = "private-room-turn-001"
+            stem = "private-room-turn-001-attempt-01"
             record = json.loads((audio_dir / f"{stem}.json").read_text())
             self.assertEqual((audio_dir / f"{stem}-rendered.pcm").read_bytes(), b"\x01\x00")
             self.assertEqual((audio_dir / f"{stem}-pushed.pcm").read_bytes(), b"")
             self.assertEqual(record["line"], "Long scripted line")
+            self.assertFalse(record["content_check_passed"])
             self.assertEqual(record["tts_http_status"], 200)
             self.assertEqual(record["tts_response_bytes"], 2)
             self.assertEqual(record["pushed_frames"], 0)
