@@ -8,7 +8,8 @@ import logging
 import os
 import re
 import time
-from collections.abc import AsyncGenerator, Callable
+import wave
+from collections.abc import AsyncGenerator, AsyncIterable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -156,6 +157,102 @@ def load_persona(path: Path = PERSONA_PATH) -> tuple[str, str]:
     return split_persona(path.read_text())
 
 
+class InputAudioRecorder:
+    """Keep STT input private and publish it only after a committed transcript."""
+
+    def __init__(self, room_name: str, output_dir: str | Path | None = None) -> None:
+        self._output_dir = Path(output_dir) if output_dir else None
+        self._room_name = re.sub(r"[^A-Za-z0-9._-]+", "_", room_name).strip("._-") or "room"
+        self._frames: list[tuple[bytes, int, int]] = []
+        self._turn_number = 0
+
+    def begin(self) -> None:
+        if self._output_dir is not None:
+            self._frames.clear()
+
+    def capture(self, frame: Any) -> None:
+        if self._output_dir is None:
+            return
+        try:
+            self._frames.append(
+                (bytes(frame.data), int(frame.sample_rate), int(frame.num_channels))
+            )
+        except Exception:
+            logger.exception("failed to capture eval STT input")
+
+    def commit(self, transcript: str) -> None:
+        if self._output_dir is None:
+            return
+        frames, self._frames = self._frames, []
+        if not frames:
+            return
+        number = self._turn_number + 1
+        audio_path: Path | None = None
+        transcript_path: Path | None = None
+        audio_fd: int | None = None
+        transcript_fd: int | None = None
+        audio_created = False
+        transcript_created = False
+        try:
+            sample_rate, channels = frames[0][1:]
+            if any(rate != sample_rate or count != channels for _, rate, count in frames):
+                raise ValueError("STT audio format changed within a committed turn")
+            self._output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            while True:
+                stem = f"{self._room_name}-turn-{number:03d}"
+                audio_path = self._output_dir / f"{stem}.wav"
+                transcript_path = self._output_dir / f"{stem}.txt"
+                try:
+                    audio_fd = os.open(
+                        audio_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                    )
+                    audio_created = True
+                except FileExistsError:
+                    number += 1
+                    continue
+                try:
+                    transcript_fd = os.open(
+                        transcript_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                    )
+                    transcript_created = True
+                except FileExistsError:
+                    os.close(audio_fd)
+                    audio_fd = None
+                    audio_path.unlink()
+                    audio_created = False
+                    number += 1
+                    continue
+                break
+            self._turn_number = number
+            with os.fdopen(audio_fd, "wb") as audio_raw:
+                audio_fd = None
+                with wave.open(audio_raw, "wb") as audio_file:
+                    audio_file.setnchannels(channels)
+                    audio_file.setsampwidth(2)
+                    audio_file.setframerate(sample_rate)
+                    audio_file.writeframes(b"".join(data for data, _, _ in frames))
+            with os.fdopen(transcript_fd, "w", encoding="utf-8") as transcript_file:
+                transcript_fd = None
+                transcript_file.write(transcript)
+        except Exception:
+            logger.exception("failed to write private eval STT input")
+            for descriptor in (audio_fd, transcript_fd):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        logger.exception("failed to close incomplete eval evidence")
+            for path, created in (
+                (audio_path, audio_created),
+                (transcript_path, transcript_created),
+            ):
+                if path is not None and created:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.exception("failed to remove incomplete eval STT evidence")
+
+
 def write_turn_marker(room_name: str, turn_id: str) -> None:
     """Write the opt-in private marker for a backend voice turn."""
     marker_path = os.environ.get("MENTAT_EVAL_DELEGATION_LOG")
@@ -194,17 +291,40 @@ class FrontAgent(Agent):
         self._background = background
         self._ending_policy = ending_policy
         self._ending_changed = ending_changed
+        input_audio_dir = os.environ.get("MENTAT_VOICE_INPUT_RECORD_DIR")
+        self._input_audio = (
+            InputAudioRecorder(room_name, input_audio_dir) if input_audio_dir else None
+        )
         self._sms_consent = False
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_text = ""
         self._turn_started_at: float | None = None
         self._closed = False
 
+    def stt_node(
+        self, audio: AsyncIterable[Any], model_settings: Any
+    ) -> AsyncIterable[Any]:
+        """Record only the exact input frames handed to STT, when opted in."""
+        if self._input_audio is None:
+            return super().stt_node(audio, model_settings)
+
+        self._input_audio.begin()
+
+        async def recorded_audio() -> AsyncGenerator[Any, None]:
+            async for frame in audio:
+                self._input_audio.capture(frame)
+                yield frame
+
+        return super().stt_node(recorded_audio(), model_settings)
+
     async def on_user_turn_completed(self, chat_ctx: Any, new_message: Any) -> None:
         """Start backend work immediately, merging only a short continuation."""
         question = str(getattr(new_message, "text_content", "")).strip()
         if not question or self._closed:
             return
+        input_audio = getattr(self, "_input_audio", None)
+        if input_audio is not None:
+            input_audio.commit(question)
         turn_started_at = time.monotonic()
         task = self._turn_task
         if task is not None and not task.done():
