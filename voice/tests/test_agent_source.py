@@ -1536,7 +1536,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertLess(backend.index("write_turn_marker("), backend.index("http.post("))
         self.assertNotIn("append_commentary", source)
 
-    def test_agent_configures_local_silero_vad_and_endpointing_grace(self):
+    def test_agent_uses_local_semantic_turn_detection_and_keeps_vad(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         tree = ast.parse(source)
         entrypoint = next(
@@ -1554,6 +1554,14 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         self.assertEqual(ast.unparse(vad), "ctx.proc.userdata['vad']")
 
+        stt = next(
+            keyword.value for keyword in session_call.keywords if keyword.arg == "stt"
+        )
+        stt_vad = next(
+            keyword.value for keyword in stt.keywords if keyword.arg == "vad"
+        )
+        self.assertEqual(ast.unparse(stt_vad), "ctx.proc.userdata['vad']")
+
         turn_handling = next(
             keyword.value for keyword in session_call.keywords
             if keyword.arg == "turn_handling"
@@ -1562,16 +1570,12 @@ class AgentSourceContractTest(unittest.TestCase):
             value for key, value in zip(turn_handling.keys, turn_handling.values)
             if isinstance(key, ast.Constant) and key.value == "turn_detection"
         )
-        self.assertEqual(ast.literal_eval(turn_detection), "vad")
-        endpointing = next(
-            value for key, value in zip(turn_handling.keys, turn_handling.values)
-            if isinstance(key, ast.Constant) and key.value == "endpointing"
-        )
-        min_delay = ast.literal_eval(next(
-            value for key, value in zip(endpointing.keys, endpointing.values)
-            if isinstance(key, ast.Constant) and key.value == "min_delay"
+        self.assertEqual(ast.unparse(turn_detection), "turn_detector.MultilingualModel()")
+        self.assertFalse(any(
+            isinstance(key, ast.Constant) and key.value == "endpointing"
+            for key in turn_handling.keys
         ))
-        self.assertEqual(min_delay, 0.5)
+        self.assertIn("from livekit.plugins import dtln, elevenlabs, openai, silero, turn_detector", source)
 
 
 if __name__ == "__main__":

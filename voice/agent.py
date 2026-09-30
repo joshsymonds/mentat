@@ -27,7 +27,7 @@ from livekit.agents import (
     tts,
 )
 from livekit.agents.voice import room_io
-from livekit.plugins import dtln, elevenlabs, openai, silero
+from livekit.plugins import dtln, elevenlabs, openai, silero, turn_detector
 
 from request import (
     END_CONVERSATION_TOOL,
@@ -496,8 +496,7 @@ async def entrypoint(ctx: JobContext) -> None:
             )
         ),
         turn_handling={
-            "turn_detection": "vad",
-            "endpointing": {"min_delay": 0.5},
+            "turn_detection": turn_detector.MultilingualModel(),
         },
     )
     voice_room_io = room_io.RoomIO(
