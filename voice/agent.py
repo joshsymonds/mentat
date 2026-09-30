@@ -296,7 +296,11 @@ class FrontAgent(Agent):
             while True:
                 backend_next = asyncio.create_task(backend_iterator.__anext__())
                 if speech_completion is None:
-                    await backend_next
+                    try:
+                        await backend_next
+                    except StopAsyncIteration:
+                        backend_next = None
+                        break
                 else:
                     done, _ = await asyncio.wait(
                         (backend_next, speech_completion),

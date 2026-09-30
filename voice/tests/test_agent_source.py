@@ -661,10 +661,12 @@ class AgentSourceContractTest(unittest.TestCase):
 
         error_line = b'{"kind":"error","message":"daemon failure"}\n'
         text_line = b'{"kind":"text_delta","text":"Partial answer."}\n'
+        done_line = b'{"kind":"done"}\n'
         cases = (
             (503, [], [namespace["CONSULT_FAILED"]]),
             (200, [error_line], [namespace["CONSULT_FAILED"]]),
             (200, [text_line], ["Partial answer.", namespace["CONSULT_FAILED"]]),
+            (200, [done_line], [namespace["CONSULT_FAILED"]]),
         )
         for status, chunks, expected in cases:
             with self.subTest(status=status, chunks=chunks):
@@ -1038,6 +1040,51 @@ class AgentSourceContractTest(unittest.TestCase):
 
         asyncio.run(interrupt_while_backend_open())
         self.assertTrue(session.handle.interrupted)
+        self.assertTrue(backend_closed.is_set())
+
+    def test_completed_empty_backend_stream_ends_without_stop_async_iteration(self):
+        from collections.abc import AsyncGenerator
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        method = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_speak_turn"
+        )
+        backend_closed = asyncio.Event()
+
+        async def backend_text(_question, _turn_id, _chat_ctx):
+            try:
+                if False:
+                    yield "unreachable"
+            finally:
+                backend_closed.set()
+
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "uuid4": lambda: SimpleNamespace(hex="turn-id"),
+            "AudioConfig": lambda *_args, **_kwargs: object(),
+            "EARCON_PATH": Path("earcon.wav"),
+            "logger": Mock(),
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _ending_policy=SimpleNamespace(delegation_started=Mock()),
+            _ending_changed=Mock(),
+            _background=SimpleNamespace(play=Mock()),
+            _backend_text=backend_text,
+            session=SimpleNamespace(say=Mock(side_effect=AssertionError("no speech expected"))),
+        )
+
+        asyncio.run(
+            namespace["_speak_turn"](agent, "Tell me now", SimpleNamespace(items=[]))
+        )
         self.assertTrue(backend_closed.is_set())
 
     def test_speech_interrupt_during_segment_flush_returns_without_cancelling_turn(self):
