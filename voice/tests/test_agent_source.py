@@ -1568,10 +1568,14 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         self.assertEqual(
             ast.unparse(turn_handling),
-            "{'turn_detection': turn_detector.MultilingualModel(), "
+            "{'turn_detection': MultilingualModel(), "
             "'endpointing': {'min_delay': 0.5, 'max_delay': 3.0}}",
         )
-        self.assertIn("from livekit.plugins import dtln, elevenlabs, openai, silero, turn_detector", source)
+        self.assertIn(
+            "from livekit.plugins.turn_detector.multilingual import MultilingualModel",
+            source,
+        )
+        self.assertNotIn("turn_detector.MultilingualModel", source)
 
     def test_input_audio_recording_is_opt_in_committed_and_keeps_real_stt_frames(self):
         agent_path = Path(__file__).resolve().parents[1] / "agent.py"
