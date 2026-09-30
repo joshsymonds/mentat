@@ -34,10 +34,11 @@ class Scenario:
 
 _ALICE_FATHER_NAME = r"(?:W\.?\s*M\.?\s*Keck|William\s+(?:(?:M\.?|Myron)\s+)?Keck)"
 _ALICE_FATHER_CLAIM = (
-    rf"\b(?:her\s+)?(?:father|dad),?\s+{_ALICE_FATHER_NAME}\b|"
-    rf"\b(?:Alice (?:Bertha )?Keck(?: Park)?|she)\b[^\n.!?;]{{0,90}}"
-    rf"\b(?:the\s+)?daughter\s+of(?:\s+\w+){{0,2}}\s+{_ALICE_FATHER_NAME}\b|"
-    rf"\b(?:Alice (?:Bertha )?Keck(?: Park)?|she)\b[^\n.!?;]{{0,90}}"
+    rf"\b(?:her\s+)?(?:father|dad)\b[^\n.!?;]{{0,40}}\b{_ALICE_FATHER_NAME}\b|"
+    rf"\bher\s+father\s+was\s+the\s+company's\s+founder\.\s+William\s+Keck\b|"
+    rf"\b(?:Alice (?:Bertha )?Keck(?: Park)?|Alice Keckpark|she)\b[^\n]{{0,150}}"
+    rf"\b(?:the\s+)?daughter\s+of(?:[\s,]+\w+){{0,4}}[\s,]+{_ALICE_FATHER_NAME}\b|"
+    rf"\b(?:Alice (?:Bertha )?Keck(?: Park)?|Alice Keckpark|she)\b[^\n.!?;]{{0,90}}"
     rf"\b{_ALICE_FATHER_NAME}'s\s+daughter\b"
 )
 _ALICE_DONOR_CLAIM = (
@@ -51,7 +52,16 @@ _ALICE_DONOR_CLAIM = (
     r"\bAlice (?:Bertha )?Keck Park,\s+a (?:local|Santa Barbara)\s+philanthropist[,.]?\s*who\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\bAlice (?:Bertha )?Keck Park\s+was\s+a Santa Barbara philanthropist\s+who\s+(?:bought|purchased|donated|gave|gifted)\b|"
     r"\b(?:bought|purchased|donated|gave|gifted|given)\b.{0,80}\b(?:by|from)\s+Alice Keck\b|"
-    r"\b(?:gift|donation)\b.{0,80}\b(?:by|from)\s+Alice Keck\b"
+    r"\b(?:gift|donation)\b.{0,80}\b(?:by|from)\s+Alice Keck\b|"
+    r"\bAlice (?:Bertha )?Keck(?: Park)?\b.{0,120}\bshe\s+"
+    r"(?:owned|held)\s+(?:the\s+)?(?:land|property|site)\b.{0,60}"
+    r"\b(?:and\s+)?gave\s+it\s+to\s+(?:the\s+)?city\b|"
+    r"\bAlice (?:Bertha )?Keck(?: Park)?\b.{0,160}"
+    r"\b(?:she\s+was\s+(?:the\s+)?donor|donor)\b.{0,60}"
+    r"\b(?:made|who\s+made)\s+(?:the\s+)?(?:park|garden)\s+possible\b|"
+    r"\bAlice (?:Bertha )?Keck Park\s+was\s+a local philanthropist\s+who\s+"
+    r"(?:bought|purchased|donated|gave|gifted)\b|"
+    r"\bAlice (?:Bertha )?Keck Park\b.{0,20}\bwho\s+paid\s+for\s+it\b"
 )
 SMS_CONFIRMATION_PATTERN = re.compile(
     r"\b(?:should i|would you like|do you want|shall i|want me to|say yes|say send|"
@@ -72,10 +82,11 @@ _PARK_LAND_OBJECT = (
     r"(?:Alice (?:Bertha )?Keck Park|(?:(?:the|that|this|her|his|their)\s+)?"
     r"(?:land|property|park|garden|site)|it)"
 )
-_OTHER_ROLE = r"(?:the\s+)?(?:her\s+)?(?:husband|wife|father|mother|daughter|son|family|city|someone else|somebody else|another person)"
+_OTHER_ROLE = r"(?:the\s+)?(?:her\s+)?(?:husband|wife|father|mother|daughter|son|family|city(?!\s+block\b)|someone else|somebody else|another person)"
 _NAMED_OTHER_ACTOR = (
     r"(?-i:(?!(?:Alice|Halis)\s+(?:Bertha\s+)?Keck\b)(?!Keck\s+Park\b)"
-    r"(?:[A-Z][A-Za-z'’-]+|[A-Z]\.)(?:\s+(?:[A-Z][A-Za-z'’-]+|[A-Z]\.|de|van|von|da)){1,5})"
+    r"(?:[A-Z][A-Za-z'’-]+|[A-Z]\.)(?:\s+(?!(?:She|He|They|Her|His)\b)"
+    r"(?:[A-Z][A-Za-z'’-]+|[A-Z]\.|de|van|von|da)){1,5})"
 )
 _OTHER_ACTOR = rf"(?:{_OTHER_ROLE}|{_NAMED_OTHER_ACTOR})"
 _ACTION_ACKNOWLEDGMENT = (
@@ -240,16 +251,22 @@ SCENARIOS = (
                 reject_patterns=(
                     r"\b(?:not|never|is not|isn't|was not|wasn't)\b.{0,80}\b(?:father|daughter|son|child|related)\b",
                     r"\b(?:not sure|don't know|do not know|can't say|cannot say|may have)\b.{0,80}\b(?:father|dad|daughter|son|child|related)\b",
+                    rf"\b(?:father|dad)\b[^.!?;]{{0,30}}\b(?:not|never|isn't|wasn't|is not|was not)\b"
+                    rf"[^.!?;]{{0,40}}\b{_ALICE_FATHER_NAME}\b",
                 ),
             ),
             TurnExpectation(
                 (
-                    r"Superior Oil",
-                    r"(?:family|father).{0,80}(?:oil|fortune)|(?:oil|fortune).{0,80}(?:family|father)",
+                    r"(?:Superior Oil|\bfamily oil money\b)",
+                    r"(?:family|father).{0,80}(?:oil|fortune)|(?:oil|fortune).{0,80}(?:family|father)|"
+                    r"daughter of William M\. Keck, who founded Superior Oil.{0,60}inherited the money from him|"
+                    r"daughter of William Myron Keck[.,]?\s+who founded Superior Oil",
                 ),
                 reject_patterns=(
                     r"\b(?:can't say|cannot say|don't know|do not know|not sure|may have)\b.{0,100}\b(?:inher|wealth|fortune|Superior Oil)\b",
-                    r"\b(?:not|never|did not|didn't|was not|wasn't)\b.{0,100}\b(?:inher|wealth|fortune|Superior Oil)\b",
+                    r"\b(?:not|never|did not|didn't|was not|wasn't)\b[^\n.!?;]{0,100}\b(?:inher|wealth|fortune|Superior Oil)\b",
+                    r"\b(?:not|never|did not|didn't|was not|wasn't)\s+"
+                    r"(?:(?:from|the result of|because of)\s+)?family\s+oil\s+money\b",
                 ),
             ),
         ),

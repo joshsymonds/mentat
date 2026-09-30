@@ -175,7 +175,7 @@ VOICE_ENV_PATH=$(
   nix build \
     --impure \
     --expr "let pkgs = import (builtins.getFlake \"nixpkgs\").outPath {}; in import $DEV_DIR/voice/voice-env.nix { inherit pkgs; }" \
-    --no-link \
+    --out-link "$DEV_DIR/voice-env-root" \
     --print-out-paths
 )
 case "$VOICE_ENV_PATH" in
@@ -258,6 +258,7 @@ for pid_file in "$DEV_DIR/agent.pid" "$DEV_DIR/voice.pid"; do
 done
 restore_voice
 trap - EXIT
+rm -f -- "$DEV_DIR/voice-env-root"
 rm -rf -- "$DEV_DIR"
 CLEANUP
 chmod 700 "$DEV_DIR/cleanup.sh"

@@ -1,8 +1,10 @@
 """Scripted LiveKit caller: python caller.py ROOM 'question@delay::answer-regex' ..."""
 
 import asyncio
+import math
 import os
 import re
+import struct
 import sys
 import time
 import wave
@@ -12,6 +14,11 @@ from typing import Any
 RATE = 24000
 FRAME_SAMPLES = RATE // 100
 MAX_ANSWER_SECONDS = 30
+MAX_CAPTURE_SECONDS = 120
+ANSWER_START_TIMEOUT_SECONDS = 30
+ANSWER_END_SILENCE_SECONDS = 20
+ANSWER_RMS_THRESHOLD = 200
+END_DRAIN_SECONDS = 0.1
 READINESS_TIMEOUT_SECONDS = 15
 MICROPHONE_SETTLE_SECONDS = 3.0
 
@@ -122,6 +129,19 @@ def _format_segments(segments: list[dict[str, Any]]) -> str:
     )
 
 
+def _frame_has_voice(frame: Any) -> bool:
+    data = bytes(frame.data)
+    if not data or len(data) % 2:
+        return False
+    samples = [sample[0] for sample in struct.iter_unpack("<h", data)]
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+    return rms >= ANSWER_RMS_THRESHOLD
+
+
+def _frame_duration(frame: Any) -> float:
+    return frame.samples_per_channel / frame.sample_rate
+
+
 async def _capture_answer(
     track_queue: asyncio.Queue[Any], ended: asyncio.Event | None = None
 ) -> tuple[bytes, int, int, float]:
@@ -147,43 +167,104 @@ async def _capture_answer(
     last_frame: Any = None
     loop = asyncio.get_running_loop()
     try:
-        no_frame_deadline = loop.time() + MAX_ANSWER_SECONDS
+        no_frame_deadline = loop.time() + min(ANSWER_START_TIMEOUT_SECONDS, MAX_CAPTURE_SECONDS)
+        capture_started_at = 0.0
+        capture_deadline = 0.0
+        answer_start_deadline = 0.0
+        answer_window_deadline = 0.0
+        last_voice_at = 0.0
+        captured_seconds = 0.0
+        heard_voice = False
+        trailing_silence = 0.0
         while True:
-            remaining = (
-                max(0.0, no_frame_deadline - loop.time())
-                if capture_started is None
-                else max(0.0, capture_deadline - loop.time())
-            )
+            if capture_started is None:
+                deadline = no_frame_deadline
+            elif not heard_voice:
+                deadline = min(capture_deadline, answer_start_deadline)
+            else:
+                idle_completion_deadline = max(
+                    answer_window_deadline,
+                    last_voice_at + ANSWER_END_SILENCE_SECONDS,
+                )
+                elapsed = max(captured_seconds, loop.time() - capture_started_at)
+                quiet = max(trailing_silence, loop.time() - last_voice_at)
+                if elapsed >= MAX_ANSWER_SECONDS and quiet >= ANSWER_END_SILENCE_SECONDS:
+                    break
+                deadline = min(capture_deadline, idle_completion_deadline)
+            remaining = max(0.0, deadline - loop.time())
             try:
                 if ended is None:
                     event = await asyncio.wait_for(audio_stream.__anext__(), timeout=remaining)
                 else:
                     next_task = asyncio.create_task(audio_stream.__anext__())
-                    ended_task = asyncio.create_task(ended.wait())
-                    done, pending = await asyncio.wait(
-                        (next_task, ended_task),
-                        timeout=remaining,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    if next_task not in done:
-                        break
-                    event = next_task.result()
-            except (TimeoutError, StopAsyncIteration):
+                    if ended.is_set():
+                        try:
+                            event = await asyncio.wait_for(next_task, timeout=min(remaining, END_DRAIN_SECONDS))
+                        except TimeoutError:
+                            break
+                    else:
+                        ended_task = asyncio.create_task(ended.wait())
+                        done, pending = await asyncio.wait(
+                            (next_task, ended_task),
+                            timeout=remaining,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if next_task in done:
+                            ended_task.cancel()
+                            await asyncio.gather(ended_task, return_exceptions=True)
+                            event = next_task.result()
+                        elif ended_task in done:
+                            try:
+                                event = await asyncio.wait_for(next_task, timeout=END_DRAIN_SECONDS)
+                            except TimeoutError:
+                                next_task.cancel()
+                                await asyncio.gather(next_task, return_exceptions=True)
+                                break
+                        else:
+                            for task in pending:
+                                task.cancel()
+                            await asyncio.gather(*pending, return_exceptions=True)
+                            if capture_started is None:
+                                break
+                            if loop.time() >= capture_deadline:
+                                raise RuntimeError("agent audio capture exceeded its deadline")
+                            if not heard_voice:
+                                raise RuntimeError("agent audio response did not start before its deadline")
+                            break
+            except TimeoutError as error:
+                if capture_started is None:
+                    break
+                if loop.time() >= capture_deadline:
+                    raise RuntimeError("agent audio capture exceeded its deadline") from error
+                if not heard_voice:
+                    raise RuntimeError("agent audio response did not start before its deadline") from error
+                break
+            except StopAsyncIteration:
                 break
             last_frame = event.frame
             if capture_started is None:
                 capture_started = time.monotonic()
-                capture_deadline = loop.time() + MAX_ANSWER_SECONDS
+                capture_started_at = loop.time()
+                capture_deadline = capture_started_at + MAX_CAPTURE_SECONDS
+                answer_start_deadline = capture_started_at + ANSWER_START_TIMEOUT_SECONDS
+                answer_window_deadline = capture_started_at + MAX_ANSWER_SECONDS
+            frame_seconds = _frame_duration(last_frame)
+            captured_seconds += frame_seconds
             frames.append(bytes(last_frame.data))
+            if _frame_has_voice(last_frame):
+                heard_voice = True
+                last_voice_at = loop.time()
+                trailing_silence = 0.0
+            elif heard_voice:
+                trailing_silence += frame_seconds
     finally:
         await audio_stream.aclose()
         if ended is None or not ended.is_set():
             track_queue.put_nowait(track)
     if not frames or capture_started is None or last_frame is None:
         raise RuntimeError("agent audio track produced no frames")
+    if not heard_voice:
+        raise RuntimeError("agent audio track produced no speech")
     return b"".join(frames), last_frame.sample_rate, last_frame.num_channels, capture_started
 
 
