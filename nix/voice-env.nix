@@ -16,8 +16,10 @@ let
 
   turnDetectorModelRevision = "v0.4.1-intl";
   turnDetectorModelCommit = "87e35fcb1e60a569bea70346191c4886ea92e281";
-  turnDetectorModelFile = name: hash: pkgs.fetchurl {
-    url = "https://huggingface.co/livekit/turn-detector/resolve/${turnDetectorModelRevision}/${name}";
+  turnDetectorEnglishModelRevision = "v1.2.2-en";
+  turnDetectorEnglishModelCommit = "ebcab0c09c2b62d926e92180d364df3aaae68a09";
+  turnDetectorModelFile = commit: name: hash: pkgs.fetchurl {
+    url = "https://huggingface.co/livekit/turn-detector/resolve/${commit}/${name}";
     inherit hash;
   };
   turnDetectorModelFiles = [
@@ -31,14 +33,30 @@ let
     { name = "tokenizer_config.json"; hash = "sha256-g99shhBsfzMplbPEVrxqQkzEbuNIv04K4bVBDGP0OT8="; }
     { name = "vocab.json"; hash = "sha256-yhDX6fs+0YV13R4neiV5wW0QjjLydDloSvoOELFECRA="; }
   ];
-  turnDetectorModel = pkgs.runCommand "livekit-turn-detector-model-${turnDetectorModelRevision}" { } ''
+  turnDetectorEnglishModelFiles = [
+    { name = "added_tokens.json"; hash = "sha256-gxw+tCvLjdPrRK2qQyH7cMdxyFZ99kSgJ/GXBpiaMBU="; }
+    { name = "config.json"; hash = "sha256-MNKKIZtlrt9gJrJM/p4PfkRbIN5Gn5BT8hh5ndxkQG4="; }
+    { name = "languages.json"; hash = "sha256-lz1RNjRPagmZVAOGvC9cJFIJBgQsNJyrfcbtRkEe5oE="; }
+    { name = "merges.txt"; hash = "sha256-C1Toqk5T1Tg+LkvGNaVrQ/lkf3sTgy1dns2PgtrE9RA="; }
+    { name = "onnx/model_q8.onnx"; hash = "sha256-/daVqZvaARVfsLXOcdNMuf05AsYkltt6bCx73qwxCsc="; }
+    { name = "special_tokens_map.json"; hash = "sha256-DC0lzahERhC73vALBN+JMzK1bZdzdE4zmdvXuPetqHc="; }
+    { name = "tokenizer.json"; hash = "sha256-bw3EsTBrGxfaRrVbaWyPVLp8sFobkdxSb9FD8x6IL8s="; }
+    { name = "tokenizer_config.json"; hash = "sha256-05YHX7h0pTRM4T2/zcDn+2RgXGdrR/+NmC4r5GinXiA="; }
+    { name = "vocab.json"; hash = "sha256-grhAEuOt1NAdEroURCAm5JuMu66tH3ns89kZeE+C3Hk="; }
+  ];
+  turnDetectorModel = pkgs.runCommand "livekit-turn-detector-models" { } ''
     cache="$out/hub/models--livekit--turn-detector"
     snapshot="$cache/snapshots/${turnDetectorModelCommit}"
-    mkdir -p "$snapshot" "$cache/refs"
+    englishSnapshot="$cache/snapshots/${turnDetectorEnglishModelCommit}"
+    mkdir -p "$snapshot" "$englishSnapshot" "$cache/refs"
     printf '%s' "${turnDetectorModelCommit}" > "$cache/refs/${turnDetectorModelRevision}"
+    printf '%s' "${turnDetectorEnglishModelCommit}" > "$cache/refs/${turnDetectorEnglishModelRevision}"
     ${builtins.concatStringsSep "\n" (map (asset: ''
-      install -D "${turnDetectorModelFile asset.name asset.hash}" "$snapshot/${asset.name}"
+      install -D "${turnDetectorModelFile turnDetectorModelCommit asset.name asset.hash}" "$snapshot/${asset.name}"
     '') turnDetectorModelFiles)}
+    ${builtins.concatStringsSep "\n" (map (asset: ''
+      install -D "${turnDetectorModelFile turnDetectorEnglishModelCommit asset.name asset.hash}" "$englishSnapshot/${asset.name}"
+    '') turnDetectorEnglishModelFiles)}
   '';
 
   # Two of the wheels below are cp314 ABI-tagged. Nothing downstream would
@@ -451,34 +469,119 @@ assert pythonVersionOk;
   livekit-plugins-turn-detector
 ])).overrideAttrs
   (old: {
+    nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.makeWrapper ];
+
     # Nix builds are sandboxed without network access, so loading the VAD here
     # is what proves silero_vad.onnx is read out of the store rather than
     # downloaded on first use. A regression would otherwise only surface as a
     # hang on the deploy host, with no route to the network to recover.
     postBuild = (old.postBuild or "") + ''
       echo "checking the voice env resolves offline..."
-      mv "$out/bin/python3.14" "$out/bin/python3.14.unwrapped"
-      cat > "$out/bin/python3.14" <<'SH'
-      #!/bin/sh
-      export HF_HUB_CACHE="''${HF_HUB_CACHE:-${turnDetectorModel}/hub}"
-      exec "$(dirname "$0")/python3.14.unwrapped" "$@"
-      SH
-      chmod +x "$out/bin/python3.14"
-      HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 $out/bin/python - <<'PY'
+      wrapProgram "$out/bin/python3.14" --set HF_HUB_CACHE "${turnDetectorModel}/hub"
+      # LiveKit's forkserver uses sys.executable directly, bypassing this wrapper.
+      # Set the cache from site startup so every interpreter finds packaged weights.
+      cat > "$out/lib/python3.14/site-packages/livekit-model-cache.pth" <<'PY'
+      import os; os.environ["HF_HUB_CACHE"] = "${turnDetectorModel}/hub"
+      PY
+      mkdir -p "$TMPDIR/clean-home" "$TMPDIR/clean-cache"
+      env -i HOME="$TMPDIR/clean-home" XDG_CACHE_HOME="$TMPDIR/clean-cache" PATH="${pkgs.coreutils}/bin" "$out/bin/python" - <<'PY'
+      import asyncio
       import json
+      import os
+      import subprocess
+      import sys
+      import textwrap
       from importlib.resources import files
       from pathlib import Path
 
+      os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+
       import livekit.agents
       from huggingface_hub import hf_hub_download
+      from livekit.agents.testing import fake_job_context
       from livekit.plugins import dtln, elevenlabs, silero
-      from livekit.plugins.turn_detector.multilingual import _EUORunnerMultilingual
+      from livekit.plugins.turn_detector.multilingual import MultilingualModel, _EUORunnerMultilingual
 
       assert livekit.agents.__version__.startswith("1.8."), livekit.agents.__version__
-      detector = _EUORunnerMultilingual()
-      detector.initialize()
-      assert detector._session is not None
-      assert detector._tokenizer is not None
+
+      async def construct_multilingual_model():
+          with fake_job_context():
+              return MultilingualModel()
+
+      detector = asyncio.run(construct_multilingual_model())
+      assert isinstance(detector, MultilingualModel)
+      runner = _EUORunnerMultilingual()
+      runner.initialize()
+      assert runner._session is not None
+      assert runner._tokenizer is not None
+      assert Path(sys.executable).name == ".python3.14-wrapped", sys.executable
+      subprocess.run(
+          [
+              "${pkgs.coreutils}/bin/env",
+              "-i",
+              f"HOME={os.environ['HOME']}",
+              f"XDG_CACHE_HOME={os.environ['XDG_CACHE_HOME']}",
+              f"PATH={os.environ['PATH']}",
+              sys.executable,
+              "-c",
+              textwrap.dedent(
+                  """
+                  import asyncio
+                  import json
+                  import os
+                  from multiprocessing import get_context
+
+                  os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+                  from livekit.agents.inference_runner import _InferenceRunner
+                  from livekit.agents.ipc.inference_proc_executor import InferenceProcExecutor
+                  from livekit.agents.testing import fake_job_context
+                  from livekit.plugins.turn_detector.english import EnglishModel
+                  from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+                  async def main():
+                      cache_dir = os.environ["HF_HUB_CACHE"]
+                      os.environ.pop("HF_HUB_CACHE", None)
+                      runners = _InferenceRunner.registered_runners
+                      required_runners = {"lk_end_of_utterance_en", "lk_end_of_utterance_multilingual"}
+                      assert required_runners <= runners.keys(), runners.keys()
+                      executor = InferenceProcExecutor(
+                          runners=runners,
+                          initialize_timeout=120,
+                          close_timeout=5,
+                          memory_warn_mb=0,
+                          memory_limit_mb=0,
+                          ping_interval=30,
+                          ping_timeout=30,
+                          high_ping_threshold=10,
+                          mp_ctx=get_context("forkserver"),
+                          loop=asyncio.get_running_loop(),
+                          http_proxy=None,
+                      )
+                      await executor.start()
+                      try:
+                          await executor.initialize()
+                          os.environ["HF_HUB_CACHE"] = cache_dir
+                          with fake_job_context(inference_executor=executor):
+                              detector = MultilingualModel()
+                              english_detector = EnglishModel()
+                          assert isinstance(detector, MultilingualModel)
+                          assert isinstance(english_detector, EnglishModel)
+                          for runner_name in runners:
+                              response = await executor.do_inference(
+                                  runner_name,
+                                  json.dumps({"chat_ctx": [{"role": "user", "content": "hello there"}]}).encode(),
+                              )
+                              assert response is not None, runner_name
+                              assert json.loads(response)["eou_probability"] >= 0, runner_name
+                      finally:
+                          await executor.aclose()
+
+                  asyncio.run(main())
+                  """
+              ),
+          ],
+          check=True,
+      )
       languages = hf_hub_download(
           "livekit/turn-detector", "languages.json", revision="${turnDetectorModelRevision}",
           local_files_only=True,

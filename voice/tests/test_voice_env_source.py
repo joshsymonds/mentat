@@ -35,9 +35,39 @@ class VoiceEnvironmentSourceContractTest(unittest.TestCase):
         self.assertIn('name = "onnx/model_q8.onnx";', source)
         self.assertIn('name = "languages.json";', source)
         self.assertIn('name = "tokenizer.json";', source)
-        self.assertIn("HF_HUB_CACHE=", source)
-        self.assertIn("HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1", source)
-        self.assertIn("detector.initialize()", source)
+        self.assertIn('turnDetectorEnglishModelRevision = "v1.2.2-en";', source)
+        self.assertIn('turnDetectorEnglishModelCommit = "ebcab0c09c2b62d926e92180d364df3aaae68a09";', source)
+        self.assertIn("turnDetectorEnglishModelFiles", source)
+        self.assertIn("--set HF_HUB_CACHE", source)
+        self.assertIn('os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")', source)
+        self.assertIn("runner.initialize()", source)
+
+    def test_interpreter_wrapper_and_offline_detector_proof_are_isolated(self):
+        source = (Path(__file__).resolve().parents[2] / "nix" / "voice-env.nix").read_text()
+
+        self.assertIn("pkgs.makeWrapper", source)
+        self.assertNotIn('$(dirname "$0")', source)
+        self.assertIn(
+            "from livekit.plugins.turn_detector.multilingual import MultilingualModel, _EUORunnerMultilingual",
+            source,
+        )
+        self.assertIn("return MultilingualModel()", source)
+        self.assertIn("runner = _EUORunnerMultilingual()", source)
+        self.assertIn("runner.initialize()", source)
+        self.assertIn("subprocess.run(", source)
+        self.assertIn('cat > "$out/lib/python3.14/site-packages/livekit-model-cache.pth"', source)
+        self.assertIn('os.environ["HF_HUB_CACHE"] = "${turnDetectorModel}/hub"', source)
+        self.assertIn('"${pkgs.coreutils}/bin/env"', source)
+        self.assertIn('Path(sys.executable).name == ".python3.14-wrapped"', source)
+        self.assertIn("InferenceProcExecutor", source)
+        self.assertIn('get_context("forkserver")', source)
+        self.assertIn("executor.do_inference(", source)
+        self.assertIn("runners = _InferenceRunner.registered_runners", source)
+        self.assertIn('required_runners = {"lk_end_of_utterance_en", "lk_end_of_utterance_multilingual"}', source)
+        self.assertIn("for runner_name in runners:", source)
+        self.assertIn('os.environ.pop("HF_HUB_CACHE", None)', source)
+        self.assertRegex(source, r'env -i .*HOME=.*XDG_CACHE_HOME=.*PATH=.*"\$out/bin/python"')
+        self.assertIn('os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")', source)
 
     def test_elevenlabs_plugin_is_pinned_in_the_production_interpreter(self):
         source = (Path(__file__).resolve().parents[2] / "nix" / "voice-env.nix").read_text()
