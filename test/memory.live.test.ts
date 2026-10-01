@@ -153,7 +153,7 @@ async function collect(events: AsyncIterable<Event>): Promise<Event[]> {
 function completedResult(events: Event[]): Extract<Event, { kind: 'done' }>['result'] {
   const done = events.at(-1);
   if (done?.kind !== 'done') throw new Error('live turn did not end in done');
-  expect(done.result.isError).toBe(false);
+  expect(done.result.isError, `stop=${done.result.stopReason} costUsd=${String(done.result.costUsd)}`).toBe(false);
   return done.result;
 }
 
@@ -265,7 +265,7 @@ describe('memory live evidence', () => {
         const config: ClaudeCodeConfig = {
           bin,
           model,
-          maxBudgetUsd: 0.5,
+          maxBudgetUsd: 5,
           statePath,
           policy: allowAllPolicy(nullLogger),
           logger: nullLogger,
