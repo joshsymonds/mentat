@@ -1769,14 +1769,21 @@ class AgentSourceContractTest(unittest.TestCase):
         class Resolver:
             def __init__(self):
                 self.calls = []
+                self.spanish_voice = "library-spanish"
 
             def resolve(self, language, default_voice):
                 self.calls.append((language, default_voice))
-                return {"es": "library-spanish", "en": "saved-english"}.get(
+                return {"es": self.spanish_voice, "en": "saved-english"}.get(
                     language, default_voice
                 )
 
-        namespace = {"json": json, "re": re, "logger": Mock()}
+        namespace = {
+            "json": json,
+            "re": re,
+            "time": time,
+            "write_voice_trace": Mock(),
+            "logger": Mock(),
+        }
         exec(compile(ast.Module(body=[apply_mode], type_ignores=[]), str(agent_path), "exec"), namespace)
 
         def make_agent(tts=None):
@@ -1789,6 +1796,8 @@ class AgentSourceContractTest(unittest.TestCase):
                 _stt=Provider(),
                 _tts=tts or Provider(),
                 _voice_resolver=resolver,
+                _traced_voices=None,
+                _room_name="synthetic-room",
                 _voice_mode_note=None,
             )
 
@@ -1821,6 +1830,13 @@ class AgentSourceContractTest(unittest.TestCase):
             agent._tts.calls[-1], {"voice_id": "default-voice", "language": "en"}
         )
 
+        agent._voice_resolver.spanish_voice = "hand-edited-spanish"
+        self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, spanish)))
+        self.assertEqual(agent._voice_id, "hand-edited-spanish")
+        self.assertEqual(agent._tts.calls[-1], {"voice_id": "hand-edited-spanish", "language": "es"})
+        self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")] * 2)
+        self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, restore)))
+
         calls_before_invalid = (len(agent._stt.calls), len(agent._tts.calls))
         self.assertFalse(
             asyncio.run(namespace["_apply_voice_mode"](
@@ -1846,6 +1862,167 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         self.assertTrue(failed._voice_mode_note)
         self.assertLessEqual(len(failed._voice_mode_note), 160)
+
+    def test_eval_voice_trace_records_switches_and_actual_reply_synthesis(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        methods = [
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name in {"_apply_voice_mode", "_speak_turn"}
+        ]
+        trace = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "write_voice_trace"
+        )
+
+        class Provider:
+            def __init__(self):
+                self.options = {"voice_id": "default-voice", "language": "en"}
+
+            def update_options(self, **options):
+                self.options.update(options)
+
+        class Resolver:
+            def __init__(self):
+                self.calls = []
+
+            def resolve(self, language, default_voice):
+                self.calls.append((language, default_voice))
+                return "library-spanish" if language == "es" else default_voice
+
+        class SpeechHandle:
+            interrupted = False
+
+            def __init__(self, task):
+                self.task = task
+
+            async def wait_for_playout(self):
+                await self.task
+
+            def interrupt(self):
+                self.task.cancel()
+
+            def exception(self):
+                return None
+
+        class Session:
+            def __init__(self, tts_provider):
+                self.tts_provider = tts_provider
+                self.calls = []
+
+            def say(self, source, *, allow_interruptions):
+                self.calls.append((dict(self.tts_provider.options), allow_interruptions))
+
+                async def consume():
+                    async for _text in source:
+                        pass
+
+                return SpeechHandle(asyncio.create_task(consume()))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            trace_path = Path(temporary) / "voice.jsonl"
+            trace_namespace = {
+                "os": os,
+                "json": json,
+                "time": time,
+                "Path": Path,
+                "logger": Mock(),
+            }
+            exec(compile(ast.Module(body=[trace], type_ignores=[]), str(agent_path), "exec"), trace_namespace)
+            namespace = {
+                "AsyncGenerator": __import__("collections.abc").abc.AsyncGenerator,
+                "asyncio": asyncio,
+                "json": json,
+                "re": re,
+                "time": time,
+                "uuid4": iter(
+                    SimpleNamespace(hex=f"reply-{index}") for index in range(1, 4)
+                ).__next__,
+                "AudioConfig": lambda *_args, **_kwargs: object(),
+                "EARCON_PATH": Path("earcon.wav"),
+                "logger": Mock(),
+                "write_voice_trace": trace_namespace["write_voice_trace"],
+            }
+            exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+            tts_provider = Provider()
+            resolver = Resolver()
+
+            async def backend_text(_question, _turn_id, _chat_ctx):
+                yield "Reply."
+
+            agent = SimpleNamespace(
+                _voice_mode="normal",
+                _voice_language="en",
+                _voice_id="default-voice",
+                _default_voice="default-voice",
+                _stt=Provider(),
+                _tts=tts_provider,
+                _voice_resolver=resolver,
+                _traced_voices={},
+                _room_name="synthetic-room",
+                _voice_mode_note=None,
+                _voice_trace_enabled=True,
+                _voice_reply_number=0,
+                _ending_policy=SimpleNamespace(delegation_started=Mock()),
+                _ending_changed=Mock(),
+                _background=SimpleNamespace(play=Mock()),
+                _backend_text=backend_text,
+                session=Session(tts_provider),
+            )
+            async def speak():
+                await namespace["_speak_turn"](agent, "synthetic request", SimpleNamespace(items=[]))
+
+            with patch.dict(os.environ, {"MENTAT_EVAL_VOICE_LOG": str(trace_path)}, clear=True):
+                asyncio.run(speak())
+                self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](
+                    agent, '{"voice_mode":{"mode":"conversation","language":"es"}}'
+                )))
+                asyncio.run(speak())
+                self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](
+                    agent, '{"voice_mode":{"mode":"normal","language":"en"}}'
+                )))
+                self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](
+                    agent, '{"voice_mode":{"mode":"conversation","language":"es"}}'
+                )))
+                asyncio.run(speak())
+
+            self.assertEqual(
+                [options for options, _ in agent.session.calls],
+                [
+                    {"voice_id": "default-voice", "language": "en"},
+                    {"voice_id": "library-spanish", "language": "es"},
+                    {"voice_id": "library-spanish", "language": "es"},
+                ],
+            )
+            self.assertEqual(resolver.calls, [("es", "default-voice")] * 2)
+            events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+            modes = [event for event in events if event["event"] == "mode"]
+            speech = [event for event in events if event["event"] == "speech"]
+            self.assertEqual([event["language"] for event in modes], ["es", "en", "es"])
+            self.assertEqual(modes[0]["selection"], "resolved")
+            self.assertEqual(modes[2]["selection"], "reused")
+            self.assertTrue(all(isinstance(event["lookup_ms"], (int, float)) for event in modes))
+            self.assertEqual(
+                [(event["reply"], event["language"], event["voice_id"]) for event in speech],
+                [
+                    (1, "en", "default-voice"),
+                    (2, "es", "library-spanish"),
+                    (3, "es", "library-spanish"),
+                ],
+            )
+            self.assertTrue(all(event["room"] == "synthetic-room" for event in events))
+
+            with patch.dict(os.environ, {}, clear=True):
+                trace_namespace["write_voice_trace"](
+                    "synthetic-room", "speech", mode="normal", language="en",
+                    voice_id="default-voice", reply=4,
+                )
+            self.assertEqual(len(trace_path.read_text().splitlines()), 6)
 
     def test_voice_mode_defaults_and_request_use_active_call_mode(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
@@ -1992,6 +2169,7 @@ class AgentSourceContractTest(unittest.TestCase):
             "TurnDone": FakeTurnDone,
             "TurnFailure": type("FakeTurnFailure", (), {}),
             "time": time,
+            "write_voice_trace": Mock(),
         }
         exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
         agent = SimpleNamespace(
@@ -2003,6 +2181,7 @@ class AgentSourceContractTest(unittest.TestCase):
             _default_voice="default-voice",
             _voice_mode_note=None,
             _voice_resolver=Resolver(),
+            _traced_voices=None,
             _stt=Provider(),
             _tts=Provider(),
             _room_name="call-one",
