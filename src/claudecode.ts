@@ -16,6 +16,7 @@ import { shouldDenyFileTool } from './file-guard.ts';
 import type { Logger } from './log.ts';
 import type { CallContext, PolicyFn, TurnContext } from './policy.ts';
 import { Translator } from './translate.ts';
+import { writeUpPrompt, writeUpToolDecision } from './writeup.ts';
 
 /**
  * With no operator tool policy at all (neither allow nor disallow lists),
@@ -53,10 +54,12 @@ const ABANDON_TIMEOUT_MS = 10_000;
  * stream to reach that tool_use block before allowing the call anyway.
  */
 const END_CONVERSATION_OBSERVE_TIMEOUT_MS = 2_000;
+const WRITE_UP_TIMEOUT_MS = 5 * 60 * 1_000;
 
 /** The slice of the SDK's query() the backend consumes — injectable in tests. */
 interface QueryHandle extends AsyncIterable<unknown> {
   interrupt(): Promise<void>;
+  close(): void;
 }
 
 export type QueryFn = (args: {
@@ -74,8 +77,8 @@ export interface ClaudeCodeConfig {
   effort?: Options['effort'];
   /** Replaces the CLI's system prompt when set. */
   systemPrompt?: string;
-  /** Everyday memory index source; records are read only when a child starts. */
-  memory?: { index(): Promise<string> };
+  /** Everyday memory source for the spawn-time index and idle write-up. */
+  memory?: { index(): Promise<string>; tombstones?(): Promise<string> };
   /** Configured memory directory, retained for startup composition. */
   memoryDir?: string;
   /** Explicit MCP server map; nothing else is reachable (strictMcpConfig). */
@@ -524,6 +527,11 @@ interface Session {
   /** Reset at each turn start with the context; fed from the stream. */
   toolUses: ToolUseOrder;
   recorder: Recorder;
+  options: Options;
+  completedTurns: number;
+  lastSurface?: string;
+  lastResult?: { sessionId: string };
+  writeUpTask?: Promise<void>;
   dead: boolean;
   closed: boolean;
 }
@@ -534,6 +542,21 @@ function userMessage(text: string): SDKUserMessage {
     message: { role: 'user', content: [{ type: 'text', text }] },
     parent_tool_use_id: null,
     session_id: '',
+  };
+}
+
+function oneMessagePrompt(text: string): AsyncIterable<SDKUserMessage> {
+  return {
+    [Symbol.asyncIterator]: () => {
+      let sent = false;
+      return {
+        next: (): Promise<IteratorResult<SDKUserMessage>> => {
+          if (sent) return Promise.resolve({ value: undefined, done: true });
+          sent = true;
+          return Promise.resolve({ value: userMessage(text), done: false });
+        },
+      };
+    },
   };
 }
 
@@ -569,6 +592,37 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
   return Promise.race([promise, timeout]).finally(() => {
     clearTimeout(timer);
   });
+}
+
+interface WriteUpMetrics {
+  outcome: string;
+  costUsd: number;
+  cacheReadInputTokens: number;
+}
+
+function writeUpMetrics(message: unknown): WriteUpMetrics | undefined {
+  if (typeof message !== 'object' || message === null || Array.isArray(message)) {
+    return undefined;
+  }
+  const record = message as Record<string, unknown>;
+  const usage = record.usage;
+  if (
+    record.type !== 'result' ||
+    typeof record.subtype !== 'string' ||
+    typeof record.is_error !== 'boolean' ||
+    typeof record.total_cost_usd !== 'number' ||
+    typeof usage !== 'object' ||
+    usage === null ||
+    Array.isArray(usage)
+  ) {
+    return undefined;
+  }
+  const cacheRead = (usage as Record<string, unknown>).cache_read_input_tokens;
+  return {
+    outcome: record.is_error ? 'error' : record.subtype,
+    costUsd: record.total_cost_usd,
+    cacheReadInputTokens: typeof cacheRead === 'number' ? cacheRead : 0,
+  };
 }
 
 export class ClaudeCode implements Backend {
@@ -647,6 +701,11 @@ export class ClaudeCode implements Backend {
       return this.startTurn(turn);
     }
     session.context.current = { sessionId: turn.sessionId, meta: turn.meta ?? {} };
+    if (turn.meta?.surface !== undefined) {
+      session.lastSurface = turn.meta.surface;
+    } else {
+      delete session.lastSurface;
+    }
     session.toolUses.reset();
     session.queue.push(userMessage(turn.text));
     return { session, release };
@@ -700,6 +759,8 @@ export class ClaudeCode implements Backend {
         for (const event of this.translateAndLog(sessionId, session, next.value)) {
           if (event.kind === 'done') {
             sawDone = true;
+            session.completedTurns += 1;
+            session.lastResult = { sessionId: event.result.sessionId };
             this.recordResume(sessionId, event.result.sessionId);
           }
           yield event;
@@ -773,6 +834,114 @@ export class ClaudeCode implements Backend {
     this.dropSession(sessionId, session);
   }
 
+  /** Runs a private, bounded summary turn on a fork of the completed session. */
+  private async writeUp(sessionId: string, session: Session): Promise<void> {
+    const memory = this.config.memory;
+    const originalSessionId = session.lastResult?.sessionId;
+    if (
+      memory?.tombstones === undefined ||
+      session.completedTurns === 0 ||
+      session.context.current !== null ||
+      originalSessionId === undefined ||
+      originalSessionId === '' ||
+      session.lastSurface === 'claude.ai' ||
+      session.lastSurface === 'claude_ai'
+    ) {
+      return;
+    }
+
+    const deadline = Date.now() + WRITE_UP_TIMEOUT_MS;
+    const remaining = (): number => Math.max(1, deadline - Date.now());
+    let handle: QueryHandle | undefined;
+    try {
+      const [index, tombstones] = await Promise.all([
+        withTimeout(memory.index(), remaining(), 'memory write-up'),
+        withTimeout(memory.tombstones(), remaining(), 'memory write-up'),
+      ]);
+      const options: Options = {
+        ...session.options,
+        resume: originalSessionId,
+        forkSession: true,
+        canUseTool: (toolName, input) => {
+          const decision = writeUpToolDecision(toolName, input, tombstones);
+          return Promise.resolve(
+            decision.behavior === 'allow'
+              ? { behavior: 'allow', updatedInput: decision.updatedInput }
+              : { behavior: 'deny', message: decision.message },
+          );
+        },
+        hooks: {
+          ...(session.options.hooks ?? {}),
+          PreToolUse: [
+            ...(session.options.hooks?.PreToolUse ?? []),
+            {
+              hooks: [(input) => {
+                if (input.hook_event_name !== 'PreToolUse') return Promise.resolve({});
+                const toolInput =
+                  typeof input.tool_input === 'object' &&
+                  input.tool_input !== null &&
+                  !Array.isArray(input.tool_input)
+                    ? input.tool_input as Record<string, unknown>
+                    : {};
+                const decision = writeUpToolDecision(input.tool_name, toolInput, tombstones);
+                return Promise.resolve(
+                  decision.behavior === 'allow'
+                    ? {}
+                    : {
+                        hookSpecificOutput: {
+                          hookEventName: 'PreToolUse',
+                          permissionDecision: 'deny',
+                          permissionDecisionReason: decision.message,
+                        },
+                      },
+                );
+              }],
+            },
+          ],
+        },
+      };
+      handle = this.queryFn({ prompt: oneMessagePrompt(writeUpPrompt(index, tombstones)), options });
+      const iterator = handle[Symbol.asyncIterator]();
+      let metrics: WriteUpMetrics | undefined;
+      for (;;) {
+        const next = await withTimeout(iterator.next(), remaining(), 'memory write-up');
+        if (next.done === true) break;
+        metrics = writeUpMetrics(next.value) ?? metrics;
+      }
+      if (metrics === undefined) {
+        throw new Error('claudecode: memory write-up ended without a result');
+      }
+      const fields = {
+        session_id: sessionId,
+        outcome: metrics.outcome,
+        cost_usd: metrics.costUsd,
+        cache_read_input_tokens: metrics.cacheReadInputTokens,
+      };
+      if (metrics.outcome === 'error') {
+        this.logger.error('claudecode: memory write-up failed', fields);
+      } else {
+        this.logger.info('claudecode: memory write-up finished', fields);
+      }
+    } catch (error) {
+      const timedOut = Date.now() >= deadline;
+      if (timedOut && handle !== undefined) {
+        try {
+          handle.close();
+        } catch (closeError) {
+          this.logger.warn('claudecode: memory write-up close failed', {
+            session_id: sessionId,
+            error: String(closeError),
+          });
+        }
+      }
+      this.logger.error('claudecode: memory write-up failed', {
+        session_id: sessionId,
+        outcome: timedOut ? 'timeout' : 'error',
+        error: String(error),
+      });
+    }
+  }
+
   /** Marks a session dead and releases its resources. The resume uuid is
    * retained, so the conversation survives into the next spawn. */
   private dropSession(sessionId: string, session: Session, closed = false): void {
@@ -783,13 +952,56 @@ export class ClaudeCode implements Backend {
     session.recorder.close();
   }
 
-  async closeSession(sessionId: string): Promise<void> {
+  /** Ends the SDK iterator before a fork can resume the same CLI session. */
+  private async waitForSessionClose(sessionId: string, session: Session): Promise<boolean> {
+    let pending: Promise<IteratorResult<unknown>> | undefined;
+    const drain = async (deadline: number): Promise<boolean> => {
+      for (let drained = 0; drained < ABANDON_DRAIN_LIMIT; drained += 1) {
+        pending ??= session.iterator.next();
+        const next = await withTimeout(
+          pending,
+          Math.max(1, deadline - Date.now()),
+          'session close',
+        );
+        pending = undefined;
+        if (next.done === true) return true;
+      }
+      return false;
+    };
+
+    try {
+      if (await drain(Date.now() + ABANDON_TIMEOUT_MS)) return true;
+      throw new Error('claudecode: session close drain exhausted');
+    } catch (error) {
+      this.logger.warn('claudecode: waiting for child close failed', {
+        session_id: sessionId,
+        error: String(error),
+      });
+      try {
+        await withTimeout(session.handle.interrupt(), ABANDON_TIMEOUT_MS, 'session close interrupt');
+        if (await drain(Date.now() + ABANDON_TIMEOUT_MS)) return true;
+      } catch (interruptError) {
+        this.logger.warn('claudecode: child close interrupt failed', {
+          session_id: sessionId,
+          error: String(interruptError),
+        });
+      }
+      return false;
+    }
+  }
+
+  async closeSession(sessionId: string, options?: { writeUp?: boolean }): Promise<void> {
     this.closing.add(sessionId);
     try {
       await this.starting.get(sessionId)?.catch(() => undefined);
       const session = this.sessions.get(sessionId);
       if (session !== undefined) {
         this.dropSession(sessionId, session, true);
+        if (options?.writeUp === true && await this.waitForSessionClose(sessionId, session)) {
+          this.closing.delete(sessionId);
+          session.writeUpTask ??= this.writeUp(sessionId, session);
+          await session.writeUpTask;
+        }
       }
     } finally {
       this.closing.delete(sessionId);
@@ -893,6 +1105,8 @@ export class ClaudeCode implements Backend {
       context,
       toolUses,
       recorder: makeRecorder(this.config.recordDir, sessionId, this.logger),
+      options,
+      completedTurns: 0,
       dead: false,
       closed: false,
     };
