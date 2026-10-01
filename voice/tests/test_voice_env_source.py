@@ -1,11 +1,52 @@
 """Source contract for the packaged LiveKit voice environment."""
 
+import ast
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
 
+def _local_agent_modules(agent: ast.AST, voice_dir: Path) -> set[str]:
+    names = set()
+    for node in ast.walk(agent):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+        elif isinstance(node, ast.Import):
+            names.update(alias.name.split(".", 1)[0] for alias in node.names)
+    return {module for module in names if (voice_dir / f"{module}.py").is_file()}
+
+
 class VoiceEnvironmentSourceContractTest(unittest.TestCase):
+    def test_plain_local_import_is_included_in_source_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            voice_dir = Path(temporary)
+            (voice_dir / "future_local.py").write_text("VALUE = 1\n")
+            agent = ast.parse("import future_local\n")
+            self.assertEqual(_local_agent_modules(agent, voice_dir), {"future_local"})
+    def test_every_local_agent_module_is_in_both_worker_sources(self):
+        root = Path(__file__).resolve().parents[2]
+        voice_dir = root / "voice"
+        agent = ast.parse((voice_dir / "agent.py").read_text())
+        local_modules = _local_agent_modules(agent, voice_dir)
+
+        module_paths = {f"../voice/{module}.py" for module in local_modules}
+        nix_source = (root / "nix" / "module.nix").read_text()
+        voice_source = nix_source.split("voiceSource =", 1)[1].split("# Keep the public front", 1)[0]
+        missing_production = module_paths - set(re.findall(r"\.\./voice/[A-Za-z0-9_]+\.py", voice_source))
+        self.assertFalse(missing_production, f"production voiceSource omits {sorted(missing_production)}")
+
+        dev_stack = ast.parse((voice_dir / "evals" / "dev_stack.py").read_text())
+        voice_files = next(
+            node.value
+            for node in ast.walk(dev_stack)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "voice_files" for target in node.targets)
+        )
+        staged_files = {name for name in ast.literal_eval(voice_files) if name.endswith(".py")}
+        missing_staging = {f"{module}.py" for module in local_modules} - staged_files
+        self.assertFalse(missing_staging, f"live-eval staging omits {sorted(missing_staging)}")
+
     def test_turn_detector_plugin_and_model_are_pinned_for_offline_use(self):
         source = (Path(__file__).resolve().parents[2] / "nix" / "voice-env.nix").read_text()
 

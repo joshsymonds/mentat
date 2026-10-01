@@ -769,7 +769,7 @@ class DevStack:
             text=True,
         )
         voice_files = [
-            "agent.py", "persona.md", "request.py", "stream.py", "caller.py",
+            "agent.py", "persona.md", "request.py", "stream.py", "voices.py", "caller.py",
         ]
         self._run(
             [

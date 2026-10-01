@@ -21,6 +21,7 @@
       ../voice/persona.md
       ../voice/request.py
       ../voice/stream.py
+      ../voice/voices.py
       ../voice/assets/earcon.wav
     ];
   };
