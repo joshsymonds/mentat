@@ -117,5 +117,5 @@ export type Event =
  */
 export interface Backend {
   converse(turn: Turn): Promise<AsyncIterable<Event>>;
-  closeSession(sessionId: string): Promise<void>;
+  closeSession(sessionId: string, options?: { writeUp?: boolean }): Promise<void>;
 }
