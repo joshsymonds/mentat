@@ -358,7 +358,12 @@ from pathlib import Path
 root = Path(sys.argv[1])
 archive = root / "retained-evidence.tar.gz"
 with tarfile.open(archive, "w:gz") as output:
-    for relative in ("agent.log", "voice.log", "voice/evals/delegations.jsonl"):
+    for relative in (
+        "agent.log",
+        "voice.log",
+        "voice/evals/delegations.jsonl",
+        "voice/evals/voice-modes.jsonl",
+    ):
         source = root / relative
         if source.is_file() and not source.is_symlink():
             output.add(source, arcname=relative, recursive=False)
@@ -448,6 +453,9 @@ if [ -f "$DEV_DIR/voice.pid" ]; then
   fi
   rm -f -- "$DEV_DIR/voice.pid"
 fi
+: > "$DEV_DIR/voice/evals/voice-modes.jsonl"
+chown nobody:nogroup "$DEV_DIR/voice/evals/voice-modes.jsonl"
+chmod 600 "$DEV_DIR/voice/evals/voice-modes.jsonl"
 : > "$DEV_DIR/voice/evals/delegations.jsonl"
 chown nobody:nogroup "$DEV_DIR/voice/evals/delegations.jsonl"
 chmod 600 "$DEV_DIR/voice/evals/delegations.jsonl"
@@ -473,6 +481,7 @@ voice_env.update({
     "XDG_CACHE_HOME": str(dev_dir / "home/voice/cache"),
     "MENTAT_VOICE_HTTP_PORT": str(health_port),
     "MENTAT_EVAL_DELEGATION_LOG": str(dev_dir / "voice/evals/delegations.jsonl"),
+    "MENTAT_EVAL_VOICE_LOG": str(dev_dir / "voice/evals/voice-modes.jsonl"),
     "MENTAT_VOICE_INPUT_RECORD_DIR": str(
         dev_dir / "voice/evals/retained-evidence/input-audio"
     ),
@@ -977,7 +986,12 @@ class DevStack:
                         caller_audio_names.update(f"caller-audio/{name}" for name in expected)
                 for member in members:
                     name = member.name
-                    allowed = name in {"agent.log", "voice.log", "voice/evals/delegations.jsonl"}
+                    allowed = name in {
+                        "agent.log",
+                        "voice.log",
+                        "voice/evals/delegations.jsonl",
+                        "voice/evals/voice-modes.jsonl",
+                    }
                     if name == "sms-audio/transcripts.jsonl":
                         allowed = True
                     elif name.startswith("sms-audio/"):
