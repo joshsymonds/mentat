@@ -86,7 +86,7 @@ export class MemoryStore {
       .filter((record) => record.tier === 'private' && record.text.toLowerCase().includes(keyword))
       .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
     if (matches.length === 0) return 'NO_MATCH';
-    return matches.map((record) => `## ${record.id}\n${record.text}`).join('\n');
+    return matches.map((record) => `## ${record.id} (revision: ${record.revision})\n${record.text}`).join('\n');
   }
 
   async forget(id: string, tier: Tier, fact?: string): Promise<void> {

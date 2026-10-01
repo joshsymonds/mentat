@@ -166,22 +166,34 @@ describe('MemoryStore', () => {
       header: header({ name: 'Synthetic Rowan', aliases: ['Ordinary alias'], summary: 'Everyday summary' }),
       facts: ['everyday-only phrase'], source: 'josh',
     });
-    await store.save({
+    const sage = await store.save({
       id: 'sage', tier: 'private',
       header: header({ name: 'Synthetic Sage', aliases: ['Private alias'], summary: 'Private summary' }),
       facts: ['private fact with cobalt'], source: 'josh',
     });
-    await store.save({
+    const wren = await store.save({
       id: 'wren', tier: 'private',
       header: header({ name: 'Synthetic Wren', aliases: ['Second private alias'], summary: 'Another private summary' }),
       facts: ['private fact with cobalt'], source: 'josh',
     });
 
     const result = await store.lookup('COBALT');
-    expect(result).toContain('sage');
+    expect(result).toContain(`## sage (revision: ${sage.revision})`);
     expect(result).toContain('private fact with cobalt');
-    expect(result).toContain('wren');
-    expect(result.indexOf('sage')).toBeLessThan(result.indexOf('wren'));
+    expect(result).toContain(`## wren (revision: ${wren.revision})`);
+    expect(result.indexOf('## sage')).toBeLessThan(result.indexOf('## wren'));
+    const observedRevision = /## sage \(revision: ([a-f0-9]{64})\)/.exec(result)?.[1];
+    if (observedRevision === undefined) throw new Error('private lookup omitted Sage revision');
+    const updated = await store.save({
+      id: 'sage', tier: 'private',
+      header: header({ name: 'Synthetic Sage', aliases: ['Private alias'], summary: 'Corrected private summary' }),
+      facts: ['corrected private fact with cobalt'], source: 'josh', revision: observedRevision,
+    });
+    expect(updated.revision).not.toBe(observedRevision);
+    await expect(store.save({
+      id: 'sage', tier: 'private', header: header({ name: 'Synthetic Sage', aliases: ['Private alias'] }),
+      facts: ['stale private correction'], source: 'josh', revision: observedRevision,
+    })).rejects.toThrow(/revision/i);
     await expect(store.lookup('EVERYDAY-ONLY')).resolves.toBe('NO_MATCH');
     await expect(store.lookup('absent keyword')).resolves.toBe('NO_MATCH');
     await expect(store.lookup('')).resolves.toBe('NO_MATCH');
