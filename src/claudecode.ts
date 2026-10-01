@@ -12,6 +12,7 @@ import { query, type Options, type SDKUserMessage } from '@anthropic-ai/claude-a
 import { z } from 'zod';
 
 import { AtCapacityError, type Backend, type Event, type Turn } from './backend.ts';
+import { shouldDenyFileTool } from './file-guard.ts';
 import type { Logger } from './log.ts';
 import type { CallContext, PolicyFn, TurnContext } from './policy.ts';
 import { Translator } from './translate.ts';
@@ -263,9 +264,41 @@ export function buildOptions(
     ...(config.allowedTools !== undefined && { allowedTools: config.allowedTools }),
     ...(config.maxBudgetUsd !== undefined && { maxBudgetUsd: config.maxBudgetUsd }),
     ...(resumeUuid !== undefined && { resume: resumeUuid }),
-    ...(spawnMeta?.surface === 'voice'
-      ? {
-          hooks: {
+    hooks: {
+      PreToolUse: [
+        {
+          hooks: [(input) => {
+            if (input.hook_event_name !== 'PreToolUse') return Promise.resolve({});
+            const toolInput =
+              typeof input.tool_input === 'object' &&
+              input.tool_input !== null &&
+              !Array.isArray(input.tool_input)
+                ? input.tool_input as Record<string, unknown>
+                : {};
+            const denied = shouldDenyFileTool(input.tool_name, toolInput, {
+              ...(config.memoryDir !== undefined && { memoryDir: config.memoryDir }),
+              ...(config.recordDir !== undefined && { recordDir: config.recordDir }),
+              ...(env.HOME !== undefined && { home: env.HOME }),
+              cwd: input.cwd,
+              transcriptPath: input.transcript_path,
+              sessionId: input.session_id,
+            });
+            return Promise.resolve(
+              denied
+                ? {
+                    hookSpecificOutput: {
+                      hookEventName: 'PreToolUse',
+                      permissionDecision: 'deny',
+                      permissionDecisionReason: 'Access to protected Mentat files is denied.',
+                    },
+                  }
+                : {},
+            );
+          }],
+        },
+      ],
+      ...(spawnMeta?.surface === 'voice'
+        ? {
             PostToolUse: [
               {
                 matcher: 'mcp__mentat__end_conversation',
@@ -286,9 +319,9 @@ export function buildOptions(
                 }],
               },
             ],
-          },
-        }
-      : {}),
+          }
+        : {}),
+    },
     canUseTool: async (toolName, input, { toolUseID }) => {
       // Read before any wait: the decision belongs to the turn that asked.
       const context = getContext();

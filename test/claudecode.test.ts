@@ -1,4 +1,4 @@
-import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -155,6 +155,87 @@ describe('buildOptions isolation invariants', () => {
 
   it('pins the executable with no PATH fallback', () => {
     expect(options.pathToClaudeCodeExecutable).toBe('/pinned/claude');
+  });
+
+  it.each(['voice', 'signal'])('guards protected file paths in %s sessions before policy', async (surface) => {
+    const root = mkdtempSync(join(tmpdir(), 'mentat-file-hook-'));
+    const cwd = join(root, 'project');
+    const privateRoot = join(root, 'private');
+    const memoryDir = join(privateRoot, 'memory');
+    const recordDir = join(privateRoot, 'recordings');
+    const home = join(root, 'home');
+    const transcriptDir = join(home, '.claude', 'projects', 'project');
+    const toolResults = join(transcriptDir, 'session-1', 'tool-results');
+    const unrelated = join(root, 'unrelated');
+    const memoryAlias = join(root, 'memory-link');
+    for (const directory of [cwd, memoryDir, recordDir, transcriptDir, toolResults, unrelated]) {
+      mkdirSync(directory, { recursive: true });
+    }
+    symlinkSync(memoryDir, memoryAlias, 'dir');
+    vi.stubEnv('HOME', home);
+
+    const options = buildOptions(
+      makeConfig({ memoryDir, recordDir, policy: () => ({ behavior: 'allow', updatedInput: {} }) }),
+      () => ({ sessionId: 'session-1', meta: { surface } }),
+      undefined,
+      { surface },
+    );
+    const hook = options.hooks?.PreToolUse?.[0]?.hooks[0];
+    if (hook === undefined) throw new Error('file guard hook not wired');
+    const canUseTool = options.canUseTool;
+    if (canUseTool === undefined) throw new Error('canUseTool not wired');
+    await expect(canUseTool('Read', { file_path: memoryDir }, {
+      signal: new AbortController().signal,
+      toolUseID: 'policy-allows-protected-read',
+    })).resolves.toEqual({ behavior: 'allow', updatedInput: {} });
+
+    const invoke = (toolName: string, toolInput: Record<string, unknown>, hookCwd = cwd) =>
+      hook(
+        {
+          hook_event_name: 'PreToolUse',
+          session_id: 'session-1',
+          transcript_path: join(transcriptDir, 'session-1.jsonl'),
+          cwd: hookCwd,
+          tool_name: toolName,
+          tool_input: toolInput,
+          tool_use_id: 'tool-1',
+        },
+        'tool-1',
+        { signal: new AbortController().signal },
+      );
+
+    for (const filePath of [
+      memoryDir,
+      join(memoryDir, 'private.md'),
+      privateRoot,
+      memoryAlias,
+      recordDir,
+      join(recordDir, 'session.jsonl'),
+      home,
+      join(home, '.claude'),
+      join(home, '.claude', 'projects', 'other-session.jsonl'),
+    ]) {
+      await expect(invoke('Read', { file_path: filePath })).resolves.toMatchObject({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: 'Access to protected Mentat files is denied.',
+        },
+      });
+    }
+    await expect(invoke('Glob', {}, memoryDir)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    await expect(invoke('Grep', { path: join(recordDir, 'child') })).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    await expect(invoke('Grep', {}, recordDir)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    await expect(invoke('Read', { file_path: join(unrelated, 'public.txt') })).resolves.toEqual({});
+    await expect(invoke('Glob', { path: unrelated })).resolves.toEqual({});
+    await expect(invoke('Grep', { path: unrelated })).resolves.toEqual({});
+    await expect(invoke('Read', { file_path: join(toolResults, 'tool-1.txt') })).resolves.toEqual({});
   });
 
   it('streams partial messages', () => {
@@ -325,9 +406,10 @@ describe('buildOptions isolation invariants', () => {
     );
     const comparable = (
       options: Options,
-    ): Omit<Options, 'canUseTool'> & { canUseTool: string } => ({
+    ): Omit<Options, 'canUseTool' | 'hooks'> & { canUseTool: string; hooks: boolean } => ({
       ...options,
       canUseTool: 'policy callback',
+      hooks: options.hooks !== undefined,
     });
 
     expect(comparable(withVoiceModel)).toEqual(comparable(withoutVoiceModel));
@@ -354,7 +436,8 @@ describe('buildOptions isolation invariants', () => {
       );
 
       expect(nonvoiceOptions.env).toEqual(expectedEnv);
-      expect(nonvoiceOptions.hooks).toBeUndefined();
+      expect(nonvoiceOptions.hooks?.PreToolUse).toHaveLength(1);
+      expect(nonvoiceOptions.hooks?.PostToolUse).toBeUndefined();
       expect(nonvoiceOptions.mcpServers).toEqual({
         local: { type: 'stdio', command: '/bin/mcp' },
       });
