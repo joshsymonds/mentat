@@ -1,10 +1,11 @@
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import process from 'node:process';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 
+import { query } from '@anthropic-ai/claude-agent-sdk';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
@@ -190,11 +191,39 @@ function expectFileToolDenied(events: Event[], tool: string): void {
   expect(result.content).toContain('Access to protected Mentat files is denied.');
 }
 
-function transcriptPathFor(sessionUuid: string): string {
+async function transcriptPathFor(sessionUuid: string, hookPath: string | undefined): Promise<string> {
   const home = process.env.HOME;
   if (home === undefined || home === '') throw new Error('HOME is required for CLI transcript evidence');
-  const project = process.cwd().replaceAll('/', '-');
-  return join(home, '.claude', 'projects', project, `${sessionUuid}.jsonl`);
+  const projects = join(home, '.claude', 'projects');
+  const filename = `${sessionUuid}.jsonl`;
+  const directoriesToSearch = [projects];
+  const matches: string[] = [];
+  while (directoriesToSearch.length > 0) {
+    const directory = directoriesToSearch.pop();
+    if (directory === undefined) break;
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+      throw error;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) directoriesToSearch.push(path);
+      else if (entry.isFile() && entry.name === filename) matches.push(path);
+    }
+  }
+  if (matches.length > 1) throw new Error(`multiple CLI transcripts for session ${sessionUuid}`);
+  const match = matches[0];
+  if (match !== undefined) {
+    console.log('memory-live transcript-location: HOME/.claude/projects');
+    return match;
+  }
+  if (hookPath === undefined) throw new Error(`CLI transcript ${sessionUuid} not found under HOME/.claude/projects or SDK hook`);
+  await access(hookPath);
+  console.log(`memory-live transcript-location: SDK hook ${hookPath.startsWith(join(home, '.claude')) ? 'under HOME/.claude' : 'outside HOME/.claude'}`);
+  return hookPath;
 }
 
 async function connectMcp(url: string): Promise<Client> {
@@ -267,6 +296,7 @@ describe('memory live evidence', () => {
 
       for (const model of models) {
         const sessionId = `memory-live-${model.replace(/[^a-zA-Z0-9-]/g, '-')}`;
+        const transcriptPaths = new Map<string, string>();
         const config: ClaudeCodeConfig = {
           bin,
           model,
@@ -279,6 +309,28 @@ describe('memory live evidence', () => {
           memoryDir,
           recordDir,
           mcpServers: { mentat: { type: 'http', url: mcpUrl } },
+          queryFn: ({ prompt: turns, options }) => {
+            const preToolUse = options.hooks?.PreToolUse;
+            if (preToolUse === undefined) throw new Error('missing file guard hook');
+            return query({
+              prompt: turns,
+              options: {
+                ...options,
+                hooks: {
+                  ...options.hooks,
+                  PreToolUse: preToolUse.map((matcher) => ({
+                    ...matcher,
+                    hooks: matcher.hooks.map((hook) => async (input, toolUseId, hookOptions) => {
+                      if (input.hook_event_name === 'PreToolUse') {
+                        transcriptPaths.set(input.session_id, resolve(input.cwd, input.transcript_path));
+                      }
+                      return hook(input, toolUseId, hookOptions);
+                    }),
+                  })),
+                },
+              },
+            });
+          },
         };
         const backend = new ClaudeCode(config);
         try {
@@ -334,7 +386,7 @@ describe('memory live evidence', () => {
             expect(completed(deniedGrep)).not.toContain(PRIVATE_CANARY);
             console.log(`memory-live ${model} Grep-memory: denied`);
 
-            const transcriptPath = transcriptPathFor(privateResult.sessionId);
+            const transcriptPath = await transcriptPathFor(privateResult.sessionId, transcriptPaths.get(privateResult.sessionId));
             await access(transcriptPath);
             const deniedTranscript = await collect(await guardBackend.converse({
               sessionId: `${guardSessionId}-transcript`,
