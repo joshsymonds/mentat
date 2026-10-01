@@ -9,6 +9,7 @@ import { ClaudeCode } from './claudecode.ts';
 import { loadConfig } from './config.ts';
 import { startJanitor } from './janitor.ts';
 import { jsonLogger } from './log.ts';
+import { MemoryStore } from './memory.ts';
 import { PhoneBridge } from './phone.ts';
 import { allowAllPolicy } from './policy.ts';
 import { SessionTracker, createHandler } from './server.ts';
@@ -19,6 +20,9 @@ const logger = jsonLogger();
 let exitCode = 0;
 try {
   const config = loadConfig(process.env);
+  const memory = config.memoryDir === undefined
+    ? undefined
+    : new MemoryStore({ dir: config.memoryDir, logger });
   const backend = new ClaudeCode({
     bin: config.bin,
     policy: allowAllPolicy(logger),
@@ -28,7 +32,8 @@ try {
     voiceModel: config.voiceModel,
     ...(config.effort !== undefined && { effort: config.effort }),
     ...(config.systemPrompt !== undefined && { systemPrompt: config.systemPrompt }),
-    ...(config.memoryDir !== undefined && { addDirs: [config.memoryDir] }),
+    ...(memory !== undefined && { memory }),
+    ...(config.memoryDir !== undefined && { memoryDir: config.memoryDir }),
     ...(config.mcpServers !== undefined && { mcpServers: config.mcpServers }),
     ...(config.voiceGateway !== undefined && { voiceGateway: config.voiceGateway }),
     ...(config.allowedTools !== undefined && { allowedTools: config.allowedTools }),

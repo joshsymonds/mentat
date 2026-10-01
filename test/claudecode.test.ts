@@ -1,4 +1,4 @@
-import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -141,7 +141,6 @@ describe('buildOptions isolation invariants', () => {
       model: 'claude-haiku-4-5',
       effort: 'low',
       systemPrompt: 'be helpful',
-      addDirs: ['/memory'],
       allowedTools: ['Read'],
       maxBudgetUsd: 1.5,
     }),
@@ -158,6 +157,87 @@ describe('buildOptions isolation invariants', () => {
     expect(options.pathToClaudeCodeExecutable).toBe('/pinned/claude');
   });
 
+  it.each(['voice', 'signal'])('guards protected file paths in %s sessions before policy', async (surface) => {
+    const root = mkdtempSync(join(tmpdir(), 'mentat-file-hook-'));
+    const cwd = join(root, 'project');
+    const privateRoot = join(root, 'private');
+    const memoryDir = join(privateRoot, 'memory');
+    const recordDir = join(privateRoot, 'recordings');
+    const home = join(root, 'home');
+    const transcriptDir = join(home, '.claude', 'projects', 'project');
+    const toolResults = join(transcriptDir, 'session-1', 'tool-results');
+    const unrelated = join(root, 'unrelated');
+    const memoryAlias = join(root, 'memory-link');
+    for (const directory of [cwd, memoryDir, recordDir, transcriptDir, toolResults, unrelated]) {
+      mkdirSync(directory, { recursive: true });
+    }
+    symlinkSync(memoryDir, memoryAlias, 'dir');
+    vi.stubEnv('HOME', home);
+
+    const options = buildOptions(
+      makeConfig({ memoryDir, recordDir, policy: () => ({ behavior: 'allow', updatedInput: {} }) }),
+      () => ({ sessionId: 'session-1', meta: { surface } }),
+      undefined,
+      { surface },
+    );
+    const hook = options.hooks?.PreToolUse?.[0]?.hooks[0];
+    if (hook === undefined) throw new Error('file guard hook not wired');
+    const canUseTool = options.canUseTool;
+    if (canUseTool === undefined) throw new Error('canUseTool not wired');
+    await expect(canUseTool('Read', { file_path: memoryDir }, {
+      signal: new AbortController().signal,
+      toolUseID: 'policy-allows-protected-read',
+    })).resolves.toEqual({ behavior: 'allow', updatedInput: {} });
+
+    const invoke = (toolName: string, toolInput: Record<string, unknown>, hookCwd = cwd) =>
+      hook(
+        {
+          hook_event_name: 'PreToolUse',
+          session_id: 'session-1',
+          transcript_path: join(transcriptDir, 'session-1.jsonl'),
+          cwd: hookCwd,
+          tool_name: toolName,
+          tool_input: toolInput,
+          tool_use_id: 'tool-1',
+        },
+        'tool-1',
+        { signal: new AbortController().signal },
+      );
+
+    for (const filePath of [
+      memoryDir,
+      join(memoryDir, 'private.md'),
+      privateRoot,
+      memoryAlias,
+      recordDir,
+      join(recordDir, 'session.jsonl'),
+      home,
+      join(home, '.claude'),
+      join(home, '.claude', 'projects', 'other-session.jsonl'),
+    ]) {
+      await expect(invoke('Read', { file_path: filePath })).resolves.toMatchObject({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: 'Access to protected Mentat files is denied.',
+        },
+      });
+    }
+    await expect(invoke('Glob', {}, memoryDir)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    await expect(invoke('Grep', { path: join(recordDir, 'child') })).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    await expect(invoke('Grep', {}, recordDir)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    await expect(invoke('Read', { file_path: join(unrelated, 'public.txt') })).resolves.toEqual({});
+    await expect(invoke('Glob', { path: unrelated })).resolves.toEqual({});
+    await expect(invoke('Grep', { path: unrelated })).resolves.toEqual({});
+    await expect(invoke('Read', { file_path: join(toolResults, 'tool-1.txt') })).resolves.toEqual({});
+  });
+
   it('streams partial messages', () => {
     expect(options.includePartialMessages).toBe(true);
   });
@@ -166,7 +246,7 @@ describe('buildOptions isolation invariants', () => {
     expect(options.model).toBe('claude-haiku-4-5');
     expect(options.effort).toBe('low');
     expect(options.systemPrompt).toBe('be helpful');
-    expect(options.additionalDirectories).toEqual(['/memory']);
+    expect(options.additionalDirectories).toBeUndefined();
     expect(options.allowedTools).toEqual(['Read']);
     expect(options.maxBudgetUsd).toBe(1.5);
   });
@@ -214,7 +294,6 @@ describe('buildOptions isolation invariants', () => {
     const voiceOptions = buildOptions(
       makeConfig({
         systemPrompt: 'voice prompt',
-        addDirs: ['/memory'],
         voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
         mcpServers: {
           web: { type: 'http', url: 'http://127.0.0.1:9000/mcp' },
@@ -243,7 +322,7 @@ describe('buildOptions isolation invariants', () => {
       local: { type: 'stdio', command: '/bin/mcp', alwaysLoad: true },
     });
     expect(voiceOptions.systemPrompt).toBe(`voice prompt\n\nSession surface: voice (user: josh)`);
-    expect(voiceOptions.additionalDirectories).toEqual(['/memory']);
+    expect(voiceOptions.additionalDirectories).toBeUndefined();
     expect(voiceOptions.settingSources).toEqual([]);
     expect(voiceOptions.skills).toEqual([]);
     expect(voiceOptions.strictMcpConfig).toBe(true);
@@ -327,9 +406,10 @@ describe('buildOptions isolation invariants', () => {
     );
     const comparable = (
       options: Options,
-    ): Omit<Options, 'canUseTool'> & { canUseTool: string } => ({
+    ): Omit<Options, 'canUseTool' | 'hooks'> & { canUseTool: string; hooks: boolean } => ({
       ...options,
       canUseTool: 'policy callback',
+      hooks: options.hooks !== undefined,
     });
 
     expect(comparable(withVoiceModel)).toEqual(comparable(withoutVoiceModel));
@@ -347,7 +427,6 @@ describe('buildOptions isolation invariants', () => {
       const nonvoiceOptions = buildOptions(
         makeConfig({
           systemPrompt: 'existing prompt',
-          addDirs: ['/existing-memory'],
           voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
           mcpServers: { local: { type: 'stdio', command: '/bin/mcp' } },
         }),
@@ -357,12 +436,13 @@ describe('buildOptions isolation invariants', () => {
       );
 
       expect(nonvoiceOptions.env).toEqual(expectedEnv);
-      expect(nonvoiceOptions.hooks).toBeUndefined();
+      expect(nonvoiceOptions.hooks?.PreToolUse).toHaveLength(1);
+      expect(nonvoiceOptions.hooks?.PostToolUse).toBeUndefined();
       expect(nonvoiceOptions.mcpServers).toEqual({
         local: { type: 'stdio', command: '/bin/mcp' },
       });
       expect(nonvoiceOptions.systemPrompt).toBe(`existing prompt\n\nSession surface: signal (user: josh)`);
-      expect(nonvoiceOptions.additionalDirectories).toEqual(['/existing-memory']);
+      expect(nonvoiceOptions.additionalDirectories).toBeUndefined();
     } finally {
       vi.unstubAllEnvs();
     }
@@ -436,7 +516,6 @@ describe('ClaudeCode turns', () => {
         queryFn: fake.fn,
         policy: voicePolicy,
         systemPrompt: 'voice prompt',
-        addDirs: ['/memory'],
         voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'fixture-caller-key' },
         mcpServers: { local: { type: 'stdio', command: '/bin/mcp' } },
       }),
@@ -454,7 +533,6 @@ describe('ClaudeCode turns', () => {
       model: 'chatgpt/sol-fast',
       effort: 'low',
       systemPrompt: 'voice prompt\n\nSession surface: voice (user: josh)',
-      additionalDirectories: ['/memory'],
       mcpServers: { local: { type: 'stdio', command: '/bin/mcp', alwaysLoad: true } },
       settingSources: [],
       skills: [],
@@ -464,6 +542,7 @@ describe('ClaudeCode turns', () => {
         ANTHROPIC_CUSTOM_HEADERS: 'X-Patchbay-Key: fixture-caller-key',
       },
     });
+    expect(fake.optionsSeen[0]?.additionalDirectories).toBeUndefined();
 
     const turn = await backend.converse({
       sessionId: 'voice-android-room',
@@ -834,6 +913,198 @@ describe('ClaudeCode turns', () => {
       await backend.converse({ sessionId: 's1', text: 'hi', meta: { surface: 'voice' } }),
     );
     expect(fake.optionsSeen[0]?.systemPrompt).toBeUndefined();
+  });
+
+  it('awaits a fresh everyday index and appends it after surface context', async () => {
+    let resolveIndex: ((value: string) => void) | undefined;
+    const index = new Promise<string>((resolve) => { resolveIndex = resolve; });
+    const memory = { index: vi.fn(() => index) };
+    const fake = fakeQuery(() => [resultMsg('u1', 'ok')]);
+    const backend = new ClaudeCode(makeConfig({
+      queryFn: fake.fn,
+      systemPrompt: 'be helpful',
+      memory,
+    }));
+    const stream = backend.converse({
+      sessionId: 's1',
+      text: 'hi',
+      meta: { surface: 'voice', user: 'josh' },
+    });
+    expect(fake.calls).toBe(0);
+    resolveIndex?.('## People\n- Rowan — likes tea [rowan]\n');
+    await collect(await stream);
+    expect(memory.index).toHaveBeenCalledOnce();
+    expect(fake.optionsSeen[0]?.systemPrompt).toBe(
+      'be helpful\n\nSession surface: voice (user: josh)\n\nEveryday memory index:\n## People\n- Rowan — likes tea [rowan]\n',
+    );
+  });
+
+  it('uses explicit empty-index wording and leaves an unconfigured prompt absent', async () => {
+    const emptyStore = { index: vi.fn(() => Promise.resolve('')) };
+    const emptyFake = fakeQuery(() => [resultMsg('u1', 'ok')]);
+    const configured = new ClaudeCode(makeConfig({
+      queryFn: emptyFake.fn,
+      systemPrompt: 'be helpful',
+      memory: emptyStore,
+    }));
+    await collect(await configured.converse({
+      sessionId: 'empty',
+      text: 'hi',
+      meta: { surface: 'chat' },
+    }));
+    expect(emptyFake.optionsSeen[0]?.systemPrompt).toBe(
+      'be helpful\n\nSession surface: chat\n\nEveryday memory index:\nNo everyday memories yet.',
+    );
+
+    const noPromptFake = fakeQuery(() => [resultMsg('u2', 'ok')]);
+    const unusedStore = { index: vi.fn(() => Promise.resolve('## People\n- private [x]')) };
+    const noPrompt = new ClaudeCode(makeConfig({
+      queryFn: noPromptFake.fn,
+      memory: unusedStore,
+    }));
+    await collect(await noPrompt.converse({ sessionId: 'no-prompt', text: 'hi' }));
+    expect(noPromptFake.optionsSeen[0]?.systemPrompt).toBeUndefined();
+    expect(unusedStore.index).not.toHaveBeenCalled();
+  });
+
+  it('logs index failures and spawns without an index section', async () => {
+    const errorLog = vi.fn();
+    const logger = { ...nullLogger, error: errorLog };
+    const fake = fakeQuery(() => [resultMsg('u1', 'ok')]);
+    const backend = new ClaudeCode(makeConfig({
+      queryFn: fake.fn,
+      logger,
+      systemPrompt: 'be helpful',
+      memory: { index: vi.fn(() => Promise.reject(new Error('private path details'))) },
+    }));
+    await collect(await backend.converse({ sessionId: 's1', text: 'hi' }));
+    expect(fake.optionsSeen[0]?.systemPrompt).toBe('be helpful');
+    expect(errorLog).toHaveBeenCalledWith('claudecode: memory index unavailable', {
+      session_id: 's1',
+      error: 'Error: private path details',
+    });
+  });
+
+  it('refreshes the index when a dead child is respawned', async () => {
+    const memory = { index: vi.fn().mockResolvedValueOnce('index first').mockResolvedValueOnce('index second') };
+    const fake = fakeQuery((turn) => [resultMsg('cli-uuid', turn === 0 ? 'first' : 'second')], 1);
+    const backend = new ClaudeCode(makeConfig({
+      queryFn: fake.fn,
+      systemPrompt: 'prompt',
+      memory,
+    }));
+    await collect(await backend.converse({ sessionId: 's1', text: 'one' }));
+    await collect(await backend.converse({ sessionId: 's1', text: 'two' }));
+    expect(fake.calls).toBe(2);
+    expect(memory.index).toHaveBeenCalledTimes(2);
+    expect(fake.optionsSeen.map((options) => options.systemPrompt)).toEqual([
+      'prompt\n\nEveryday memory index:\nindex first',
+      'prompt\n\nEveryday memory index:\nindex second',
+    ]);
+  });
+
+  it('single-flights concurrent child creation for one session', async () => {
+    let resolveIndex: ((value: string) => void) | undefined;
+    const index = new Promise<string>((resolve) => { resolveIndex = resolve; });
+    const memory = { index: vi.fn(() => index) };
+    const fake = fakeQuery(() => [resultMsg('u1', 'ok')]);
+    const backend = new ClaudeCode(makeConfig({
+      queryFn: fake.fn,
+      systemPrompt: 'prompt',
+      memory,
+      voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'key' },
+    }));
+    const conversation = backend.converse({
+      sessionId: 'shared',
+      text: 'hi',
+      meta: { surface: 'voice', user: 'josh' },
+    });
+    const prestart = backend.prestartVoiceSession('shared');
+    resolveIndex?.('current index');
+    await collect(await conversation);
+    await expect(prestart).resolves.toBe(true);
+    expect(memory.index).toHaveBeenCalledOnce();
+    expect(fake.calls).toBe(1);
+    await backend.close();
+  });
+
+  it('counts pending child starts against maxSessions', async () => {
+    let resolveIndex: ((value: string) => void) | undefined;
+    const index = new Promise<string>((resolve) => { resolveIndex = resolve; });
+    const memory = { index: vi.fn(() => index) };
+    const fake = fakeQuery(() => [resultMsg('u1', 'ok')]);
+    const backend = new ClaudeCode(makeConfig({
+      queryFn: fake.fn,
+      systemPrompt: 'prompt',
+      memory,
+      maxSessions: 1,
+    }));
+    const first = backend.converse({ sessionId: 'first', text: 'hi' });
+    const second = backend.converse({ sessionId: 'second', text: 'hi' });
+    resolveIndex?.('current index');
+    await collect(await first);
+    await expect(second).rejects.toBeInstanceOf(AtCapacityError);
+    expect(fake.calls).toBe(1);
+    expect(memory.index).toHaveBeenCalledOnce();
+    await backend.close();
+  });
+
+  it('closes a session whose memory index is still loading', async () => {
+    let resolveIndex: ((value: string) => void) | undefined;
+    const indexPromise = new Promise<string>((resolve) => { resolveIndex = resolve; });
+    const memory = {
+      index: vi.fn()
+        .mockImplementationOnce(() => indexPromise)
+        .mockResolvedValue('next index'),
+    };
+    const fake = fakeQuery(() => [resultMsg('u1', 'ok')]);
+    const backend = new ClaudeCode(makeConfig({
+      queryFn: fake.fn,
+      systemPrompt: 'prompt',
+      memory,
+      maxSessions: 1,
+    }));
+    const first = backend.converse({ sessionId: 's1', text: 'first' }).then(
+      async (stream) => {
+        await collect(stream);
+        return undefined;
+      },
+      (error: unknown) => error,
+    );
+    let closeFinished = false;
+    const closing = backend.closeSession('s1').then(() => { closeFinished = true; });
+    await Promise.resolve();
+    expect(closeFinished).toBe(false);
+
+    resolveIndex?.('first index');
+    await closing;
+    await first;
+    expect(fake.calls).toBe(1);
+
+    await collect(await backend.converse({ sessionId: 's2', text: 'second' }));
+    expect(fake.calls).toBe(2);
+    expect(memory.index).toHaveBeenCalledTimes(2);
+    await backend.close();
+  });
+
+  it('loads the index before prestarting a voice child', async () => {
+    let resolveIndex: ((value: string) => void) | undefined;
+    const memory = { index: vi.fn(() => new Promise<string>((resolve) => { resolveIndex = resolve; })) };
+    const fake = fakeQuery(() => []);
+    const backend = new ClaudeCode(makeConfig({
+      queryFn: fake.fn,
+      systemPrompt: 'voice prompt',
+      memory,
+      voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'key' },
+    }));
+    const prestart = backend.prestartVoiceSession('voice');
+    expect(fake.calls).toBe(0);
+    resolveIndex?.('voice index');
+    await expect(prestart).resolves.toBe(true);
+    expect(fake.optionsSeen[0]?.systemPrompt).toBe(
+      'voice prompt\n\nSession surface: voice (user: josh)\n\nEveryday memory index:\nvoice index',
+    );
+    await backend.close();
   });
 
   it('interrupts abandoned turns and keeps the session usable', async () => {
