@@ -837,6 +837,8 @@ export class ClaudeCode implements Backend {
   /** Runs a private, bounded summary turn on a fork of the completed session. */
   private async writeUp(sessionId: string, session: Session): Promise<void> {
     const memory = this.config.memory;
+    const readTombstones = (): Promise<string> =>
+      memory?.tombstones?.() ?? Promise.reject(new Error('memory tombstones unavailable'));
     const originalSessionId = session.lastResult?.sessionId;
     if (
       memory?.tombstones === undefined ||
@@ -856,45 +858,57 @@ export class ClaudeCode implements Backend {
     try {
       const [index, tombstones] = await Promise.all([
         withTimeout(memory.index(), remaining(), 'memory write-up'),
-        withTimeout(memory.tombstones(), remaining(), 'memory write-up'),
+        withTimeout(readTombstones(), remaining(), 'memory write-up'),
       ]);
       const options: Options = {
         ...session.options,
         resume: originalSessionId,
         forkSession: true,
-        canUseTool: (toolName, input) => {
-          const decision = writeUpToolDecision(toolName, input, tombstones);
-          return Promise.resolve(
-            decision.behavior === 'allow'
-              ? { behavior: 'allow', updatedInput: decision.updatedInput }
-              : { behavior: 'deny', message: decision.message },
-          );
+        canUseTool: async (toolName, input) => {
+          let decision: ReturnType<typeof writeUpToolDecision>;
+          try {
+            const currentTombstones = toolName === 'mcp__mentat__memory_save'
+              ? await readTombstones()
+              : tombstones;
+            decision = writeUpToolDecision(toolName, input, currentTombstones);
+          } catch {
+            decision = { behavior: 'deny', message: 'Write-up cannot verify forgotten memory' };
+          }
+          return decision.behavior === 'allow'
+            ? { behavior: 'allow', updatedInput: decision.updatedInput }
+            : { behavior: 'deny', message: decision.message };
         },
         hooks: {
           ...(session.options.hooks ?? {}),
           PreToolUse: [
             ...(session.options.hooks?.PreToolUse ?? []),
             {
-              hooks: [(input) => {
-                if (input.hook_event_name !== 'PreToolUse') return Promise.resolve({});
+              hooks: [async (input) => {
+                if (input.hook_event_name !== 'PreToolUse') return {};
                 const toolInput =
                   typeof input.tool_input === 'object' &&
                   input.tool_input !== null &&
                   !Array.isArray(input.tool_input)
                     ? input.tool_input as Record<string, unknown>
                     : {};
-                const decision = writeUpToolDecision(input.tool_name, toolInput, tombstones);
-                return Promise.resolve(
-                  decision.behavior === 'allow'
-                    ? {}
-                    : {
-                        hookSpecificOutput: {
-                          hookEventName: 'PreToolUse',
-                          permissionDecision: 'deny',
-                          permissionDecisionReason: decision.message,
-                        },
+                let decision: ReturnType<typeof writeUpToolDecision>;
+                try {
+                  const currentTombstones = input.tool_name === 'mcp__mentat__memory_save'
+                    ? await readTombstones()
+                    : tombstones;
+                  decision = writeUpToolDecision(input.tool_name, toolInput, currentTombstones);
+                } catch {
+                  decision = { behavior: 'deny', message: 'Write-up cannot verify forgotten memory' };
+                }
+                return decision.behavior === 'allow'
+                  ? {}
+                  : {
+                      hookSpecificOutput: {
+                        hookEventName: 'PreToolUse',
+                        permissionDecision: 'deny',
+                        permissionDecisionReason: decision.message,
                       },
-                );
+                    };
               }],
             },
           ],
@@ -997,8 +1011,8 @@ export class ClaudeCode implements Backend {
       const session = this.sessions.get(sessionId);
       if (session !== undefined) {
         this.dropSession(sessionId, session, true);
+        this.closing.delete(sessionId);
         if (options?.writeUp === true && await this.waitForSessionClose(sessionId, session)) {
-          this.closing.delete(sessionId);
           session.writeUpTask ??= this.writeUp(sessionId, session);
           await session.writeUpTask;
         }

@@ -52,6 +52,25 @@ describe('write-up tool decision', () => {
     }
   });
 
+  it('denies forgotten records by id or normalized name even with no facts', () => {
+    const tombstones = '- [2026-09-30] synthetic-id (everyday): record forgotten — Synthetic Person: Synthetic summary.';
+
+    expect(writeUpToolDecision('mcp__mentat__memory_save', {
+      id: 'synthetic-id', tier: 'everyday', name: 'A New Name', facts: [],
+    }, tombstones)).toMatchObject({ behavior: 'deny' });
+    expect(writeUpToolDecision('mcp__mentat__memory_save', {
+      id: 'new-id', tier: 'everyday', name: '  synthetic person  ', facts: [],
+    }, tombstones)).toMatchObject({ behavior: 'deny' });
+  });
+
+  it('denies a forgotten record name containing a colon under a new id', () => {
+    const tombstones = '- [2026-09-30] forgotten-id (everyday): record forgotten — Jordan: Manager: Synthetic summary.';
+
+    expect(writeUpToolDecision('mcp__mentat__memory_save', {
+      id: 'new-id', tier: 'everyday', name: 'Jordan: Manager', facts: [],
+    }, tombstones)).toMatchObject({ behavior: 'deny' });
+  });
+
   it('denies every other tool with a reason', () => {
     for (const toolName of [
       'mcp__mentat__memory_forget',

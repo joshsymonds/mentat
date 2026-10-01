@@ -17,16 +17,23 @@ function normalizedFact(text: string): string {
     .toLowerCase();
 }
 
-function forgottenFacts(tombstones: string): Set<string> {
+function forgottenMemory(tombstones: string): { facts: Set<string>; ids: Set<string>; names: Set<string> } {
   const facts = new Set<string>();
+  const ids = new Set<string>();
+  const names = new Set<string>();
   for (const line of tombstones.split('\n')) {
-    const match = /^- \[\d{4}-\d{2}-\d{2}\] [^:]+: (.+)$/.exec(line);
-    const fact = match?.[1];
-    if (fact !== undefined && !fact.startsWith('record forgotten —')) {
-      facts.add(normalizedFact(fact));
+    const match = /^- \[\d{4}-\d{2}-\d{2}\] ([^:]+): (.+)$/.exec(line);
+    const label = match?.[1];
+    const entry = match?.[2];
+    if (label === undefined || entry === undefined) continue;
+    if (entry.startsWith('record forgotten —')) {
+      ids.add(label.replace(/ \((?:everyday|private)\)$/, ''));
+      names.add(normalizedFact(entry.slice('record forgotten —'.length)));
+    } else {
+      facts.add(normalizedFact(entry));
     }
   }
-  return facts;
+  return { facts, ids, names };
 }
 
 export function writeUpToolDecision(
@@ -39,12 +46,22 @@ export function writeUpToolDecision(
   }
 
   if (toolName === 'mcp__mentat__memory_save') {
-    const forgotten = forgottenFacts(tombstones);
+    const forgotten = forgottenMemory(tombstones);
     const facts = input.facts;
     if (Array.isArray(facts) && facts.some(
-      (fact) => typeof fact === 'string' && forgotten.has(normalizedFact(fact)),
+      (fact) => typeof fact === 'string' && forgotten.facts.has(normalizedFact(fact)),
     )) {
       return { behavior: 'deny', message: 'Write-up cannot restore a forgotten fact' };
+    }
+    const id = input.id;
+    if (typeof id === 'string' && forgotten.ids.has(id)) {
+      return { behavior: 'deny', message: 'Write-up cannot restore a forgotten record' };
+    }
+    const name = input.name;
+    if (typeof name === 'string' && Array.from(forgotten.names).some(
+      (forgottenName) => forgottenName.startsWith(`${normalizedFact(name)}:`),
+    )) {
+      return { behavior: 'deny', message: 'Write-up cannot restore a forgotten record' };
     }
   }
 

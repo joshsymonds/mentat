@@ -1679,12 +1679,129 @@ describe('idle memory write-up fork', () => {
       cache_read_input_tokens: 0,
     }));
     expect(memory.index).toHaveBeenCalledTimes(2);
-    expect(memory.tombstones).toHaveBeenCalledOnce();
+    expect(memory.tombstones).toHaveBeenCalledTimes(3);
 
     const next = await collect(await backend.converse({ sessionId: 'synthetic-session', text: 'another synthetic turn' }));
     expect(next.at(-1)).toMatchObject({ kind: 'done', result: { sessionId: 'original-cli-uuid' } });
     expect(calls[2]?.options.resume).toBe('original-cli-uuid');
     expect(calls[2]?.options).not.toHaveProperty('forkSession', true);
+  });
+
+  it('accepts a returning turn while the old child drain is blocked', async () => {
+    const calls: Options[] = [];
+    let signalDrainStarted: (() => void) | undefined;
+    const drainStarted = new Promise<void>((resolve) => { signalDrainStarted = resolve; });
+    let releaseDrain: (() => void) | undefined;
+    const drainGate = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    const queryFn: QueryFn = ({ prompt, options }) => {
+      const callIndex = calls.push(options) - 1;
+      const fork = (options as Options & { forkSession?: boolean }).forkSession === true;
+      async function* messages(): AsyncGenerator {
+        for await (const _input of prompt) {
+          yield resultMsg(fork ? 'fork-only-uuid' : `original-cli-uuid-${String(callIndex)}`, 'synthetic result');
+        }
+        if (callIndex === 0) {
+          signalDrainStarted?.();
+          await drainGate;
+        }
+      }
+      const iterable = messages();
+      return {
+        [Symbol.asyncIterator]: () => iterable[Symbol.asyncIterator](),
+        interrupt: () => Promise.resolve(),
+        close: vi.fn(() => undefined),
+      };
+    };
+    const backend = new ClaudeCode(makeConfig({
+      queryFn,
+      memory: {
+        index: vi.fn().mockResolvedValue('synthetic index'),
+        tombstones: vi.fn().mockResolvedValue(''),
+      },
+    }));
+    const closeBackend: Pick<Backend, 'closeSession'> = backend;
+    await collect(await backend.converse({ sessionId: 'synthetic-session', text: 'first turn' }));
+    const closing = closeBackend.closeSession('synthetic-session', { writeUp: true });
+    try {
+      await drainStarted;
+      expect(calls).toHaveLength(1);
+      const returning = await collect(await backend.converse({
+        sessionId: 'synthetic-session', text: 'return during drain',
+      }));
+      expect(returning.at(-1)).toMatchObject({
+        kind: 'done', result: { sessionId: 'original-cli-uuid-1' },
+      });
+      expect(calls[1]?.forkSession).toBeUndefined();
+      expect(calls.some((options) => (options as Options & { forkSession?: boolean }).forkSession === true)).toBe(false);
+    } finally {
+      releaseDrain?.();
+      await closing;
+      await closeBackend.closeSession('synthetic-session');
+    }
+    expect(calls.some((options) => (options as Options & { forkSession?: boolean }).forkSession === true)).toBe(true);
+  });
+
+  it('checks fresh tombstones in both write-up permission paths', async () => {
+    const calls: Options[] = [];
+    let tombstones = '';
+    let signalForkStarted: (() => void) | undefined;
+    const forkStarted = new Promise<void>((resolve) => { signalForkStarted = resolve; });
+    let releaseFork: (() => void) | undefined;
+    const forkGate = new Promise<void>((resolve) => { releaseFork = resolve; });
+    const queryFn: QueryFn = ({ prompt, options }) => {
+      calls.push(options);
+      const fork = (options as Options & { forkSession?: boolean }).forkSession === true;
+      async function* messages(): AsyncGenerator {
+        for await (const _input of prompt) {
+          if (fork) {
+            signalForkStarted?.();
+            await forkGate;
+          }
+          yield resultMsg(fork ? 'fork-only-uuid' : 'original-cli-uuid', 'synthetic result');
+        }
+      }
+      const iterable = messages();
+      return {
+        [Symbol.asyncIterator]: () => iterable[Symbol.asyncIterator](),
+        interrupt: () => Promise.resolve(),
+        close: vi.fn(() => undefined),
+      };
+    };
+    const memory = {
+      index: vi.fn().mockResolvedValue('synthetic index'),
+      tombstones: vi.fn().mockImplementation(() => Promise.resolve(tombstones)),
+    };
+    const backend = new ClaudeCode(makeConfig({ queryFn, memory }));
+    const closeBackend: Pick<Backend, 'closeSession'> = backend;
+    await collect(await backend.converse({ sessionId: 'synthetic-session', text: 'first turn' }));
+    const closing = closeBackend.closeSession('synthetic-session', { writeUp: true });
+    try {
+      await forkStarted;
+      tombstones = '- [2026-09-30] synthetic-id (everyday): record forgotten — Synthetic Person: Synthetic summary.';
+      const options = calls[1];
+      if (options?.canUseTool === undefined) throw new Error('write-up policy not wired');
+      const context = { signal: new AbortController().signal, toolUseID: 'fresh-tombstone-save' };
+      const saveInput = { id: 'synthetic-id', tier: 'everyday', name: 'Synthetic Person', facts: [] };
+      await expect(options.canUseTool('mcp__mentat__memory_save', saveInput, context))
+        .resolves.toMatchObject({ behavior: 'deny' });
+      const hook = options.hooks?.PreToolUse?.at(-1)?.hooks[0];
+      if (hook === undefined) throw new Error('write-up PreToolUse hook not wired');
+      await expect(hook({
+        hook_event_name: 'PreToolUse',
+        session_id: 'synthetic-session',
+        transcript_path: '/fixture/synthetic-session.jsonl',
+        cwd: '/fixture',
+        tool_name: 'mcp__mentat__memory_save',
+        tool_input: saveInput,
+        tool_use_id: 'fresh-tombstone-save',
+      }, 'fresh-tombstone-save', { signal: new AbortController().signal })).resolves.toMatchObject({
+        hookSpecificOutput: { permissionDecision: 'deny' },
+      });
+      expect(memory.tombstones).toHaveBeenCalledTimes(3);
+    } finally {
+      releaseFork?.();
+      await closing;
+    }
   });
 
   it('accepts a same-session turn while the write-up fork is pending', async () => {
