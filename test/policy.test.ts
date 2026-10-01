@@ -32,6 +32,62 @@ describe('allowAllPolicy', () => {
     ).toEqual({ behavior: 'allow', updatedInput: { reason: 'done' } });
   });
 
+  it('allows set_voice_mode on the voice surface and preserves its input', async () => {
+    const input = { mode: 'conversation', language: 'es' };
+    const decision = await allowAllPolicy(nullLogger)(
+      'mcp__mentat__set_voice_mode',
+      input,
+      { sessionId: 'session', meta: { surface: 'voice' } },
+    );
+    expect(decision).toEqual({ behavior: 'allow', updatedInput: input });
+    if (decision.behavior === 'deny') throw new Error('expected an allow decision');
+    expect(decision.updatedInput).toBe(input);
+  });
+
+  it('denies set_voice_mode outside the voice surface and names the surface', async () => {
+    const decision = await allowAllPolicy(nullLogger)(
+      'mcp__mentat__set_voice_mode',
+      { mode: 'conversation', language: 'es' },
+      { sessionId: 'session', meta: { surface: 'chat' } },
+    );
+    expect(decision.behavior).toBe('deny');
+    if (decision.behavior === 'allow') throw new Error('expected a denial');
+    expect(decision.message).toContain('chat');
+  });
+
+  it('denies set_voice_mode when the surface is missing', async () => {
+    const decision = await allowAllPolicy(nullLogger)(
+      'mcp__mentat__set_voice_mode',
+      { mode: 'conversation', language: 'es' },
+      { sessionId: 'session', meta: {} },
+    );
+    expect(decision.behavior).toBe('deny');
+    if (decision.behavior === 'allow') throw new Error('expected a denial');
+    expect(decision.message).toContain('unknown');
+  });
+
+  it('logs the reason for a non-voice set_voice_mode denial', async () => {
+    const lines: { message: string; fields?: Record<string, unknown> }[] = [];
+    await allowAllPolicy(capturingLogger(lines))(
+      'mcp__mentat__set_voice_mode',
+      { mode: 'conversation', language: 'es' },
+      { sessionId: 'session', meta: { surface: 'chat', user: 'josh' } },
+    );
+    expect(lines).toEqual([
+      {
+        message: 'permission decision',
+        fields: {
+          tool: 'mcp__mentat__set_voice_mode',
+          decision: 'deny',
+          reason: 'non-voice surface',
+          session_id: 'session',
+          surface: 'chat',
+          user: 'josh',
+        },
+      },
+    ]);
+  });
+
   it('allows other tools on every surface', () => {
     expect(
       allowAllPolicy(nullLogger)(

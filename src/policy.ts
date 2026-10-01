@@ -42,7 +42,10 @@ export function allowAllPolicy(logger: Logger): PolicyFn {
   return (toolName, input, context, call) => {
     const surface = context.meta.surface ?? '';
     const user = context.meta.user ?? '';
-    if (toolName === 'mcp__mentat__end_conversation' && surface !== 'voice') {
+    if (
+      (toolName === 'mcp__mentat__end_conversation' || toolName === 'mcp__mentat__set_voice_mode') &&
+      surface !== 'voice'
+    ) {
       logger.info('permission decision', {
         tool: toolName,
         decision: 'deny',
@@ -53,7 +56,7 @@ export function allowAllPolicy(logger: Logger): PolicyFn {
       });
       return {
         behavior: 'deny',
-        message: `mcp__mentat__end_conversation is only allowed on the voice surface; received ${surface || 'unknown'}`,
+        message: `${toolName} is only allowed on the voice surface; received ${surface || 'unknown'}`,
       };
     }
     if (toolName === 'mcp__mentat__end_conversation' && call?.followsUnspokenTool === true) {
