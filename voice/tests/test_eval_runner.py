@@ -2797,6 +2797,20 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertIn("say-back", sms_failures)
         self.assertIn("confirmation observation is missing", sms_failures)
 
+    def test_spanish_caller_rendering_matches_accented_transcription(self):
+        self.assertTrue(
+            runner._rendered_content_matches(
+                "¿Cuál es la capital de Francia?",
+                [{"text": "Cuál es la capital de Francia."}],
+            )
+        )
+        self.assertFalse(
+            runner._rendered_content_matches(
+                "¿Cuál es la capital de Francia?",
+                [{"text": "Cuál es la capital de España."}],
+            )
+        )
+
     def test_every_scenario_script_fits_the_single_room_capture_format(self):
         for scenario in SCENARIOS:
             with self.subTest(scenario=scenario.name):
@@ -2806,6 +2820,139 @@ class ScenarioObservationTests(unittest.TestCase):
                     [runner.caller.parse_step(step)[1] for step in steps],
                     list(scenario.caller_lines),
                 )
+                if scenario.name == "spanish-language-switch":
+                    self.assertEqual(
+                        [runner.caller.parse_step_language(step) for step in steps],
+                        ["en", "es", "en", "en", "es"],
+                    )
+
+    def test_spanish_language_evidence_binds_stt_modes_and_synthesized_voices(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-language-switch")
+        records = [
+            {"room": "switch-room", "event": "mode", "mode": "conversation", "language": "es", "voice_id": "spanish-library", "created_at": 101.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": "switch-room", "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 104.0, "lookup_ms": 0.0, "selection": "default"},
+            {"room": "switch-room", "event": "mode", "mode": "conversation", "language": "es", "voice_id": "spanish-library", "created_at": 105.0, "lookup_ms": 0.0, "selection": "reused"},
+            *[
+                {"room": "switch-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice_id, "created_at": 100.0 + index}
+                for index, (language, voice_id) in enumerate(zip(
+                    ("es", "es", "en", "es", "es"),
+                    ("spanish-library", "spanish-library", "english-default", "spanish-library", "spanish-library"),
+                    strict=True,
+                ), 1)
+            ],
+        ]
+        transcript_sidecars = list(scenario.caller_lines)
+
+        failures, first_lookup_ms = runner._spanish_switch_evidence_failures(
+            scenario, "switch-room", records, transcript_sidecars
+        )
+        self.assertEqual(failures, [])
+        self.assertEqual(first_lookup_ms, 24.5)
+
+        invalid_evidence = (
+            ([*records[:-1], {**records[-1], "voice_id": "different-spanish-voice"}], transcript_sidecars, "reused"),
+            (records, transcript_sidecars[:-1] + ["Cambia a español."], "turn 5"),
+            ([record for record in records if record.get("event") != "mode" or record["language"] != "en"], transcript_sidecars, "mode transition"),
+            ([{**record, "reply": 6} if record.get("event") == "speech" and record["reply"] == 5 else record for record in records], transcript_sidecars, "reply order"),
+            ([{key: value for key, value in record.items() if key != "turn_id"} if record.get("event") == "speech" and record["reply"] == 5 else record for record in records], transcript_sidecars, "turn id"),
+            ([{**record, "selection": "resolved"} if record.get("event") == "mode" and record["language"] == "es" and record["created_at"] == 105.0 else record for record in records], transcript_sidecars, "second spanish switch"),
+        )
+        for changed_records, changed_sidecars, expected in invalid_evidence:
+            with self.subTest(expected=expected):
+                failures, _ = runner._spanish_switch_evidence_failures(
+                    scenario, "switch-room", changed_records, changed_sidecars
+                )
+                self.assertTrue(any(expected in failure.lower() for failure in failures), failures)
+
+    def test_spanish_switch_observation_loads_private_sidecars_and_voice_trace(self):
+        import json
+        import subprocess
+        from subprocess import CompletedProcess
+
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-language-switch")
+        room = "spanish-switch-room"
+        replies = (
+            "Claro, continuaremos en español.",
+            "La capital de Francia es París.",
+            "Sure, we're back to English.",
+            "Claro, hablaremos español otra vez.",
+            "El cielo es azul.",
+        )
+        traces = [
+            {
+                "turn": index,
+                "room": room,
+                "line": line,
+                "transcript": reply,
+                "speech_started_at": 100.0 + index,
+                "speech_end": 100.5 + index,
+                "speech_end_wall": 1_700_000_000.5 + index,
+                "first_audio": 101.0 + index,
+                "capture_started": 100.8 + index,
+                "overlap": False,
+                "segments": [{"start": 0.2, "end": 0.6, "text": reply}],
+                "room_deleted": 106.0 if index == 5 else None,
+            }
+            for index, (line, reply) in enumerate(
+                zip(scenario.caller_lines, replies, strict=True), 1
+            )
+        ]
+        languages = ("es", "es", "en", "es", "es")
+        voices = ("spanish-library", "spanish-library", "english-default", "spanish-library", "spanish-library")
+        evidence = [
+            {"room": room, "event": "mode", "mode": "conversation", "language": "es", "voice_id": "spanish-library", "created_at": 102.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": room, "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 104.0, "lookup_ms": 0.0, "selection": "default"},
+            {"room": room, "event": "mode", "mode": "conversation", "language": "es", "voice_id": "spanish-library", "created_at": 105.0, "lookup_ms": 0.0, "selection": "reused"},
+            *[
+                {"room": room, "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": 100.0 + index}
+                for index, (language, voice) in enumerate(zip(languages, voices, strict=True), 1)
+            ],
+        ]
+        requested_paths = []
+        record_path = f"records/voice-{room}.jsonl"
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, json.dumps({"turns": traces}), "")
+
+            def run_remote(self, command):
+                path = command[-1]
+                requested_paths.append(path)
+                if path == "voice/evals/phone.jsonl":
+                    return CompletedProcess(command, 0, "", "")
+                if path == "voice/evals/voice-modes.jsonl":
+                    return CompletedProcess(command, 0, "".join(json.dumps(row) + "\n" for row in evidence), "")
+                if path == "voice/evals/delegations.jsonl":
+                    return CompletedProcess(command, 0, "", "")
+                if path == record_path:
+                    raise subprocess.CalledProcessError(
+                        1, command, output="", stderr=f"cat: {record_path}: No such file or directory\n"
+                    )
+                prefix = "voice/evals/retained-evidence/input-audio/"
+                if path.startswith(prefix) and path.endswith(".txt"):
+                    index = int(path.rsplit("-", 1)[1][:-4])
+                    return CompletedProcess(command, 0, scenario.caller_lines[index - 1], "")
+                raise AssertionError(f"unexpected remote artifact {path!r}")
+
+        with patch.object(
+            runner,
+            "_voice_token",
+            return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"},
+        ):
+            observation = runner.observe_scenario(scenario, Stack())
+
+        self.assertNotIn("product_failures", observation)
+        self.assertEqual(observation["first_spanish_lookup_ms"], 24.5)
+        self.assertIn("voice/evals/voice-modes.jsonl", requested_paths)
+        self.assertEqual(
+            sum(path.endswith(".txt") for path in requested_paths),
+            len(scenario.caller_lines),
+        )
 
     def test_same_turn_hangup_timeout_retains_sdk_and_fake_phone_evidence(self):
         import json
@@ -4224,7 +4371,10 @@ class LocalEvalCliTests(unittest.TestCase):
                         "fast_mode_state": "off",
                     }],
                 })
-            return {"turns": turns}
+            observation = {"turns": turns}
+            if scenario.name == "spanish-language-switch":
+                observation["first_spanish_lookup_ms"] = 24.5
+            return observation
 
         output = []
         with patch.dict(os.environ, {"MENTAT_VOICE_MODEL": "claude-opus-5-5"}), patch.object(
@@ -4252,6 +4402,9 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertIn("latency_seconds", report["cases"][0]["turns"][0])
         self.assertIn("model_call_count", report["cases"][0]["turns"][0])
         self.assertEqual(report["cases"][0]["turns"][0]["latency_seconds"]["room_deleted"], 3.0)
+        self.assertEqual(
+            report["cases"][6]["first_spanish_lookup_ms"], [24.5, 24.5]
+        )
 
     def test_live_eval_requires_opt_in_and_continues_after_case_failure(self):
         from contextlib import contextmanager

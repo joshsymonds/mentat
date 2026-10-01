@@ -30,6 +30,9 @@ class Scenario:
     place_query: str | None = None
     selected_place_pattern: str | None = None
     spoken_place_pattern: str | None = None
+    caller_languages: tuple[str, ...] = ()
+    reply_languages: tuple[str, ...] = ()
+    voice_mode_expectations: tuple[str, ...] = ()
 
 
 _ALICE_FATHER_NAME = r"(?:W\.?\s*M\.?\s*Keck|William\s+(?:(?:M\.?|Myron)\s+)?Keck)"
@@ -272,6 +275,28 @@ SCENARIOS = (
         ),
         commands=(),
         room_close_after=None,
+    ),
+    Scenario(
+        name="spanish-language-switch",
+        caller_lines=(
+            "Can we continue in Spanish, please?",
+            "¿Cuál es la capital de Francia?",
+            "Let's switch back to English, please.",
+            "Can we speak Spanish again, please?",
+            "¿De qué color es el cielo en un día despejado?",
+        ),
+        turns=(
+            TurnExpectation((r"(?i)\b(?:español|espanol|claro|por supuesto)\b",)),
+            TurnExpectation((r"(?i)\bpar[ií]s\b",)),
+            TurnExpectation((r"(?i)\b(?:english|back to english|sure|okay)\b",)),
+            TurnExpectation((r"(?i)\b(?:español|espanol|claro|por supuesto)\b",)),
+            TurnExpectation((r"(?i)\bazul\b",)),
+        ),
+        commands=(),
+        room_close_after=5,
+        caller_languages=("en", "es", "en", "en", "es"),
+        reply_languages=("es", "es", "en", "es", "es"),
+        voice_mode_expectations=("es", "en", "es"),
     ),
 )
 

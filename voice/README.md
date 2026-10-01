@@ -246,8 +246,12 @@ python3 -m voice.evals.runner eval --list
 ```
 
 The current scenarios are `timer-300-seconds`, `equivalent-alarm`,
-`place-search-navigation`, `sms-say-back-yes`, `sms-correction-new-yes`, and
-`alice-keck-context-chain`.
+`place-search-navigation`, `sms-say-back-yes`, `sms-correction-new-yes`,
+`alice-keck-context-chain`, and `spanish-language-switch`. The Spanish scenario
+switches from English to Spanish, back to English, then to Spanish again; its
+pass verdict requires the recorded input transcripts, mode transitions, and
+synthesis voices to agree with each scripted turn. The report includes the first
+Spanish voice lookup duration.
 
 The eval prints a JSON report to stdout and exits nonzero if any scenario,
 observation-count, or latency gate fails. Keep the report when diagnosing a
