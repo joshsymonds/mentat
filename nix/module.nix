@@ -206,6 +206,7 @@ in {
       description = "mentat personal assistant daemon";
       after = [ "network.target" ];
       wantedBy = [ "multi-user.target" ];
+      path = [ pkgs.git ];
 
       # No restartTriggers on cfg.environmentFile here: that's the constant
       # /run/agenix path, which never changes between generations. The host
@@ -215,6 +216,7 @@ in {
         MENTAT_CLAUDE_BIN = lib.getExe' cfg.claudePackage "claude";
         MENTAT_LISTEN = "127.0.0.1:${toString cfg.listenPort}";
         MENTAT_STATE_PATH = "/var/lib/mentat/sessions.json";
+        MENTAT_MEMORY_DIR = "/var/lib/mentat/memory";
         MENTAT_MODEL = cfg.model;
         MENTAT_MAX_BUDGET_USD = toString cfg.maxBudgetUsd;
         # The SDK child writes $HOME/.claude state; point it at the state
