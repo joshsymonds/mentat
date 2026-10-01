@@ -259,6 +259,10 @@
       # while mentatd itself is still the static mentat user.
       assert lib.assertMsg (observed.daemonUser == "mentat")
         "mentatd no longer runs as mentat: ${observed.daemonUser}";
+      assert lib.assertMsg (observed.daemonEnv.MENTAT_MEMORY_DIR or null == "/var/lib/mentat/memory")
+        "mentatd MENTAT_MEMORY_DIR mismatch: ${builtins.toJSON (observed.daemonEnv.MENTAT_MEMORY_DIR or null)}";
+      assert lib.assertMsg (builtins.elem "${pkgs.git}/bin" (lib.splitString ":" observed.daemonEnv.PATH))
+        "mentatd service PATH must include git: ${observed.daemonEnv.PATH}";
 
       pkgs.runCommand "mentat-module-eval" {} ''
         cat > $out <<'EOF'
