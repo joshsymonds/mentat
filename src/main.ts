@@ -50,6 +50,7 @@ try {
   const bridge = new PhoneBridge(logger);
   const mcp = {
     bridge,
+    ...(memory !== undefined && { memory }),
     places: {
       ...(config.placesApiKey !== undefined && { apiKey: config.placesApiKey }),
       fetch: globalThis.fetch,
