@@ -129,6 +129,52 @@ describe('MemoryStore', () => {
     })).rejects.toThrow(/rowan/i);
   });
 
+  it('refuses identity tokens held by another identity after trimming whitespace', async () => {
+    const store = makeStore();
+    await store.save({
+      id: 'rowan', tier: 'everyday',
+      header: header({ name: 'Shared name', aliases: ['Shared alias'] }), facts: ['rowan fact'], source: 'josh',
+    });
+
+    await expect(store.save({
+      id: 'sage', tier: 'everyday',
+      header: header({ name: 'Synthetic Sage', aliases: [' Shared alias '] }),
+      facts: ['sage fact'], source: 'josh',
+    })).rejects.toThrow(/rowan/i);
+    await expect(store.save({
+      id: 'sage', tier: 'everyday',
+      header: header({ name: 'Synthetic Sage', aliases: [' Shared name '] }),
+      facts: ['sage fact'], source: 'josh',
+    })).rejects.toThrow(/rowan/i);
+    await expect(store.save({
+      id: 'sage', tier: 'everyday',
+      header: header({ name: ' Shared alias ', aliases: ['Sage alias'] }),
+      facts: ['sage fact'], source: 'josh',
+    })).rejects.toThrow(/rowan/i);
+
+    await store.save({
+      id: 'sage', tier: 'everyday',
+      header: header({ name: ' Synthetic Sage ', aliases: [' Sage alias '] }),
+      facts: ['sage fact'], source: 'josh',
+    });
+    const saved = await store.read('sage');
+    expect(saved.text).toContain('name: Synthetic Sage');
+    expect(saved.text).toContain('aliases: Sage alias');
+  });
+
+  it('validates malformed identity fields before normalizing them', async () => {
+    const store = makeStore();
+
+    await expect(store.save({
+      id: 'rowan', tier: 'everyday',
+      header: header({ name: 1 as unknown as string }), facts: ['fact'], source: 'josh',
+    })).rejects.toThrow('invalid memory record: name is required');
+    await expect(store.save({
+      id: 'sage', tier: 'everyday',
+      header: header({ aliases: null as unknown as string[] }), facts: ['fact'], source: 'josh',
+    })).rejects.toThrow('invalid memory record: aliases must be an array');
+  });
+
   it('confirms a save only after its commit is visible in git', async () => {
     const store = makeStore();
     await store.save({

@@ -183,12 +183,22 @@ export class MemoryStore {
         throw new Error(`revision mismatch for memory record ${input.id}`);
       }
 
+      const now = this.now();
+      formatMemoryRecord(input.header, input.facts, input.source, now);
+      const normalizedInput: SaveInput = {
+        ...input,
+        header: {
+          ...input.header,
+          name: input.header.name.trim(),
+          aliases: input.header.aliases.map((alias) => alias.trim()),
+        },
+      };
       const before = await this.everydayRecords();
-      this.checkIdentityClashes(input, await this.allRecords());
-      const text = formatMemoryRecord(input.header, input.facts, input.source, this.now());
+      this.checkIdentityClashes(normalizedInput, await this.allRecords());
+      const text = formatMemoryRecord(normalizedInput.header, normalizedInput.facts, normalizedInput.source, now);
       const revision = this.revision(text);
-      const after = input.tier === 'everyday'
-        ? [...before.filter((record) => record.id !== input.id), this.toRecord(input.id, input.tier, text)]
+      const after = normalizedInput.tier === 'everyday'
+        ? [...before.filter((record) => record.id !== normalizedInput.id), this.toRecord(normalizedInput.id, normalizedInput.tier, text)]
         : before;
       const currentSize = Buffer.byteLength(this.formatIndex(before));
       const nextIndex = this.formatIndex(after);
@@ -405,7 +415,7 @@ export class MemoryStore {
     const proposed = [input.header.name, ...input.header.aliases].map((value) => value.toLowerCase());
     for (const record of records) {
       if (record.id === input.id) continue;
-      const current = [record.header.name, ...record.header.aliases].map((value) => value.toLowerCase());
+      const current = [record.header.name, ...record.header.aliases].map((value) => value.trim().toLowerCase());
       if (proposed.some((value) => current.includes(value))) {
         throw new Error(`memory identity clashes with ${record.id}`);
       }
