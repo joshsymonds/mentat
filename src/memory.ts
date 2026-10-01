@@ -79,6 +79,16 @@ export class MemoryStore {
     throw new Error(`memory record ${id} is missing`);
   }
 
+  async lookup(query: string): Promise<string> {
+    const keyword = query.trim().toLowerCase();
+    if (keyword === '') return 'NO_MATCH';
+    const matches = (await this.allRecords())
+      .filter((record) => record.tier === 'private' && record.text.toLowerCase().includes(keyword))
+      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+    if (matches.length === 0) return 'NO_MATCH';
+    return matches.map((record) => `## ${record.id}\n${record.text}`).join('\n');
+  }
+
   async forget(id: string, tier: Tier, fact?: string): Promise<void> {
     this.validateId(id);
     return this.withLock(async () => {

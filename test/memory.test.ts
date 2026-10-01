@@ -159,6 +159,37 @@ describe('MemoryStore', () => {
     expect(readFileSync(join(memoryDir, 'rowan.md'), 'utf8')).not.toContain('replacement fact');
   });
 
+  it('looks up private records by case-insensitive keywords without matching everyday records', async () => {
+    const store = makeStore();
+    await store.save({
+      id: 'rowan', tier: 'everyday',
+      header: header({ name: 'Synthetic Rowan', aliases: ['Ordinary alias'], summary: 'Everyday summary' }),
+      facts: ['everyday-only phrase'], source: 'josh',
+    });
+    await store.save({
+      id: 'sage', tier: 'private',
+      header: header({ name: 'Synthetic Sage', aliases: ['Private alias'], summary: 'Private summary' }),
+      facts: ['private fact with cobalt'], source: 'josh',
+    });
+    await store.save({
+      id: 'wren', tier: 'private',
+      header: header({ name: 'Synthetic Wren', aliases: ['Second private alias'], summary: 'Another private summary' }),
+      facts: ['private fact with cobalt'], source: 'josh',
+    });
+
+    const result = await store.lookup('COBALT');
+    expect(result).toContain('sage');
+    expect(result).toContain('private fact with cobalt');
+    expect(result).toContain('wren');
+    expect(result.indexOf('sage')).toBeLessThan(result.indexOf('wren'));
+    await expect(store.lookup('EVERYDAY-ONLY')).resolves.toBe('NO_MATCH');
+    await expect(store.lookup('absent keyword')).resolves.toBe('NO_MATCH');
+    await expect(store.lookup('')).resolves.toBe('NO_MATCH');
+    await expect(store.lookup('  \t ')).resolves.toBe('NO_MATCH');
+    await expect(store.lookup('PRIVATE ALIAS')).resolves.toContain('sage');
+    await expect(store.lookup('synthetic sage')).resolves.toContain('## sage');
+  });
+
   it('refuses reads of private and missing identities', async () => {
     const store = makeStore();
     await store.save({
