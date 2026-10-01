@@ -1,4 +1,6 @@
+import { execFile } from 'node:child_process';
 import type { ReadableStreamDefaultReader } from 'node:stream/web';
+import { promisify } from 'node:util';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -11,15 +13,26 @@ import { SessionTracker, createHandler } from '../src/server.ts';
 import type { PlacesDeps } from '../src/places.ts';
 import type { Backend } from '../src/backend.ts';
 import { createServer, type Server } from 'node:http';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { MemoryStore } from '../src/memory.ts';
+
+const execFileAsync = promisify(execFile);
 const servers: Server[] = [];
+const memoryDirs: string[] = [];
 const backend: Backend = {
   converse: () => Promise.resolve((async function* () { await Promise.resolve(); return; })()),
   closeSession: () => Promise.resolve(),
 };
 
-async function serve(bridge: PhoneBridge, places: PlacesDeps = {}): Promise<string> {
-  const server = createServer(createHandler(backend, new SessionTracker(), nullLogger, undefined, { bridge, places }));
+async function serve(bridge: PhoneBridge, places: PlacesDeps = {}, memory?: MemoryStore): Promise<string> {
+  const server = createServer(createHandler(backend, new SessionTracker(), nullLogger, undefined, {
+    bridge,
+    places,
+    ...(memory !== undefined && { memory }),
+  }));
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -55,9 +68,231 @@ afterEach(async () => {
   for (const server of servers.splice(0)) {
     await new Promise((resolve) => server.close(resolve));
   }
+  for (const dir of memoryDirs.splice(0)) await rm(dir, { recursive: true, force: true });
 });
 
+async function createMemoryStore(): Promise<MemoryStore> {
+  const dir = await mkdtemp(join(tmpdir(), 'mentat-mcp-memory-'));
+  memoryDirs.push(dir);
+  return new MemoryStore({ dir, logger: nullLogger, now: () => new Date('2026-10-01T12:00:00.000Z') });
+}
+
 describe('POST /mcp', () => {
+  it('registers memory tools only when memory is configured and describes their safe use', async () => {
+    const bridge = new PhoneBridge(nullLogger);
+    const base = await serve(bridge);
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+    const absent = await client.listTools();
+    expect(absent.tools.map((tool) => tool.name).filter((name) => name.startsWith('memory_'))).toEqual([]);
+    await client.close();
+    bridge.close();
+
+    const configuredBridge = new PhoneBridge(nullLogger);
+    const memory = await createMemoryStore();
+    const configuredBase = await serve(configuredBridge, {}, memory);
+    const configuredTransport = new StreamableHTTPClientTransport(new URL(`${configuredBase}/mcp`));
+    const configuredClient = new Client({ name: 'test-client', version: '1.0.0' });
+    await configuredClient.connect(configuredTransport as Transport);
+    const listed = await configuredClient.listTools();
+    expect(listed.tools.map((tool) => tool.name).filter((name) => name.startsWith('memory_'))).toEqual([
+      'memory_read', 'memory_save', 'memory_forget', 'memory_lookup',
+    ]);
+    const read = listed.tools.find((tool) => tool.name === 'memory_read');
+    const save = listed.tools.find((tool) => tool.name === 'memory_save');
+    const lookup = listed.tools.find((tool) => tool.name === 'memory_lookup');
+    expect(read?.description).toContain('no id');
+    expect(save?.description?.toLowerCase()).toContain('read the record first');
+    expect(save?.description?.toLowerCase()).toContain('private corrections');
+    expect(save?.description?.toLowerCase()).toContain('memory_lookup');
+    expect(save?.description).toContain('third-party');
+    expect(lookup?.description).toContain('explicitly asks');
+    expect(lookup?.description?.toLowerCase()).toContain('revision');
+    expect(Object.keys(save?.inputSchema.properties ?? {})).toEqual([
+      'id', 'tier', 'name', 'relation', 'aliases', 'contact', 'group', 'summary', 'facts', 'source', 'revision',
+    ]);
+    expect(save?.inputSchema.properties?.id).toEqual({ type: 'string' });
+    expect(save?.inputSchema.properties).not.toHaveProperty('path');
+    await configuredClient.close();
+    configuredBridge.close();
+  });
+
+  it('indexes everyday memory, reads its revision, restricts private records, and looks them up explicitly', async () => {
+    const bridge = new PhoneBridge(nullLogger);
+    const memory = await createMemoryStore();
+    const base = await serve(bridge, {}, memory);
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+
+    expect(textContent(await client.callTool({ name: 'memory_read', arguments: {} }))).toContain('no memories yet');
+    const saved = await client.callTool({
+      name: 'memory_save',
+      arguments: {
+        id: 'work-preference', tier: 'everyday', name: 'Synthetic Person', aliases: [], group: 'work',
+        summary: 'Synthetic everyday preference.', facts: ['Prefers concise updates.'], source: 'josh',
+      },
+    });
+    expect(saved.isError).not.toBe(true);
+    const revision = textContent(saved);
+    expect(revision).toMatch(/^[a-f0-9]{64}$/);
+    const index = textContent(await client.callTool({ name: 'memory_read', arguments: {} }));
+    expect(index).toContain('work-preference');
+    expect(index).toContain('Synthetic everyday preference.');
+    const record = textContent(await client.callTool({ name: 'memory_read', arguments: { id: 'work-preference' } }));
+    expect(record).toContain('[2026-10-01, josh] Prefers concise updates.');
+    expect(record).toContain(revision);
+
+    const privateSave = await client.callTool({
+      name: 'memory_save',
+      arguments: {
+        id: 'private-topic', tier: 'private', name: 'Synthetic Private Person', aliases: [], group: 'private',
+        summary: 'Synthetic private summary.', facts: ['Private synthetic fact.'], source: 'josh',
+      },
+    });
+    expect(privateSave.isError).not.toBe(true);
+    const privateRead = await client.callTool({ name: 'memory_read', arguments: { id: 'private-topic' } });
+    expect(privateRead).toMatchObject({ isError: true });
+    expect(textContent(privateRead)).toContain('is private');
+    const privateLookup = await client.callTool({ name: 'memory_lookup', arguments: { query: 'Private synthetic fact' } });
+    const privateText = textContent(privateLookup);
+    expect(privateText).toContain('Private synthetic fact.');
+    const revisionMatch = /\(revision: ([a-f0-9]{64})\)/.exec(privateText);
+    expect(revisionMatch).not.toBeNull();
+    const privateRevision = revisionMatch?.[1];
+    if (privateRevision === undefined) throw new Error('private lookup omitted its revision');
+
+    const privateCorrection = await client.callTool({
+      name: 'memory_save',
+      arguments: {
+        id: 'private-topic', tier: 'private', name: 'Synthetic Private Person', aliases: [], group: 'private',
+        summary: 'Corrected synthetic private summary.', facts: ['Corrected private synthetic fact.'],
+        source: 'josh', revision: privateRevision,
+      },
+    });
+    expect(privateCorrection.isError).not.toBe(true);
+    const staleCorrection = await client.callTool({
+      name: 'memory_save',
+      arguments: {
+        id: 'private-topic', tier: 'private', name: 'Synthetic Private Person', aliases: [], group: 'private',
+        summary: 'Stale private summary.', facts: ['Stale private synthetic fact.'], source: 'josh', revision: privateRevision,
+      },
+    });
+    expect(staleCorrection).toMatchObject({ isError: true });
+    expect(textContent(staleCorrection)).toContain('revision mismatch');
+    const correctedLookup = await client.callTool({
+      name: 'memory_lookup', arguments: { query: 'Corrected private synthetic fact' },
+    });
+    expect(textContent(correctedLookup)).toContain('Corrected private synthetic fact.');
+    expect(textContent(await client.callTool({ name: 'memory_lookup', arguments: { query: 'no-match' } }))).toBe('NO_MATCH');
+
+    await client.close();
+    bridge.close();
+  });
+
+  it('saves with revision checks and forgets records or individual facts', async () => {
+    const bridge = new PhoneBridge(nullLogger);
+    const memoryDir = await mkdtemp(join(tmpdir(), 'mentat-mcp-memory-'));
+    memoryDirs.push(memoryDir);
+    const memory = new MemoryStore({ dir: memoryDir, logger: nullLogger, now: () => new Date('2026-10-01T12:00:00.000Z') });
+    const base = await serve(bridge, {}, memory);
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+
+    const initial = await client.callTool({
+      name: 'memory_save',
+      arguments: {
+        id: 'project-notes', tier: 'everyday', name: 'Synthetic Project', aliases: [], group: 'projects',
+        summary: 'Synthetic project details.', facts: ['First synthetic fact.', 'Second synthetic fact.'], source: 'josh',
+      },
+    });
+    const firstRevision = textContent(initial);
+    const { stdout: commitSubject } = await execFileAsync('git', [
+      '-C', memoryDir, 'log', '-1', '--format=%s',
+    ], { encoding: 'utf8' });
+    expect(commitSubject.trim()).toBe('memory: save project-notes (everyday)');
+    const update = await client.callTool({
+      name: 'memory_save',
+      arguments: {
+        id: 'project-notes', tier: 'everyday', name: 'Synthetic Project', aliases: [], group: 'projects',
+        summary: 'Updated synthetic project details.', facts: ['Updated synthetic fact.'], source: 'inferred', revision: firstRevision,
+      },
+    });
+    const nextRevision = textContent(update);
+    expect(nextRevision).not.toBe(firstRevision);
+    const conflict = await client.callTool({
+      name: 'memory_save',
+      arguments: {
+        id: 'project-notes', tier: 'everyday', name: 'Synthetic Project', aliases: [], group: 'projects',
+        summary: 'Conflicting update.', facts: ['Conflict.'], source: 'josh', revision: firstRevision,
+      },
+    });
+    expect(conflict).toMatchObject({ isError: true });
+    expect(textContent(conflict)).toContain('revision mismatch');
+    const invalid = await client.callTool({
+      name: 'memory_save',
+      arguments: {
+        id: '../outside', tier: 'everyday', name: 'Synthetic Project', aliases: [], group: 'projects',
+        summary: 'Invalid id.', facts: ['Fact.'], source: 'josh',
+      },
+    });
+    expect(invalid).toMatchObject({ isError: true });
+    expect(textContent(invalid)).toContain('invalid memory id');
+
+    const forgotFact = await client.callTool({
+      name: 'memory_forget',
+      arguments: { id: 'project-notes', tier: 'everyday', fact: 'Updated synthetic fact.' },
+    });
+    expect(forgotFact.isError).not.toBe(true);
+    expect(textContent(forgotFact)).toContain('Forgot fact');
+    const afterFactForget = textContent(await client.callTool({ name: 'memory_read', arguments: { id: 'project-notes' } }));
+    expect(afterFactForget).not.toContain('Updated synthetic fact.');
+    const forgotRecord = await client.callTool({ name: 'memory_forget', arguments: { id: 'project-notes', tier: 'everyday' } });
+    expect(forgotRecord.isError).not.toBe(true);
+    expect(textContent(forgotRecord)).toContain('Forgot memory record');
+    const afterRecordForget = textContent(await client.callTool({ name: 'memory_read', arguments: {} }));
+    expect(afterRecordForget).toContain('no memories yet');
+
+    const missingForget = await client.callTool({ name: 'memory_forget', arguments: { id: 'project-notes', tier: 'everyday' } });
+    expect(missingForget).toMatchObject({ isError: true });
+    expect(textContent(missingForget)).toContain('memory record project-notes is missing');
+    await client.close();
+    bridge.close();
+  });
+  it('returns an MCP error when a memory save commit fails', async () => {
+    const supportDir = await mkdtemp(join(tmpdir(), 'mentat-mcp-memory-git-'));
+    memoryDirs.push(supportDir);
+    const failingGit = join(supportDir, 'git-fail-commit');
+    await writeFile(failingGit, '#!/bin/sh\nfor arg do\n  if [ "$arg" = "commit" ]; then\n    echo "synthetic commit failure" >&2\n    exit 1\n  fi\ndone\nexec git "$@"\n');
+    await chmod(failingGit, 0o700);
+    const memoryDir = await mkdtemp(join(tmpdir(), 'mentat-mcp-memory-'));
+    memoryDirs.push(memoryDir);
+    const memory = new MemoryStore({ dir: memoryDir, logger: nullLogger, git: failingGit });
+    const bridge = new PhoneBridge(nullLogger);
+    const base = await serve(bridge, {}, memory);
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+
+    const result = await client.callTool({
+      name: 'memory_save',
+      arguments: {
+        id: 'commit-failure', tier: 'everyday', name: 'Synthetic Record', aliases: [], group: 'test',
+        summary: 'Synthetic commit failure case.', facts: ['Synthetic fact.'], source: 'josh',
+      },
+    });
+    expect(result).toMatchObject({ isError: true });
+    expect(textContent(result)).toContain('memory commit failed for commit-failure');
+    const unreadable = await client.callTool({ name: 'memory_read', arguments: { id: 'commit-failure' } });
+    expect(unreadable).toMatchObject({ isError: true });
+    expect(textContent(unreadable)).toContain('memory record commit-failure is missing');
+
+    await client.close();
+    bridge.close();
+  });
+
   it('lists the phone tools with required string schemas', async () => {
     const bridge = new PhoneBridge(nullLogger);
     const base = await serve(bridge);
