@@ -30,24 +30,62 @@ class AgentSourceContractTest(unittest.TestCase):
         stt = next(
             keyword.value for keyword in session_call.keywords if keyword.arg == "stt"
         )
-        expected_stt = ast.parse(
-            'openai.STT(model="gpt-live-transcribe", api_key=os.environ["OPENAI_API_KEY"], '
-            'vad=ctx.proc.userdata["vad"])',
-            mode="eval",
-        ).body
+        expected_stt = ast.parse("stt", mode="eval").body
         self.assertEqual(
             ast.dump(stt, include_attributes=False),
             ast.dump(expected_stt, include_attributes=False),
         )
+        stt_provider = next(
+            node.value for node in entrypoint.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "stt" for target in node.targets)
+        )
+        expected_stt_provider = ast.parse(
+            'openai.STT(model="gpt-live-transcribe", api_key=os.environ["OPENAI_API_KEY"], '
+            'vad=ctx.proc.userdata["vad"], language="en")',
+            mode="eval",
+        ).body
+        self.assertEqual(
+            ast.dump(stt_provider, include_attributes=False),
+            ast.dump(expected_stt_provider, include_attributes=False),
+        )
+        default_voice = next(
+            node.value for node in entrypoint.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "default_voice"
+                for target in node.targets
+            )
+        )
+        expected_default_voice = ast.parse(
+            'os.environ.get("MENTAT_VOICE_TTS_VOICE", TTS_VOICE)', mode="eval"
+        ).body
+        self.assertEqual(
+            ast.dump(default_voice, include_attributes=False),
+            ast.dump(expected_default_voice, include_attributes=False),
+        )
+        tts_provider = next(
+            node.value for node in entrypoint.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "tts_provider"
+                for target in node.targets
+            )
+        )
+        expected_tts_provider = ast.parse(
+            'elevenlabs.TTS(model="eleven_v4_turbo", '
+            'api_key=os.environ["ELEVENLABS_API_KEY"], '
+            'voice_id=default_voice, language="en")',
+            mode="eval",
+        ).body
+        self.assertEqual(
+            ast.dump(tts_provider, include_attributes=False),
+            ast.dump(expected_tts_provider, include_attributes=False),
+        )
         tts_call = next(
             keyword.value for keyword in session_call.keywords if keyword.arg == "tts"
         )
-        expected_tts = ast.parse(
-            'tts.StreamAdapter(tts=elevenlabs.TTS(model="eleven_v4_turbo", '
-            'api_key=os.environ["ELEVENLABS_API_KEY"], '
-            'voice_id=os.environ.get("MENTAT_VOICE_TTS_VOICE", TTS_VOICE)))',
-            mode="eval",
-        ).body
+        expected_tts = ast.parse("tts.StreamAdapter(tts=tts_provider)", mode="eval").body
         self.assertEqual(
             ast.dump(tts_call, include_attributes=False),
             ast.dump(expected_tts, include_attributes=False),
@@ -82,7 +120,9 @@ class AgentSourceContractTest(unittest.TestCase):
             "\n\ndef log_turn_metrics", 1
         )[0]
         self.assertIn('f"{self._mentat_url}/v1/conversation"', backend)
-        self.assertIn("turn_request(self._room_name, envelope)", backend)
+        self.assertIn("turn_request(", backend)
+        self.assertIn("self._room_name", backend)
+        self.assertIn("envelope", backend)
         self.assertIn("yield item", backend)
         self.assertNotIn("chunker", backend)
 
@@ -395,10 +435,11 @@ class AgentSourceContractTest(unittest.TestCase):
             "is_sms_followup": lambda _text: False,
             "consult_envelope": lambda *_args, **_kwargs: "envelope",
             "recent_turns": lambda _items: [],
-            "turn_request": lambda *_args: {},
+            "turn_request": lambda *_args, **_kwargs: {},
             "write_turn_marker": Mock(),
             "logger": Mock(),
             "SEND_SMS_TOOL": "mcp__mentat__send_sms",
+            "SET_VOICE_MODE_TOOL": "mcp__mentat__set_voice_mode",
             "END_CONVERSATION_TOOL": "mcp__mentat__end_conversation",
             "ToolResult": FakeToolResult,
             "ToolStart": FakeToolStart,
@@ -414,6 +455,9 @@ class AgentSourceContractTest(unittest.TestCase):
         agent = SimpleNamespace(
             _sms_consent=False,
             _voice_card="voice card",
+            _voice_mode="normal",
+            _voice_language="en",
+            _voice_mode_note=None,
             _room_name="eval-room",
             _mentat_url="http://127.0.0.1:8484",
             _ending_policy=SimpleNamespace(
@@ -631,10 +675,11 @@ class AgentSourceContractTest(unittest.TestCase):
             "is_sms_followup": lambda _text: False,
             "consult_envelope": lambda *_args, **_kwargs: "envelope",
             "recent_turns": lambda _items: [],
-            "turn_request": lambda *_args: {},
+            "turn_request": lambda *_args, **_kwargs: {},
             "write_turn_marker": Mock(),
             "logger": Mock(),
             "SEND_SMS_TOOL": "mcp__mentat__send_sms",
+            "SET_VOICE_MODE_TOOL": "mcp__mentat__set_voice_mode",
             "END_CONVERSATION_TOOL": "mcp__mentat__end_conversation",
             "ToolResult": type("ToolResult", (), {}),
             "TurnDone": FakeTurnDone,
@@ -645,6 +690,9 @@ class AgentSourceContractTest(unittest.TestCase):
         agent = SimpleNamespace(
             _sms_consent=False,
             _voice_card="voice card",
+            _voice_mode="normal",
+            _voice_language="en",
+            _voice_mode_note=None,
             _room_name="eval-room",
             _mentat_url="http://127.0.0.1:8484",
             _ending_policy=policy,
@@ -1331,10 +1379,11 @@ class AgentSourceContractTest(unittest.TestCase):
             "is_sms_followup": lambda _text: False,
             "consult_envelope": lambda *_args, **_kwargs: "envelope",
             "recent_turns": lambda _items: [],
-            "turn_request": lambda *_args: {},
+            "turn_request": lambda *_args, **_kwargs: {},
             "write_turn_marker": Mock(),
             "logger": Mock(),
             "SEND_SMS_TOOL": "mcp__mentat__send_sms",
+            "SET_VOICE_MODE_TOOL": "mcp__mentat__set_voice_mode",
             "END_CONVERSATION_TOOL": "mcp__mentat__end_conversation",
             "ToolResult": FakeToolResult,
             "ToolStart": FakeTurnStart,
@@ -1349,6 +1398,9 @@ class AgentSourceContractTest(unittest.TestCase):
         agent = SimpleNamespace(
             _sms_consent=False,
             _voice_card="voice card",
+            _voice_mode="normal",
+            _voice_language="en",
+            _voice_mode_note=None,
             _room_name="eval-room",
             _mentat_url="http://127.0.0.1:8484",
             _ending_policy=policy,
@@ -1479,10 +1531,11 @@ class AgentSourceContractTest(unittest.TestCase):
             "is_sms_followup": lambda _text: False,
             "consult_envelope": lambda *_args, **_kwargs: "envelope",
             "recent_turns": lambda _items: [],
-            "turn_request": lambda *_args: {},
+            "turn_request": lambda *_args, **_kwargs: {},
             "write_turn_marker": Mock(),
             "logger": Mock(),
             "SEND_SMS_TOOL": "mcp__mentat__send_sms",
+            "SET_VOICE_MODE_TOOL": "mcp__mentat__set_voice_mode",
             "END_CONVERSATION_TOOL": "mcp__mentat__end_conversation",
             "ToolResult": FakeToolResult,
             "ToolStart": FakeTurnStart,
@@ -1494,6 +1547,9 @@ class AgentSourceContractTest(unittest.TestCase):
         agent = SimpleNamespace(
             _sms_consent=False,
             _voice_card="voice card",
+            _voice_mode="normal",
+            _voice_language="en",
+            _voice_mode_note=None,
             _room_name="eval-room",
             _mentat_url="http://127.0.0.1:8484",
             _ending_policy=policy,
@@ -1555,7 +1611,10 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(ast.unparse(vad), "ctx.proc.userdata['vad']")
 
         stt = next(
-            keyword.value for keyword in session_call.keywords if keyword.arg == "stt"
+            node.value
+            for node in entrypoint.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "stt" for target in node.targets)
         )
         stt_vad = next(
             keyword.value for keyword in stt.keywords if keyword.arg == "vad"
@@ -1684,6 +1743,357 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         self.assertIn("if input_audio_dir else None", ast.unparse(init))
         self.assertNotIn("user_input_transcribed", source)
+
+    def test_voice_mode_result_updates_call_local_stt_and_tts_or_rolls_back(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        apply_mode = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_apply_voice_mode"
+        )
+
+        class Provider:
+            def __init__(self, *, fail_on=None):
+                self.calls = []
+                self.fail_on = fail_on
+
+            def update_options(self, **options):
+                self.calls.append(options)
+                if options == self.fail_on:
+                    raise RuntimeError("provider update failed")
+
+        class Resolver:
+            def __init__(self):
+                self.calls = []
+
+            def resolve(self, language, default_voice):
+                self.calls.append((language, default_voice))
+                return {"es": "library-spanish", "en": "saved-english"}.get(
+                    language, default_voice
+                )
+
+        namespace = {"json": json, "re": re, "logger": Mock()}
+        exec(compile(ast.Module(body=[apply_mode], type_ignores=[]), str(agent_path), "exec"), namespace)
+
+        def make_agent(tts=None):
+            resolver = Resolver()
+            return SimpleNamespace(
+                _voice_mode="normal",
+                _voice_language="en",
+                _voice_id="default-voice",
+                _default_voice="default-voice",
+                _stt=Provider(),
+                _tts=tts or Provider(),
+                _voice_resolver=resolver,
+                _voice_mode_note=None,
+            )
+
+        spanish = '{"voice_mode":{"mode":"conversation","language":"es"}}'
+        agent = make_agent()
+        self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, spanish)))
+        self.assertEqual(agent._voice_mode, "conversation")
+        self.assertEqual(agent._voice_language, "es")
+        self.assertEqual(agent._voice_id, "library-spanish")
+        self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")])
+        self.assertEqual(agent._stt.calls, [{"language": "es"}])
+        self.assertEqual(
+            agent._tts.calls,
+            [{"voice_id": "library-spanish", "language": "es"}],
+        )
+
+        separate_call = make_agent()
+        self.assertEqual(
+            (separate_call._voice_mode, separate_call._voice_language, separate_call._voice_id),
+            ("normal", "en", "default-voice"),
+        )
+        restore = '{"voice_mode":{"mode":"normal","language":"en"}}'
+        self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, restore)))
+        self.assertEqual(agent._voice_mode, "normal")
+        self.assertEqual(agent._voice_language, "en")
+        self.assertEqual(agent._voice_id, "default-voice")
+        self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")])
+        self.assertEqual(agent._stt.calls[-1], {"language": "en"})
+        self.assertEqual(
+            agent._tts.calls[-1], {"voice_id": "default-voice", "language": "en"}
+        )
+
+        calls_before_invalid = (len(agent._stt.calls), len(agent._tts.calls))
+        self.assertFalse(
+            asyncio.run(namespace["_apply_voice_mode"](
+                agent, '{"voice_mode":{"mode":"unknown","language":"es"}}'
+            ))
+        )
+        self.assertFalse(asyncio.run(namespace["_apply_voice_mode"](agent, spanish, is_error=True)))
+        self.assertEqual((len(agent._stt.calls), len(agent._tts.calls)), calls_before_invalid)
+        self.assertEqual((agent._voice_mode, agent._voice_language), ("normal", "en"))
+
+        failing_tts = Provider(fail_on={"voice_id": "library-spanish", "language": "es"})
+        failed = make_agent(failing_tts)
+        self.assertFalse(asyncio.run(namespace["_apply_voice_mode"](failed, spanish)))
+        self.assertEqual((failed._voice_mode, failed._voice_language, failed._voice_id),
+                         ("normal", "en", "default-voice"))
+        self.assertEqual(failed._stt.calls, [{"language": "es"}, {"language": "en"}])
+        self.assertEqual(
+            failing_tts.calls,
+            [
+                {"voice_id": "library-spanish", "language": "es"},
+                {"voice_id": "default-voice", "language": "en"},
+            ],
+        )
+        self.assertTrue(failed._voice_mode_note)
+        self.assertLessEqual(len(failed._voice_mode_note), 160)
+
+    def test_voice_mode_defaults_and_request_use_active_call_mode(self):
+        source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
+        tree = ast.parse(source)
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        init = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        init_source = ast.unparse(init)
+        backend = source.split("    async def _backend_text(", 1)[1].split(
+            "\n\ndef log_turn_metrics", 1
+        )[0]
+        entry = source.split("async def entrypoint(", 1)[1]
+        self.assertIn("self._voice_mode = 'normal'", init_source)
+        self.assertIn("self._voice_language = 'en'", init_source)
+        self.assertIn("voice_mode=self._voice_mode", backend)
+        self.assertIn("voice_language=self._voice_language", backend)
+        self.assertIn("_apply_voice_mode(", backend)
+        self.assertIn("item.content", backend)
+        self.assertIn("is_error=item.is_error", backend)
+        self.assertIn("stt=stt", entry)
+        self.assertIn("tts=tts.StreamAdapter(tts=tts_provider)", entry)
+        self.assertIn("voice_resolver=voice_resolver", entry)
+        self.assertIn("_voice_mode_note", backend)
+
+    def test_tool_result_changes_meta_before_the_next_backend_turn_and_speech(self):
+        from collections.abc import AsyncGenerator
+        from types import MethodType
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        methods = [
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name in {"_apply_voice_mode", "_backend_text"}
+        ]
+
+        class FakeToolResult:
+            def __init__(self, name, is_error, content):
+                self.name = name
+                self.is_error = is_error
+                self.content = content
+
+        class FakeTurnDone:
+            pass
+
+        class FakeTurnStream:
+            done = False
+
+            def feed(self, data):
+                event = json.loads(data)
+                if event["kind"] == "text_delta":
+                    return [event["text"]]
+                if event["kind"] == "tool_result":
+                    return [FakeToolResult(event["tool"], event["is_error"], event["content"])]
+                if event["kind"] == "done":
+                    self.done = True
+                    return [FakeTurnDone()]
+                return []
+
+        class FakeContent:
+            def __init__(self, chunks):
+                self.chunks = chunks
+
+            async def iter_any(self):
+                for chunk in self.chunks:
+                    yield chunk
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, chunks):
+                self.content = FakeContent(chunks)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeHttp:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, *_args, **_kwargs):
+                return self.response
+
+        timeline = []
+        requests = []
+        response = None
+
+        class Provider:
+            def update_options(self, **options):
+                timeline.append(("update", options))
+
+        class Resolver:
+            def resolve(self, language, default_voice):
+                return "library-spanish" if language == "es" else default_voice
+
+        def make_turn_request(*args, **kwargs):
+            requests.append((args, kwargs))
+            return {}
+
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "json": json,
+            "re": re,
+            "aiohttp": SimpleNamespace(
+                ClientSession=lambda **_kwargs: FakeHttp(response),
+                ClientError=Exception,
+            ),
+            "TIMEOUT": None,
+            "CONSULT_FAILED": "request failed",
+            "TurnError": RuntimeError,
+            "TurnStream": FakeTurnStream,
+            "is_sms_request": lambda _text: False,
+            "is_sms_decline": lambda _text: False,
+            "is_sms_followup": lambda _text: False,
+            "consult_envelope": lambda *_args, **_kwargs: "envelope",
+            "recent_turns": lambda _items: [],
+            "turn_request": make_turn_request,
+            "write_turn_marker": Mock(),
+            "logger": Mock(),
+            "SEND_SMS_TOOL": "mcp__mentat__send_sms",
+            "SET_VOICE_MODE_TOOL": "mcp__mentat__set_voice_mode",
+            "END_CONVERSATION_TOOL": "mcp__mentat__end_conversation",
+            "ToolResult": FakeToolResult,
+            "ToolStart": type("FakeToolStart", (), {}),
+            "TurnDone": FakeTurnDone,
+            "TurnFailure": type("FakeTurnFailure", (), {}),
+            "time": time,
+        }
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+        agent = SimpleNamespace(
+            _sms_consent=False,
+            _voice_card="voice card",
+            _voice_mode="normal",
+            _voice_language="en",
+            _voice_id="default-voice",
+            _default_voice="default-voice",
+            _voice_mode_note=None,
+            _voice_resolver=Resolver(),
+            _stt=Provider(),
+            _tts=Provider(),
+            _room_name="call-one",
+            _mentat_url="http://127.0.0.1:8484",
+            _ending_policy=SimpleNamespace(
+                tool_result_seen=Mock(), turn_done=Mock(), describe=lambda: "test policy"
+            ),
+            _ending_changed=Mock(),
+        )
+        agent._apply_voice_mode = MethodType(namespace["_apply_voice_mode"], agent)
+        backend_text = MethodType(namespace["_backend_text"], agent)
+        mode_result = json.dumps({"voice_mode": {"mode": "conversation", "language": "es"}})
+
+        async def run_turn(chunks, question):
+            nonlocal response
+            response = FakeResponse(chunks)
+            speech = []
+            async for text in backend_text(question, "turn-id", SimpleNamespace(items=[])):
+                timeline.append(("speech", text))
+                speech.append(text)
+            return speech
+
+        first_wire = [
+            json.dumps({"kind": "text_delta", "text": "Switching now."}).encode(),
+            json.dumps({
+                "kind": "tool_result",
+                "tool": "mcp__mentat__set_voice_mode",
+                "is_error": False,
+                "content": mode_result,
+            }).encode(),
+            json.dumps({"kind": "text_delta", "text": "Continuando en español."}).encode(),
+            b'{"kind":"done"}',
+        ]
+        second_wire = [
+            b'{"kind":"text_delta","text":"Siguiente turno."}',
+            b'{"kind":"done"}',
+        ]
+        self.assertEqual(
+            asyncio.run(run_turn(first_wire, "Switch to Spanish")),
+            ["Switching now.", "Continuando en español."],
+        )
+        self.assertLess(
+            timeline.index(("update", {"language": "es"})),
+            timeline.index(("speech", "Continuando en español.")),
+        )
+        self.assertEqual(
+            requests[0][1], {"voice_mode": "normal", "voice_language": "en"}
+        )
+        self.assertEqual(
+            asyncio.run(run_turn(second_wire, "Continue")), ["Siguiente turno."]
+        )
+        self.assertEqual(
+            requests[1][1], {"voice_mode": "conversation", "voice_language": "es"}
+        )
+
+        class FailingTTS(Provider):
+            def update_options(self, **options):
+                super().update_options(**options)
+                if options.get("language") == "fr":
+                    raise RuntimeError("synthetic provider failure")
+
+        agent._tts = FailingTTS()
+        failed_mode = json.dumps({"voice_mode": {"mode": "conversation", "language": "fr"}})
+        failed_wire = [
+            b'{"kind":"text_delta","text":"Trying another language."}',
+            json.dumps({
+                "kind": "tool_result",
+                "tool": "mcp__mentat__set_voice_mode",
+                "is_error": False,
+                "content": failed_mode,
+            }).encode(),
+            b'{"kind":"done"}',
+        ]
+        self.assertEqual(
+            asyncio.run(run_turn(failed_wire, "Switch again")),
+            ["Trying another language."],
+        )
+        note = agent._voice_mode_note
+        self.assertIsNotNone(note)
+        self.assertEqual((agent._voice_mode, agent._voice_language), ("conversation", "es"))
+        self.assertEqual(
+            asyncio.run(run_turn(second_wire, "Continue after failure")),
+            ["Siguiente turno."],
+        )
+        self.assertEqual(requests[3][0][1].count(note), 1)
+        self.assertEqual(
+            requests[3][1], {"voice_mode": "conversation", "voice_language": "es"}
+        )
+        self.assertIsNone(agent._voice_mode_note)
+        self.assertEqual(asyncio.run(run_turn(second_wire, "Another turn")), ["Siguiente turno."])
+        self.assertNotIn(note, requests[4][0][1])
 
 
 if __name__ == "__main__":
