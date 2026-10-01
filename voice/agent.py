@@ -46,6 +46,7 @@ from request import (
     with_private_context,
 )
 from stream import ToolResult, ToolStart, TurnDone, TurnError, TurnFailure, TurnStream
+from voices import VoiceResolver
 
 logger = logging.getLogger("mentat.voice")
 
@@ -58,6 +59,7 @@ PERSONA_PATH = HERE / "persona.md"
 EARCON_PATH = HERE / "assets" / "earcon.wav"
 TTS_VOICE = "21m00Tcm4TlvDq8ikWAM"
 SEND_SMS_TOOL = "mcp__mentat__send_sms"
+SET_VOICE_MODE_TOOL = "mcp__mentat__set_voice_mode"
 
 
 def is_sms_request(text: str) -> bool:
@@ -284,6 +286,10 @@ class FrontAgent(Agent):
         background: BackgroundAudioPlayer,
         ending_policy: EndingPolicy,
         ending_changed: Callable[[], None],
+        stt: Any,
+        tts_provider: Any,
+        default_voice: str,
+        voice_resolver: VoiceResolver,
     ) -> None:
         super().__init__(instructions=instructions)
         self._voice_card = voice_card
@@ -292,6 +298,14 @@ class FrontAgent(Agent):
         self._background = background
         self._ending_policy = ending_policy
         self._ending_changed = ending_changed
+        self._stt = stt
+        self._tts = tts_provider
+        self._default_voice = default_voice
+        self._voice_resolver = voice_resolver
+        self._voice_mode = "normal"
+        self._voice_language = "en"
+        self._voice_id = default_voice
+        self._voice_mode_note: str | None = None
         input_audio_dir = os.environ.get("MENTAT_VOICE_INPUT_RECORD_DIR")
         self._input_audio = (
             InputAudioRecorder(room_name, input_audio_dir) if input_audio_dir else None
@@ -461,6 +475,73 @@ class FrontAgent(Agent):
                     await asyncio.gather(speech_completion, return_exceptions=True)
             await backend_text.aclose()
 
+    async def _apply_voice_mode(self, content: str, *, is_error: bool = False) -> bool:
+        """Apply a validated tool result to this call's STT and TTS providers."""
+        if is_error:
+            return False
+        try:
+            result = json.loads(content)
+            voice_mode = result["voice_mode"]
+            mode = voice_mode["mode"]
+            language = voice_mode["language"]
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+        if (
+            not isinstance(result, dict)
+            or set(result) != {"voice_mode"}
+            or not isinstance(voice_mode, dict)
+            or set(voice_mode) != {"mode", "language"}
+            or not isinstance(mode, str)
+            or mode not in {"normal", "conversation"}
+            or not isinstance(language, str)
+            or re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", language) is None
+        ):
+            return False
+
+        previous_mode = self._voice_mode
+        previous_language = self._voice_language
+        previous_voice = self._voice_id
+        rollback_failed = False
+        try:
+            voice_id = (
+                self._default_voice
+                if mode == "normal" and language == "en"
+                else self._voice_resolver.resolve(language, self._default_voice)
+            )
+            self._stt.update_options(language=language)
+            self._tts.update_options(voice_id=voice_id, language=language)
+        except Exception as error:
+            logger.warning("voice mode apply failed for %s: %s", language, type(error).__name__)
+            for provider, options in (
+                (self._stt, {"language": previous_language}),
+                (self._tts, {"voice_id": previous_voice, "language": previous_language}),
+            ):
+                try:
+                    provider.update_options(**options)
+                except Exception as rollback_error:
+                    rollback_failed = True
+                    logger.error(
+                        "voice mode rollback failed for %s: %s",
+                        language,
+                        type(rollback_error).__name__,
+                    )
+            if rollback_failed:
+                self._voice_mode_note = (
+                    f"Voice mode change to {mode}/{language} failed; previous settings "
+                    "may not be fully restored."
+                )
+            else:
+                self._voice_mode_note = (
+                    f"Voice mode change to {mode}/{language} failed; remain in "
+                    f"{previous_mode}/{previous_language}."
+                )
+            return False
+
+        self._voice_mode = mode
+        self._voice_language = language
+        self._voice_id = voice_id
+        return True
+
     async def _backend_text(
         self, question: str, turn_id: str, chat_ctx: Any
     ) -> AsyncGenerator[str | None, None]:
@@ -481,6 +562,9 @@ class FrontAgent(Agent):
             last_turns=recent_turns(chat_ctx.items),
             question=question,
         )
+        if self._voice_mode_note:
+            envelope += "\n\n" + self._voice_mode_note
+            self._voice_mode_note = None
         write_turn_marker(self._room_name, turn_id)
         turn = TurnStream()
         pending_sms_text: list[str | None] = []
@@ -500,7 +584,12 @@ class FrontAgent(Agent):
             async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
                 async with http.post(
                     f"{self._mentat_url}/v1/conversation",
-                    json=turn_request(self._room_name, envelope),
+                    json=turn_request(
+                        self._room_name,
+                        envelope,
+                        voice_mode=self._voice_mode,
+                        voice_language=self._voice_language,
+                    ),
                 ) as response:
                     if response.status != 200:
                         raise TurnError(f"daemon answered HTTP {response.status}")
@@ -527,6 +616,10 @@ class FrontAgent(Agent):
                                     yield None
                                     commentary_tail = ""
                             elif isinstance(item, ToolResult):
+                                if item.name == SET_VOICE_MODE_TOOL:
+                                    await self._apply_voice_mode(
+                                        item.content, is_error=item.is_error
+                                    )
                                 if sms_buffer is not None:
                                     sms_buffer.tool_result(item.name, is_error=item.is_error)
                                 if item.name == SEND_SMS_TOOL:
@@ -602,20 +695,24 @@ def prewarm(proc: agents.JobProcess) -> None:
 
 async def entrypoint(ctx: JobContext) -> None:
     """Serve one room until mentatd or the close policy ends it."""
+    stt = openai.STT(
+        model="gpt-live-transcribe",
+        api_key=os.environ["OPENAI_API_KEY"],
+        vad=ctx.proc.userdata["vad"],
+        language="en",
+    )
+    default_voice = os.environ.get("MENTAT_VOICE_TTS_VOICE", TTS_VOICE)
+    tts_provider = elevenlabs.TTS(
+        model="eleven_v4_turbo",
+        api_key=os.environ["ELEVENLABS_API_KEY"],
+        voice_id=default_voice,
+        language="en",
+    )
+    voice_resolver = VoiceResolver(os.environ.get("ELEVENLABS_API_KEY"))
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
-        stt=openai.STT(
-            model="gpt-live-transcribe",
-            api_key=os.environ["OPENAI_API_KEY"],
-            vad=ctx.proc.userdata["vad"],
-        ),
-        tts=tts.StreamAdapter(
-            tts=elevenlabs.TTS(
-                model="eleven_v4_turbo",
-                api_key=os.environ["ELEVENLABS_API_KEY"],
-                voice_id=os.environ.get("MENTAT_VOICE_TTS_VOICE", TTS_VOICE),
-            )
-        ),
+        stt=stt,
+        tts=tts.StreamAdapter(tts=tts_provider),
         turn_handling={
             "turn_detection": MultilingualModel(),
             "endpointing": {"min_delay": 0.5, "max_delay": 3.0},
@@ -746,6 +843,10 @@ async def entrypoint(ctx: JobContext) -> None:
         background=background,
         ending_policy=ending_policy,
         ending_changed=_rearm_timer,
+        stt=stt,
+        tts_provider=tts_provider,
+        default_voice=default_voice,
+        voice_resolver=voice_resolver,
     )
 
     @session.on("user_state_changed")

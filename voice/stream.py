@@ -17,6 +17,7 @@ class TurnError(Exception):
 class ToolResult:
     name: str
     is_error: bool
+    content: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,11 @@ class TurnStream:
         if kind == "tool_start":
             return ToolStart(str(event.get("tool", "")))
         if kind == "tool_result":
-            return ToolResult(str(event.get("tool", "")), bool(event.get("is_error", False)))
+            return ToolResult(
+                str(event.get("tool", "")),
+                bool(event.get("is_error", False)),
+                str(event.get("content", "")),
+            )
         if kind == "error":
             return TurnFailure(str(event.get("message", "unknown daemon error")))
         if kind == "done":
