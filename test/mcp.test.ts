@@ -3,6 +3,7 @@ import type { ReadableStreamDefaultReader } from 'node:stream/web';
 import { promisify } from 'node:util';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readFile } from 'node:fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
@@ -926,6 +927,25 @@ describe('POST /mcp', () => {
     await client.close();
     bridge.close();
     await reader.cancel();
+  });
+
+  it('guides spoken language switching and states the current language limits', async () => {
+    const prompt = await readFile(new URL('../prompt.md', import.meta.url), 'utf8');
+    const persona = await readFile(new URL('../voice/persona.md', import.meta.url), 'utf8');
+    const spokenPrompt = prompt.replace(/\s+/g, ' ');
+    const voicePersona = persona.replace(/\s+/g, ' ');
+
+    expect(spokenPrompt).toMatch(/infer.*(?:switch|language).*conversation/is);
+    expect(spokenPrompt).toMatch(/switch back.*(?:English|normal)|return to English/is);
+    expect(spokenPrompt).toMatch(/without requiring a fixed phrase|no fixed phrase|without a magic phrase/i);
+    expect(spokenPrompt).toMatch(/ask which language.*before.*tool/i);
+    expect(spokenPrompt).toMatch(/cannot understand a language/i);
+    expect(spokenPrompt).toMatch(/cannot speak that language/i);
+    expect(voicePersona).toMatch(/infers from conversation.*another language.*return to English/i);
+    expect(voicePersona).toMatch(/there is no required phrase/i);
+    expect(voicePersona).toMatch(/asks which language.*before calling the tool/i);
+    expect(voicePersona).toMatch(/cannot understand a language/i);
+    expect(voicePersona).toMatch(/cannot speak that language/i);
   });
 
 });
