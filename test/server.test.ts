@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AtCapacityError, type Backend, type Event, type Turn } from '../src/backend.ts';
 import { nullLogger, type Logger } from '../src/log.ts';
+import { startJanitor } from '../src/janitor.ts';
 import type { McpDependencies } from '../src/mcp.ts';
 import { PhoneBridge } from '../src/phone.ts';
 import { SessionTracker, createHandler } from '../src/server.ts';
@@ -638,6 +639,28 @@ describe('SessionTracker idle expiry', () => {
     expect(tracker.expireIdle(30_000)).toEqual(['idle']);
     expect(tracker.expireIdle(30_000)).toEqual([]); // already claimed
     expect(tracker.expireIdle(0)).toEqual([]); // active never expires
+  });
+
+  it('requests a write-up only when an idle session expires', async () => {
+    vi.useFakeTimers();
+    let now = 1_000_000;
+    const tracker = new SessionTracker(() => now);
+    tracker.beginTurn('idle');
+    tracker.endTurn('idle');
+    tracker.beginTurn('active');
+    now += 60_000;
+
+    const backend = new FakeBackend(() => []);
+    const closeSession = vi.spyOn(backend, 'closeSession');
+    const stop = startJanitor(tracker, backend, 30_000, nullLogger);
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(closeSession).toHaveBeenCalledExactlyOnceWith('idle', { writeUp: true });
+      expect(closeSession).not.toHaveBeenCalledWith('active', expect.anything());
+    } finally {
+      stop();
+      vi.useRealTimers();
+    }
   });
 
   it('spares a session that turns active again between scan and claim', () => {

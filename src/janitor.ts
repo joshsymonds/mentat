@@ -17,7 +17,7 @@ export function startJanitor(
   const timer = setInterval(() => {
     const expired = tracker.expireIdle(ttlMs);
     for (const sessionId of expired) {
-      backend.closeSession(sessionId).catch((error: unknown) => {
+      backend.closeSession(sessionId, { writeUp: true }).catch((error: unknown) => {
         logger.error('closing idle session failed', {
           session_id: sessionId,
           error: String(error),

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { AtCapacityError, type Event } from '../src/backend.ts';
+import { AtCapacityError, type Backend, type Event } from '../src/backend.ts';
 import {
   ClaudeCode,
   DEFAULT_DISALLOWED_TOOLS,
@@ -93,6 +93,7 @@ function fakeQuery(
             ? Promise.resolve()
             : Promise.reject(interruptError);
         },
+        close: vi.fn(),
       };
     },
   };
@@ -1170,6 +1171,7 @@ describe('ClaudeCode turns', () => {
           releaseResult?.();
           return Promise.resolve();
         },
+        close: vi.fn(),
       };
     };
     const backend = new ClaudeCode(makeConfig({ queryFn: fn }));
@@ -1550,5 +1552,277 @@ describe('resume state persistence', () => {
     const statePath = join(dir, 'state.json');
     writeFileSync(statePath, 'not json');
     expect(() => new ClaudeCode(makeConfig({ statePath }))).toThrow(/state/);
+  });
+});
+
+describe('idle memory write-up fork', () => {
+  it('forks a completed conversation privately without changing its resume UUID or user stream', async () => {
+    const calls: { options: Options; inputs: SDKUserMessage[] }[] = [];
+    const lifecycle: string[] = [];
+    const policy = vi.fn(allowAllPolicy(nullLogger));
+    const queryFn: QueryFn = ({ prompt, options }) => {
+      const inputs: SDKUserMessage[] = [];
+      const fork = (options as Options & { forkSession?: boolean }).forkSession === true;
+      calls.push({ options, inputs });
+      if (fork) lifecycle.push('fork-start');
+      async function* messages(): AsyncGenerator {
+        try {
+          for await (const input of prompt) {
+            inputs.push(input);
+            yield resultMsg(fork ? 'fork-only-uuid' : 'original-cli-uuid', fork ? 'private reply' : 'visible reply');
+          }
+        } finally {
+          lifecycle.push(fork ? 'fork-ended' : 'original-ended');
+        }
+      }
+      const iterable = messages();
+      return {
+        [Symbol.asyncIterator]: () => iterable[Symbol.asyncIterator](),
+        interrupt: () => Promise.resolve(),
+        close: vi.fn(),
+      };
+    };
+    const memoryDir = mkdtempSync(join(tmpdir(), 'mentat-writeup-guard-'));
+    const memory = {
+      index: vi.fn().mockResolvedValue('synthetic memory index'),
+      tombstones: vi.fn().mockResolvedValue('- [2026-09-30] synthetic-id: [2026-09-30, josh] Synthetic forgotten fact.'),
+    };
+    const info = vi.fn();
+    const backend = new ClaudeCode(makeConfig({
+      queryFn,
+      model: 'synthetic-model',
+      systemPrompt: 'synthetic system prompt',
+      memory,
+      memoryDir,
+      policy,
+      logger: { ...nullLogger, info },
+      mcpServers: { synthetic: { type: 'http', url: 'http://127.0.0.1:9000/mcp' } },
+    }));
+
+    const visible = await collect(await backend.converse({ sessionId: 'synthetic-session', text: 'synthetic user turn' }));
+    expect(visible.at(-1)).toMatchObject({ kind: 'done', result: { sessionId: 'original-cli-uuid' } });
+    const normalCanUseTool = calls[0]?.options.canUseTool;
+    if (normalCanUseTool === undefined) throw new Error('normal memory policy not wired');
+    await expect(normalCanUseTool('mcp__mentat__memory_save', { facts: ['Synthetic new fact.'] }, {
+      signal: new AbortController().signal,
+      toolUseID: 'normal-memory-save',
+    })).resolves.toMatchObject({ behavior: 'allow' });
+    const backendWithCloseOptions: Pick<Backend, 'closeSession'> = backend;
+    await backendWithCloseOptions.closeSession('synthetic-session', { writeUp: true });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.options).toMatchObject({
+      resume: 'original-cli-uuid',
+      forkSession: true,
+      model: 'synthetic-model',
+      systemPrompt: 'synthetic system prompt\n\nEveryday memory index:\nsynthetic memory index',
+      settingSources: [],
+      skills: [],
+      strictMcpConfig: true,
+      mcpServers: { synthetic: { type: 'http', url: 'http://127.0.0.1:9000/mcp' } },
+    });
+    expect(calls[1]?.options.env).toEqual(calls[0]?.options.env);
+    expect(calls[1]?.inputs).toHaveLength(1);
+    expect(JSON.stringify(calls[1]?.inputs[0]?.message.content)).toContain('Synthetic forgotten fact.');
+    expect(visible.some((event) => event.kind === 'textDelta' && event.text.includes('private reply'))).toBe(false);
+    const forkCanUseTool = calls[1]?.options.canUseTool;
+    if (forkCanUseTool === undefined) throw new Error('write-up policy not wired');
+    const toolContext = { signal: new AbortController().signal, toolUseID: 'synthetic-tool' };
+    await expect(forkCanUseTool('mcp__mentat__memory_read', {}, toolContext)).resolves.toMatchObject({ behavior: 'allow' });
+    await expect(forkCanUseTool('ToolSearch', {}, toolContext)).resolves.toMatchObject({ behavior: 'allow' });
+    await expect(forkCanUseTool('mcp__mentat__memory_save', { facts: ['Synthetic forgotten fact.'] }, toolContext)).resolves.toMatchObject({ behavior: 'deny' });
+    await expect(forkCanUseTool('mcp__mentat__send_sms', {}, toolContext)).resolves.toMatchObject({ behavior: 'deny' });
+    const forkHooks = calls[1]?.options.hooks?.PreToolUse ?? [];
+    const writeUpHook = forkHooks.at(-1)?.hooks[0];
+    if (writeUpHook === undefined) throw new Error('write-up PreToolUse hook not wired');
+    const hookInput = (toolName: string, toolInput: Record<string, unknown>) => writeUpHook({
+      hook_event_name: 'PreToolUse',
+      session_id: 'synthetic-session',
+      transcript_path: '/fixture/synthetic-session.jsonl',
+      cwd: '/fixture',
+      tool_name: toolName,
+      tool_input: toolInput,
+      tool_use_id: 'write-up-tool',
+    }, 'write-up-tool', { signal: new AbortController().signal });
+    const callsBeforeHookChecks = policy.mock.calls.length;
+    await expect(hookInput('mcp__mentat__memory_read', {})).resolves.toEqual({});
+    await expect(hookInput('ToolSearch', {})).resolves.toEqual({});
+    for (const [toolName, toolInput] of [
+      ['mcp__mentat__send_sms', {}],
+      ['mcp__mentat__memory_save', { facts: ['Synthetic forgotten fact.'] }],
+    ] as const) {
+      await expect(hookInput(toolName, toolInput)).resolves.toMatchObject({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+        },
+      });
+    }
+    expect(policy).toHaveBeenCalledTimes(callsBeforeHookChecks);
+    const fileGuardHook = forkHooks[0]?.hooks[0];
+    if (fileGuardHook === undefined) throw new Error('inherited file guard hook missing');
+    await expect(fileGuardHook({
+      hook_event_name: 'PreToolUse',
+      session_id: 'synthetic-session',
+      transcript_path: '/fixture/synthetic-session.jsonl',
+      cwd: '/fixture',
+      tool_name: 'Read',
+      tool_input: { file_path: join(memoryDir, 'synthetic-fact.md') },
+      tool_use_id: 'protected-read',
+    }, 'protected-read', { signal: new AbortController().signal })).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    expect(lifecycle).toEqual(['original-ended', 'fork-start', 'fork-ended']);
+    expect(info).toHaveBeenCalledWith('claudecode: memory write-up finished', expect.objectContaining({
+      outcome: 'success',
+      cost_usd: 0.01,
+      cache_read_input_tokens: 0,
+    }));
+    expect(memory.index).toHaveBeenCalledTimes(2);
+    expect(memory.tombstones).toHaveBeenCalledOnce();
+
+    const next = await collect(await backend.converse({ sessionId: 'synthetic-session', text: 'another synthetic turn' }));
+    expect(next.at(-1)).toMatchObject({ kind: 'done', result: { sessionId: 'original-cli-uuid' } });
+    expect(calls[2]?.options.resume).toBe('original-cli-uuid');
+    expect(calls[2]?.options).not.toHaveProperty('forkSession', true);
+  });
+
+  it('accepts a same-session turn while the write-up fork is pending', async () => {
+    const calls: Options[] = [];
+    let signalForkStarted: (() => void) | undefined;
+    const forkStarted = new Promise<void>((resolve) => { signalForkStarted = resolve; });
+    let releaseFork: (() => void) | undefined;
+    const forkGate = new Promise<void>((resolve) => { releaseFork = resolve; });
+    const queryFn: QueryFn = ({ prompt, options }) => {
+      calls.push(options);
+      const fork = (options as Options & { forkSession?: boolean }).forkSession === true;
+      async function* messages(): AsyncGenerator {
+        for await (const _input of prompt) {
+          if (fork) {
+            signalForkStarted?.();
+            await forkGate;
+          }
+          yield resultMsg(fork ? 'fork-only-uuid' : 'original-cli-uuid', 'synthetic result');
+        }
+      }
+      const iterable = messages();
+      return {
+        [Symbol.asyncIterator]: () => iterable[Symbol.asyncIterator](),
+        interrupt: () => Promise.resolve(),
+        close: vi.fn(() => undefined),
+      };
+    };
+    const backend = new ClaudeCode(makeConfig({
+      queryFn,
+      systemPrompt: 'synthetic prompt',
+      memory: {
+        index: vi.fn().mockResolvedValue('synthetic index'),
+        tombstones: vi.fn().mockResolvedValue(''),
+      },
+    }));
+    const backendWithCloseOptions: Pick<Backend, 'closeSession'> = backend;
+    await collect(await backend.converse({ sessionId: 'synthetic-session', text: 'first turn' }));
+    const closing = backendWithCloseOptions.closeSession('synthetic-session', { writeUp: true });
+    try {
+      await forkStarted;
+      const followUp = await collect(await backend.converse({
+        sessionId: 'synthetic-session',
+        text: 'turn during fork',
+      }));
+      expect(followUp.at(-1)).toMatchObject({
+        kind: 'done',
+        result: { sessionId: 'original-cli-uuid' },
+      });
+      expect(calls[2]?.resume).toBe('original-cli-uuid');
+      expect(calls[2]?.forkSession).toBeUndefined();
+    } finally {
+      releaseFork?.();
+      await closing;
+    }
+  });
+
+  it.each([
+    { name: 'zero completed turns', turns: false, memory: true, writeUp: true, meta: {} },
+    { name: 'no memory store', turns: true, memory: false, writeUp: true, meta: {} },
+    { name: 'daemon shutdown', turns: true, memory: true, writeUp: false, meta: {} },
+    { name: 'claude.ai session', turns: true, memory: true, writeUp: true, meta: { surface: 'claude.ai' } },
+  ])('does not fork for $name', async ({ turns, memory: withMemory, writeUp, meta }) => {
+    const fake = fakeQuery(() => [resultMsg('original-cli-uuid', 'ok')]);
+    const store = {
+      index: vi.fn().mockResolvedValue('synthetic index'),
+      tombstones: vi.fn().mockResolvedValue(''),
+    };
+    const backend = new ClaudeCode(makeConfig({
+      queryFn: fake.fn,
+      systemPrompt: 'synthetic prompt',
+      ...(!turns && { voiceGateway: { url: 'http://127.0.0.1:4100', callerKey: 'synthetic-key' } }),
+      ...(withMemory && { memory: store }),
+    }));
+    if (turns) {
+      await collect(await backend.converse({ sessionId: 'synthetic-session', text: 'synthetic', meta }));
+    } else {
+      await backend.prestartVoiceSession('synthetic-session');
+    }
+    const backendWithCloseOptions: Pick<Backend, 'closeSession'> = backend;
+    await backendWithCloseOptions.closeSession('synthetic-session', { writeUp });
+    expect(fake.calls).toBe(
+      turns && withMemory && writeUp && meta.surface !== 'claude.ai' ? 2 : 1,
+    );
+    expect(fake.optionsSeen).toHaveLength(1);
+    expect((fake.optionsSeen[1] as (Options & { forkSession?: boolean }) | undefined)?.forkSession).not.toBe(true);
+  });
+
+  it('interrupts a five-minute write-up timeout and does not retry it', async () => {
+    vi.useFakeTimers();
+    try {
+      const warnings = vi.fn();
+      const errors = vi.fn();
+      const logger = { ...nullLogger, warn: warnings, error: errors };
+      const base = fakeQuery(() => [resultMsg('original-cli-uuid', 'ok')]);
+      const interrupt = vi.fn(() => Promise.resolve());
+      let closed = false;
+      let releasePending: (() => void) | undefined;
+      const close = vi.fn(() => {
+        closed = true;
+        releasePending?.();
+      });
+      let calls = 0;
+      const queryFn: QueryFn = (args) => {
+        calls += 1;
+        if (calls === 1) return base.fn(args);
+        return Object.assign({
+          [Symbol.asyncIterator]: () => ({
+            next: () => new Promise<IteratorResult<unknown>>((resolve) => {
+              releasePending = () => {
+                resolve({ value: undefined, done: true });
+              };
+            }),
+          }),
+          interrupt,
+        }, { close });
+      };
+      const backend = new ClaudeCode(makeConfig({
+        queryFn,
+        systemPrompt: 'synthetic prompt',
+        memory: Object.assign(
+          { index: vi.fn().mockResolvedValue('synthetic index') },
+          { tombstones: vi.fn().mockResolvedValue('') },
+        ),
+        logger,
+      }));
+      const backendWithCloseOptions: Pick<Backend, 'closeSession'> = backend;
+      await collect(await backend.converse({ sessionId: 'synthetic-session', text: 'synthetic' }));
+      const closing = backendWithCloseOptions.closeSession('synthetic-session', { writeUp: true });
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1_000);
+      await closing;
+      expect(close).toHaveBeenCalledOnce();
+      expect(closed).toBe(true);
+      expect(calls).toBe(2);
+      expect(errors).toHaveBeenCalledWith('claudecode: memory write-up failed', expect.objectContaining({
+        outcome: 'timeout',
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
