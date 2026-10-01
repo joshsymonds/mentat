@@ -223,6 +223,10 @@ async function readRecords(memoryDir: string): Promise<StoredRecord[]> {
   }));
 }
 
+function recordsMentioningForgottenFact(records: StoredRecord[]): StoredRecord[] {
+  return records.filter((record) => record.text.toLowerCase().includes(FORGOTTEN_FACT.toLowerCase()));
+}
+
 async function collect(events: AsyncIterable<Event>): Promise<Event[]> {
   const result: Event[] = [];
   for await (const event of events) result.push(event);
@@ -276,6 +280,16 @@ afterEach(async () => {
 });
 
 describe('synthetic memory write-up lifecycle', () => {
+  it('recognizes an R5 topic held in a record header without a repeated fact line', () => {
+    const record: StoredRecord = {
+      id: 'synthetic-topic', tier: 'everyday', path: '/synthetic/topic',
+      header: { name: 'Lantern Ledger', aliases: [], group: 'topics', summary: 'An old station list.' },
+      facts: ['A synthetic weekend list of old stations.'],
+      text: '# Lantern Ledger\nA synthetic weekend list of old stations.',
+    };
+    expect(recordsMentioningForgottenFact([record])).toEqual([record]);
+  });
+
   it('surfaces synthetic phone result failures after the connection is ready', async () => {
     const server = createServer((req, res) => {
       if (req.url === '/v1/phone/commands' && req.method === 'GET') {
@@ -323,6 +337,7 @@ describe('synthetic memory write-up lifecycle', () => {
       const fixtureMcpUrl = await startFixtureMcp(webInstruction);
       const logs: { message: string; fields?: Record<string, unknown> }[] = [];
       const writeUpTools: string[] = [];
+      const writeUpDenials: string[] = [];
       const config: ClaudeCodeConfig = {
         bin,
         model,
@@ -345,7 +360,20 @@ describe('synthetic memory write-up lifecycle', () => {
             return Promise.resolve({});
           };
           const hooks = options.forkSession === true
-            ? [...priorHooks, { hooks: [observeWriteUpTool] }]
+            ? [...priorHooks.map((entry) => ({
+                ...entry,
+                hooks: entry.hooks.map((hook): HookCallback => async (input, toolUseId, context) => {
+                  const result = await hook(input, toolUseId, context);
+                  if ('hookSpecificOutput' in result) {
+                    const output = result.hookSpecificOutput;
+                    if ('permissionDecisionReason' in output &&
+                      typeof output.permissionDecisionReason === 'string') {
+                      writeUpDenials.push(output.permissionDecisionReason);
+                    }
+                  }
+                  return result;
+                }),
+              })), { hooks: [observeWriteUpTool] }]
             : priorHooks;
           return query({
             prompt: turns,
@@ -443,13 +471,20 @@ describe('synthetic memory write-up lifecycle', () => {
         }));
         completed(firstR5);
         await backend.closeSession(r5Session, { writeUp: true });
-        const factRecords = (await readRecords(memoryDir)).filter((record) =>
-          record.facts.some((fact) => fact.includes(FORGOTTEN_FACT)),
-        );
+        const initialR5Records = await readRecords(memoryDir);
+        const factRecords = recordsMentioningForgottenFact(initialR5Records);
+        if (factRecords.length !== 1) {
+          console.log(`memory-writeup ${model} R5 initial write-up diagnostic: ${JSON.stringify({
+            writeUpLogs: logs.filter((entry) => entry.fields?.session_id === r5Session),
+            toolCalls: writeUpTools,
+            denialReasons: writeUpDenials,
+            records: initialR5Records.map((record) => ({ id: record.id, tier: record.tier, text: record.text })),
+            index: await memory.index(),
+          })}`);
+        }
         expect(factRecords).toHaveLength(1);
-        const savedFact = factRecords[0]?.facts.find((fact) => fact.includes(FORGOTTEN_FACT));
         const savedRecord = factRecords[0];
-        if (savedFact === undefined || savedRecord === undefined) throw new Error('write-up did not save the R5 fact');
+        if (savedRecord === undefined) throw new Error('write-up did not save the R5 record');
         expect(savedRecord.tier).toBe('everyday');
         expect(await memory.index()).toContain(savedRecord.header.name);
         const r5ForgetSession = `memory-writeup-r5-forget-${model}`;
