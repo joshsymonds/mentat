@@ -73,8 +73,10 @@ export interface ClaudeCodeConfig {
   effort?: Options['effort'];
   /** Replaces the CLI's system prompt when set. */
   systemPrompt?: string;
-  /** Extra directories granted to sessions (the memory dir rides here). */
-  addDirs?: string[];
+  /** Everyday memory index source; records are read only when a child starts. */
+  memory?: { index(): Promise<string> };
+  /** Configured memory directory, retained for startup composition. */
+  memoryDir?: string;
   /** Explicit MCP server map; nothing else is reachable (strictMcpConfig). */
   mcpServers?: Options['mcpServers'];
   /** Per-voice-session gateway and caller key loaded from its configured file. */
@@ -227,6 +229,7 @@ export function buildOptions(
   resumeUuid?: string,
   spawnMeta?: Record<string, string>,
   callContextFor?: (toolUseID: string) => Promise<CallContext | undefined>,
+  memoryIndex?: string,
 ): Options {
   const voiceGateway = spawnMeta?.surface === 'voice' ? config.voiceGateway : undefined;
   const mcpServers =
@@ -236,10 +239,15 @@ export function buildOptions(
   if (spawnMeta?.surface === 'voice' && config.model === OPUS_MODEL) {
     env.CLAUDE_CODE_DISABLE_FAST_MODE = '1';
   }
-  const systemPrompt =
-    config.systemPrompt !== undefined && surfaceLine !== undefined
-      ? `${config.systemPrompt}\n\n${surfaceLine}`
-      : config.systemPrompt;
+  const systemPrompt = config.systemPrompt === undefined
+    ? undefined
+    : [
+        config.systemPrompt,
+        surfaceLine,
+        ...(memoryIndex !== undefined
+          ? [`Everyday memory index:\n${memoryIndex === '' ? 'No everyday memories yet.' : memoryIndex}`]
+          : []),
+      ].filter((line): line is string => line !== undefined).join('\n\n');
   return {
     settingSources: [],
     skills: [],
@@ -251,7 +259,6 @@ export function buildOptions(
     ...(config.model !== undefined && { model: config.model }),
     ...(config.effort !== undefined && { effort: config.effort }),
     ...(systemPrompt !== undefined && { systemPrompt }),
-    ...(config.addDirs !== undefined && { additionalDirectories: config.addDirs }),
     ...(mcpServers !== undefined && { mcpServers }),
     ...(config.allowedTools !== undefined && { allowedTools: config.allowedTools }),
     ...(config.maxBudgetUsd !== undefined && { maxBudgetUsd: config.maxBudgetUsd }),
@@ -485,6 +492,7 @@ interface Session {
   toolUses: ToolUseOrder;
   recorder: Recorder;
   dead: boolean;
+  closed: boolean;
 }
 
 function userMessage(text: string): SDKUserMessage {
@@ -535,6 +543,8 @@ export class ClaudeCode implements Backend {
   private readonly logger: Logger;
   private readonly queryFn: QueryFn;
   private readonly sessions = new Map<string, Session>();
+  private readonly starting = new Map<string, Promise<Session>>();
+  private readonly closing = new Set<string>();
   /**
    * sessionId→CLI-UUID for every session this backend has started. It
    * outlives the live Session entries (and a daemon restart, when statePath
@@ -576,10 +586,13 @@ export class ClaudeCode implements Backend {
       model: this.config.voiceModel ?? DEFAULT_VOICE_MODEL,
     };
     for (;;) {
-      const session = this.sessionFor(turn);
+      const session = await this.sessionFor(turn);
       const release = await session.mutex.acquire();
       if (session.dead) {
         release();
+        if (session.closed) {
+          throw new Error('claudecode: session closed during pre-start');
+        }
         continue;
       }
       release();
@@ -589,12 +602,15 @@ export class ClaudeCode implements Backend {
 
   /** Acquires the session's turn slot and sends the turn into the child. */
   private async startTurn(turn: Turn): Promise<{ session: Session; release: () => void }> {
-    const session = this.sessionFor(turn);
+    const session = await this.sessionFor(turn);
     const release = await session.mutex.acquire();
     // The session may have died while this turn waited on the previous one;
     // respawn rather than reading a dead iterator.
     if (session.dead) {
       release();
+      if (session.closed) {
+        throw new Error('claudecode: session closed during turn start');
+      }
       return this.startTurn(turn);
     }
     session.context.current = { sessionId: turn.sessionId, meta: turn.meta ?? {} };
@@ -627,6 +643,9 @@ export class ClaudeCode implements Backend {
         pending = null;
         if (next.done === true) {
           this.dropSession(sessionId, session);
+          if (session.closed) {
+            throw new Error('claudecode: session closed during turn');
+          }
           if (messagesRead === 0 && !retried) {
             // The child died between turns: nothing of this turn was
             // processed, so respawn with resume and replay it — the Go
@@ -723,37 +742,67 @@ export class ClaudeCode implements Backend {
 
   /** Marks a session dead and releases its resources. The resume uuid is
    * retained, so the conversation survives into the next spawn. */
-  private dropSession(sessionId: string, session: Session): void {
+  private dropSession(sessionId: string, session: Session, closed = false): void {
     session.dead = true;
+    session.closed ||= closed;
     this.sessions.delete(sessionId);
     session.queue.end(); // input end is the child's exit signal
     session.recorder.close();
   }
 
-  closeSession(sessionId: string): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (session !== undefined) {
-      this.dropSession(sessionId, session);
+  async closeSession(sessionId: string): Promise<void> {
+    this.closing.add(sessionId);
+    try {
+      await this.starting.get(sessionId)?.catch(() => undefined);
+      const session = this.sessions.get(sessionId);
+      if (session !== undefined) {
+        this.dropSession(sessionId, session, true);
+      }
+    } finally {
+      this.closing.delete(sessionId);
     }
-    return Promise.resolve();
   }
 
   async close(): Promise<void> {
+    await Promise.allSettled([...this.starting.values()]);
     for (const sessionId of [...this.sessions.keys()]) {
       await this.closeSession(sessionId);
     }
   }
 
-  private sessionFor(turn: Turn): Session {
+  private sessionFor(turn: Turn): Promise<Session> {
     const sessionId = turn.sessionId;
+    if (this.closing.has(sessionId)) {
+      return Promise.reject(new Error('claudecode: session is closing'));
+    }
     const existing = this.sessions.get(sessionId);
     if (existing !== undefined && !existing.dead) {
-      return existing;
+      return Promise.resolve(existing);
+    }
+    const starting = this.starting.get(sessionId);
+    if (starting !== undefined) {
+      return starting;
     }
     const maxSessions = this.config.maxSessions ?? 0;
     if (maxSessions > 0 && this.liveCountExcluding(sessionId) >= maxSessions) {
-      throw new AtCapacityError();
+      return Promise.reject(new AtCapacityError());
     }
+
+    const pending = this.createSession(turn);
+    this.starting.set(sessionId, pending);
+    void pending.then(
+      () => {
+        if (this.starting.get(sessionId) === pending) this.starting.delete(sessionId);
+      },
+      () => {
+        if (this.starting.get(sessionId) === pending) this.starting.delete(sessionId);
+      },
+    );
+    return pending;
+  }
+
+  private async createSession(turn: Turn): Promise<Session> {
+    const sessionId = turn.sessionId;
     const queue = new AsyncQueue<SDKUserMessage>();
     const context: Session['context'] = { current: null };
     // The creating turn's effort/model win over daemon defaults for non-voice
@@ -767,6 +816,17 @@ export class ClaudeCode implements Backend {
       ...(turn.model !== undefined && { model: turn.model }),
       ...(isVoice && { model: this.config.voiceModel ?? DEFAULT_VOICE_MODEL }),
     };
+    let memoryIndex: string | undefined;
+    if (this.config.memory !== undefined && this.config.systemPrompt !== undefined) {
+      try {
+        memoryIndex = await this.config.memory.index();
+      } catch (error) {
+        this.logger.error('claudecode: memory index unavailable', {
+          session_id: sessionId,
+          error: String(error),
+        });
+      }
+    }
     const toolUses = new ToolUseOrder();
     const options = buildOptions(
       config,
@@ -788,6 +848,7 @@ export class ClaudeCode implements Backend {
         }
         return { followsUnspokenTool };
       },
+      memoryIndex,
     );
     const handle = this.queryFn({ prompt: queue, options });
     const session: Session = {
@@ -800,6 +861,7 @@ export class ClaudeCode implements Backend {
       toolUses,
       recorder: makeRecorder(this.config.recordDir, sessionId, this.logger),
       dead: false,
+      closed: false,
     };
     this.sessions.set(sessionId, session);
     return session;
@@ -810,6 +872,12 @@ export class ClaudeCode implements Backend {
     let live = 0;
     for (const [id, session] of this.sessions) {
       if (id !== sessionId && !session.dead) {
+        live += 1;
+      }
+    }
+    for (const id of this.starting.keys()) {
+      const session = this.sessions.get(id);
+      if (id !== sessionId && (session === undefined || session.dead)) {
         live += 1;
       }
     }
