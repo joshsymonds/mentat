@@ -1,5 +1,6 @@
 """Offline tests for mentat NDJSON streams and commentary chunking."""
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -74,25 +75,49 @@ class TurnStreamTest(unittest.TestCase):
             ["Hello", " there"],
         )
 
-    def test_tool_events_are_surfaced_alongside_text(self):
+    def test_tool_events_preserve_content_and_order_alongside_text(self):
         stream = TurnStream()
+        content = '{"voice_mode":{"mode":"conversation","language":"fr"}}'
         self.assertEqual(
             stream.feed(
                 b'{"kind":"tool_start","tool":"Read"}\n'
                 b'{"kind":"text_delta","text":"Checking."}\n'
                 b'{"kind":"tool_result","tool":"Read","content":"ok"}\n'
+                b'{"kind":"text_delta","text":"Done."}\n'
+                + json.dumps(
+                    {
+                        "kind": "tool_result",
+                        "tool": "mcp__mentat__end_conversation",
+                        "is_error": True,
+                        "content": content,
+                    }
+                ).encode()
+                + b"\n"
             ),
-            [ToolStart("Read"), "Checking.", ToolResult("Read", False)],
+            [
+                ToolStart("Read"),
+                "Checking.",
+                ToolResult("Read", False, "ok"),
+                "Done.",
+                ToolResult("mcp__mentat__end_conversation", True, content),
+            ],
         )
 
     def test_end_conversation_tool_result_pins_success_and_error(self):
         ok = TurnStream()
+        content = '{"voice_mode":{"mode":"normal","language":"en"}}'
         self.assertEqual(
             ok.feed(
-                b'{"kind":"tool_result","tool":"mcp__mentat__end_conversation",'
-                b'"content":"ok"}\n'
+                json.dumps(
+                    {
+                        "kind": "tool_result",
+                        "tool": "mcp__mentat__end_conversation",
+                        "content": content,
+                    }
+                ).encode()
+                + b"\n"
             ),
-            [ToolResult("mcp__mentat__end_conversation", False)],
+            [ToolResult("mcp__mentat__end_conversation", False, content)],
         )
         error = TurnStream()
         self.assertEqual(
@@ -100,7 +125,7 @@ class TurnStreamTest(unittest.TestCase):
                 b'{"kind":"tool_result","tool":"mcp__mentat__end_conversation",'
                 b'"is_error":true,"content":"failed"}\n'
             ),
-            [ToolResult("mcp__mentat__end_conversation", True)],
+            [ToolResult("mcp__mentat__end_conversation", True, "failed")],
         )
 
     def test_thinking_and_unknown_events_remain_silent(self):
