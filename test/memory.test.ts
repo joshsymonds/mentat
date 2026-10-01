@@ -232,6 +232,102 @@ describe('MemoryStore', () => {
     expect(Buffer.byteLength(await overCap.index())).toBeLessThan(Buffer.byteLength(longIndex));
   });
 
+  it('forgets one fact as one commit and records a dated tombstone', async () => {
+    const store = makeStore();
+    await store.save({
+      id: 'rowan', tier: 'everyday', header: header(),
+      facts: ['keep this fact', '[2025-02-03, josh] forget this fact'], source: 'josh',
+    });
+    const before = git(firstDirectory(), 'rev-list', '--count', 'HEAD');
+
+    await store.forget('rowan', 'everyday', 'forget this fact');
+
+    const record = readFileSync(join(firstDirectory(), 'rowan.md'), 'utf8');
+    const tombstones = await store.tombstones();
+    expect(record).toContain('keep this fact');
+    expect(record).not.toContain('forget this fact');
+    expect(tombstones).toContain('[2026-09-30] rowan: [2025-02-03, josh] forget this fact');
+    expect(git(firstDirectory(), 'rev-list', '--count', 'HEAD')).toBe(String(Number(before) + 1));
+    expect(git(firstDirectory(), 'show', 'HEAD:_tombstones.md')).toBe(tombstones.trimEnd());
+  });
+
+  it('forgets a whole record, tombstones every fact, and permits index shrinkage over cap', async () => {
+    const store = makeStore({ capBytes: 1000 });
+    await store.save({
+      id: 'rowan', tier: 'everyday', header: header({ summary: 'x'.repeat(120) }),
+      facts: ['first removed fact', '[2025-02-03, inferred] second removed fact'], source: 'josh',
+    });
+    const dir = firstDirectory();
+    const record = readFileSync(join(dir, 'rowan.md'), 'utf8');
+    const indexLength = Buffer.byteLength(await store.index());
+    const capped = makeStore({ dir, capBytes: indexLength - 1 });
+    const before = git(dir, 'rev-list', '--count', 'HEAD');
+
+    await capped.forget('rowan', 'everyday');
+
+    expect(() => readFileSync(join(dir, 'rowan.md'), 'utf8')).toThrow();
+    expect(await capped.tombstones()).toContain('[2026-09-30] rowan: [2026-09-30, josh] first removed fact');
+    expect(await capped.tombstones()).toContain('[2026-09-30] rowan: [2025-02-03, inferred] second removed fact');
+    expect(await capped.tombstones()).toContain('[2026-09-30] rowan (everyday): record forgotten — Synthetic Rowan: ');
+    expect(await capped.tombstones()).toContain('x'.repeat(120));
+    expect(git(dir, 'rev-list', '--count', 'HEAD')).toBe(String(Number(before) + 1));
+    expect(git(dir, 'show', 'HEAD:_tombstones.md')).toBe((await capped.tombstones()).trimEnd());
+    expect(record).toContain('first removed fact');
+    expect(await capped.index()).toBe('');
+  });
+
+  it('writes a record-level tombstone for a whole-record forget with no facts', async () => {
+    const store = makeStore();
+    await store.save({
+      id: 'rowan', tier: 'private', header: header({ summary: 'Empty record summary' }),
+      facts: [], source: 'josh',
+    });
+
+    await store.forget('rowan', 'private');
+
+    await expect(store.tombstones()).resolves.toBe(
+      '- [2026-09-30] rowan (private): record forgotten — Synthetic Rowan: Empty record summary\n',
+    );
+    expect(git(firstDirectory(), 'show', 'HEAD:_tombstones.md')).toContain(
+      'rowan (private): record forgotten — Synthetic Rowan: Empty record summary',
+    );
+  });
+
+  it('restores the record and tombstones when a forget commit fails', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'mentat-memory-forget-fail-'));
+    directories.push(parent);
+    const realGit = gitExecutable();
+    const shim = join(parent, 'git-shim');
+    writeFileSync(shim, `#!/bin/sh\nif [ -f "${join(parent, 'fail-commit')}" ] && [ "$1" = "-C" ] && [ "$3" = "commit" ]; then exit 23; fi\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+    const dir = join(parent, 'memory');
+    const store = makeStore({ dir, git: shim });
+    await store.save({
+      id: 'rowan', tier: 'everyday', header: header(), facts: ['first fact', 'second fact'], source: 'josh',
+    });
+    await store.forget('rowan', 'everyday', 'first fact');
+    const record = readFileSync(join(dir, 'rowan.md'), 'utf8');
+    const tombstones = await store.tombstones();
+    writeFileSync(join(parent, 'fail-commit'), 'fail');
+
+    await expect(store.forget('rowan', 'everyday', 'second fact')).rejects.toThrow(/commit/i);
+
+    expect(readFileSync(join(dir, 'rowan.md'), 'utf8')).toBe(record);
+    await expect(store.tombstones()).resolves.toBe(tombstones);
+  });
+
+  it('refuses invalid forget ids and symlink record paths', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'mentat-memory-forget-path-'));
+    directories.push(parent);
+    const dir = join(parent, 'memory');
+    mkdirSync(dir);
+    writeFileSync(join(parent, 'outside.md'), 'outside');
+    symlinkSync(join(parent, 'outside.md'), join(dir, 'rowan.md'));
+    const store = makeStore({ dir });
+
+    await expect(store.forget('../outside', 'everyday')).rejects.toThrow(/id/i);
+    await expect(store.forget('rowan', 'everyday')).rejects.toThrow(/symbolic link|symlink/i);
+  });
+
   it('rejects invalid ids and symlinks that escape the memory directory', async () => {
     const parent = mkdtempSync(join(tmpdir(), 'mentat-memory-path-'));
     directories.push(parent);

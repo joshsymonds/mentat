@@ -79,6 +79,87 @@ export class MemoryStore {
     throw new Error(`memory record ${id} is missing`);
   }
 
+  async forget(id: string, tier: Tier, fact?: string): Promise<void> {
+    this.validateId(id);
+    return this.withLock(async () => {
+      await this.ensureDirectory();
+      const path = this.recordPath(id, tier);
+      const existing = await this.readRecordPath(path);
+      if (existing === undefined) throw new Error(`memory record ${id} is missing`);
+
+      const factToRemove = fact === undefined ? '' : this.findFact(existing.facts, fact) ?? '';
+      if (fact !== undefined && factToRemove === '') {
+        throw new Error(`memory fact is missing from record ${id}`);
+      }
+      const removedFacts = factToRemove === '' ? existing.facts : [factToRemove];
+
+      const before = await this.everydayRecords();
+      const after = tier === 'everyday' && fact === undefined
+        ? before.filter((record) => record.id !== id)
+        : tier === 'everyday'
+          ? [...before.filter((record) => record.id !== id), this.toRecord(
+            id,
+            tier,
+            existing.text.split('\n').filter((line) => line !== `- ${factToRemove}`).join('\n'),
+          )]
+          : before;
+      const currentSize = Buffer.byteLength(this.formatIndex(before));
+      const nextSize = Buffer.byteLength(this.formatIndex(after));
+      if (nextSize > this.capBytes && nextSize > currentSize) {
+        throw new Error(`memory index would exceed ${String(this.capBytes)} byte cap`);
+      }
+
+      const tombstonesPath = join(this.dir, '_tombstones.md');
+      const previousTombstones = await this.readTombstonesFile();
+      const date = this.localDate();
+      const entries = [
+        ...(fact === undefined
+          ? [`- [${date}] ${id} (${tier}): record forgotten — ${existing.header.name}: ${existing.header.summary}`]
+          : []),
+        ...removedFacts.map((removedFact) => `- [${date}] ${id}: ${removedFact}`),
+      ];
+      const nextTombstones = entries.length === 0
+        ? previousTombstones
+        : `${previousTombstones}${previousTombstones !== '' && !previousTombstones.endsWith('\n') ? '\n' : ''}${entries.join('\n')}\n`;
+      await this.ensureRepository();
+      try {
+        if (fact === undefined) {
+          await rm(path);
+        } else {
+          const lines = existing.text.split('\n');
+          const factLineIndex = lines.findIndex((line) => line === `- ${factToRemove}`);
+          if (factLineIndex < 0) throw new Error(`memory fact is missing from record ${id}`);
+          lines.splice(factLineIndex, 1);
+          await this.writeRecord(path, lines.join('\n'));
+        }
+        if (entries.length > 0) await this.writeRecord(tombstonesPath, nextTombstones);
+        await this.runGit('add', '-A');
+        await this.runGit('commit', '-m', `memory: forget ${id} (${tier})`);
+      } catch (error) {
+        await this.restoreRecord(path, existing.text);
+        await this.restoreRecord(tombstonesPath, previousTombstones === '' ? undefined : previousTombstones);
+        for (const stagedPath of [path, tombstonesPath]) {
+          try {
+            await this.runGit('reset', '--', stagedPath.slice(this.dir.length + 1));
+          } catch (resetError) {
+            this.logger.error('could not reset staged memory after failed forget', {
+              id,
+              error: this.errorMessage(resetError),
+            });
+          }
+        }
+        throw new Error(`memory commit failed for ${id}: ${this.errorMessage(error)}`, { cause: error });
+      }
+
+      this.reportIndexSize(nextSize);
+    });
+  }
+
+  async tombstones(): Promise<string> {
+    await this.ensureDirectory();
+    return this.readTombstonesFile();
+  }
+
   async save(input: SaveInput): Promise<{ revision: string }> {
     this.validateId(input.id);
     return this.withLock(async () => {
@@ -209,6 +290,31 @@ export class MemoryStore {
       return;
     }
     await this.writeRecord(path, text);
+  }
+
+  private async readTombstonesFile(): Promise<string> {
+    const path = join(this.dir, '_tombstones.md');
+    try {
+      await this.assertRecordPath(path);
+      return await readFile(path, 'utf8');
+    } catch (error) {
+      if (this.isMissing(error)) return '';
+      throw error;
+    }
+  }
+
+  private findFact(facts: string[], fact: string): string | undefined {
+    return facts.find((storedFact) => storedFact === fact
+      || storedFact.replace(/^\[\d{4}-\d{2}-\d{2}, (?:josh|inferred|third-party)\] /, '') === fact);
+  }
+
+  private localDate(): string {
+    const now = this.now();
+    return [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+    ].join('-');
   }
 
   private async readRecordPath(path: string): Promise<StoredRecord | undefined> {
