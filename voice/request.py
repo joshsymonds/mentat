@@ -322,12 +322,18 @@ def turn_request(
     room_name: str,
     text: str,
     effort: str = TURN_EFFORT,
+    voice_mode: str = "normal",
+    voice_language: str = "en",
 ) -> dict[str, Any]:
     """Build one voice request for the conversation API."""
     return {
         "session_id": SESSION_PREFIX + room_name,
         "text": text,
-        "meta": TURN_META,
+        "meta": {
+            **TURN_META,
+            "voice_mode": voice_mode,
+            "voice_language": voice_language,
+        },
         "effort": effort,
     }
 

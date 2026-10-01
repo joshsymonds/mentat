@@ -53,16 +53,51 @@ class RequestTest(unittest.TestCase):
             {
                 "session_id": "voice-kitchen",
                 "text": "what's on today?",
-                "meta": {"surface": "voice", "user": "josh"},
+                "meta": {
+                    "surface": "voice",
+                    "user": "josh",
+                    "voice_mode": "normal",
+                    "voice_language": "en",
+                },
                 "effort": "low",
             },
         )
+
+    def test_turn_request_includes_default_voice_mode_and_language(self):
+        request = turn_request("kitchen", "what's on today?")
+        self.assertEqual(
+            request["meta"],
+            {
+                "surface": "voice",
+                "user": "josh",
+                "voice_mode": "normal",
+                "voice_language": "en",
+            },
+        )
+
+    def test_turn_request_accepts_call_specific_voice_settings_without_sharing_meta(self):
+        first = turn_request(
+            "kitchen", "bonjour", voice_mode="conversation", voice_language="fr"
+        )
+        second = turn_request("bedroom", "hello")
+        self.assertEqual(first["meta"]["voice_mode"], "conversation")
+        self.assertEqual(first["meta"]["voice_language"], "fr")
+        self.assertEqual(second["meta"]["voice_mode"], "normal")
+        self.assertEqual(second["meta"]["voice_language"], "en")
+        self.assertIsNot(first["meta"], second["meta"])
+        first["meta"]["voice_language"] = "de"
+        self.assertEqual(second["meta"]["voice_language"], "en")
 
     def test_turn_request_preserves_effort_without_exposing_model_selection(self):
         request = turn_request("kitchen", "what's on today?", effort="high")
         self.assertEqual(request["effort"], "high")
         self.assertEqual(request["session_id"], "voice-kitchen")
-        self.assertEqual(request["meta"], TURN_META)
+        self.assertEqual(
+            {key: request["meta"][key] for key in TURN_META},
+            TURN_META,
+        )
+        self.assertEqual(request["meta"]["voice_mode"], "normal")
+        self.assertEqual(request["meta"]["voice_language"], "en")
         self.assertNotIn("model", request)
         with self.assertRaises(TypeError):
             turn_request("kitchen", "what's on today?", model="another-model")
