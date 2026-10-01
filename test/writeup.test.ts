@@ -1,6 +1,79 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
-import { writeUpPrompt } from '../src/writeup.ts';
+import { writeUpPrompt, writeUpToolDecision } from '../src/writeup.ts';
+import { allowAllPolicy } from '../src/policy.ts';
+import { nullLogger } from '../src/log.ts';
+import { MemoryStore } from '../src/memory.ts';
+
+describe('write-up tool decision', () => {
+  const input = { facts: ['[2026-09-30, josh] Synthetic durable fact.'] };
+
+  it('allows exactly memory read, save, lookup, and ToolSearch', () => {
+    for (const toolName of [
+      'mcp__mentat__memory_read',
+      'mcp__mentat__memory_save',
+      'mcp__mentat__memory_lookup',
+      'ToolSearch',
+    ]) {
+      expect(writeUpToolDecision(toolName, input, '')).toEqual({
+        behavior: 'allow',
+        updatedInput: input,
+      });
+    }
+  });
+
+  it('denies a forgotten fact from real MemoryStore tombstones after normalizing provenance', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mentat-writeup-'));
+    const store = new MemoryStore({ dir, logger: nullLogger, now: () => new Date(2026, 8, 30, 12) });
+    const header = { name: 'Synthetic Person', aliases: [], group: 'people', summary: 'Synthetic summary' };
+    try {
+      await store.save({ id: 'synthetic-id', tier: 'everyday', header,
+        facts: ['[2026-09-29, josh] Synthetic durable fact.'], source: 'josh' });
+      await store.forget('synthetic-id', 'everyday', 'Synthetic durable fact.');
+      await store.save({ id: 'other-id', tier: 'everyday', header: { ...header, name: 'Other Synthetic Person' },
+        facts: ['Unrelated forgotten fact.'], source: 'inferred' });
+      await store.forget('other-id', 'everyday');
+      const tombstones = await store.tombstones();
+      expect(tombstones).toContain('synthetic-id: [2026-09-29, josh] Synthetic durable fact.');
+      expect(tombstones).toContain('other-id (everyday): record forgotten');
+      for (const fact of [
+        '[2026-09-30, josh]  synthetic DURABLE FACT.  ',
+        ' [2026-09-30, third-party] Synthetic durable fact. ',
+      ]) {
+        expect(writeUpToolDecision('mcp__mentat__memory_save',
+          { facts: ['Unrelated new fact.', fact] }, tombstones)).toMatchObject({ behavior: 'deny' });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('denies every other tool with a reason', () => {
+    for (const toolName of [
+      'mcp__mentat__memory_forget',
+      'mcp__mentat__send_sms',
+      'Read',
+      'web_search',
+      'OtherTool',
+    ]) {
+      const decision = writeUpToolDecision(toolName, input, '');
+      expect(decision.behavior).toBe('deny');
+      if (decision.behavior === 'deny') expect(decision.message).toContain(toolName);
+    }
+  });
+
+  it('leaves explicit normal-session saves outside the write-up decision', () => {
+    const policy = allowAllPolicy(nullLogger);
+    expect(policy('mcp__mentat__memory_save', input, {
+      sessionId: 'synthetic-session',
+      meta: { surface: 'test' },
+    })).toMatchObject({ behavior: 'allow', updatedInput: input });
+  });
+});
 
 describe('write-up prompt', () => {
   it('uses the supplied memory state and constrains durable fact extraction', () => {
