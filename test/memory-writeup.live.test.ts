@@ -256,7 +256,28 @@ describe('synthetic memory write-up lifecycle', () => {
         if (savedFact === undefined || savedRecord === undefined) throw new Error('write-up did not save the R5 fact');
         expect(savedRecord.tier).toBe('everyday');
         expect(await memory.index()).toContain(savedRecord.header.name);
-        await memory.forget(savedRecord.id, savedRecord.tier, savedFact);
+        const r5ForgetSession = `memory-writeup-r5-forget-${model}`;
+        const forgetTurn = await collect(await backend.converse({
+          sessionId: r5ForgetSession,
+          text: 'Please forget everything about my Lantern Ledger, the list of old train stations I have visited. I do not want any memory of the list or its name kept.',
+        }));
+        completed(forgetTurn);
+        expect(forgetTurn.some((event) => event.kind === 'toolStart' && event.tool.endsWith('memory_forget'))).toBe(true);
+        const afterForgetRecords = await readRecords(memoryDir);
+        const afterForgetIndex = await memory.index();
+        const residualForgetRecords = afterForgetRecords.filter((record) =>
+          record.text.toLowerCase().includes(FORGOTTEN_FACT.toLowerCase()),
+        );
+        if (residualForgetRecords.length > 0 || afterForgetIndex.toLowerCase().includes(FORGOTTEN_FACT.toLowerCase())) {
+          console.log(`memory-writeup ${model} R5 B forget residue: ${JSON.stringify({
+            records: residualForgetRecords.map((record) => ({ id: record.id, tier: record.tier, text: record.text })),
+            index: afterForgetIndex,
+          })}`);
+        }
+        expect(residualForgetRecords).toEqual([]);
+        expect(afterForgetIndex.toLowerCase()).not.toContain(FORGOTTEN_FACT.toLowerCase());
+        console.log(`memory-writeup ${model} R5 B: separate normal session forgot the topic; all records and index clear`);
+
         const smallTalk = await collect(await backend.converse({
           sessionId: r5Session,
           text: 'That was a pleasant walk today. What is a good way to keep a paper notebook tidy?',
@@ -265,11 +286,11 @@ describe('synthetic memory write-up lifecycle', () => {
         await backend.closeSession(r5Session, { writeUp: true });
         const afterSecondWriteUp = await readRecords(memoryDir);
         for (const record of afterSecondWriteUp) {
-          expect(record.header.summary).not.toContain(FORGOTTEN_FACT);
-          expect(record.text).not.toContain(FORGOTTEN_FACT);
+          expect(record.text.toLowerCase()).not.toContain(FORGOTTEN_FACT.toLowerCase());
         }
-        expect(await memory.index()).not.toContain(FORGOTTEN_FACT);
-        console.log(`memory-writeup ${model} R5: forgotten fact absent after later write-up`);
+        const afterSecondWriteUpIndex = await memory.index();
+        expect(afterSecondWriteUpIndex.toLowerCase()).not.toContain(FORGOTTEN_FACT.toLowerCase());
+        console.log(`memory-writeup ${model} R5 A: later ordinary turn/write-up did not restore forgotten topic`);
 
         const explicitRestore = await collect(await backend.converse({
           sessionId: r5Session,
