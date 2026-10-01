@@ -9,7 +9,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8484"
 # can never collide with HA's conversation ids.
 SESSION_PREFIX = "ha-"
 
-# Voice turns are latency-bound: low effort, identified surface. The user is
-# part of the turn's authority context (mentat policy is per-turn).
-TURN_META = {"surface": "voice", "user": "josh"}
+# Home Assistant turns are latency-bound: low effort, identified surface. The
+# user is part of the turn's authority context (mentat policy is per-turn).
+TURN_META = {"surface": "home-assistant", "user": "josh"}
 TURN_EFFORT = "low"

@@ -81,11 +81,6 @@ in {
       description = "MCP servers attrset; rendered as MENTAT_MCP_CONFIG ({\"mcpServers\": ...}).";
     };
 
-    maxBudgetUsd = lib.mkOption {
-      type = lib.types.float;
-      description = "Per-turn budget ceiling (MENTAT_MAX_BUDGET_USD). Required: an unattended daemon never runs uncapped.";
-    };
-
     environmentFile = lib.mkOption {
       type = lib.types.str;
       description = "EnvironmentFile with secrets (CLAUDE_CODE_OAUTH_TOKEN at minimum). An agenix-decrypted path, never a store path.";
@@ -218,7 +213,6 @@ in {
         MENTAT_STATE_PATH = "/var/lib/mentat/sessions.json";
         MENTAT_MEMORY_DIR = "/var/lib/mentat/memory";
         MENTAT_MODEL = cfg.model;
-        MENTAT_MAX_BUDGET_USD = toString cfg.maxBudgetUsd;
         # The SDK child writes $HOME/.claude state; point it at the state
         # directory instead of weakening ProtectHome.
         HOME = "/var/lib/mentat";

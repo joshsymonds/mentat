@@ -133,7 +133,6 @@
           enable = true;
           claudePackage = pkgs.hello; # any package with a bin; eval-only
           environmentFile = "/run/agenix/mentat-env";
-          maxBudgetUsd = 2.0;
           mcpConfig.shimmer = {
             type = "http";
             url = "http://127.0.0.1:8001/mcp";

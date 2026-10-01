@@ -29,7 +29,6 @@ export interface Config {
   extraEnv?: string[];
   maxSessions: number;
   sessionTtlMs: number;
-  maxBudgetUsd?: number;
   voiceToken?: { apiKey: string; apiSecret: string; url: string };
   voiceGateway?: { url: string; callerKey: string };
   placesApiKey?: string;
@@ -130,9 +129,6 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
       disallowedTools: splitCsv(env.MENTAT_DISALLOWED_TOOLS),
     }),
     ...(env.MENTAT_EXTRA_ENV !== undefined && { extraEnv: splitCsv(env.MENTAT_EXTRA_ENV) }),
-    ...(env.MENTAT_MAX_BUDGET_USD !== undefined && {
-      maxBudgetUsd: floatOrThrow(env.MENTAT_MAX_BUDGET_USD, 'MENTAT_MAX_BUDGET_USD'),
-    }),
     ...(voiceToken !== undefined && { voiceToken }),
     ...(voiceGateway !== undefined && { voiceGateway }),
     ...(placesApiKey !== undefined && { placesApiKey }),
@@ -277,14 +273,6 @@ function intOr(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(`invalid integer ${value}`);
-  }
-  return parsed;
-}
-
-function floatOrThrow(value: string, name: string): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error(`invalid ${name}: ${value}`);
   }
   return parsed;
 }
