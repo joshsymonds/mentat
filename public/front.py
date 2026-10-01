@@ -16,8 +16,15 @@ from fastmcp import FastMCP, settings
 from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.oidc_proxy import OIDCProxy
 from fastmcp.server.auth.jwt_issuer import derive_jwt_key
-from fastmcp.server.auth.providers.jwt import JWTVerifier
+from fastmcp.server.auth.providers.jwt import (
+    JWTVerifier,
+    _has_unsupported_critical_headers,
+    _import_key_for_algorithm,
+)
 from fastmcp.server.server import create_proxy
+from fastmcp.utilities.auth import decode_jwt_header
+from joserfc import jwt
+from joserfc.jws import JWSRegistry
 from key_value.aio.protocols import AsyncKeyValue
 from key_value.aio.stores.filetree import (
     FileTreeStore,
@@ -195,7 +202,19 @@ class NoExpiryJWTVerifier(JWTVerifier):
     async def load_access_token(self, token: str) -> AccessToken | None:
         try:
             verification_key = await self._get_verification_key(token)
-            claims = self.jwt.decode(token, verification_key)
+            key = _import_key_for_algorithm(verification_key, self.algorithm)
+            header = decode_jwt_header(token)
+            if _has_unsupported_critical_headers(header):
+                return None
+            claims = jwt.decode(
+                token,
+                key,
+                algorithms=[self.algorithm],
+                registry=JWSRegistry(
+                    algorithms=[self.algorithm],
+                    strict_check_header=False,
+                ),
+            ).claims
             client_id = (
                 claims.get("client_id")
                 or claims.get("azp")
