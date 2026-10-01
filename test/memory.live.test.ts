@@ -359,7 +359,7 @@ describe('memory live evidence', () => {
           const guardBackend = new ClaudeCode({
             bin,
             model,
-            maxBudgetUsd: 0.5,
+            maxBudgetUsd: 5,
             policy: allowAllPolicy(nullLogger),
             logger: nullLogger,
             memoryDir,
