@@ -312,7 +312,14 @@ describe('POST /mcp', () => {
       'set_alarm',
       'set_timer',
       'end_conversation',
+      'set_voice_mode',
     ]);
+    const voiceMode = listed.tools.find((tool) => tool.name === 'set_voice_mode');
+    expect(voiceMode?.inputSchema.type).toBe('object');
+    expect(Object.keys(voiceMode?.inputSchema.properties ?? {})).toEqual(['mode', 'language']);
+    expect(voiceMode?.inputSchema.properties?.mode).toMatchObject({ type: 'string', enum: ['normal', 'conversation'] });
+    expect(voiceMode?.inputSchema.properties?.language).toEqual({ type: 'string' });
+    expect(voiceMode?.inputSchema.required).toEqual(['mode']);
     const send = listed.tools.find((tool) => tool.name === 'send_sms');
     const open = listed.tools.find((tool) => tool.name === 'open_on_phone');
     expect(send).toBeDefined();
@@ -327,6 +334,53 @@ describe('POST /mcp', () => {
     expect(Object.keys(open?.inputSchema.properties ?? {})).toEqual(['uri']);
     expect(open?.inputSchema.required).toEqual(['uri']);
     expect(open?.inputSchema.properties?.uri).toEqual({ type: 'string' });
+    await client.close();
+    bridge.close();
+  });
+
+  it('returns validated voice mode requests and errors for invalid language inputs', async () => {
+    const bridge = new PhoneBridge(nullLogger);
+    const base = await serve(bridge);
+    const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    await client.connect(transport as Transport);
+
+    const normal = await client.callTool({
+      name: 'set_voice_mode',
+      arguments: { mode: 'normal', language: 'fr' },
+    });
+    expect(normal).toEqual({ content: [{ type: 'text', text: '{"voice_mode":{"mode":"normal","language":"en"}}' }] });
+
+    for (const language of ['es', 'fr', 'it']) {
+      const conversation = await client.callTool({
+        name: 'set_voice_mode',
+        arguments: { mode: 'conversation', language },
+      });
+      expect(conversation).toEqual({
+        content: [{ type: 'text', text: `{"voice_mode":{"mode":"conversation","language":"${language}"}}` }],
+      });
+    }
+
+    for (const language of ['fra', 'xx', 'english', 'e', 'EN']) {
+      const invalid = await client.callTool({
+        name: 'set_voice_mode',
+        arguments: { mode: 'conversation', language },
+      });
+      expect(invalid).toEqual({
+        isError: true,
+        content: [{ type: 'text', text: `invalid ISO 639 language code: ${language}` }],
+      });
+    }
+
+    const missing = await client.callTool({
+      name: 'set_voice_mode',
+      arguments: { mode: 'conversation' },
+    });
+    expect(missing).toEqual({
+      isError: true,
+      content: [{ type: 'text', text: 'language is required for conversation mode.' }],
+    });
+
     await client.close();
     bridge.close();
   });
