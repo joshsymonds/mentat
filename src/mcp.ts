@@ -348,19 +348,22 @@ export async function handleMcp(
     'set_voice_mode',
     {
       description:
-        'Change the language for this voice conversation, or return to the normal English voice mode.',
+        'Change the language for this voice conversation, interpret between English and another language, or return to normal English voice mode.',
       inputSchema: {
-        mode: z.enum(['normal', 'conversation']),
+        mode: z.enum(['normal', 'conversation', 'interpreter']),
         language: z.string().optional(),
       },
     },
     ({ mode, language }) => {
-      if (mode === 'conversation') {
+      if (mode !== 'normal') {
         if (language === undefined) {
-          return errorResult('language is required for conversation mode.');
+          return errorResult(`language is required for ${mode} mode.`);
         }
         if (!ISO_639_1_CODES.has(language)) {
           return errorResult(`invalid ISO 639 language code: ${language}`);
+        }
+        if (mode === 'interpreter' && language === 'en') {
+          return errorResult('interpreter language must not be English.');
         }
       }
       return textResult(JSON.stringify({

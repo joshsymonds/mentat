@@ -318,7 +318,7 @@ describe('POST /mcp', () => {
     const voiceMode = listed.tools.find((tool) => tool.name === 'set_voice_mode');
     expect(voiceMode?.inputSchema.type).toBe('object');
     expect(Object.keys(voiceMode?.inputSchema.properties ?? {})).toEqual(['mode', 'language']);
-    expect(voiceMode?.inputSchema.properties?.mode).toMatchObject({ type: 'string', enum: ['normal', 'conversation'] });
+    expect(voiceMode?.inputSchema.properties?.mode).toMatchObject({ type: 'string', enum: ['normal', 'conversation', 'interpreter'] });
     expect(voiceMode?.inputSchema.properties?.language).toEqual({ type: 'string' });
     expect(voiceMode?.inputSchema.required).toEqual(['mode']);
     const send = listed.tools.find((tool) => tool.name === 'send_sms');
@@ -360,6 +360,14 @@ describe('POST /mcp', () => {
       expect(conversation).toEqual({
         content: [{ type: 'text', text: `{"voice_mode":{"mode":"conversation","language":"${language}"}}` }],
       });
+
+      const interpreter = await client.callTool({
+        name: 'set_voice_mode',
+        arguments: { mode: 'interpreter', language },
+      });
+      expect(interpreter).toEqual({
+        content: [{ type: 'text', text: `{"voice_mode":{"mode":"interpreter","language":"${language}"}}` }],
+      });
     }
 
     for (const language of ['fra', 'xx', 'english', 'e', 'EN']) {
@@ -371,7 +379,24 @@ describe('POST /mcp', () => {
         isError: true,
         content: [{ type: 'text', text: `invalid ISO 639 language code: ${language}` }],
       });
+      const invalidInterpreter = await client.callTool({
+        name: 'set_voice_mode',
+        arguments: { mode: 'interpreter', language },
+      });
+      expect(invalidInterpreter).toEqual({
+        isError: true,
+        content: [{ type: 'text', text: `invalid ISO 639 language code: ${language}` }],
+      });
     }
+
+    const englishInterpreter = await client.callTool({
+      name: 'set_voice_mode',
+      arguments: { mode: 'interpreter', language: 'en' },
+    });
+    expect(englishInterpreter).toEqual({
+      isError: true,
+      content: [{ type: 'text', text: 'interpreter language must not be English.' }],
+    });
 
     const missing = await client.callTool({
       name: 'set_voice_mode',
@@ -380,6 +405,15 @@ describe('POST /mcp', () => {
     expect(missing).toEqual({
       isError: true,
       content: [{ type: 'text', text: 'language is required for conversation mode.' }],
+    });
+
+    const missingInterpreterLanguage = await client.callTool({
+      name: 'set_voice_mode',
+      arguments: { mode: 'interpreter' },
+    });
+    expect(missingInterpreterLanguage).toEqual({
+      isError: true,
+      content: [{ type: 'text', text: 'language is required for interpreter mode.' }],
     });
 
     await client.close();
