@@ -18,6 +18,8 @@ API_BASE = "https://api.elevenlabs.io/v1"
 VOICE_STATE_ENV = "MENTAT_VOICE_STATE_DIR"
 VOICE_STATE_FILE = "voices.json"
 VOICE_MODEL = "eleven_v4_turbo"
+SHARED_VOICE_PAGE_SIZE = 100
+MAX_SHARED_VOICE_PAGES = 100
 HTTP_TIMEOUT_S = 10
 
 Fetch = Callable[..., Any]
@@ -90,28 +92,38 @@ class VoiceResolver:
         return raw
 
     def _find_voice(self, language: str) -> dict[str, str] | None:
-        query = urlencode({"language": language, "use_cases": "conversational"})
-        payload = self._request_json("GET", f"{API_BASE}/shared-voices?{query}")
-        voices = payload.get("voices")
-        if not isinstance(voices, list):
-            raise ValueError("shared voices response has no voices list")
-        for candidate in voices:
-            if not isinstance(candidate, Mapping):
-                continue
-            voice_id = candidate.get("voice_id")
-            owner_id = candidate.get("public_owner_id")
-            verified = candidate.get("verified_languages")
-            if not isinstance(voice_id, str) or not voice_id or not isinstance(owner_id, str) or not owner_id:
-                continue
-            if not isinstance(verified, list):
-                continue
-            if any(
-                isinstance(item, Mapping)
-                and item.get("language") == language
-                and item.get("model_id") == VOICE_MODEL
-                for item in verified
-            ):
-                return {"voice_id": voice_id, "public_owner_id": owner_id}
+        for page in range(MAX_SHARED_VOICE_PAGES):
+            query = urlencode(
+                {
+                    "language": language,
+                    "use_cases": "conversational",
+                    "page": page,
+                    "page_size": SHARED_VOICE_PAGE_SIZE,
+                }
+            )
+            payload = self._request_json("GET", f"{API_BASE}/shared-voices?{query}")
+            voices = payload.get("voices")
+            if not isinstance(voices, list):
+                raise ValueError("shared voices response has no voices list")
+            for candidate in voices:
+                if not isinstance(candidate, Mapping):
+                    continue
+                voice_id = candidate.get("voice_id")
+                owner_id = candidate.get("public_owner_id")
+                verified = candidate.get("verified_languages")
+                if not isinstance(voice_id, str) or not voice_id or not isinstance(owner_id, str) or not owner_id:
+                    continue
+                if not isinstance(verified, list):
+                    continue
+                if any(
+                    isinstance(item, Mapping)
+                    and item.get("language") == language
+                    and item.get("model_id") == VOICE_MODEL
+                    for item in verified
+                ):
+                    return {"voice_id": voice_id, "public_owner_id": owner_id}
+            if payload.get("has_more") is not True:
+                return None
         return None
 
     def _add_voice(self, voice: Mapping[str, str], language: str) -> str:

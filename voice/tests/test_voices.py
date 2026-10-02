@@ -25,7 +25,7 @@ class FakeResponse:
 
 class FakeHTTP:
     def __init__(self, voices):
-        self.voices = voices
+        self.pages = [{"voices": voices}]
         self.requests = []
         self.fail = False
         self.added_voice_id = "newest-eligible"
@@ -35,7 +35,8 @@ class FakeHTTP:
         if self.fail:
             raise OSError("synthetic provider failure")
         if request.method == "GET":
-            return FakeResponse({"voices": self.voices})
+            page = int(parse_qs(urlparse(request.full_url).query).get("page", ["0"])[0])
+            return FakeResponse(self.pages[min(page, len(self.pages) - 1)])
         assert isinstance(json.loads(request.data).get("new_name"), str)
         assert json.loads(request.data)["new_name"]
         return FakeResponse({"voice_id": self.added_voice_id})
@@ -70,7 +71,12 @@ class VoiceResolverTest(unittest.TestCase):
             self.assertEqual(lookup.method, "GET")
             self.assertEqual(
                 parse_qs(urlparse(lookup.full_url).query),
-                {"language": ["es"], "use_cases": ["conversational"]},
+                {
+                    "language": ["es"],
+                    "use_cases": ["conversational"],
+                    "page": ["0"],
+                    "page_size": ["100"],
+                },
             )
             self.assertEqual(add.method, "POST")
             self.assertTrue(add.full_url.endswith("/v1/voices/add/owner/newest-eligible"))
@@ -78,6 +84,54 @@ class VoiceResolverTest(unittest.TestCase):
                 json.loads((Path(temporary) / "voices.json").read_text()),
                 {"es": "added-library-voice"},
             )
+
+    def test_fetches_next_page_and_adds_first_eligible_verified_voice(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fetch = FakeHTTP([])
+            fetch.pages = [
+                {
+                    "voices": [
+                        self.voice("page-zero-unverified", [self.verified("es", "eleven_multilingual_v2")]),
+                    ],
+                    "has_more": True,
+                },
+                {
+                    "voices": [
+                        self.voice("page-one-eligible", [self.verified("es")]),
+                        self.voice("page-one-older", [self.verified("es")]),
+                    ],
+                    "has_more": False,
+                },
+            ]
+            fetch.added_voice_id = "added-page-one-voice"
+            resolver = VoiceResolver("synthetic-key", Path(temporary), fetch=fetch)
+
+            actual = resolver.resolve("es", "mentat-default")
+
+            self.assertEqual(actual, "added-page-one-voice")
+            lookup_requests = [request for request in fetch.requests if request.method == "GET"]
+            self.assertEqual(
+                [parse_qs(urlparse(request.full_url).query)["page"] for request in lookup_requests],
+                [["0"], ["1"]],
+            )
+            self.assertTrue(fetch.requests[-1].full_url.endswith("/v1/voices/add/owner/page-one-eligible"))
+            self.assertEqual(
+                json.loads((Path(temporary) / "voices.json").read_text()),
+                {"es": "added-page-one-voice"},
+            )
+
+    def test_non_exhausting_pagination_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fetch = FakeHTTP([])
+            fetch.pages = [{"voices": [], "has_more": True}]
+            resolver = VoiceResolver("synthetic-key", Path(temporary), fetch=fetch)
+
+            actual = resolver.resolve("es", "mentat-default")
+
+            self.assertEqual(actual, "mentat-default")
+            lookup_requests = [request for request in fetch.requests if request.method == "GET"]
+            self.assertLessEqual(len(lookup_requests), 100)
+            self.assertGreater(len(lookup_requests), 1)
 
     def test_saved_voice_is_reused_by_a_new_resolver(self):
         with tempfile.TemporaryDirectory() as temporary:
