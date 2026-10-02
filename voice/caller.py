@@ -72,6 +72,22 @@ class ScriptStep:
     delay: float
     line: str
     answer_pattern: str
+    language: str = "en"
+
+
+def parse_step_language(value: str) -> str:
+    """Read an optional private scripted-caller language marker."""
+    if not isinstance(value, str) or "::" not in value:
+        raise ValueError("script step must be LINE@DELAY::ANSWER_REGEX")
+    speech = value.rsplit("::", 1)[0]
+    line = speech.rpartition("@")[0]
+    match = re.match(r"^\[\[([a-z]{2,3})\]\]", line)
+    if match is None:
+        return "en"
+    language = match.group(1)
+    if language not in {"en", "es"}:
+        raise ValueError("script language must be en or es")
+    return language
 
 
 def parse_step(value: str) -> tuple[float, str, str]:
@@ -82,6 +98,9 @@ def parse_step(value: str) -> tuple[float, str, str]:
     line, separator, delay_text = speech.rpartition("@")
     if not separator or not line or not pattern:
         raise ValueError("script step must be LINE@DELAY::ANSWER_REGEX")
+    language = parse_step_language(value)
+    if language != "en":
+        line = line[len(f"[[{language}]]"):]
     try:
         delay = float(delay_text)
     except ValueError as exc:
@@ -302,11 +321,21 @@ async def _speech_end_after_playout(source: Any) -> float:
     return time.monotonic()
 
 
-async def _tts(http: Any, text: str) -> TTSResponse:
+async def _tts(http: Any, text: str, *, language: str = "en") -> TTSResponse:
+    request = {
+        "model": "gpt-4o-mini-tts",
+        "voice": "ash",
+        "input": text,
+        "response_format": "pcm",
+    }
+    if language == "es":
+        request["instructions"] = "Speak clearly in Spanish."
+    elif language != "en":
+        raise ValueError("script language must be en or es")
     async with http.post(
         "https://api.openai.com/v1/audio/speech",
         headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-        json={"model": "gpt-4o-mini-tts", "voice": "ash", "input": text, "response_format": "pcm"},
+        json=request,
     ) as response:
         pcm = await response.read()
         response.raise_for_status()
@@ -349,9 +378,20 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
     import aiohttp
     from livekit import api, rtc
 
-    steps = [ScriptStep(*parse_step(step)) for step in raw_steps]
+    steps = [
+        ScriptStep(*parse_step(step), language=parse_step_language(step))
+        for step in raw_steps
+    ]
     async with aiohttp.ClientSession() as http:
-        audio = [(step, await _tts(http, step.line)) for step in steps]
+        audio = [
+            (
+                step,
+                await _tts(http, step.line, language="es")
+                if step.language == "es"
+                else await _tts(http, step.line),
+            )
+            for step in steps
+        ]
         token = (
             api.AccessToken(os.environ["LIVEKIT_API_KEY"], os.environ["LIVEKIT_API_SECRET"])
             .with_identity("scripted-caller")

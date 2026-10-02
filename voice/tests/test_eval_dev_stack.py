@@ -174,7 +174,20 @@ class DevStackTest(unittest.TestCase):
         setup = "\n".join(script for script in remote_scripts if script)
         self.assertIn("127.0.0.1", setup)
         self.assertIn('"MENTAT_LISTEN": f"127.0.0.1:{dev_port}"', setup)
-        self.assertIn('"MENTAT_STATE_PATH": str(dev_dir / "state.json")', setup)
+        self.assertIn('"MENTAT_STATE_PATH": str(dev_dir / "home/mentat/state.json")', setup)
+        self.assertIn('mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat"', setup)
+        self.assertIn('chmod 700 "$DEV_DIR/home/mentat"', setup)
+        self.assertIn('chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat"', setup)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_home = Path(temporary_directory) / "home/mentat"
+            state_home.mkdir(parents=True, mode=0o700)
+            os.chmod(state_home, 0o700)
+            state_path = state_home / "state.json"
+            temporary_state = state_path.with_name("state.json.tmp")
+            temporary_state.write_text('{"session":"persisted"}')
+            os.replace(temporary_state, state_path)
+            self.assertEqual(state_path.read_text(), '{"session":"persisted"}')
+            self.assertEqual(stat.S_IMODE(state_home.stat().st_mode), 0o700)
         self.assertIn('"MENTAT_RECORD_DIR": str(dev_dir / "records")', setup)
         self.assertIn('"HOME": str(dev_dir / "home/mentat")', setup)
         self.assertIn('"MENTAT_MCP_CONFIG"', setup)
@@ -468,6 +481,37 @@ class DevStackTest(unittest.TestCase):
             for args, kwargs in calls
             if args[:2] == ["ssh", "ultraviolet"]
         ))
+
+    @patch("voice.evals.dev_stack.subprocess.Popen")
+    def test_worker_creates_private_mode_trace_and_sets_only_worker_opt_in(self, popen):
+        popen.return_value = unittest.mock.Mock(poll=lambda: None)
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.trace\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
+            stack.start_worker("trace-room")
+
+        worker_script = next(
+            kwargs["input"] for args, kwargs in calls
+            if args[:2] == ["ssh", "ultraviolet"] and "--room" in kwargs.get("input", "")
+        )
+        trace_creation = worker_script.index(': > "$DEV_DIR/voice/evals/voice-modes.jsonl"')
+        worker_launch = worker_script.index("voice = subprocess.Popen(")
+        self.assertLess(trace_creation, worker_launch)
+        self.assertIn('chown nobody:nogroup "$DEV_DIR/voice/evals/voice-modes.jsonl"', worker_script)
+        self.assertIn('chmod 600 "$DEV_DIR/voice/evals/voice-modes.jsonl"', worker_script)
+        self.assertIn(
+            '"MENTAT_EVAL_VOICE_LOG": str(dev_dir / "voice/evals/voice-modes.jsonl")',
+            worker_script,
+        )
+        self.assertNotIn("MENTAT_EVAL_VOICE_LOG", _SETUP_SCRIPT)
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_worker_joins_the_room_returned_by_the_voice_token(self, popen):
@@ -1435,6 +1479,9 @@ class DevStackTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as staging:
             root = Path(staging)
             (root / "agent.log").write_text("synthetic diagnostics\n")
+            mode_trace = root / "voice/evals/voice-modes.jsonl"
+            mode_trace.parent.mkdir(parents=True)
+            mode_trace.write_text('{"room":"room-1","event":"mode"}\\n')
             sms_audio = root / "voice/evals/retained-evidence/sms-audio"
             sms_audio.mkdir(parents=True)
             (sms_audio / "room-turn-001.wav").write_bytes(b"RIFF synthetic wav")
@@ -1454,7 +1501,12 @@ class DevStackTest(unittest.TestCase):
             with tarfile.open(archive, "r:gz") as retained:
                 self.assertEqual(
                     retained.getnames(),
-                    ["agent.log", "sms-audio/room-turn-001.wav", "sms-audio/transcripts.jsonl"],
+                    [
+                        "agent.log",
+                        "voice/evals/voice-modes.jsonl",
+                        "sms-audio/room-turn-001.wav",
+                        "sms-audio/transcripts.jsonl",
+                    ],
                 )
 
     def test_cleanup_retains_private_eval_evidence_without_environment_files(self):
@@ -1475,6 +1527,7 @@ class DevStackTest(unittest.TestCase):
                         ("voice.log", "voice diagnostics\\n"),
                         ("records/session.jsonl", "{}\\n"),
                         ("voice/evals/delegations.jsonl", "{}\\n"),
+                        ("voice/evals/voice-modes.jsonl", '{"room":"room-1","event":"mode"}\\n'),
                         ("sms-audio/room-turn-001.wav", "RIFF synthetic wav"),
                         ("sms-audio/transcripts.jsonl", '{"turn":1,"transcript":"private"}\\n'),
                         ("input-audio/room-turn-001.wav", "RIFF input wav"),
@@ -1508,7 +1561,8 @@ class DevStackTest(unittest.TestCase):
                     with tarfile.open(destination, "w:gz") as archive:
                         for name in (
                             "agent.log", "voice.log", "records/session.jsonl",
-                            "voice/evals/delegations.jsonl", "sms-audio/room-turn-001.wav",
+                            "voice/evals/delegations.jsonl", "voice/evals/voice-modes.jsonl",
+                            "sms-audio/room-turn-001.wav",
                             "sms-audio/transcripts.jsonl", "input-audio/room-turn-001.wav",
                             "input-audio/room-turn-001.txt", "input-audio/orphan-turn-002.txt",
                             "input-audio/room-turn-001.json", "input-audio/linked-turn-003.wav",
@@ -1547,7 +1601,8 @@ class DevStackTest(unittest.TestCase):
             {path.relative_to(retained).as_posix() for path in retained.rglob("*") if path.is_file()},
             {
                 "agent.log", "voice.log", "records/session.jsonl",
-                "voice/evals/delegations.jsonl", "sms-audio/room-turn-001.wav",
+                "voice/evals/delegations.jsonl", "voice/evals/voice-modes.jsonl",
+                "sms-audio/room-turn-001.wav",
                 "sms-audio/transcripts.jsonl", "input-audio/room-turn-001.wav",
                 "input-audio/room-turn-001.txt", "caller-audio/room-turn-001-rendered.pcm",
                 "caller-audio/room-turn-001-pushed.pcm", "caller-audio/room-turn-001.json",

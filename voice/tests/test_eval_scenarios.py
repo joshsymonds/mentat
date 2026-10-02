@@ -22,6 +22,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                 "sms-say-back-yes",
                 "sms-correction-new-yes",
                 "alice-keck-context-chain",
+                "spanish-language-switch",
             },
         )
         for scenario in SCENARIOS:
@@ -47,6 +48,25 @@ class ScenarioCorpusTests(unittest.TestCase):
             sms = by_name[name]
             self.assertIn(sms_number, sms.caller_lines[0])
             self.assertEqual(sms.commands[0]["to"], sms_number)
+
+    def test_spanish_switch_scenario_covers_switch_back_and_saved_voice_reuse(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-language-switch")
+        self.assertEqual(len(scenario.caller_lines), 5)
+        self.assertEqual(
+            scenario.caller_lines,
+            (
+                "Can we continue in Spanish, please?",
+                "¿Cuál es la capital de Francia?",
+                "Let's switch back to English, please.",
+                "Can we speak Spanish again, please?",
+                "¿De qué color es el cielo en un día despejado?",
+            ),
+        )
+        self.assertEqual(scenario.caller_languages, ("en", "es", "en", "en", "es"))
+        self.assertEqual(scenario.reply_languages, ("es", "es", "en", "es", "es"))
+        self.assertEqual(scenario.voice_mode_expectations, ("es", "en", "es"))
+        self.assertEqual(len(scenario.turns), 5)
+        self.assertEqual(scenario.room_close_after, 5)
 
     def test_complete_evaluator_returns_all_structured_product_failures(self):
         scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")

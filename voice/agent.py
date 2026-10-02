@@ -273,6 +273,25 @@ def write_turn_marker(room_name: str, turn_id: str) -> None:
         logger.exception("failed to write eval delegation marker")
 
 
+def write_voice_trace(room_name: str, event: str, **fields: Any) -> None:
+    """Append opt-in, text-free voice configuration evidence for evals."""
+    trace_path = os.environ.get("MENTAT_EVAL_VOICE_LOG")
+    if not trace_path:
+        return
+    record = {
+        "room": room_name,
+        "event": event,
+        **fields,
+        "created_at": time.time(),
+    }
+    try:
+        line = json.dumps(record, separators=(",", ":"), allow_nan=False)
+        with Path(trace_path).open("a", encoding="utf-8") as trace_file:
+            trace_file.write(line + "\n")
+    except (OSError, TypeError, ValueError):
+        logger.exception("failed to write eval voice trace")
+
+
 class FrontAgent(Agent):
     """A text-only front that streams every user turn through mentatd."""
 
@@ -298,14 +317,17 @@ class FrontAgent(Agent):
         self._background = background
         self._ending_policy = ending_policy
         self._ending_changed = ending_changed
-        self._stt = stt
-        self._tts = tts_provider
+        self._stt_provider = stt
+        self._tts_provider = tts_provider
         self._default_voice = default_voice
         self._voice_resolver = voice_resolver
         self._voice_mode = "normal"
         self._voice_language = "en"
         self._voice_id = default_voice
         self._voice_mode_note: str | None = None
+        self._voice_trace_enabled = bool(os.environ.get("MENTAT_EVAL_VOICE_LOG"))
+        self._traced_voices: dict[str, str] | None = {} if self._voice_trace_enabled else None
+        self._voice_reply_number = 0
         input_audio_dir = os.environ.get("MENTAT_VOICE_INPUT_RECORD_DIR")
         self._input_audio = (
             InputAudioRecorder(room_name, input_audio_dir) if input_audio_dir else None
@@ -392,10 +414,23 @@ class FrontAgent(Agent):
             while (text := await queue.get()) is not None:
                 yield text
 
+        self._voice_reply_number = getattr(self, "_voice_reply_number", 0) + 1
+        reply_number = self._voice_reply_number
+
         def start_speech() -> tuple[
             asyncio.Queue[str | None], Any, asyncio.Task[None]
         ]:
             queue: asyncio.Queue[str | None] = asyncio.Queue()
+            if getattr(self, "_voice_trace_enabled", False):
+                write_voice_trace(
+                    self._room_name,
+                    "speech",
+                    mode=self._voice_mode,
+                    language=self._voice_language,
+                    voice_id=self._voice_id,
+                    reply=reply_number,
+                    turn_id=turn_id,
+                )
             handle = self.session.say(speech_source(queue), allow_interruptions=True)
             completion = asyncio.create_task(handle.wait_for_playout())
             return queue, handle, completion
@@ -502,19 +537,27 @@ class FrontAgent(Agent):
         previous_language = self._voice_language
         previous_voice = self._voice_id
         rollback_failed = False
+        lookup_started = time.monotonic()
+        selection = "default"
         try:
-            voice_id = (
-                self._default_voice
-                if mode == "normal" and language == "en"
-                else self._voice_resolver.resolve(language, self._default_voice)
-            )
-            self._stt.update_options(language=language)
-            self._tts.update_options(voice_id=voice_id, language=language)
+            if mode == "normal" and language == "en":
+                voice_id = self._default_voice
+            else:
+                voice_id = self._voice_resolver.resolve(language, self._default_voice)
+                if voice_id == self._default_voice:
+                    selection = "fallback"
+                elif self._traced_voices is not None and self._traced_voices.get(language) == voice_id:
+                    selection = "reused"
+                else:
+                    selection = "resolved"
+            lookup_ms = (time.monotonic() - lookup_started) * 1000
+            self._stt_provider.update_options(language=language)
+            self._tts_provider.update_options(voice_id=voice_id)
         except Exception as error:
             logger.warning("voice mode apply failed for %s: %s", language, type(error).__name__)
             for provider, options in (
-                (self._stt, {"language": previous_language}),
-                (self._tts, {"voice_id": previous_voice, "language": previous_language}),
+                (self._stt_provider, {"language": previous_language}),
+                (self._tts_provider, {"voice_id": previous_voice}),
             ):
                 try:
                     provider.update_options(**options)
@@ -540,6 +583,17 @@ class FrontAgent(Agent):
         self._voice_mode = mode
         self._voice_language = language
         self._voice_id = voice_id
+        if self._traced_voices is not None and voice_id != self._default_voice:
+            self._traced_voices[language] = voice_id
+        write_voice_trace(
+            self._room_name,
+            "mode",
+            mode=mode,
+            language=language,
+            voice_id=voice_id,
+            lookup_ms=lookup_ms,
+            selection=selection,
+        )
         return True
 
     async def _backend_text(
@@ -706,7 +760,6 @@ async def entrypoint(ctx: JobContext) -> None:
         model="eleven_v4_turbo",
         api_key=os.environ["ELEVENLABS_API_KEY"],
         voice_id=default_voice,
-        language="en",
     )
     voice_resolver = VoiceResolver(os.environ.get("ELEVENLABS_API_KEY"))
     session = AgentSession(

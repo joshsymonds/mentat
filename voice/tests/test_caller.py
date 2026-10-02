@@ -42,6 +42,15 @@ class ParseStepTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_step("Question@soon::answer")
 
+    def test_script_language_marker_is_removed_from_the_spoken_line(self):
+        raw_step = "[[es]]¿Cuál es la capital de Francia?@0::.*"
+        self.assertEqual(
+            parse_step(raw_step),
+            (0.0, "¿Cuál es la capital de Francia?", ".*"),
+        )
+        self.assertEqual(caller.parse_step_language(raw_step), "es")
+        self.assertEqual(caller.parse_step_language("English@0::.*"), "en")
+
 
 class MatchingLatencyTests(unittest.TestCase):
     def test_latency_uses_first_matching_segment_start(self):
@@ -177,6 +186,38 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.pcm, b"\x01\x00\x02\x00")
         self.assertEqual(result.http_status, 206)
         self.assertEqual(result.response_bytes, 4)
+
+    async def test_spanish_tts_requests_a_clear_spanish_rendering(self):
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def read(self):
+                return b"\\x01\\x00\\x02\\x00"
+
+        http = Mock()
+        http.post.return_value = Response()
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            await caller._tts(http, "¿Cuál es la capital de Francia?", language="es")
+
+        self.assertEqual(
+            http.post.call_args.kwargs["json"],
+            {
+                "model": "gpt-4o-mini-tts",
+                "voice": "ash",
+                "input": "¿Cuál es la capital de Francia?",
+                "instructions": "Speak clearly in Spanish.",
+                "response_format": "pcm",
+            },
+        )
 
     async def test_skips_40ms_pcm_before_wav_form_or_upload(self):
         class Response:

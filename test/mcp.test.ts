@@ -941,11 +941,17 @@ describe('POST /mcp', () => {
     expect(spokenPrompt).toMatch(/ask which language.*before.*tool/i);
     expect(spokenPrompt).toMatch(/cannot understand a language/i);
     expect(spokenPrompt).toMatch(/cannot speak that language/i);
+    expect(spokenPrompt).toMatch(/a turn whose only action is `?set_voice_mode`?.*(?:another language|English).*do not call `?end_conversation`?\(reason=["']done["']\)/i);
+    expect(spokenPrompt).toMatch(/listen for a follow-up/i);
+    expect(spokenPrompt).toMatch(/explicit goodbye.*or.*independently completed task.*may still end/i);
     expect(voicePersona).toMatch(/infers from conversation.*another language.*return to English/i);
     expect(voicePersona).toMatch(/there is no required phrase/i);
     expect(voicePersona).toMatch(/asks which language.*before calling the tool/i);
     expect(voicePersona).toMatch(/cannot understand a language/i);
     expect(voicePersona).toMatch(/cannot speak that language/i);
+    expect(voicePersona).toMatch(/a turn whose only action is `?set_voice_mode`?.*(?:another language|English).*do not call `?end_conversation`?\(reason=["']done["']\)/i);
+    expect(voicePersona).toMatch(/listen for a follow-up/i);
+    expect(voicePersona).toMatch(/explicit goodbye.*or.*independently completed task.*may still end/i);
   });
 
 });
