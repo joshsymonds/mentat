@@ -169,6 +169,23 @@ class ScenarioCorpusTests(unittest.TestCase):
                 turns[turn_index] = answer
                 evaluate_scenario(scenario, turns, [], room_closed_after=None)
 
+    def test_spanish_interpreter_accepts_todas_las_mananas_before_sun_and_rejects_after(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riegue las plántulas todas las mañanas antes de que el sol esté fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+        turns[2] = "Riegue las plántulas todas las mañanas después de que el sol esté fuerte."
+        with self.assertRaisesRegex(AssertionError, "before|after|después|antes"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
     def test_spanish_interpreter_rejects_reversed_sun_timing(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
         turns = [

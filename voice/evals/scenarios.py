@@ -320,7 +320,7 @@ SCENARIOS = (
             TurnExpectation(
                 (
                     r"(?i)\b(?:riega|regar|riegue)\b",
-                    r"(?i)\b(?:cada mañana|por la mañana)\b",
+                    r"(?i)\b(?:cada mañana|por la mañana|todas las mañanas)\b",
                     r"(?i)\b(?:antes de|before)\b",
                     r"(?i)\b(?:sol|sun)\b",
                     r"(?i)\b(?:fuerte|intens[oa]|mucho sol|strong|intense)\b",
