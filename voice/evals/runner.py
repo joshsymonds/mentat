@@ -2049,6 +2049,211 @@ def _spanish_switch_evidence_failures(
     return failures, first_lookup_ms
 
 
+def _spanish_interpreter_evidence_failures(
+    scenario: Any,
+    room: str,
+    entries: list[dict[str, Any]],
+    transcript_sidecars: list[str | None],
+    phone_commands: list[dict[str, Any]],
+) -> tuple[list[str], float | None]:
+    """Require live interpreter STT, mode, per-reply voice, and phone evidence."""
+    failures: list[str] = []
+    caller_lines = getattr(scenario, "caller_lines", ())
+    caller_languages = getattr(scenario, "caller_languages", ())
+    reply_languages = getattr(scenario, "reply_languages", ())
+    expected_transitions = getattr(scenario, "voice_mode_expectations", ())
+    if (
+        not isinstance(caller_lines, tuple)
+        or len(caller_lines) != 6
+        or not isinstance(caller_languages, tuple)
+        or caller_languages != ("en", "es", "en", "es", "es", "en")
+        or not isinstance(reply_languages, tuple)
+        or reply_languages != ("es", "en", "es", "en", "en", "en")
+        or not isinstance(expected_transitions, tuple)
+        or expected_transitions != ("es", "en")
+        or len(transcript_sidecars) != len(caller_lines)
+    ):
+        return ["spanish-interpreter: incomplete voice evidence expectations"], None
+
+    for turn, (expected, observed) in enumerate(
+        zip(caller_lines, transcript_sidecars, strict=True), 1
+    ):
+        if not isinstance(observed, str) or _content_tokens(expected) != _content_tokens(observed):
+            failures.append(
+                f"spanish-interpreter: input STT sidecar turn {turn} did not match its scripted line"
+            )
+
+    room_entries = [entry for entry in entries if entry.get("room") == room]
+    mode_entries = [entry for entry in room_entries if entry.get("event") == "mode"]
+    speech_entries = [entry for entry in room_entries if entry.get("event") == "speech"]
+    expected_modes = (("interpreter", "es"), ("normal", "en"))
+    if len(mode_entries) != len(expected_modes):
+        failures.append(
+            f"spanish-interpreter: expected exactly 2 mode transitions, got {len(mode_entries)}"
+        )
+    mode_times: list[float] = []
+    interpreter_at: float | None = None
+    normal_at: float | None = None
+    spanish_voice: str | None = None
+    english_voice: str | None = None
+    first_lookup_ms: float | None = None
+    for index, (entry, (expected_mode, expected_language)) in enumerate(
+        zip(mode_entries, expected_modes), 1
+    ):
+        if (entry.get("mode"), entry.get("language")) != (expected_mode, expected_language):
+            failures.append(
+                f"spanish-interpreter: mode transition {index} did not select {expected_mode}/{expected_language}"
+            )
+        voice_id = entry.get("voice_id")
+        if not isinstance(voice_id, str) or not voice_id.strip():
+            failures.append(f"spanish-interpreter: mode transition {index} has no selected voice")
+        elif index == 1:
+            spanish_voice = voice_id
+        else:
+            english_voice = voice_id
+        expected_selection = "resolved" if index == 1 else "default"
+        if entry.get("selection") != expected_selection:
+            failures.append(
+                f"spanish-interpreter: mode transition {index} did not select the expected voice"
+            )
+        created_at = entry.get("created_at")
+        if (
+            not isinstance(created_at, (int, float))
+            or isinstance(created_at, bool)
+            or not math.isfinite(created_at)
+            or created_at < 0
+        ):
+            failures.append(f"spanish-interpreter: mode transition {index} has invalid timestamp")
+        else:
+            if mode_times and created_at <= mode_times[-1]:
+                failures.append("spanish-interpreter: mode transition timestamps are out of order")
+            mode_times.append(float(created_at))
+            if index == 1:
+                interpreter_at = float(created_at)
+            else:
+                normal_at = float(created_at)
+        if index == 1:
+            lookup_ms = entry.get("lookup_ms")
+            if (
+                not isinstance(lookup_ms, (int, float))
+                or isinstance(lookup_ms, bool)
+                or not math.isfinite(lookup_ms)
+                or lookup_ms < 0
+            ):
+                failures.append("spanish-interpreter: Spanish voice lookup duration is missing or invalid")
+            else:
+                first_lookup_ms = float(lookup_ms)
+
+    observed_replies: dict[int, list[dict[str, Any]]] = {}
+    observed_turn_ids: dict[int, set[str]] = {}
+    seen_reply_groups: set[int] = set()
+    previous_reply_group: int | None = None
+    previous_speech_at: float | None = None
+    for entry in speech_entries:
+        reply_order = entry.get("reply")
+        if isinstance(reply_order, bool) or not isinstance(reply_order, int) or reply_order < 1:
+            failures.append("spanish-interpreter: speech observation has invalid reply order")
+            continue
+        if reply_order > len(reply_languages):
+            failures.append(f"spanish-interpreter: unexpected speech reply order {reply_order}")
+            continue
+        turn_id = entry.get("turn_id")
+        if not isinstance(turn_id, str) or not turn_id:
+            failures.append(f"spanish-interpreter: speech reply order {reply_order} has no turn id")
+        else:
+            observed_turn_ids.setdefault(reply_order, set()).add(turn_id)
+        if reply_order != previous_reply_group:
+            if reply_order in seen_reply_groups:
+                failures.append(f"spanish-interpreter: duplicate speech reply order group {reply_order}")
+            if previous_reply_group is not None and reply_order <= previous_reply_group:
+                failures.append("spanish-interpreter: speech reply groups are out of order")
+            seen_reply_groups.add(reply_order)
+            previous_reply_group = reply_order
+        observed_replies.setdefault(reply_order, []).append(entry)
+        created_at = entry.get("created_at")
+        if (
+            not isinstance(created_at, (int, float))
+            or isinstance(created_at, bool)
+            or not math.isfinite(created_at)
+            or created_at < 0
+        ):
+            failures.append(f"spanish-interpreter: speech reply order {reply_order} has invalid timestamp")
+        elif previous_speech_at is not None and created_at <= previous_speech_at:
+            failures.append("spanish-interpreter: speech reply timestamps are out of order")
+        else:
+            previous_speech_at = float(created_at)
+
+    turn_replies: dict[str, int] = {}
+    for reply_order, turn_ids in observed_turn_ids.items():
+        if len(turn_ids) != 1:
+            failures.append(f"spanish-interpreter: speech reply order {reply_order} has mismatched turn ids")
+        for turn_id in turn_ids:
+            other_reply = turn_replies.get(turn_id)
+            if other_reply is not None and other_reply != reply_order:
+                failures.append(
+                    f"spanish-interpreter: turn id is shared by replies {other_reply} and {reply_order}"
+                )
+            turn_replies[turn_id] = reply_order
+
+    for reply_order, expected_language in enumerate(reply_languages, 1):
+        segments = observed_replies.get(reply_order)
+        if not segments:
+            failures.append(f"spanish-interpreter: speech reply {reply_order} is missing")
+            continue
+        for entry in segments:
+            created_at = entry.get("created_at")
+            before_interpreter = (
+                reply_order == 1
+                and interpreter_at is not None
+                and isinstance(created_at, (int, float))
+                and not isinstance(created_at, bool)
+                and math.isfinite(created_at)
+                and created_at < interpreter_at
+            )
+            segment_language = "en" if before_interpreter else expected_language
+            expected_voice = spanish_voice if segment_language == "es" else english_voice
+            if entry.get("language") != segment_language:
+                failures.append(
+                    f"spanish-interpreter: speech reply {reply_order} used the wrong language"
+                )
+            voice_id = entry.get("voice_id")
+            if not isinstance(voice_id, str) or not voice_id.strip():
+                failures.append(f"spanish-interpreter: speech reply {reply_order} has no synthesized voice")
+            elif expected_voice is not None and voice_id != expected_voice:
+                failures.append(f"spanish-interpreter: speech reply {reply_order} used the wrong voice")
+
+    first_reply = observed_replies.get(1, [])
+    fifth_reply = observed_replies.get(5, [])
+    sixth_reply = observed_replies.get(6, [])
+    if interpreter_at is not None and first_reply:
+        if not any(
+            entry.get("language") == "es"
+            and isinstance(entry.get("created_at"), (int, float))
+            and not isinstance(entry.get("created_at"), bool)
+            and math.isfinite(entry["created_at"])
+            and entry["created_at"] > interpreter_at
+            for entry in first_reply
+        ):
+            failures.append("spanish-interpreter: reply 1 has no Spanish speech after interpreter mode")
+    if normal_at is not None and fifth_reply and sixth_reply:
+        reply_five_at = fifth_reply[-1].get("created_at")
+        reply_six_at = sixth_reply[0].get("created_at")
+        if (
+            isinstance(reply_five_at, (int, float))
+            and isinstance(reply_six_at, (int, float))
+            and not isinstance(reply_five_at, bool)
+            and not isinstance(reply_six_at, bool)
+            and not (reply_five_at < normal_at < reply_six_at)
+        ):
+            failures.append("spanish-interpreter: normal/en transition does not follow the quoted line and precede the final reply")
+
+    if phone_commands:
+        failures.append(
+            f"spanish-interpreter: fake phone recorded {len(phone_commands)} command(s) during interpretation"
+        )
+    return failures, first_lookup_ms
+
+
 def _scenario_steps(scenario: Any) -> list[str]:
     caller_lines = getattr(scenario, "caller_lines", None)
     expectations = getattr(scenario, "turns", None)
@@ -2394,6 +2599,8 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
 
     language_evidence_failures: list[str] = []
     first_spanish_lookup_ms: float | None = None
+    interpreter_transcript_sidecars: list[str | None] | None = None
+    voice_entries: list[dict[str, Any]] = []
     if getattr(scenario, "reply_languages", ()):
         voice_log_path = "voice/evals/voice-modes.jsonl"
         voice_log_text = _remote_artifact_text(
@@ -2414,11 +2621,14 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
                 stack, sidecar_path, "input STT transcript", allow_missing=True
             )
             transcript_sidecars.append(sidecar)
-        language_evidence_failures, first_spanish_lookup_ms = (
-            _spanish_switch_evidence_failures(
-                scenario, room, voice_entries, transcript_sidecars
+        if getattr(scenario, "name", None) == "spanish-interpreter":
+            interpreter_transcript_sidecars = transcript_sidecars
+        else:
+            language_evidence_failures, first_spanish_lookup_ms = (
+                _spanish_switch_evidence_failures(
+                    scenario, room, voice_entries, transcript_sidecars
+                )
             )
-        )
 
     phone_log_path = "voice/" + FAKE_PHONE_LOG
     phone_text = _remote_artifact_text(stack, phone_log_path, "fake phone log")
@@ -2462,6 +2672,16 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
         unattributed_model_calls = []
         recorded_turns = []
     phone_commands = _match_phone_tools(phone_commands, recorded_turns)
+    if interpreter_transcript_sidecars is not None:
+        language_evidence_failures, first_spanish_lookup_ms = (
+            _spanish_interpreter_evidence_failures(
+                scenario,
+                room,
+                voice_entries,
+                interpreter_transcript_sidecars,
+                phone_commands,
+            )
+        )
     # Phone receipt and paired speech-end timestamps use the same epoch clock.
     command_receipts: dict[int, float] = {}
     for command in phone_commands:
@@ -2744,11 +2964,39 @@ def _run_local_eval(argv: list[str]) -> int:
     for observation_case, report_case in zip(
         observations["cases"], report["cases"], strict=False
     ):
-        if observation_case.get("name") == "spanish-language-switch":
+        if observation_case.get("name") in {"spanish-language-switch", "spanish-interpreter"}:
             report_case["first_spanish_lookup_ms"] = [
                 run.get("first_spanish_lookup_ms") if isinstance(run, dict) else None
                 for run in observation_case.get("runs", [])
             ]
+        if observation_case.get("name") == "spanish-interpreter":
+            run_phone_commands = [
+                run.get("phone_commands") if isinstance(run, dict) else None
+                for run in observation_case.get("runs", [])
+            ]
+            report_case["phone_commands"] = run_phone_commands
+            for run_index, commands in enumerate(run_phone_commands, 1):
+                if isinstance(commands, list) and not commands:
+                    continue
+                if isinstance(commands, list) and commands:
+                    already_reported = any(
+                        f"{observation_case['name']} run {run_index} " in failure
+                        and "fake phone recorded" in failure.lower()
+                        for failure in report_case["failures"]
+                    )
+                    if already_reported:
+                        continue
+                    message = (
+                        f"{observation_case['name']} run {run_index}: "
+                        "fake phone command log is not empty"
+                    )
+                else:
+                    message = (
+                        f"{observation_case['name']} run {run_index}: "
+                        "fake phone command log is missing or invalid"
+                    )
+                report_case["failures"].append(message)
+                report["failures"].append(message)
     for scenario_index, _run_index, message in capture_failures:
         report["failures"].append(message)
         case = report["cases"][scenario_index]
