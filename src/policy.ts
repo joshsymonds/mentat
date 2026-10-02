@@ -43,6 +43,24 @@ export function allowAllPolicy(logger: Logger): PolicyFn {
     const surface = context.meta.surface ?? '';
     const user = context.meta.user ?? '';
     if (
+      context.meta.voice_mode === 'interpreter' &&
+      toolName !== 'mcp__mentat__set_voice_mode' &&
+      toolName !== 'mcp__mentat__end_conversation'
+    ) {
+      logger.info('permission decision', {
+        tool: toolName,
+        decision: 'deny',
+        reason: 'interpreter mode restriction',
+        session_id: context.sessionId,
+        surface,
+        user,
+      });
+      return {
+        behavior: 'deny',
+        message: `${toolName} is not allowed while interpreter mode is active`,
+      };
+    }
+    if (
       (toolName === 'mcp__mentat__end_conversation' || toolName === 'mcp__mentat__set_voice_mode') &&
       surface !== 'voice'
     ) {
