@@ -2079,6 +2079,155 @@ class AgentSourceContractTest(unittest.TestCase):
                 )
             self.assertEqual(len(trace_path.read_text().splitlines()), 6)
 
+    def test_interpreter_speech_strips_tags_and_selects_each_utterance_voice(self):
+        from collections.abc import AsyncGenerator
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        speak_turn = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_speak_turn"
+        )
+        trace = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "write_voice_trace"
+        )
+
+        class Provider:
+            def __init__(self):
+                self.options = {"voice_id": "library-spanish"}
+                self.calls = []
+
+            def update_options(self, **options):
+                self.options.update(options)
+
+        class SpeechHandle:
+            interrupted = False
+
+            def __init__(self, task):
+                self.task = task
+
+            async def wait_for_playout(self):
+                await self.task
+
+            def interrupt(self):
+                self.task.cancel()
+
+            def exception(self):
+                return None
+
+        class Session:
+            def __init__(self, provider):
+                self.provider = provider
+                self.calls = []
+
+            def say(self, source, *, allow_interruptions):
+                options = dict(self.provider.options)
+
+                async def consume():
+                    self.calls.append((options, [text async for text in source]))
+
+                return SpeechHandle(asyncio.create_task(consume()))
+
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "uuid4": lambda: SimpleNamespace(hex="turn-id"),
+            "AudioConfig": lambda *_args, **_kwargs: object(),
+            "EARCON_PATH": Path("earcon.wav"),
+            "logger": Mock(),
+            "write_voice_trace": lambda *args, **kwargs: trace_events.append(kwargs),
+        }
+        trace_events = []
+        exec(compile(ast.Module(body=[speak_turn], type_ignores=[]), str(agent_path), "exec"), namespace)
+
+        def run_scenario(chunks):
+            provider = Provider()
+            session = Session(provider)
+
+            async def backend_text(_question, _turn_id, _chat_ctx):
+                for chunk in chunks:
+                    yield chunk
+
+            agent = SimpleNamespace(
+                _voice_mode="interpreter",
+                _voice_language="es",
+                _voice_id="library-spanish",
+                _default_voice="default-voice",
+                _tts_provider=provider,
+                _voice_trace_enabled=True,
+                _voice_reply_number=0,
+                _room_name="synthetic-room",
+                _ending_policy=SimpleNamespace(delegation_started=Mock()),
+                _ending_changed=Mock(),
+                _background=SimpleNamespace(play=Mock()),
+                _backend_text=backend_text,
+                session=session,
+            )
+            asyncio.run(
+                namespace["_speak_turn"](
+                    agent, "synthetic request", SimpleNamespace(items=[])
+                )
+            )
+            return session.calls
+
+        with self.subTest("split tags, unknown tag, and unterminated tag at EOF"):
+            trace_events.clear()
+            calls = run_scenario((
+                "[[", "es]]Hola.", None,
+                "[[en", "]]Hello.", None,
+                "[[fr]]Unknown.", None,
+                "[[es?]]Fallback.", None,
+                "[[es Missing close",
+            ))
+            self.assertEqual(
+                calls,
+                [
+                    ({"voice_id": "library-spanish"}, ["Hola."]),
+                    ({"voice_id": "default-voice"}, ["Hello."]),
+                    ({"voice_id": "library-spanish"}, ["Unknown."]),
+                    ({"voice_id": "library-spanish"}, ["Fallback."]),
+                    ({"voice_id": "library-spanish"}, ["Missing close"]),
+                ],
+            )
+            self.assertEqual(
+                [event["voice_id"] for event in trace_events],
+                [
+                    "library-spanish", "default-voice", "library-spanish",
+                    "library-spanish", "library-spanish",
+                ],
+            )
+
+        with self.subTest("unterminated tag after text in the same utterance"):
+            trace_events.clear()
+            calls = run_scenario(("[[es?]]Fallback.", "[[es Missing close"))
+            self.assertEqual(
+                calls,
+                [({"voice_id": "library-spanish"}, ["Fallback.", "Missing close"])],
+            )
+            self.assertEqual(
+                [event["voice_id"] for event in trace_events], ["library-spanish"]
+            )
+
+        with self.subTest("unterminated tag split between chunks after text"):
+            trace_events.clear()
+            calls = run_scenario(("[[es?]]Fallback.", "[", "[es Missing close"))
+            self.assertEqual(
+                calls,
+                [({"voice_id": "library-spanish"}, ["Fallback.", "Missing close"])],
+            )
+            self.assertEqual(
+                [event["voice_id"] for event in trace_events], ["library-spanish"]
+            )
+        self.assertTrue(
+            all("[[" not in text and "]]" not in text
+                for _, texts in calls for text in texts)
+        )
+
     def test_voice_mode_defaults_and_request_use_active_call_mode(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         tree = ast.parse(source)
