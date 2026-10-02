@@ -552,12 +552,12 @@ class FrontAgent(Agent):
                     selection = "resolved"
             lookup_ms = (time.monotonic() - lookup_started) * 1000
             self._stt.update_options(language=language)
-            self._tts.update_options(voice_id=voice_id, language=language)
+            self._tts.update_options(voice_id=voice_id)
         except Exception as error:
             logger.warning("voice mode apply failed for %s: %s", language, type(error).__name__)
             for provider, options in (
                 (self._stt, {"language": previous_language}),
-                (self._tts, {"voice_id": previous_voice, "language": previous_language}),
+                (self._tts, {"voice_id": previous_voice}),
             ):
                 try:
                     provider.update_options(**options)
@@ -760,7 +760,6 @@ async def entrypoint(ctx: JobContext) -> None:
         model="eleven_v4_turbo",
         api_key=os.environ["ELEVENLABS_API_KEY"],
         voice_id=default_voice,
-        language="en",
     )
     voice_resolver = VoiceResolver(os.environ.get("ELEVENLABS_API_KEY"))
     session = AgentSession(

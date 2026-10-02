@@ -75,7 +75,7 @@ class AgentSourceContractTest(unittest.TestCase):
         expected_tts_provider = ast.parse(
             'elevenlabs.TTS(model="eleven_v4_turbo", '
             'api_key=os.environ["ELEVENLABS_API_KEY"], '
-            'voice_id=default_voice, language="en")',
+            'voice_id=default_voice)',
             mode="eval",
         ).body
         self.assertEqual(
@@ -1811,7 +1811,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(agent._stt.calls, [{"language": "es"}])
         self.assertEqual(
             agent._tts.calls,
-            [{"voice_id": "library-spanish", "language": "es"}],
+            [{"voice_id": "library-spanish"}],
         )
 
         separate_call = make_agent()
@@ -1827,13 +1827,13 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")])
         self.assertEqual(agent._stt.calls[-1], {"language": "en"})
         self.assertEqual(
-            agent._tts.calls[-1], {"voice_id": "default-voice", "language": "en"}
+            agent._tts.calls[-1], {"voice_id": "default-voice"}
         )
 
         agent._voice_resolver.spanish_voice = "hand-edited-spanish"
         self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, spanish)))
         self.assertEqual(agent._voice_id, "hand-edited-spanish")
-        self.assertEqual(agent._tts.calls[-1], {"voice_id": "hand-edited-spanish", "language": "es"})
+        self.assertEqual(agent._tts.calls[-1], {"voice_id": "hand-edited-spanish"})
         self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")] * 2)
         self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, restore)))
 
@@ -1847,7 +1847,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual((len(agent._stt.calls), len(agent._tts.calls)), calls_before_invalid)
         self.assertEqual((agent._voice_mode, agent._voice_language), ("normal", "en"))
 
-        failing_tts = Provider(fail_on={"voice_id": "library-spanish", "language": "es"})
+        failing_tts = Provider(fail_on={"voice_id": "library-spanish"})
         failed = make_agent(failing_tts)
         self.assertFalse(asyncio.run(namespace["_apply_voice_mode"](failed, spanish)))
         self.assertEqual((failed._voice_mode, failed._voice_language, failed._voice_id),
@@ -1856,8 +1856,8 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(
             failing_tts.calls,
             [
-                {"voice_id": "library-spanish", "language": "es"},
-                {"voice_id": "default-voice", "language": "en"},
+                {"voice_id": "library-spanish"},
+                {"voice_id": "default-voice"},
             ],
         )
         self.assertTrue(failed._voice_mode_note)
@@ -1882,7 +1882,7 @@ class AgentSourceContractTest(unittest.TestCase):
 
         class Provider:
             def __init__(self):
-                self.options = {"voice_id": "default-voice", "language": "en"}
+                self.options = {"voice_id": "default-voice"}
 
             def update_options(self, **options):
                 self.options.update(options)
@@ -1994,9 +1994,9 @@ class AgentSourceContractTest(unittest.TestCase):
             self.assertEqual(
                 [options for options, _ in agent.session.calls],
                 [
-                    {"voice_id": "default-voice", "language": "en"},
-                    {"voice_id": "library-spanish", "language": "es"},
-                    {"voice_id": "library-spanish", "language": "es"},
+                    {"voice_id": "default-voice"},
+                    {"voice_id": "library-spanish"},
+                    {"voice_id": "library-spanish"},
                 ],
             )
             self.assertEqual(resolver.calls, [("es", "default-voice")] * 2)
@@ -2238,9 +2238,13 @@ class AgentSourceContractTest(unittest.TestCase):
         )
 
         class FailingTTS(Provider):
+            def __init__(self):
+                self.failed = False
+
             def update_options(self, **options):
                 super().update_options(**options)
-                if options.get("language") == "fr":
+                if not self.failed:
+                    self.failed = True
                     raise RuntimeError("synthetic provider failure")
 
         agent._tts = FailingTTS()
