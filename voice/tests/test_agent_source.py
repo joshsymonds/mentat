@@ -1854,6 +1854,8 @@ class AgentSourceContractTest(unittest.TestCase):
                 _traced_voices=None,
                 _room_name="synthetic-room",
                 _voice_mode_note=None,
+                _ending_policy=SimpleNamespace(set_interpreter_mode=Mock()),
+                session=Provider(),
             )
 
         spanish = '{"voice_mode":{"mode":"conversation","language":"es"}}'
@@ -1970,6 +1972,9 @@ class AgentSourceContractTest(unittest.TestCase):
                 self.tts_provider = tts_provider
                 self.calls = []
 
+            def update_options(self, **_options):
+                pass
+
             def say(self, source, *, allow_interruptions):
                 self.calls.append((dict(self.tts_provider.options), allow_interruptions))
 
@@ -2023,7 +2028,9 @@ class AgentSourceContractTest(unittest.TestCase):
                 _voice_mode_note=None,
                 _voice_trace_enabled=True,
                 _voice_reply_number=0,
-                _ending_policy=SimpleNamespace(delegation_started=Mock()),
+                _ending_policy=SimpleNamespace(
+                    delegation_started=Mock(), set_interpreter_mode=Mock()
+                ),
                 _ending_changed=Mock(),
                 _background=SimpleNamespace(play=Mock()),
                 _backend_text=backend_text,
@@ -2078,6 +2085,160 @@ class AgentSourceContractTest(unittest.TestCase):
                     voice_id="default-voice", reply=4,
                 )
             self.assertEqual(len(trace_path.read_text().splitlines()), 6)
+
+    def test_interpreter_speech_strips_tags_and_selects_each_utterance_voice(self):
+        from collections.abc import AsyncGenerator
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        speak_turn = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_speak_turn"
+        )
+        trace = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "write_voice_trace"
+        )
+
+        class Provider:
+            def __init__(self):
+                self.options = {"voice_id": "library-spanish"}
+                self.calls = []
+
+            def update_options(self, **options):
+                self.options.update(options)
+
+        class SpeechHandle:
+            interrupted = False
+
+            def __init__(self, task):
+                self.task = task
+
+            async def wait_for_playout(self):
+                await self.task
+
+            def interrupt(self):
+                self.task.cancel()
+
+            def exception(self):
+                return None
+
+        class Session:
+            def __init__(self, provider):
+                self.provider = provider
+                self.calls = []
+
+            def say(self, source, *, allow_interruptions):
+                options = dict(self.provider.options)
+
+                async def consume():
+                    self.calls.append((options, [text async for text in source]))
+
+                return SpeechHandle(asyncio.create_task(consume()))
+
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "uuid4": lambda: SimpleNamespace(hex="turn-id"),
+            "AudioConfig": lambda *_args, **_kwargs: object(),
+            "EARCON_PATH": Path("earcon.wav"),
+            "logger": Mock(),
+            "write_voice_trace": lambda *args, **kwargs: trace_events.append(kwargs),
+        }
+        trace_events = []
+        exec(compile(ast.Module(body=[speak_turn], type_ignores=[]), str(agent_path), "exec"), namespace)
+
+        def run_scenario(chunks):
+            provider = Provider()
+            session = Session(provider)
+
+            async def backend_text(_question, _turn_id, _chat_ctx):
+                for chunk in chunks:
+                    yield chunk
+
+            agent = SimpleNamespace(
+                _voice_mode="interpreter",
+                _voice_language="es",
+                _voice_id="library-spanish",
+                _default_voice="default-voice",
+                _tts_provider=provider,
+                _voice_trace_enabled=True,
+                _voice_reply_number=0,
+                _room_name="synthetic-room",
+                _ending_policy=SimpleNamespace(delegation_started=Mock()),
+                _ending_changed=Mock(),
+                _background=SimpleNamespace(play=Mock()),
+                _backend_text=backend_text,
+                session=session,
+            )
+            asyncio.run(
+                namespace["_speak_turn"](
+                    agent, "synthetic request", SimpleNamespace(items=[])
+                )
+            )
+            return session.calls
+
+        with self.subTest("split tags, unknown tag, and unterminated tag at EOF"):
+            trace_events.clear()
+            calls = run_scenario((
+                "[[", "es]]Hola.", None,
+                "[[en", "]]Hello.", None,
+                "[[fr]]Unknown.", None,
+                "[[es?]]Fallback.", None,
+                "[[es Missing close",
+            ))
+            self.assertEqual(
+                calls,
+                [
+                    ({"voice_id": "library-spanish"}, ["Hola."]),
+                    ({"voice_id": "default-voice"}, ["Hello."]),
+                    ({"voice_id": "library-spanish"}, ["Unknown."]),
+                    ({"voice_id": "library-spanish"}, ["Fallback."]),
+                    ({"voice_id": "library-spanish"}, ["Missing close"]),
+                ],
+            )
+            self.assertEqual(
+                [event["voice_id"] for event in trace_events],
+                [
+                    "library-spanish", "default-voice", "library-spanish",
+                    "library-spanish", "library-spanish",
+                ],
+            )
+
+        with self.subTest("unterminated tag after text in the same utterance"):
+            trace_events.clear()
+            calls = run_scenario(("[[es?]]Fallback.", "[[es Missing close"))
+            self.assertEqual(
+                calls,
+                [({"voice_id": "library-spanish"}, ["Fallback.", "Missing close"])],
+            )
+            self.assertEqual(
+                [event["voice_id"] for event in trace_events], ["library-spanish"]
+            )
+
+        with self.subTest("unterminated tag split between chunks after text"):
+            trace_events.clear()
+            calls = run_scenario(("[[es?]]Fallback.", "[", "[es Missing close"))
+            self.assertEqual(
+                calls,
+                [({"voice_id": "library-spanish"}, ["Fallback.", "Missing close"])],
+            )
+            self.assertEqual(
+                [event["voice_id"] for event in trace_events], ["library-spanish"]
+            )
+        with self.subTest("tag-only chunk keeps its selected voice for body chunk"):
+            trace_events.clear()
+            calls = run_scenario(("[[en]]", "Hello.", None))
+            self.assertEqual(calls, [({"voice_id": "default-voice"}, ["Hello."])])
+
+        self.assertTrue(
+            all("[[" not in text and "]]" not in text
+                for _, texts in calls for text in texts)
+        )
 
     def test_voice_mode_defaults_and_request_use_active_call_mode(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
@@ -2242,9 +2403,13 @@ class AgentSourceContractTest(unittest.TestCase):
             _room_name="call-one",
             _mentat_url="http://127.0.0.1:8484",
             _ending_policy=SimpleNamespace(
-                tool_result_seen=Mock(), turn_done=Mock(), describe=lambda: "test policy"
+                tool_result_seen=Mock(),
+                set_interpreter_mode=Mock(),
+                turn_done=Mock(),
+                describe=lambda: "test policy",
             ),
             _ending_changed=Mock(),
+            session=Provider(),
         )
         agent._apply_voice_mode = MethodType(namespace["_apply_voice_mode"], agent)
         backend_text = MethodType(namespace["_backend_text"], agent)
@@ -2332,6 +2497,257 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertIsNone(agent._voice_mode_note)
         self.assertEqual(asyncio.run(run_turn(second_wire, "Another turn")), ["Siguiente turno."])
         self.assertNotIn(note, requests[4][0][1])
+
+        agent._tts_provider = Provider()
+        interpreter_result = json.dumps({
+            "voice_mode": {"mode": "interpreter", "language": "es"}
+        })
+        interpreter_wire = [
+            b'{"kind":"text_delta","text":"Starting interpreter."}',
+            json.dumps({
+                "kind": "tool_result",
+                "tool": "mcp__mentat__set_voice_mode",
+                "is_error": False,
+                "content": interpreter_result,
+            }).encode(),
+            b'{"kind":"text_delta","text":"Ahora."}',
+            b'{"kind":"done"}',
+        ]
+        self.assertEqual(
+            asyncio.run(run_turn(interpreter_wire, "Start interpreter")),
+            ["Starting interpreter.", "Ahora."],
+        )
+        self.assertEqual(
+            requests[5][1], {"voice_mode": "conversation", "voice_language": "es"}
+        )
+        end_wire = [
+            b'{"kind":"text_delta","text":"Understood."}',
+            json.dumps({
+                "kind": "tool_result",
+                "tool": "mcp__mentat__end_conversation",
+                "is_error": False,
+                "content": "Conversation ended: done",
+            }).encode(),
+            b'{"kind":"done"}',
+        ]
+        self.assertEqual(
+            asyncio.run(run_turn(end_wire, "Finish")), ["Understood."]
+        )
+        self.assertEqual(
+            requests[6][1], {"voice_mode": "interpreter", "voice_language": "es"}
+        )
+        agent._ending_policy.tool_result_seen.assert_any_call(
+            "mcp__mentat__end_conversation", False, "Conversation ended: done"
+        )
+
+    def test_interpreter_mode_updates_stt_endpointing_and_ending_policy(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        apply_mode = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_apply_voice_mode"
+        )
+
+        class Provider:
+            def __init__(self):
+                self.calls = []
+
+            def update_options(self, **options):
+                self.calls.append(options)
+
+        class Resolver:
+            def resolve(self, language, default_voice):
+                return "library-spanish" if language == "es" else default_voice
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+
+            def update_options(self, **options):
+                self.calls.append(options)
+
+        namespace = {
+            "json": json,
+            "re": re,
+            "time": time,
+            "write_voice_trace": Mock(),
+            "logger": Mock(),
+        }
+        exec(compile(ast.Module(body=[apply_mode], type_ignores=[]), str(agent_path), "exec"), namespace)
+        policy = SimpleNamespace(set_interpreter_mode=Mock())
+        agent = SimpleNamespace(
+            _voice_mode="normal",
+            _voice_language="en",
+            _voice_id="default-voice",
+            _default_voice="default-voice",
+            _stt_provider=Provider(),
+            _tts_provider=Provider(),
+            _voice_resolver=Resolver(),
+            _traced_voices=None,
+            _room_name="synthetic-room",
+            _voice_mode_note=None,
+            _ending_policy=policy,
+            session=Session(),
+        )
+        interpreter = json.dumps({"voice_mode": {"mode": "interpreter", "language": "es"}})
+        self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, interpreter)))
+        self.assertEqual(agent._stt_provider.calls, [{"language": ["en", "es"]}])
+        self.assertEqual(
+            agent.session.calls,
+            [{"endpointing_opts": {"mode": "fixed", "min_delay": 1.0, "max_delay": 5.0}}],
+        )
+        self.assertEqual(agent._voice_id, "library-spanish")
+        policy.set_interpreter_mode.assert_called_once()
+        self.assertTrue(policy.set_interpreter_mode.call_args.args[0])
+
+        restore = json.dumps({"voice_mode": {"mode": "normal", "language": "en"}})
+        self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, restore)))
+        self.assertEqual(agent._stt_provider.calls[-1], {"language": "en"})
+        self.assertEqual(
+            agent.session.calls[-1],
+            {"endpointing_opts": {"mode": "fixed", "min_delay": 0.5, "max_delay": 3.0}},
+        )
+        self.assertEqual(agent._voice_id, "default-voice")
+        self.assertFalse(policy.set_interpreter_mode.call_args.args[0])
+
+        class FailingSession(Session):
+            def update_options(self, **options):
+                super().update_options(**options)
+                if len(self.calls) == 1:
+                    raise RuntimeError("endpointing update failed")
+
+        agent.session = FailingSession()
+        policy_calls = policy.set_interpreter_mode.call_count
+        self.assertFalse(asyncio.run(namespace["_apply_voice_mode"](agent, interpreter)))
+        self.assertEqual((agent._voice_mode, agent._voice_language), ("normal", "en"))
+        self.assertEqual(agent._stt_provider.calls[-2:], [{"language": ["en", "es"]}, {"language": "en"}])
+        self.assertEqual(
+            agent.session.calls,
+            [
+                {"endpointing_opts": {"mode": "fixed", "min_delay": 1.0, "max_delay": 5.0}},
+                {"endpointing_opts": {"mode": "fixed", "min_delay": 0.5, "max_delay": 3.0}},
+            ],
+        )
+        self.assertEqual(policy.set_interpreter_mode.call_count, policy_calls)
+
+    def test_same_reply_interpreter_switch_refreshes_tag_parsing_and_voice(self):
+        from collections.abc import AsyncGenerator
+
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        methods = [
+            node for node in front_agent.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name in {"_apply_voice_mode", "_speak_turn"}
+        ]
+
+        class Provider:
+            def __init__(self):
+                self.voice_id = "default-voice"
+                self.calls = []
+
+            def update_options(self, **options):
+                self.calls.append(options)
+                self.voice_id = options["voice_id"]
+
+        class SpeechHandle:
+            interrupted = False
+
+            def __init__(self, task):
+                self.task = task
+
+            async def wait_for_playout(self):
+                await self.task
+
+            def interrupt(self):
+                self.task.cancel()
+
+            def exception(self):
+                return None
+
+        class Session:
+            def __init__(self, provider):
+                self.provider = provider
+                self.calls = []
+
+            def update_options(self, **_options):
+                pass
+
+            def say(self, source, *, allow_interruptions):
+                voice_id = self.provider.voice_id
+
+                async def consume():
+                    self.calls.append((voice_id, [text async for text in source]))
+
+                return SpeechHandle(asyncio.create_task(consume()))
+
+        namespace = {
+            "AsyncGenerator": AsyncGenerator,
+            "asyncio": asyncio,
+            "json": json,
+            "re": re,
+            "time": time,
+            "uuid4": lambda: SimpleNamespace(hex="same-reply"),
+            "AudioConfig": lambda *_args, **_kwargs: object(),
+            "EARCON_PATH": Path("earcon.wav"),
+            "logger": Mock(),
+            "write_voice_trace": Mock(),
+        }
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+        provider = Provider()
+        session = Session(provider)
+        agent = SimpleNamespace(
+            _voice_mode="normal",
+            _voice_language="en",
+            _voice_id="default-voice",
+            _default_voice="default-voice",
+            _tts_provider=provider,
+            _stt_provider=SimpleNamespace(update_options=Mock()),
+            _voice_resolver=SimpleNamespace(resolve=lambda _language, _default: "library-spanish"),
+            _traced_voices=None,
+            _voice_mode_note=None,
+            _voice_trace_enabled=False,
+            _voice_reply_number=0,
+            _room_name="synthetic-room",
+            _ending_policy=SimpleNamespace(
+                delegation_started=Mock(), set_interpreter_mode=Mock()
+            ),
+            _ending_changed=Mock(),
+            _background=SimpleNamespace(play=Mock()),
+            session=session,
+        )
+
+        async def backend_text(_question, _turn_id, _chat_ctx):
+            yield "Switching modes."
+            yield None
+            mode_result = json.dumps({
+                "voice_mode": {"mode": "interpreter", "language": "es"}
+            })
+            self.assertTrue(
+                await namespace["_apply_voice_mode"](agent, mode_result)
+            )
+            yield "[[en]]"
+            yield "Hello."
+            yield None
+
+        agent._backend_text = backend_text
+        asyncio.run(namespace["_speak_turn"](agent, "switch", SimpleNamespace(items=[])))
+        self.assertEqual(
+            session.calls,
+            [("default-voice", ["Switching modes."]), ("default-voice", ["Hello."])],
+        )
+        self.assertEqual(
+            provider.calls,
+            [{"voice_id": "library-spanish"}, {"voice_id": "default-voice"}],
+        )
 
 
 if __name__ == "__main__":

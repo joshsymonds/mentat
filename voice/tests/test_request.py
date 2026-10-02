@@ -389,6 +389,55 @@ class DelegationRunnerTest(unittest.IsolatedAsyncioTestCase):
 
 
 class EndingPolicyTest(unittest.TestCase):
+    def test_interpreter_mode_ignores_automatic_done_but_keeps_signoff(self):
+        policy = EndingPolicy()
+        policy.set_interpreter_mode(True, 100.0)
+        policy.tool_result_seen(
+            "mcp__mentat__end_conversation",
+            is_error=False,
+            result="Conversation ended: done",
+        )
+        policy.turn_done(100.0)
+        self.assertIsNone(policy.deadline)
+        self.assertIsNone(policy.elapsed(200.0))
+
+        policy.tool_result_seen(
+            "mcp__mentat__end_conversation",
+            is_error=False,
+            result="Conversation ended: signoff",
+        )
+        policy.turn_done(200.0)
+        self.assertEqual(policy.deadline, CLOSE_UNSPOKEN_S)
+        self.assertEqual(policy.elapsed(200.0 + CLOSE_UNSPOKEN_S), "close")
+
+    def test_interpreter_idle_close_waits_two_minutes(self):
+        policy = EndingPolicy()
+        policy.set_interpreter_mode(True, 100.0)
+        policy.agent_listening(100.0)
+        self.assertEqual(policy.deadline, 120.0)
+        self.assertIsNone(policy.elapsed(219.9))
+        self.assertEqual(policy.elapsed(220.0), "close")
+
+    def test_mode_departure_restores_normal_idle_window_when_already_armed(self):
+        policy = EndingPolicy()
+        policy.agent_listening(100.0)
+        policy.set_interpreter_mode(True, 110.0)
+        self.assertEqual(policy.deadline, 120.0)
+        self.assertEqual(policy.remaining(110.0), 120.0)
+
+        policy.set_interpreter_mode(False, 130.0)
+        self.assertEqual(policy.deadline, IDLE_S)
+        self.assertIsNone(policy.elapsed(159.9))
+        self.assertEqual(policy.elapsed(160.0), "close")
+
+        policy.tool_result_seen(
+            "mcp__mentat__end_conversation",
+            is_error=False,
+            result="Conversation ended: done",
+        )
+        policy.turn_done(200.0)
+        self.assertEqual(policy.deadline, CLOSE_UNSPOKEN_S)
+
     def test_end_tool_closes_a_second_after_the_goodbye_finishes(self):
         policy = EndingPolicy()
         policy.tool_result_seen("mcp__mentat__end_conversation", is_error=False)

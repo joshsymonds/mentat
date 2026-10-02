@@ -417,23 +417,132 @@ class FrontAgent(Agent):
         self._voice_reply_number = getattr(self, "_voice_reply_number", 0) + 1
         reply_number = self._voice_reply_number
 
+        interpreter = getattr(self, "_voice_mode", "normal") == "interpreter"
+        utterance_prefix = ""
+        utterance_tag_resolved = not interpreter
+        embedded_tag_buffer = ""
+        utterance_mode_refreshed = False
+        utterance_voice = getattr(self, "_voice_id", None)
+        utterance_language = getattr(self, "_voice_language", None)
+
+        def strip_embedded_tags(text: str, *, final: bool = False) -> str:
+            nonlocal embedded_tag_buffer
+            text = embedded_tag_buffer + text
+            embedded_tag_buffer = ""
+            output = ""
+            while text:
+                start = text.find("[[")
+                if start < 0:
+                    if not final and text.endswith("["):
+                        embedded_tag_buffer = "["
+                        text = text[:-1]
+                    return output + text.replace("]]", "")
+                output += text[:start]
+                tag_tail = text[start:]
+                end = tag_tail.find("]]", 2)
+                whitespace = next(
+                    (index for index, char in enumerate(tag_tail[2:], 2) if char.isspace()),
+                    -1,
+                )
+                if end >= 0 and (whitespace < 0 or end < whitespace):
+                    text = tag_tail[end + 2 :]
+                    continue
+                if whitespace >= 0 and (end < 0 or whitespace < end):
+                    text = tag_tail[whitespace + 1 :]
+                    continue
+                if not final:
+                    embedded_tag_buffer = tag_tail
+                return output
+            return output
+
+        def resolve_utterance_text(text: str, *, final: bool = False) -> str:
+            nonlocal utterance_prefix, utterance_tag_resolved
+            nonlocal utterance_voice, utterance_language
+            if not interpreter:
+                return text
+            if utterance_tag_resolved:
+                return strip_embedded_tags(text, final=final)
+            utterance_prefix += text
+            if utterance_prefix.startswith("[["):
+                end = utterance_prefix.find("]]", 2)
+                whitespace = next(
+                    (index for index, char in enumerate(utterance_prefix[2:], 2) if char.isspace()),
+                    -1,
+                )
+                if end >= 0 and (whitespace < 0 or end < whitespace):
+                    tag = utterance_prefix[2:end]
+                    if tag == "en":
+                        utterance_voice = self._default_voice
+                        utterance_language = "en"
+                    else:
+                        utterance_voice = self._voice_id
+                        utterance_language = self._voice_language
+                    utterance_tag_resolved = True
+                    text = utterance_prefix[end + 2 :]
+                    utterance_prefix = ""
+                    return strip_embedded_tags(text, final=final)
+                if whitespace >= 0 and (end < 0 or whitespace < end):
+                    utterance_voice = self._voice_id
+                    utterance_language = self._voice_language
+                    utterance_tag_resolved = True
+                    text = utterance_prefix[whitespace + 1 :]
+                    utterance_prefix = ""
+                    return strip_embedded_tags(text, final=final)
+                if final:
+                    utterance_prefix = ""
+                    utterance_tag_resolved = True
+                return ""
+            if utterance_prefix == "[" and not final:
+                return ""
+            utterance_tag_resolved = True
+            text = utterance_prefix
+            utterance_prefix = ""
+            return strip_embedded_tags(text, final=final)
+
         def start_speech() -> tuple[
             asyncio.Queue[str | None], Any, asyncio.Task[None]
         ]:
             queue: asyncio.Queue[str | None] = asyncio.Queue()
+            voice_id = utterance_voice if interpreter else getattr(self, "_voice_id", None)
+            language = (
+                utterance_language
+                if interpreter
+                else getattr(self, "_voice_language", None)
+            )
+            if interpreter:
+                self._tts_provider.update_options(voice_id=voice_id)
             if getattr(self, "_voice_trace_enabled", False):
                 write_voice_trace(
                     self._room_name,
                     "speech",
                     mode=self._voice_mode,
-                    language=self._voice_language,
-                    voice_id=self._voice_id,
+                    language=language,
+                    voice_id=voice_id,
                     reply=reply_number,
                     turn_id=turn_id,
                 )
             handle = self.session.say(speech_source(queue), allow_interruptions=True)
             completion = asyncio.create_task(handle.wait_for_playout())
             return queue, handle, completion
+
+        def reset_utterance() -> None:
+            nonlocal utterance_prefix, utterance_tag_resolved, embedded_tag_buffer
+            nonlocal utterance_voice, utterance_language, utterance_mode_refreshed
+            utterance_prefix = ""
+            utterance_tag_resolved = not interpreter
+            embedded_tag_buffer = ""
+            utterance_mode_refreshed = False
+            utterance_voice = getattr(self, "_voice_id", None)
+            utterance_language = getattr(self, "_voice_language", None)
+
+        def refresh_utterance_mode() -> None:
+            nonlocal interpreter, utterance_tag_resolved, utterance_mode_refreshed
+            nonlocal utterance_voice, utterance_language
+            interpreter = getattr(self, "_voice_mode", "normal") == "interpreter"
+            utterance_tag_resolved = not interpreter
+            utterance_mode_refreshed = True
+            utterance_voice = getattr(self, "_voice_id", None)
+            utterance_language = getattr(self, "_voice_language", None)
 
         async def finish_speech() -> bool:
             nonlocal speech_queue, speech_handle, speech_completion
@@ -491,10 +600,26 @@ class FrontAgent(Agent):
                     backend_next = None
                     break
                 backend_next = None
+                if not utterance_mode_refreshed:
+                    refresh_utterance_mode()
                 if text is None:
+                    text = resolve_utterance_text("", final=True)
+                    if text:
+                        if speech_queue is None:
+                            speech_queue, speech_handle, speech_completion = start_speech()
+                        await speech_queue.put(text)
                     if await finish_speech():
                         return
+                    reset_utterance()
                     continue
+                text = resolve_utterance_text(text)
+                if not text:
+                    continue
+                if speech_queue is None:
+                    speech_queue, speech_handle, speech_completion = start_speech()
+                await speech_queue.put(text)
+            text = resolve_utterance_text("", final=True)
+            if text:
                 if speech_queue is None:
                     speech_queue, speech_handle, speech_completion = start_speech()
                 await speech_queue.put(text)
@@ -527,7 +652,7 @@ class FrontAgent(Agent):
             or not isinstance(voice_mode, dict)
             or set(voice_mode) != {"mode", "language"}
             or not isinstance(mode, str)
-            or mode not in {"normal", "conversation"}
+            or mode not in {"normal", "conversation", "interpreter"}
             or not isinstance(language, str)
             or re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", language) is None
         ):
@@ -536,6 +661,13 @@ class FrontAgent(Agent):
         previous_mode = self._voice_mode
         previous_language = self._voice_language
         previous_voice = self._voice_id
+        previous_interpreter = previous_mode == "interpreter"
+        stt_language = ["en", language] if mode == "interpreter" else language
+        endpointing_opts = {
+            "mode": "fixed",
+            "min_delay": 1.0 if mode == "interpreter" else 0.5,
+            "max_delay": 5.0 if mode == "interpreter" else 3.0,
+        }
         rollback_failed = False
         lookup_started = time.monotonic()
         selection = "default"
@@ -551,13 +683,23 @@ class FrontAgent(Agent):
                 else:
                     selection = "resolved"
             lookup_ms = (time.monotonic() - lookup_started) * 1000
-            self._stt_provider.update_options(language=language)
+            self._stt_provider.update_options(language=stt_language)
             self._tts_provider.update_options(voice_id=voice_id)
+            self.session.update_options(endpointing_opts=endpointing_opts)
         except Exception as error:
             logger.warning("voice mode apply failed for %s: %s", language, type(error).__name__)
+            previous_endpointing_opts = {
+                "mode": "fixed",
+                "min_delay": 1.0 if previous_interpreter else 0.5,
+                "max_delay": 5.0 if previous_interpreter else 3.0,
+            }
             for provider, options in (
-                (self._stt_provider, {"language": previous_language}),
+                (
+                    self._stt_provider,
+                    {"language": ["en", previous_language] if previous_interpreter else previous_language},
+                ),
                 (self._tts_provider, {"voice_id": previous_voice}),
+                (self.session, {"endpointing_opts": previous_endpointing_opts}),
             ):
                 try:
                     provider.update_options(**options)
@@ -583,6 +725,9 @@ class FrontAgent(Agent):
         self._voice_mode = mode
         self._voice_language = language
         self._voice_id = voice_id
+        self._ending_policy.set_interpreter_mode(
+            mode == "interpreter", time.monotonic()
+        )
         if self._traced_voices is not None and voice_id != self._default_voice:
             self._traced_voices[language] = voice_id
         write_voice_trace(
@@ -686,7 +831,14 @@ class FrontAgent(Agent):
                                 )
                                 if item.name == END_CONVERSATION_TOOL and not item.is_error:
                                     end_tool_succeeded = True
-                                self._ending_policy.tool_result_seen(item.name, item.is_error)
+                                if item.name == END_CONVERSATION_TOOL:
+                                    self._ending_policy.tool_result_seen(
+                                        item.name, item.is_error, item.content
+                                    )
+                                else:
+                                    self._ending_policy.tool_result_seen(
+                                        item.name, item.is_error
+                                    )
                                 self._ending_changed()
                             elif isinstance(item, TurnFailure):
                                 raise TurnError(item.message)
