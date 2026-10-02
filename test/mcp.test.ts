@@ -946,10 +946,13 @@ describe('POST /mcp', () => {
       await expect(call).resolves.toMatchObject({ content: [{ type: 'text', text: 'ok' }] });
     }
 
+    const signedOff = await client.callTool({ name: 'end_conversation', arguments: { reason: 'signoff' } });
+    expect(textContent(signedOff as unknown)).toBe('Conversation ended: signoff');
     const ended = await client.callTool({ name: 'end_conversation', arguments: { reason: 'done' } });
-    expect(textContent(ended as unknown)).toContain('ended');
+    expect(textContent(ended as unknown)).toBe('Conversation ended: done');
 
     for (const invalid of [
+      { name: 'end_conversation', arguments: { reason: 'unknown' } },
       { name: 'dial', arguments: { number: '' } },
       { name: 'set_alarm', arguments: { hour: 24, minute: 0 } },
       { name: 'set_alarm', arguments: { hour: 0, minute: 60 } },
