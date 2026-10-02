@@ -348,7 +348,7 @@ SCENARIOS = (
             ),
         ),
         commands=(),
-        room_close_after=6,
+        room_close_after=None,
         caller_languages=("en", "es", "en", "es", "es", "en"),
         reply_languages=("es", "en", "es", "en", "en", "en"),
         voice_mode_expectations=("es", "en"),

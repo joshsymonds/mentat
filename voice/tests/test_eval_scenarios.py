@@ -86,7 +86,7 @@ class ScenarioCorpusTests(unittest.TestCase):
         self.assertEqual(scenario.reply_languages, ("es", "en", "es", "en", "en", "en"))
         self.assertEqual(scenario.voice_mode_expectations, ("es", "en"))
         self.assertEqual(scenario.commands, ())
-        self.assertEqual(scenario.room_close_after, 6)
+        self.assertIsNone(scenario.room_close_after)
         self.assertEqual(len(scenario.turns), 6)
 
         evaluate_scenario(
@@ -100,7 +100,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                 "Understood. I'll stop interpreting and speak in English.",
             ],
             phone_commands=[],
-            room_closed_after=6,
+            room_closed_after=None,
         )
 
         invalid_turns = (
@@ -121,10 +121,26 @@ class ScenarioCorpusTests(unittest.TestCase):
             with self.subTest(turn=index, answer=answer), self.assertRaises(AssertionError):
                 turns = valid_turns.copy()
                 turns[index] = answer
-                evaluate_scenario(scenario, turns, [], room_closed_after=6)
+                evaluate_scenario(scenario, turns, [], room_closed_after=None)
 
         with self.assertRaises(AssertionError):
-            evaluate_scenario(scenario, valid_turns, [{"turn": 4, "kind": "timer", "seconds": 300}], 6)
+            evaluate_scenario(scenario, valid_turns, [{"turn": 4, "kind": "timer", "seconds": 300}], None)
+
+    def test_spanish_interpreter_stays_open_after_switch_back(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertIsNone(scenario.room_close_after)
+        valid_turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+
+        evaluate_scenario(scenario, valid_turns, [], room_closed_after=None)
+        with self.assertRaisesRegex(AssertionError, "expected room close after turn None"):
+            evaluate_scenario(scenario, valid_turns, [], room_closed_after=6)
 
     def test_spanish_interpreter_accepts_correct_translation_paraphrases(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
@@ -151,7 +167,7 @@ class ScenarioCorpusTests(unittest.TestCase):
             with self.subTest(turn=turn_index + 1, answer=answer):
                 turns = valid_turns.copy()
                 turns[turn_index] = answer
-                evaluate_scenario(scenario, turns, [], room_closed_after=6)
+                evaluate_scenario(scenario, turns, [], room_closed_after=None)
 
     def test_spanish_interpreter_rejects_reversed_sun_timing(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
@@ -164,7 +180,7 @@ class ScenarioCorpusTests(unittest.TestCase):
             "Understood. I'll stop interpreting and speak in English.",
         ]
         with self.assertRaisesRegex(AssertionError, "before|after|después|antes"):
-            evaluate_scenario(scenario, turns, [], room_closed_after=6)
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
 
     def test_complete_evaluator_returns_all_structured_product_failures(self):
         scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
