@@ -19,6 +19,8 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
 from unittest.mock import patch
 
+from voice.evals import runner
+from voice.evals.scenarios import SCENARIOS
 from voice.evals.dev_stack import (
     DevStack,
     _MCP_REWRITE_SOURCE,
@@ -577,6 +579,153 @@ class DevStackTest(unittest.TestCase):
             if args[:2] == ["ssh", "ultraviolet"]
         ))
 
+    def test_successive_worker_starts_preserve_room_scoped_voice_mode_entries(self):
+        scenario = next(item for item in SCENARIOS if item.name == "spanish-interpreter")
+        sidecars = list(scenario.caller_lines)
+
+        def interpreter_trace(room, offset):
+            return [
+                {
+                    "room": room,
+                    "event": "mode",
+                    "mode": "interpreter",
+                    "language": "es",
+                    "voice_id": "spanish-library",
+                    "created_at": offset + 101.0,
+                    "lookup_ms": 24.5,
+                    "selection": "resolved",
+                },
+                {
+                    "room": room,
+                    "event": "mode",
+                    "mode": "normal",
+                    "language": "en",
+                    "voice_id": "english-default",
+                    "created_at": offset + 106.0,
+                    "lookup_ms": 0.0,
+                    "selection": "default",
+                },
+                *[
+                    {
+                        "room": room,
+                        "event": "speech",
+                        "reply": index,
+                        "turn_id": f"{room}-turn-{index}",
+                        "language": language,
+                        "voice_id": voice,
+                        "created_at": offset + timestamp,
+                    }
+                    for index, (language, voice, timestamp) in enumerate(
+                        zip(
+                            scenario.reply_languages,
+                            (
+                                "spanish-library",
+                                "english-default",
+                                "spanish-library",
+                                "english-default",
+                                "english-default",
+                                "english-default",
+                            ),
+                            (102.0, 103.0, 104.0, 105.0, 105.5, 107.0),
+                            strict=True,
+                        ),
+                        1,
+                    )
+                ],
+            ]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evals = root / "voice/evals"
+            evals.mkdir(parents=True)
+            trace = evals / "voice-modes.jsonl"
+            self.assertFalse(trace.exists())
+
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            for command in ("systemctl", "chown", "chmod", "install"):
+                executable = bin_dir / command
+                executable.write_text("#!/bin/sh\nexit 0\n")
+                executable.chmod(0o700)
+
+            setup_script = _START_WORKER_SCRIPT.split(
+                'python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" "$ROOM" <<\'PY\'\n',
+                1,
+            )[0]
+            environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+            def start_worker(room):
+                result = subprocess.run(
+                    ["bash", "-s", "--", str(root), "8485", "8486", room],
+                    input=setup_script,
+                    text=True,
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            start_worker("interpreter-room-one")
+            self.assertEqual(trace.read_text(), "")
+            first_trace = interpreter_trace("interpreter-room-one", 0.0)
+            trace.write_text("".join(json.dumps(entry) + "\n" for entry in first_trace))
+            start_worker("interpreter-room-two")
+            second_trace = interpreter_trace("interpreter-room-two", 10.0)
+            with trace.open("a") as retained:
+                retained.write("".join(json.dumps(entry) + "\n" for entry in second_trace))
+
+            entries = [json.loads(line) for line in trace.read_text().splitlines()]
+            self.assertEqual(len(entries), len(first_trace) + len(second_trace))
+            for room in ("interpreter-room-one", "interpreter-room-two"):
+                with self.subTest(room=room):
+                    failures, _ = runner._spanish_interpreter_evidence_failures(
+                        scenario, room, entries, sidecars, []
+                    )
+                    self.assertEqual(failures, [])
+
+            subprocess.run(
+                ["bash", "-s", "--", str(root)],
+                input=_RETAIN_EVIDENCE_SCRIPT,
+                text=True,
+                check=True,
+                capture_output=True,
+                env={**os.environ, "SUDO_USER": pwd.getpwuid(os.getuid()).pw_name},
+            )
+            with tarfile.open(root / "retained-evidence.tar.gz", "r:gz") as archive:
+                member = archive.extractfile("voice/evals/voice-modes.jsonl")
+                self.assertIsNotNone(member)
+                archived_entries = [
+                    json.loads(line) for line in member.read().decode().splitlines()
+                ]
+            self.assertEqual(
+                {entry["room"] for entry in archived_entries},
+                {"interpreter-room-one", "interpreter-room-two"},
+            )
+            self.assertEqual(archived_entries, entries)
+
+            corrupted_entries = [dict(entry) for entry in entries]
+            for entry in corrupted_entries:
+                if entry["room"] == "interpreter-room-two":
+                    if entry["event"] == "mode" and entry["mode"] == "interpreter":
+                        entry["language"] = "fr"
+                    elif entry["event"] == "speech" and entry["reply"] == 2:
+                        entry["language"] = "es"
+            first_failures, _ = runner._spanish_interpreter_evidence_failures(
+                scenario, "interpreter-room-one", corrupted_entries, sidecars, []
+            )
+            second_failures, _ = runner._spanish_interpreter_evidence_failures(
+                scenario, "interpreter-room-two", corrupted_entries, sidecars, []
+            )
+            self.assertEqual(first_failures, [])
+            self.assertTrue(
+                any("mode transition 1 did not select interpreter/es" in failure for failure in second_failures),
+                second_failures,
+            )
+            self.assertTrue(
+                any("speech reply 2 used the wrong language" in failure for failure in second_failures),
+                second_failures,
+            )
+
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_worker_creates_private_mode_trace_and_sets_only_worker_opt_in(self, popen):
         popen.return_value = unittest.mock.Mock(poll=lambda: None)
@@ -597,7 +746,9 @@ class DevStackTest(unittest.TestCase):
             kwargs["input"] for args, kwargs in calls
             if args[:2] == ["ssh", "ultraviolet"] and "--room" in kwargs.get("input", "")
         )
-        trace_creation = worker_script.index(': > "$DEV_DIR/voice/evals/voice-modes.jsonl"')
+        trace_creation = worker_script.index(
+            'if [ ! -e "$DEV_DIR/voice/evals/voice-modes.jsonl" ]; then'
+        )
         worker_launch = worker_script.index("voice = subprocess.Popen(")
         self.assertLess(trace_creation, worker_launch)
         self.assertIn('chown nobody:nogroup "$DEV_DIR/voice/evals/voice-modes.jsonl"', worker_script)

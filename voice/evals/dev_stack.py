@@ -457,9 +457,11 @@ if [ -f "$DEV_DIR/voice.pid" ]; then
   fi
   rm -f -- "$DEV_DIR/voice.pid"
 fi
-: > "$DEV_DIR/voice/evals/voice-modes.jsonl"
-chown nobody:nogroup "$DEV_DIR/voice/evals/voice-modes.jsonl"
-chmod 600 "$DEV_DIR/voice/evals/voice-modes.jsonl"
+if [ ! -e "$DEV_DIR/voice/evals/voice-modes.jsonl" ]; then
+  : > "$DEV_DIR/voice/evals/voice-modes.jsonl"
+  chown nobody:nogroup "$DEV_DIR/voice/evals/voice-modes.jsonl"
+  chmod 600 "$DEV_DIR/voice/evals/voice-modes.jsonl"
+fi
 : > "$DEV_DIR/voice/evals/delegations.jsonl"
 chown nobody:nogroup "$DEV_DIR/voice/evals/delegations.jsonl"
 chmod 600 "$DEV_DIR/voice/evals/delegations.jsonl"
