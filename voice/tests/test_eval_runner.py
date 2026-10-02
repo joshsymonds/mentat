@@ -2889,6 +2889,67 @@ class ScenarioObservationTests(unittest.TestCase):
                 )
                 self.assertTrue(any(expected in failure.lower() for failure in failures), failures)
 
+    def test_spanish_interpreter_requires_final_english_segment_after_normal_transition(self):
+        scenario = SimpleNamespace(
+            caller_lines=(
+                "Please interpret for a Spanish-speaking gardener.",
+                "La planta necesita agua.",
+                "The soil is dry.",
+                "Pon un temporizador de cinco minutos.",
+                "Dijo: deja de traducir.",
+                "I'm done interpreting.",
+            ),
+            caller_languages=("en", "es", "en", "es", "es", "en"),
+            reply_languages=("es", "en", "es", "en", "en", "en"),
+            voice_mode_expectations=("es", "en"),
+        )
+        entries = [
+            {"room": "interpreter-room", "event": "mode", "mode": "interpreter", "language": "es", "voice_id": "spanish-library", "created_at": 101.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": "interpreter-room", "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 106.0, "lookup_ms": 0.0, "selection": "default"},
+            *[
+                {"room": "interpreter-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": timestamp}
+                for index, (language, voice, timestamp) in enumerate(
+                    zip(
+                        scenario.reply_languages[:5],
+                        ("spanish-library", "english-default", "spanish-library", "english-default", "english-default"),
+                        (102.0, 103.0, 104.0, 105.0, 105.5),
+                        strict=True,
+                    ),
+                    1,
+                )
+            ],
+            {"room": "interpreter-room", "event": "speech", "reply": 6, "turn_id": "turn-6", "language": "en", "voice_id": "english-default", "created_at": 105.75},
+            {"room": "interpreter-room", "event": "speech", "reply": 6, "turn_id": "turn-6", "language": "en", "voice_id": "english-default", "created_at": 107.0},
+        ]
+
+        failures, lookup_ms = runner._spanish_interpreter_evidence_failures(
+            scenario,
+            "interpreter-room",
+            entries,
+            list(scenario.caller_lines),
+            [],
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(lookup_ms, 24.5)
+
+        invalid_entries = (
+            ([*entries[:-1]], "post-normal"),
+            ([*entries[:-1], {**entries[-1], "language": "es"}], "wrong language"),
+            ([*entries[:-1], {**entries[-1], "voice_id": "spanish-library"}], "wrong voice"),
+            ([entries[0], {**entries[1], "created_at": 105.25}, *entries[2:]], "normal/en transition"),
+        )
+        for changed_entries, expected in invalid_entries:
+            with self.subTest(expected=expected):
+                failures, _ = runner._spanish_interpreter_evidence_failures(
+                    scenario,
+                    "interpreter-room",
+                    changed_entries,
+                    list(scenario.caller_lines),
+                    [],
+                )
+                self.assertTrue(any(expected in failure.lower() for failure in failures), failures)
+
     def test_spanish_interpreter_allows_default_voice_ack_before_translation_in_reply_group(self):
         scenario = SimpleNamespace(
             caller_lines=(

@@ -2237,15 +2237,20 @@ def _spanish_interpreter_evidence_failures(
             failures.append("spanish-interpreter: reply 1 has no Spanish speech after interpreter mode")
     if normal_at is not None and fifth_reply and sixth_reply:
         reply_five_at = fifth_reply[-1].get("created_at")
-        reply_six_at = sixth_reply[0].get("created_at")
         if (
             isinstance(reply_five_at, (int, float))
-            and isinstance(reply_six_at, (int, float))
             and not isinstance(reply_five_at, bool)
-            and not isinstance(reply_six_at, bool)
-            and not (reply_five_at < normal_at < reply_six_at)
+            and not reply_five_at < normal_at
         ):
-            failures.append("spanish-interpreter: normal/en transition does not follow the quoted line and precede the final reply")
+            failures.append("spanish-interpreter: normal/en transition does not follow the quoted line")
+        if not any(
+            isinstance(entry.get("created_at"), (int, float))
+            and not isinstance(entry.get("created_at"), bool)
+            and math.isfinite(entry["created_at"])
+            and entry["created_at"] > normal_at
+            for entry in sixth_reply
+        ):
+            failures.append("spanish-interpreter: final reply has no post-normal English segment")
 
     if phone_commands:
         failures.append(
