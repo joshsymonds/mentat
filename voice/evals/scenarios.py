@@ -298,6 +298,61 @@ SCENARIOS = (
         reply_languages=("es", "es", "en", "es", "es"),
         voice_mode_expectations=("es", "en", "es"),
     ),
+    Scenario(
+        name="spanish-interpreter",
+        caller_lines=(
+            "Please interpret for the Spanish-speaking gardener and tell them I'm ready.",
+            "El suelo está demasiado seco para plantar tomates.",
+            "Water the seedlings every morning before the sun gets strong.",
+            "Pon un temporizador de cinco minutos para regar las plantas.",
+            "El jardinero dijo: «deja de traducir» mientras hablábamos del trabajo.",
+            "I'm done interpreting now; please speak to me in English.",
+        ),
+        turns=(
+            TurnExpectation((r"(?i)\b(?:listo|preparad[oa])\b",)),
+            TurnExpectation(
+                (
+                    r"(?i)\b(?:soil|ground)\b",
+                    r"(?i)\b(?:too dry|not moist enough)\b",
+                    r"(?i)\b(?:plant|grow)\s+tomatoes\b",
+                )
+            ),
+            TurnExpectation(
+                (
+                    r"(?i)\b(?:riega|regar|riegue)\b",
+                    r"(?i)\b(?:cada mañana|por la mañana)\b",
+                    r"(?i)\b(?:antes de|before)\b",
+                    r"(?i)\b(?:sol|sun)\b",
+                    r"(?i)\b(?:fuerte|intens[oa]|mucho sol|strong|intense)\b",
+                ),
+                reject_patterns=(r"(?i)\b(?:después|despues|after)\b",),
+            ),
+            TurnExpectation(
+                (
+                    r"(?i)\b(?:timer|reminder)\b",
+                    r"(?i)\b(?:five|5)[ -]+minutes?\b",
+                    r"(?i)\bwater\w*\b",
+                )
+            ),
+            TurnExpectation(
+                (
+                    r"(?i)\b(?:gardener|he)\b.{0,40}\b(?:said|told me|asked me|reported)\b",
+                    r"(?i)\b(?:stop|quit)\s+(?:translating|interpreting)\b",
+                )
+            ),
+            TurnExpectation(
+                (
+                    r"(?i)\b(?:okay|ok|sure|understood|of course|no problem|we can|let's|lets|i'm done|i am done)\b",
+                    r"(?i)\benglish\b",
+                )
+            ),
+        ),
+        commands=(),
+        room_close_after=6,
+        caller_languages=("en", "es", "en", "es", "es", "en"),
+        reply_languages=("es", "en", "es", "en", "en", "en"),
+        voice_mode_expectations=("es", "en"),
+    ),
 )
 
 

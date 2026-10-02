@@ -23,6 +23,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                 "sms-correction-new-yes",
                 "alice-keck-context-chain",
                 "spanish-language-switch",
+                "spanish-interpreter",
             },
         )
         for scenario in SCENARIOS:
@@ -67,6 +68,103 @@ class ScenarioCorpusTests(unittest.TestCase):
         self.assertEqual(scenario.voice_mode_expectations, ("es", "en", "es"))
         self.assertEqual(len(scenario.turns), 5)
         self.assertEqual(scenario.room_close_after, 5)
+
+    def test_spanish_interpreter_scenario_covers_translation_without_actions(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines,
+            (
+                "Please interpret for the Spanish-speaking gardener and tell them I'm ready.",
+                "El suelo está demasiado seco para plantar tomates.",
+                "Water the seedlings every morning before the sun gets strong.",
+                "Pon un temporizador de cinco minutos para regar las plantas.",
+                "El jardinero dijo: «deja de traducir» mientras hablábamos del trabajo.",
+                "I'm done interpreting now; please speak to me in English.",
+            ),
+        )
+        self.assertEqual(scenario.caller_languages, ("en", "es", "en", "es", "es", "en"))
+        self.assertEqual(scenario.reply_languages, ("es", "en", "es", "en", "en", "en"))
+        self.assertEqual(scenario.voice_mode_expectations, ("es", "en"))
+        self.assertEqual(scenario.commands, ())
+        self.assertEqual(scenario.room_close_after, 6)
+        self.assertEqual(len(scenario.turns), 6)
+
+        evaluate_scenario(
+            scenario,
+            turns=[
+                "Claro, interpretaré para el jardinero en español. Estoy listo.",
+                "The soil is too dry to plant tomatoes.",
+                "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+                "Set a timer for five minutes to water the plants.",
+                'The gardener said, “stop translating” while we were discussing the work.',
+                "Understood. I'll stop interpreting and speak in English.",
+            ],
+            phone_commands=[],
+            room_closed_after=6,
+        )
+
+        invalid_turns = (
+            (1, "The soil is too wet to plant tomatoes."),
+            (2, "No riegues las plántulas antes de que salga el sol."),
+            (3, "Set a timer for ten minutes to water the plants."),
+            (4, 'The gardener told me, “continue translating” while we discussed the work.'),
+        )
+        valid_turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        for index, answer in invalid_turns:
+            with self.subTest(turn=index, answer=answer), self.assertRaises(AssertionError):
+                turns = valid_turns.copy()
+                turns[index] = answer
+                evaluate_scenario(scenario, turns, [], room_closed_after=6)
+
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(scenario, valid_turns, [{"turn": 4, "kind": "timer", "seconds": 300}], 6)
+
+    def test_spanish_interpreter_accepts_correct_translation_paraphrases(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        valid_turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        paraphrases = (
+            (0, "Estoy listo."),
+            (1, "The ground is not moist enough to grow tomatoes."),
+            (1, "The ground is not moist enough to plant tomatoes."),
+            (2, "Riega las plántulas cada mañana antes de que el sol se vuelva intenso."),
+            (2, "Riegue las plántulas por la mañana antes de que haga mucho sol."),
+            (3, "Set a five-minute reminder for watering the plants."),
+            (4, "The gardener reported, 'stop translating,' while we discussed work."),
+            (4, "The gardener reported saying to stop translating while we discussed the work."),
+            (5, "Okay, we can continue in English."),
+        )
+        for turn_index, answer in paraphrases:
+            with self.subTest(turn=turn_index + 1, answer=answer):
+                turns = valid_turns.copy()
+                turns[turn_index] = answer
+                evaluate_scenario(scenario, turns, [], room_closed_after=6)
+
+    def test_spanish_interpreter_rejects_reversed_sun_timing(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana después de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        with self.assertRaisesRegex(AssertionError, "before|after|después|antes"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=6)
 
     def test_complete_evaluator_returns_all_structured_product_failures(self):
         scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")
