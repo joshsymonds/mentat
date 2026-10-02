@@ -174,7 +174,20 @@ class DevStackTest(unittest.TestCase):
         setup = "\n".join(script for script in remote_scripts if script)
         self.assertIn("127.0.0.1", setup)
         self.assertIn('"MENTAT_LISTEN": f"127.0.0.1:{dev_port}"', setup)
-        self.assertIn('"MENTAT_STATE_PATH": str(dev_dir / "state.json")', setup)
+        self.assertIn('"MENTAT_STATE_PATH": str(dev_dir / "home/mentat/state.json")', setup)
+        self.assertIn('mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat"', setup)
+        self.assertIn('chmod 700 "$DEV_DIR/home/mentat"', setup)
+        self.assertIn('chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat"', setup)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_home = Path(temporary_directory) / "home/mentat"
+            state_home.mkdir(parents=True, mode=0o700)
+            os.chmod(state_home, 0o700)
+            state_path = state_home / "state.json"
+            temporary_state = state_path.with_name("state.json.tmp")
+            temporary_state.write_text('{"session":"persisted"}')
+            os.replace(temporary_state, state_path)
+            self.assertEqual(state_path.read_text(), '{"session":"persisted"}')
+            self.assertEqual(stat.S_IMODE(state_home.stat().st_mode), 0o700)
         self.assertIn('"MENTAT_RECORD_DIR": str(dev_dir / "records")', setup)
         self.assertIn('"HOME": str(dev_dir / "home/mentat")', setup)
         self.assertIn('"MENTAT_MCP_CONFIG"', setup)

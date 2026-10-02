@@ -326,7 +326,7 @@ if "MENTAT_MCP_CONFIG" in env:
     env["MENTAT_MCP_CONFIG"] = rewrite_mcp_config(env["MENTAT_MCP_CONFIG"], production_port, dev_port)
 env.update({
     "MENTAT_LISTEN": f"127.0.0.1:{dev_port}",
-    "MENTAT_STATE_PATH": str(dev_dir / "state.json"),
+    "MENTAT_STATE_PATH": str(dev_dir / "home/mentat/state.json"),
     "MENTAT_RECORD_DIR": str(dev_dir / "records"),
     "HOME": str(dev_dir / "home/mentat"),
 })
