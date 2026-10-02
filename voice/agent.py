@@ -421,12 +421,13 @@ class FrontAgent(Agent):
         utterance_prefix = ""
         utterance_tag_resolved = not interpreter
         embedded_tag_buffer = ""
+        embedded_tag_boundary = False
         utterance_mode_refreshed = False
         utterance_voice = getattr(self, "_voice_id", None)
         utterance_language = getattr(self, "_voice_language", None)
 
         def strip_embedded_tags(text: str, *, final: bool = False) -> str:
-            nonlocal embedded_tag_buffer
+            nonlocal embedded_tag_buffer, embedded_tag_boundary
             text = embedded_tag_buffer + text
             embedded_tag_buffer = ""
             output = ""
@@ -445,6 +446,11 @@ class FrontAgent(Agent):
                     -1,
                 )
                 if end >= 0 and (whitespace < 0 or end < whitespace):
+                    tag = tag_tail[2:end]
+                    if tag in {"en", self._voice_language}:
+                        embedded_tag_buffer = tag_tail
+                        embedded_tag_boundary = True
+                        return output
                     text = tag_tail[end + 2 :]
                     continue
                 if whitespace >= 0 and (end < 0 or whitespace < end):
@@ -527,10 +533,12 @@ class FrontAgent(Agent):
 
         def reset_utterance() -> None:
             nonlocal utterance_prefix, utterance_tag_resolved, embedded_tag_buffer
+            nonlocal embedded_tag_boundary
             nonlocal utterance_voice, utterance_language, utterance_mode_refreshed
             utterance_prefix = ""
             utterance_tag_resolved = not interpreter
             embedded_tag_buffer = ""
+            embedded_tag_boundary = False
             utterance_mode_refreshed = False
             utterance_voice = getattr(self, "_voice_id", None)
             utterance_language = getattr(self, "_voice_language", None)
@@ -569,6 +577,24 @@ class FrontAgent(Agent):
                 raise speech_exception
             return False
 
+        async def queue_speech_text(text: str) -> bool:
+            nonlocal speech_queue, speech_handle, speech_completion
+            nonlocal embedded_tag_buffer, embedded_tag_boundary
+            while True:
+                if text:
+                    if speech_queue is None:
+                        speech_queue, speech_handle, speech_completion = start_speech()
+                    await speech_queue.put(text)
+                if not embedded_tag_boundary:
+                    return False
+                deferred_tag = embedded_tag_buffer
+                embedded_tag_buffer = ""
+                embedded_tag_boundary = False
+                if await finish_speech():
+                    return True
+                reset_utterance()
+                text = resolve_utterance_text(deferred_tag)
+
         backend_iterator = backend_text.__aiter__()
         backend_next: asyncio.Task[str | None] | None = None
         try:
@@ -604,25 +630,18 @@ class FrontAgent(Agent):
                     refresh_utterance_mode()
                 if text is None:
                     text = resolve_utterance_text("", final=True)
-                    if text:
-                        if speech_queue is None:
-                            speech_queue, speech_handle, speech_completion = start_speech()
-                        await speech_queue.put(text)
+                    if await queue_speech_text(text):
+                        return
                     if await finish_speech():
                         return
                     reset_utterance()
                     continue
                 text = resolve_utterance_text(text)
-                if not text:
-                    continue
-                if speech_queue is None:
-                    speech_queue, speech_handle, speech_completion = start_speech()
-                await speech_queue.put(text)
+                if await queue_speech_text(text):
+                    return
             text = resolve_utterance_text("", final=True)
-            if text:
-                if speech_queue is None:
-                    speech_queue, speech_handle, speech_completion = start_speech()
-                await speech_queue.put(text)
+            if await queue_speech_text(text):
+                return
             if await finish_speech():
                 return
         finally:
