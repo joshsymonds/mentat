@@ -88,7 +88,7 @@ describe('allowAllPolicy', () => {
     ]);
   });
 
-  it('allows other tools on every surface', () => {
+  it('allows other tools on every non-interpreter surface', () => {
     expect(
       allowAllPolicy(nullLogger)(
         'mcp__mentat__dial',
@@ -96,6 +96,49 @@ describe('allowAllPolicy', () => {
         { sessionId: 'session', meta: { surface: 'chat' } },
       ),
     ).toEqual({ behavior: 'allow', updatedInput: { number: '+15555550123' } });
+  });
+
+  it('denies all tools except mode and conversation-ending tools in interpreter mode', () => {
+    const policy = allowAllPolicy(nullLogger);
+    const context = {
+      sessionId: 'session',
+      meta: { surface: 'voice', voice_mode: 'interpreter' },
+    };
+
+    for (const toolName of ['mcp__mentat__dial', 'Bash', 'Write']) {
+      expect(policy(toolName, {}, context)).toMatchObject({ behavior: 'deny' });
+    }
+    expect(
+      policy('mcp__mentat__set_voice_mode', { mode: 'conversation' }, context),
+    ).toEqual({ behavior: 'allow', updatedInput: { mode: 'conversation' } });
+    expect(
+      policy('mcp__mentat__end_conversation', { reason: 'done' }, context),
+    ).toEqual({ behavior: 'allow', updatedInput: { reason: 'done' } });
+  });
+
+  it('logs the reason for a tool denied in interpreter mode', async () => {
+    const lines: { message: string; fields?: Record<string, unknown> }[] = [];
+    await allowAllPolicy(capturingLogger(lines))(
+      'mcp__mentat__dial',
+      { number: '+15555550123' },
+      {
+        sessionId: 'session',
+        meta: { surface: 'voice', user: 'josh', voice_mode: 'interpreter' },
+      },
+    );
+    expect(lines).toEqual([
+      {
+        message: 'permission decision',
+        fields: {
+          tool: 'mcp__mentat__dial',
+          decision: 'deny',
+          reason: 'interpreter mode restriction',
+          session_id: 'session',
+          surface: 'voice',
+          user: 'josh',
+        },
+      },
+    ]);
   });
 
   it('denies voice end_conversation that follows an unspoken tool and logs the reason', async () => {
