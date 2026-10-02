@@ -320,6 +320,10 @@ production_listen = source_env.get("MENTAT_LISTEN", "127.0.0.1:8484")
 production_port = int(production_listen.rsplit(":", 1)[1])
 
 env = {key: value for key, value in source_env.items() if key != "OPENAI_API_KEY"}
+candidate_prompt = dev_dir / "mentat/prompt.md"
+if not candidate_prompt.is_file():
+    raise RuntimeError("candidate system prompt is unavailable")
+env["MENTAT_SYSTEM_PROMPT"] = candidate_prompt.read_text(encoding="utf-8")
 env["MENTAT_VOICE_MODEL"] = voice_model
 env["MENTAT_SESSION_TTL"] = "90s"
 if "MENTAT_MCP_CONFIG" in env:
@@ -762,6 +766,7 @@ class DevStack:
                 str(package / "src"),
                 str(package / "node_modules"),
                 str(package / "package.json"),
+                str(self.checkout / "prompt.md"),
                 f"{self.remote}:{self._remote_dir}/mentat/",
             ],
             check=True,

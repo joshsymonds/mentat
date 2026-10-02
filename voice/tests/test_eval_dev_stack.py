@@ -245,6 +245,7 @@ class DevStackTest(unittest.TestCase):
             root = Path(temporary)
             dev_dir = root / "stage"
             (dev_dir / "mentat").mkdir(parents=True)
+            (dev_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
             production_env = root / "production-mentat.env.json"
             original_production = {
                 "PATH": "/usr/bin",
@@ -321,6 +322,100 @@ class DevStackTest(unittest.TestCase):
             and '"MENTAT_STATE_PATH"' in kwargs.get("input", "")
         )
         self.assertEqual(default_setup_args[-1], default_model)
+
+    def test_candidate_prompt_overrides_production_prompt_and_missing_fails_closed(self):
+        calls = []
+
+        def stage_run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.prompttest\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
+            with DevStack(
+                checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=stage_run
+            ):
+                pass
+
+        transfers = [args for args, _ in calls if args and args[0] == "scp"]
+        self.assertTrue(any(os.fspath(CHECKOUT / "prompt.md") in args for args in transfers))
+
+        setup = _SETUP_SCRIPT.replace(
+            "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
+        ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
+        setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
+        setup_body = setup.split(setup_header + "\n", 1)[1].split("\nPY\n", 1)[0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            setup_path = root / "setup.py"
+            setup_path.write_text(setup_body)
+            setpriv = root / "setpriv"
+            capture_path = root / "captured-env.json"
+            setpriv.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os\n"
+                "with open(os.environ['CAPTURE_ENV'], 'w') as output:\n"
+                "    json.dump(dict(os.environ), output)\n"
+            )
+            setpriv.chmod(0o755)
+            candidate_prompt = "Candidate interpreter prompt: [[en]]\n"
+            production_prompt = "Synthetic production prompt without tags"
+            production_values = {
+                "PATH": "/usr/bin",
+                "CAPTURE_ENV": os.fspath(capture_path),
+                "MENTAT_LISTEN": "127.0.0.1:8484",
+                "MENTAT_SYSTEM_PROMPT": production_prompt,
+            }
+            production_bytes = json.dumps(production_values).encode()
+            dev_dir = root / "stage"
+            mentat_dir = dev_dir / "mentat"
+            mentat_dir.mkdir(parents=True)
+            staged_prompt = mentat_dir / "prompt.md"
+            staged_prompt.write_bytes(candidate_prompt.encode())
+            production_env = root / "production-mentat.env.json"
+            production_env.write_bytes(production_bytes)
+            staged_env = dev_dir / "mentat.env.json"
+            staged_env.write_bytes(production_bytes)
+
+            env = {
+                **os.environ,
+                "PATH": f"{root}:{os.environ['PATH']}",
+                "MENTAT_VOICE_MODEL": "synthetic-model",
+            }
+            result = subprocess.run(
+                [sys.executable, os.fspath(setup_path), os.fspath(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for _ in range(100):
+                if capture_path.exists():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(capture_path.is_file(), "candidate process did not capture its environment")
+            candidate_env = json.loads(capture_path.read_text())
+            self.assertEqual(candidate_env["MENTAT_SYSTEM_PROMPT"], candidate_prompt)
+            self.assertEqual(production_env.read_bytes(), production_bytes)
+
+            capture_path.unlink()
+            staged_prompt.unlink()
+            staged_env.write_bytes(production_bytes)
+            result = subprocess.run(
+                [sys.executable, os.fspath(setup_path), os.fspath(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(capture_path.exists(), "missing candidate prompt launched the daemon")
+            self.assertEqual(production_env.read_bytes(), production_bytes)
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_controlmaster_handoff_does_not_abort_a_live_forward(self, popen):
@@ -883,6 +978,7 @@ class DevStackTest(unittest.TestCase):
             root = Path(temporary)
             dev_dir = root / "stage"
             (dev_dir / "mentat").mkdir(parents=True)
+            (dev_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
             (dev_dir / "voice").mkdir()
             (dev_dir / "voice/evals").mkdir()
             shutil.copy2(
