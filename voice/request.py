@@ -60,6 +60,7 @@ PRIVATE_CONTEXT_ENV = "MENTAT_VOICE_PRIVATE"
 CLOSE_TAIL_S = 1.0
 CLOSE_UNSPOKEN_S = 4.0
 IDLE_S = 30.0
+INTERPRETER_IDLE_S = 120.0
 END_CONVERSATION_TOOL = "mcp__mentat__end_conversation"
 
 class EndingPolicy:
@@ -76,6 +77,8 @@ class EndingPolicy:
         self._window: float | None = None
         self._armed_at: float | None = None
         self._end_tool_succeeded = False
+        self._end_tool_result: str | None = None
+        self._interpreter_mode = False
         self._user_speaking = False
         self._agent_speaking = False
 
@@ -106,15 +109,36 @@ class EndingPolicy:
         self._window = None
         self._armed_at = None
 
-    def tool_result_seen(self, name: str, is_error: bool) -> None:
+    def tool_result_seen(
+        self, name: str, is_error: bool, result: str | None = None
+    ) -> None:
         """Remember whether the successful call-ending tool was observed."""
         if name == END_CONVERSATION_TOOL:
-            self._end_tool_succeeded = not is_error
+            self._end_tool_result = result
+            self._end_tool_succeeded = not is_error and (
+                not self._interpreter_mode or result == "Conversation ended: signoff"
+            )
+
+    def set_interpreter_mode(self, enabled: bool, now: float) -> None:
+        """Switch idle and automatic done-close behavior for interpreter calls."""
+        if self._interpreter_mode == enabled:
+            return
+        self._interpreter_mode = enabled
+        if enabled:
+            if self._end_tool_result == "Conversation ended: done":
+                self._end_tool_succeeded = False
+                if self._deadline_kind == "tool":
+                    self._clear_deadline()
+        elif self._deadline_kind == "idle":
+            self._arm("idle", IDLE_S, now)
+        if self._deadline_kind == "idle" and enabled:
+            self._arm("idle", INTERPRETER_IDLE_S, now)
 
     def delegation_started(self) -> None:
         """Cancel an ending when a newer backend delegation begins."""
         self._clear_deadline()
         self._end_tool_succeeded = False
+        self._end_tool_result = None
 
     def turn_done(self, now: float) -> None:
         """Arm the close after a successful ending tool and clean turn."""
@@ -145,9 +169,10 @@ class EndingPolicy:
         self._user_speaking = False
 
     def agent_listening(self, now: float) -> None:
-        """Arm the existing thirty-second idle close window."""
+        """Arm the normal or interpreter idle close window."""
         if not self._user_speaking and self._deadline_kind is None:
-            self._arm("idle", IDLE_S, now)
+            window = INTERPRETER_IDLE_S if self._interpreter_mode else IDLE_S
+            self._arm("idle", window, now)
 
     def agent_busy(self) -> None:
         """Cancel idle closure while the assistant is working."""
