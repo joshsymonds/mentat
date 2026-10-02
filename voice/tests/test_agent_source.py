@@ -14,6 +14,61 @@ from unittest.mock import Mock, patch
 
 
 class AgentSourceContractTest(unittest.TestCase):
+    def test_front_agent_does_not_assign_livekit_agent_reserved_attributes(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        reserved = {
+            "_activity",
+            "_allow_interruptions",
+            "_async_tool_options",
+            "_chat_ctx",
+            "_expressive",
+            "_id",
+            "_instructions",
+            "_interruption_detection",
+            "_llm",
+            "_max_endpointing_delay",
+            "_mcp_servers",
+            "_min_consecutive_speech_delay",
+            "_min_endpointing_delay",
+            "_stt",
+            "_tools",
+            "_tts",
+            "_turn_detection",
+            "_turn_handling",
+            "_use_tts_aligned_transcript",
+            "_vad",
+        }
+
+        def self_attributes(target):
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                return {target.attr}
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return set().union(*(self_attributes(item) for item in target.elts))
+            return set()
+
+        assigned = set()
+        for node in ast.walk(front_agent):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets = [node.target]
+            else:
+                continue
+            for target in targets:
+                assigned.update(self_attributes(target))
+
+        self.assertEqual(len(reserved), 20)
+        self.assertFalse(reserved & assigned, sorted(reserved & assigned))
+
     def test_agent_uses_openai_transcription_and_elevenlabs_http_stream_adapter(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         tree = ast.parse(source)
@@ -1793,8 +1848,8 @@ class AgentSourceContractTest(unittest.TestCase):
                 _voice_language="en",
                 _voice_id="default-voice",
                 _default_voice="default-voice",
-                _stt=Provider(),
-                _tts=tts or Provider(),
+                _stt_provider=Provider(),
+                _tts_provider=tts or Provider(),
                 _voice_resolver=resolver,
                 _traced_voices=None,
                 _room_name="synthetic-room",
@@ -1808,9 +1863,9 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(agent._voice_language, "es")
         self.assertEqual(agent._voice_id, "library-spanish")
         self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")])
-        self.assertEqual(agent._stt.calls, [{"language": "es"}])
+        self.assertEqual(agent._stt_provider.calls, [{"language": "es"}])
         self.assertEqual(
-            agent._tts.calls,
+            agent._tts_provider.calls,
             [{"voice_id": "library-spanish"}],
         )
 
@@ -1825,26 +1880,26 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(agent._voice_language, "en")
         self.assertEqual(agent._voice_id, "default-voice")
         self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")])
-        self.assertEqual(agent._stt.calls[-1], {"language": "en"})
+        self.assertEqual(agent._stt_provider.calls[-1], {"language": "en"})
         self.assertEqual(
-            agent._tts.calls[-1], {"voice_id": "default-voice"}
+            agent._tts_provider.calls[-1], {"voice_id": "default-voice"}
         )
 
         agent._voice_resolver.spanish_voice = "hand-edited-spanish"
         self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, spanish)))
         self.assertEqual(agent._voice_id, "hand-edited-spanish")
-        self.assertEqual(agent._tts.calls[-1], {"voice_id": "hand-edited-spanish"})
+        self.assertEqual(agent._tts_provider.calls[-1], {"voice_id": "hand-edited-spanish"})
         self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")] * 2)
         self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, restore)))
 
-        calls_before_invalid = (len(agent._stt.calls), len(agent._tts.calls))
+        calls_before_invalid = (len(agent._stt_provider.calls), len(agent._tts_provider.calls))
         self.assertFalse(
             asyncio.run(namespace["_apply_voice_mode"](
                 agent, '{"voice_mode":{"mode":"unknown","language":"es"}}'
             ))
         )
         self.assertFalse(asyncio.run(namespace["_apply_voice_mode"](agent, spanish, is_error=True)))
-        self.assertEqual((len(agent._stt.calls), len(agent._tts.calls)), calls_before_invalid)
+        self.assertEqual((len(agent._stt_provider.calls), len(agent._tts_provider.calls)), calls_before_invalid)
         self.assertEqual((agent._voice_mode, agent._voice_language), ("normal", "en"))
 
         failing_tts = Provider(fail_on={"voice_id": "library-spanish"})
@@ -1852,7 +1907,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertFalse(asyncio.run(namespace["_apply_voice_mode"](failed, spanish)))
         self.assertEqual((failed._voice_mode, failed._voice_language, failed._voice_id),
                          ("normal", "en", "default-voice"))
-        self.assertEqual(failed._stt.calls, [{"language": "es"}, {"language": "en"}])
+        self.assertEqual(failed._stt_provider.calls, [{"language": "es"}, {"language": "en"}])
         self.assertEqual(
             failing_tts.calls,
             [
@@ -1960,8 +2015,8 @@ class AgentSourceContractTest(unittest.TestCase):
                 _voice_language="en",
                 _voice_id="default-voice",
                 _default_voice="default-voice",
-                _stt=Provider(),
-                _tts=tts_provider,
+                _stt_provider=Provider(),
+                _tts_provider=tts_provider,
                 _voice_resolver=resolver,
                 _traced_voices={},
                 _room_name="synthetic-room",
@@ -2182,8 +2237,8 @@ class AgentSourceContractTest(unittest.TestCase):
             _voice_mode_note=None,
             _voice_resolver=Resolver(),
             _traced_voices=None,
-            _stt=Provider(),
-            _tts=Provider(),
+            _stt_provider=Provider(),
+            _tts_provider=Provider(),
             _room_name="call-one",
             _mentat_url="http://127.0.0.1:8484",
             _ending_policy=SimpleNamespace(
@@ -2247,7 +2302,7 @@ class AgentSourceContractTest(unittest.TestCase):
                     self.failed = True
                     raise RuntimeError("synthetic provider failure")
 
-        agent._tts = FailingTTS()
+        agent._tts_provider = FailingTTS()
         failed_mode = json.dumps({"voice_mode": {"mode": "conversation", "language": "fr"}})
         failed_wire = [
             b'{"kind":"text_delta","text":"Trying another language."}',

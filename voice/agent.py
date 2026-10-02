@@ -317,8 +317,8 @@ class FrontAgent(Agent):
         self._background = background
         self._ending_policy = ending_policy
         self._ending_changed = ending_changed
-        self._stt = stt
-        self._tts = tts_provider
+        self._stt_provider = stt
+        self._tts_provider = tts_provider
         self._default_voice = default_voice
         self._voice_resolver = voice_resolver
         self._voice_mode = "normal"
@@ -551,13 +551,13 @@ class FrontAgent(Agent):
                 else:
                     selection = "resolved"
             lookup_ms = (time.monotonic() - lookup_started) * 1000
-            self._stt.update_options(language=language)
-            self._tts.update_options(voice_id=voice_id)
+            self._stt_provider.update_options(language=language)
+            self._tts_provider.update_options(voice_id=voice_id)
         except Exception as error:
             logger.warning("voice mode apply failed for %s: %s", language, type(error).__name__)
             for provider, options in (
-                (self._stt, {"language": previous_language}),
-                (self._tts, {"voice_id": previous_voice}),
+                (self._stt_provider, {"language": previous_language}),
+                (self._tts_provider, {"voice_id": previous_voice}),
             ):
                 try:
                     provider.update_options(**options)
