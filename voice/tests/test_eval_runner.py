@@ -2826,6 +2826,49 @@ class ScenarioObservationTests(unittest.TestCase):
                         ["en", "es", "en", "en", "es"],
                     )
 
+    def test_spanish_language_evidence_accepts_only_mode_correct_reply_segments(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-language-switch")
+        records = [
+            {"room": "switch-room", "event": "mode", "mode": "conversation", "language": "es", "voice_id": "spanish-library", "created_at": 102.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": "switch-room", "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 104.0, "lookup_ms": 0.0, "selection": "default"},
+            {"room": "switch-room", "event": "mode", "mode": "conversation", "language": "es", "voice_id": "spanish-library", "created_at": 105.0, "lookup_ms": 0.0, "selection": "reused"},
+            {"room": "switch-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "en", "voice_id": "english-default", "created_at": 101.0},
+            {"room": "switch-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "es", "voice_id": "spanish-library", "created_at": 103.0},
+            *[
+                {"room": "switch-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice_id, "created_at": timestamp}
+                for index, language, voice_id, timestamp in (
+                    (2, "es", "spanish-library", 103.5),
+                    (3, "en", "english-default", 104.5),
+                    (4, "es", "spanish-library", 105.5),
+                    (5, "es", "spanish-library", 106.5),
+                )
+            ],
+        ]
+        failures, first_lookup_ms = runner._spanish_switch_evidence_failures(
+            scenario, "switch-room", records, list(scenario.caller_lines)
+        )
+        self.assertEqual(failures, [])
+        self.assertEqual(first_lookup_ms, 24.5)
+
+        invalid_evidence = (
+            ([*records[:4], {**records[4], "language": "en", "voice_id": "english-default"}, *records[5:]], "speech reply order 1"),
+            ([*records[:4], {**records[4], "voice_id": "wrong-spanish-voice"}, *records[5:]], "speech reply order 1"),
+            ([*records[:4], {**records[4], "voice_id": ""}, *records[5:]], "no synthesized voice"),
+            ([*records[:5], {**records[5], "turn_id": "turn-1"}, *records[6:]], "turn id is shared"),
+            ([*records[:4], {**records[4], "turn_id": "turn-other"}, *records[5:]], "turn id"),
+            ([*records[:4], {**records[4], "turn_id": ""}, *records[5:]], "turn id"),
+            ([*records[:4], {**records[4], "created_at": float("nan")}, *records[5:]], "timestamp"),
+            ([*records, {**records[4], "reply": 1, "created_at": 103.2}], "duplicate speech reply order"),
+            ([*records, {"room": "switch-room", "event": "speech", "reply": 6, "turn_id": "turn-6", "language": "xx", "voice_id": "wrong-voice", "created_at": float("nan")}], "unexpected speech reply order 6"),
+            ([*records[:5], records[6], records[5], *records[7:]], "speech reply groups are out of order"),
+        )
+        for changed_records, expected in invalid_evidence:
+            with self.subTest(expected=expected):
+                failures, _ = runner._spanish_switch_evidence_failures(
+                    scenario, "switch-room", changed_records, list(scenario.caller_lines)
+                )
+                self.assertTrue(any(expected in failure.lower() for failure in failures), failures)
+
     def test_spanish_language_evidence_binds_stt_modes_and_synthesized_voices(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-language-switch")
         records = [
@@ -2833,10 +2876,11 @@ class ScenarioObservationTests(unittest.TestCase):
             {"room": "switch-room", "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 104.0, "lookup_ms": 0.0, "selection": "default"},
             {"room": "switch-room", "event": "mode", "mode": "conversation", "language": "es", "voice_id": "spanish-library", "created_at": 105.0, "lookup_ms": 0.0, "selection": "reused"},
             *[
-                {"room": "switch-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice_id, "created_at": 100.0 + index}
-                for index, (language, voice_id) in enumerate(zip(
+                {"room": "switch-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice_id, "created_at": created_at}
+                for index, (language, voice_id, created_at) in enumerate(zip(
                     ("es", "es", "en", "es", "es"),
                     ("spanish-library", "spanish-library", "english-default", "spanish-library", "spanish-library"),
+                    (102.5, 103.0, 104.5, 105.5, 106.0),
                     strict=True,
                 ), 1)
             ],
@@ -2904,8 +2948,10 @@ class ScenarioObservationTests(unittest.TestCase):
             {"room": room, "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 104.0, "lookup_ms": 0.0, "selection": "default"},
             {"room": room, "event": "mode", "mode": "conversation", "language": "es", "voice_id": "spanish-library", "created_at": 105.0, "lookup_ms": 0.0, "selection": "reused"},
             *[
-                {"room": room, "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": 100.0 + index}
-                for index, (language, voice) in enumerate(zip(languages, voices, strict=True), 1)
+                {"room": room, "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": timestamp}
+                for index, (language, voice, timestamp) in enumerate(
+                    zip(languages, voices, (102.5, 103.0, 104.5, 105.5, 106.0), strict=True), 1
+                )
             ],
         ]
         requested_paths = []

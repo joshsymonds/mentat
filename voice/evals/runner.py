@@ -1872,11 +1872,6 @@ def _spanish_switch_evidence_failures(
         failures.append(
             f"spanish-language-switch: expected {len(expected_transitions)} mode transitions, got {len(mode_entries)}"
         )
-    if len(speech_entries) != len(reply_languages):
-        failures.append(
-            f"spanish-language-switch: expected {len(reply_languages)} speech voice observations, got {len(speech_entries)}"
-        )
-
     first_lookup_ms: float | None = None
     first_spanish_transition_seen = False
     previous_created_at: float | None = None
@@ -1936,56 +1931,119 @@ def _spanish_switch_evidence_failures(
             else:
                 first_lookup_ms = float(lookup_ms)
 
-    observed_replies: dict[int, dict[str, Any]] = {}
+    observed_replies: dict[int, list[dict[str, Any]]] = {}
+    observed_turn_ids: dict[int, set[str]] = {}
+    seen_reply_groups: set[int] = set()
+    previous_reply_group: int | None = None
     for entry in speech_entries:
         reply_order = entry.get("reply")
         if isinstance(reply_order, bool) or not isinstance(reply_order, int) or reply_order < 1:
             failures.append("spanish-language-switch: speech observation has invalid reply order")
             continue
-        if not isinstance(entry.get("turn_id"), str) or not entry["turn_id"]:
+        if reply_order > len(reply_languages):
+            failures.append(f"spanish-language-switch: unexpected speech reply order {reply_order}")
+            continue
+        turn_id = entry.get("turn_id")
+        if not isinstance(turn_id, str) or not turn_id:
             failures.append(f"spanish-language-switch: speech reply order {reply_order} has no turn id")
-        if reply_order in observed_replies:
-            failures.append(f"spanish-language-switch: duplicate speech reply order {reply_order}")
-        observed_replies[reply_order] = entry
+        else:
+            observed_turn_ids.setdefault(reply_order, set()).add(turn_id)
+        if reply_order != previous_reply_group:
+            if reply_order in seen_reply_groups:
+                failures.append(f"spanish-language-switch: duplicate speech reply order group {reply_order}")
+            if previous_reply_group is not None and reply_order <= previous_reply_group:
+                failures.append("spanish-language-switch: speech reply groups are out of order")
+            seen_reply_groups.add(reply_order)
+            previous_reply_group = reply_order
+        observed_replies.setdefault(reply_order, []).append(entry)
+
+    turn_replies: dict[str, int] = {}
+    for reply_order, turn_ids in observed_turn_ids.items():
+        if len(turn_ids) != 1:
+            failures.append(f"spanish-language-switch: speech reply order {reply_order} has mismatched turn ids")
+        for turn_id in turn_ids:
+            other_reply = turn_replies.get(turn_id)
+            if other_reply is not None and other_reply != reply_order:
+                failures.append(f"spanish-language-switch: turn id is shared by replies {other_reply} and {reply_order}")
+            turn_replies[turn_id] = reply_order
+
+    valid_mode_timeline = []
+    for entry in mode_entries:
+        created_at = entry.get("created_at")
+        language = entry.get("language")
+        voice_id = entry.get("voice_id")
+        if (
+            isinstance(created_at, (int, float))
+            and not isinstance(created_at, bool)
+            and math.isfinite(created_at)
+            and created_at >= 0
+            and isinstance(language, str)
+            and isinstance(voice_id, str)
+            and voice_id.strip()
+        ):
+            valid_mode_timeline.append((float(created_at), language, voice_id))
+
     speech_spanish_voice: str | None = None
     previous_speech_at: float | None = None
     for turn, expected_language in enumerate(reply_languages, 1):
-        entry = observed_replies.get(turn)
-        if entry is None:
+        segments = observed_replies.get(turn)
+        if not segments:
             failures.append(f"spanish-language-switch: speech reply order {turn} is missing")
             continue
-        voice_id = entry.get("voice_id")
-        if entry.get("language") != expected_language:
-            failures.append(f"spanish-language-switch: speech reply order {turn} used the wrong language")
-        created_at = entry.get("created_at")
-        if (
-            not isinstance(created_at, (int, float))
-            or isinstance(created_at, bool)
-            or not math.isfinite(created_at)
-            or created_at < 0
-        ):
-            failures.append(f"spanish-language-switch: speech reply order {turn} has invalid timestamp")
-        elif previous_speech_at is not None and created_at <= previous_speech_at:
-            failures.append("spanish-language-switch: speech reply timestamps are out of order")
-        else:
-            previous_speech_at = float(created_at)
-        if not isinstance(voice_id, str) or not voice_id.strip():
+        for segment_index, entry in enumerate(segments, 1):
+            voice_id = entry.get("voice_id")
+            language = entry.get("language")
+            created_at = entry.get("created_at")
+            if (
+                not isinstance(created_at, (int, float))
+                or isinstance(created_at, bool)
+                or not math.isfinite(created_at)
+                or created_at < 0
+            ):
+                failures.append(f"spanish-language-switch: speech reply order {turn} segment {segment_index} has invalid timestamp")
+                continue
+            if previous_speech_at is not None and created_at <= previous_speech_at:
+                failures.append("spanish-language-switch: speech reply timestamps are out of order")
+            else:
+                previous_speech_at = float(created_at)
+
+            active_language = "en"
+            active_voice = english_default_voice
+            for mode_at, mode_language, mode_voice in valid_mode_timeline:
+                if mode_at > created_at:
+                    break
+                active_language, active_voice = mode_language, mode_voice
+            if language != active_language:
+                failures.append(
+                    f"spanish-language-switch: speech reply order {turn} segment {segment_index} used the wrong active language"
+                )
+            if not isinstance(voice_id, str) or not voice_id.strip():
+                failures.append(f"spanish-language-switch: speech reply order {turn} segment {segment_index} has no synthesized voice")
+            elif active_voice is not None and voice_id != active_voice:
+                failures.append(
+                    f"spanish-language-switch: speech reply order {turn} segment {segment_index} used the wrong active voice"
+                )
+
+            if language == "es" and isinstance(voice_id, str) and voice_id.strip():
+                if speech_spanish_voice is None:
+                    speech_spanish_voice = voice_id
+                elif voice_id != speech_spanish_voice:
+                    failures.append("spanish-language-switch: saved Spanish voice was not reused")
+                if spanish_mode_voice is not None and voice_id != spanish_mode_voice:
+                    failures.append(f"spanish-language-switch: Spanish reply {turn} did not use the selected library voice")
+
+        final_segment = segments[-1]
+        final_voice = final_segment.get("voice_id")
+        if final_segment.get("language") != expected_language:
+            failures.append(f"spanish-language-switch: speech reply order {turn} used the wrong final language")
+        expected_voice = spanish_mode_voice if expected_language == "es" else english_default_voice
+        if not isinstance(final_voice, str) or not final_voice.strip():
             failures.append(f"spanish-language-switch: speech reply order {turn} has no synthesized voice")
-            continue
-        if expected_language == "en":
-            if english_default_voice is None:
-                english_default_voice = voice_id
-            elif voice_id != english_default_voice:
-                failures.append("spanish-language-switch: English default voice was not restored")
-        else:
-            if speech_spanish_voice is None:
-                speech_spanish_voice = voice_id
-            elif voice_id != speech_spanish_voice:
-                failures.append("spanish-language-switch: saved Spanish voice was not reused")
-            if spanish_mode_voice is not None and voice_id != spanish_mode_voice:
+        elif expected_voice is not None and final_voice != expected_voice:
+            if expected_language == "es":
                 failures.append(f"spanish-language-switch: Spanish reply {turn} did not use the selected library voice")
-        if expected_language == "en" and english_default_voice != voice_id:
-            failures.append(f"spanish-language-switch: English reply {turn} did not use the default voice")
+            else:
+                failures.append(f"spanish-language-switch: English reply {turn} did not use the default voice")
     if spanish_mode_voice is None or speech_spanish_voice != spanish_mode_voice:
         failures.append("spanish-language-switch: Spanish synthesis voice is not proven by the mode trace")
     return failures, first_lookup_ms
