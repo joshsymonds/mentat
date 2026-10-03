@@ -2,6 +2,8 @@ import asyncio
 import http.server
 import json
 import math
+import os
+import signal
 import sys
 import tempfile
 import threading
@@ -33,6 +35,10 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
         self.command_delay = command_delay
         result_status = {"code": 204}
         self.result_status = result_status
+        result_delay = {"seconds": 0.0}
+        self.result_delay = result_delay
+        self.post_received = threading.Event()
+        post_received = self.post_received
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -64,6 +70,8 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 results.append(json.loads(body))
                 events.append(("post", len(results) - 1))
+                post_received.set()
+                time.sleep(result_delay["seconds"])
                 self.send_response(result_status["code"])
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -101,6 +109,56 @@ class FakePhoneTests(unittest.IsolatedAsyncioTestCase):
             "payload": {"lat": 47.6205, "lng": -122.3493, "accuracy_m": 8, "age_s": 3},
         })
         self.assertEqual([entry["result"] for entry in recorded if entry["event"] == "result"], self.results)
+
+    async def test_sigint_and_sigterm_drain_received_result_without_handling_next_command(self):
+        self.result_delay["seconds"] = 0.2
+        script = (
+            "import asyncio, sys; "
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parent.parent / 'evals')!r}); "
+            "from phone import run_fake_phone; "
+            "asyncio.run(run_fake_phone(sys.argv[1], sys.argv[2], 'success'))"
+        )
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                self.results.clear()
+                self.events.clear()
+                self.post_received.clear()
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    script,
+                    self.base_url,
+                    str(self.output),
+                )
+                try:
+                    self.assertTrue(await asyncio.to_thread(self.post_received.wait, 2))
+                    os.kill(process.pid, signum)
+                    self.assertEqual(await asyncio.wait_for(process.wait(), timeout=3), 0)
+                finally:
+                    if process.returncode is None:
+                        process.kill()
+                        await process.wait()
+
+                recorded = [json.loads(line) for line in self.output.read_text().splitlines()]
+                self.assertEqual(
+                    [entry["command"]["id"] for entry in recorded if entry["event"] == "command"],
+                    ["command-1"],
+                )
+                self.assertEqual(
+                    [entry["result"]["id"] for entry in recorded if entry["event"] == "result"],
+                    ["command-1"],
+                )
+                self.assertEqual([result["id"] for result in self.results], ["command-1"])
+
+    async def test_signal_handlers_are_restored_after_normal_return(self):
+        previous_handlers = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+
+        await run_fake_phone(self.base_url, self.output, "success")
+
+        self.assertEqual(
+            {signum: signal.getsignal(signum) for signum in previous_handlers},
+            previous_handlers,
+        )
 
     async def test_command_receipt_timestamp_precedes_result_post_without_changing_command(self):
         clock_values = iter((1_750_000_000.125, 1_750_000_001.25))
