@@ -212,12 +212,12 @@ for module in (
         ) from error
 PY
 
-mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records"
+mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records" "$DEV_DIR/memory"
 umask 077
 chown root:root "$DEV_DIR"
 chmod 711 "$DEV_DIR" "$DEV_DIR/home"
-chmod 700 "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records"
-chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat" "$DEV_DIR/records"
+chmod 700 "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records" "$DEV_DIR/memory"
+chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat" "$DEV_DIR/records" "$DEV_DIR/memory"
 chown -R nobody:nogroup "$DEV_DIR/voice" "$DEV_DIR/home/voice"
 
 if systemctl is-active --quiet mentat-voice; then
@@ -316,10 +316,17 @@ setpriv_file = dev_dir / "setpriv.path"
 setpriv_file.write_text(setpriv_path)
 setpriv_file.chmod(0o644)
 source_env = json.loads((dev_dir / "mentat.env.json").read_text())
+memory_dir = dev_dir / "memory"
+if not memory_dir.is_dir():
+    raise RuntimeError("candidate memory directory is unavailable")
 production_listen = source_env.get("MENTAT_LISTEN", "127.0.0.1:8484")
 production_port = int(production_listen.rsplit(":", 1)[1])
 
 env = {key: value for key, value in source_env.items() if key != "OPENAI_API_KEY"}
+candidate_prompt = dev_dir / "mentat/prompt.md"
+if not candidate_prompt.is_file():
+    raise RuntimeError("candidate system prompt is unavailable")
+env["MENTAT_SYSTEM_PROMPT"] = candidate_prompt.read_text(encoding="utf-8")
 env["MENTAT_VOICE_MODEL"] = voice_model
 env["MENTAT_SESSION_TTL"] = "90s"
 if "MENTAT_MCP_CONFIG" in env:
@@ -328,6 +335,7 @@ env.update({
     "MENTAT_LISTEN": f"127.0.0.1:{dev_port}",
     "MENTAT_STATE_PATH": str(dev_dir / "home/mentat/state.json"),
     "MENTAT_RECORD_DIR": str(dev_dir / "records"),
+    "MENTAT_MEMORY_DIR": str(memory_dir),
     "HOME": str(dev_dir / "home/mentat"),
 })
 log = (dev_dir / "agent.log").open("ab", buffering=0)
@@ -453,9 +461,11 @@ if [ -f "$DEV_DIR/voice.pid" ]; then
   fi
   rm -f -- "$DEV_DIR/voice.pid"
 fi
-: > "$DEV_DIR/voice/evals/voice-modes.jsonl"
-chown nobody:nogroup "$DEV_DIR/voice/evals/voice-modes.jsonl"
-chmod 600 "$DEV_DIR/voice/evals/voice-modes.jsonl"
+if [ ! -e "$DEV_DIR/voice/evals/voice-modes.jsonl" ]; then
+  : > "$DEV_DIR/voice/evals/voice-modes.jsonl"
+  chown nobody:nogroup "$DEV_DIR/voice/evals/voice-modes.jsonl"
+  chmod 600 "$DEV_DIR/voice/evals/voice-modes.jsonl"
+fi
 : > "$DEV_DIR/voice/evals/delegations.jsonl"
 chown nobody:nogroup "$DEV_DIR/voice/evals/delegations.jsonl"
 chmod 600 "$DEV_DIR/voice/evals/delegations.jsonl"
@@ -762,6 +772,7 @@ class DevStack:
                 str(package / "src"),
                 str(package / "node_modules"),
                 str(package / "package.json"),
+                str(self.checkout / "prompt.md"),
                 f"{self.remote}:{self._remote_dir}/mentat/",
             ],
             check=True,

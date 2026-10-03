@@ -23,6 +23,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                 "sms-correction-new-yes",
                 "alice-keck-context-chain",
                 "spanish-language-switch",
+                "spanish-interpreter",
             },
         )
         for scenario in SCENARIOS:
@@ -67,6 +68,266 @@ class ScenarioCorpusTests(unittest.TestCase):
         self.assertEqual(scenario.voice_mode_expectations, ("es", "en", "es"))
         self.assertEqual(len(scenario.turns), 5)
         self.assertEqual(scenario.room_close_after, 5)
+
+    def test_spanish_interpreter_timer_line_has_clear_imperative_lead_in(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        timer_line = scenario.caller_lines[3]
+
+        self.assertTrue(timer_line.startswith("Ahora programa "))
+        self.assertIn("temporizador de cinco minutos", timer_line)
+        self.assertIn("para regar las plantas", timer_line)
+
+    def test_spanish_interpreter_timer_imperative_has_no_internal_pause(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines[3],
+            "Ahora programa un temporizador de cinco minutos para regar las plantas.",
+        )
+
+    def test_spanish_interpreter_timer_imperative_uses_programa(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines[3],
+            "Ahora programa un temporizador de cinco minutos para regar las plantas.",
+        )
+
+    def test_spanish_interpreter_uses_unambiguous_soil_line_and_accepts_earth_or_dirt(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines[1],
+            "La tierra está demasiado seca para plantar tomates.",
+        )
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The earth is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        for translation in (
+            "The earth is too dry to plant tomatoes.",
+            "The dirt is too dry to plant tomatoes.",
+        ):
+            with self.subTest(translation=translation):
+                candidate = turns.copy()
+                candidate[1] = translation
+                evaluate_scenario(scenario, candidate, [], room_closed_after=None)
+
+        for translation in (
+            "The earth is too wet to plant tomatoes.",
+            "The dirt is too dry to plant potatoes.",
+        ):
+            with self.subTest(translation=translation), self.assertRaises(AssertionError):
+                candidate = turns.copy()
+                candidate[1] = translation
+                evaluate_scenario(scenario, candidate, [], room_closed_after=None)
+
+    def test_spanish_interpreter_final_stimuli_are_single_clear_sentences(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines[4],
+            "Mientras hablábamos del trabajo, el jardinero dijo: «deja de traducir».",
+        )
+        self.assertEqual(
+            scenario.caller_lines[5],
+            "Please stop interpreting and speak to me in English.",
+        )
+
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+    def test_spanish_interpreter_stop_stimulus_is_one_sentence(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines[5],
+            "Please stop interpreting and speak to me in English.",
+        )
+
+    def test_spanish_interpreter_accepts_run2_stop_acknowledgment_but_requires_english(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "You got it. Switching back to English. I'm back to plain English, and I've stopped interpreting.",
+        ]
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+        turns[5] = "You got it. I'm back to plain Spanish, and I've stopped interpreting."
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+    def test_spanish_interpreter_accepts_explicit_stop_acknowledgment(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "I've stopped interpreting. So, we're back in plain English.",
+        ]
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+        turns[5] = "You got it. Switching back to English."
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+    def test_spanish_interpreter_requires_stop_acknowledgment_and_english(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "The garden looks lovely in English.",
+        ]
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+        turns[5] = "He dejado de interpretar. Volvemos al español."
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+    def test_spanish_interpreter_scenario_covers_translation_without_actions(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines,
+            (
+                "Please interpret for the Spanish-speaking gardener and tell them I'm ready.",
+                "La tierra está demasiado seca para plantar tomates.",
+                "Water the seedlings every morning before the sun gets strong.",
+                "Ahora programa un temporizador de cinco minutos para regar las plantas.",
+                "Mientras hablábamos del trabajo, el jardinero dijo: «deja de traducir».",
+                "Please stop interpreting and speak to me in English.",
+            ),
+        )
+        self.assertEqual(scenario.caller_languages, ("en", "es", "en", "es", "es", "en"))
+        self.assertEqual(scenario.reply_languages, ("es", "en", "es", "en", "en", "en"))
+        self.assertEqual(scenario.voice_mode_expectations, ("es", "en"))
+        self.assertEqual(scenario.commands, ())
+        self.assertIsNone(scenario.room_close_after)
+        self.assertEqual(len(scenario.turns), 6)
+
+        evaluate_scenario(
+            scenario,
+            turns=[
+                "Claro, interpretaré para el jardinero en español. Estoy listo.",
+                "The soil is too dry to plant tomatoes.",
+                "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+                "Set a timer for five minutes to water the plants.",
+                'The gardener said, “stop translating” while we were discussing the work.',
+                "Understood. I'll stop interpreting and speak in English.",
+            ],
+            phone_commands=[],
+            room_closed_after=None,
+        )
+
+        invalid_turns = (
+            (1, "The soil is too wet to plant tomatoes."),
+            (2, "No riegues las plántulas antes de que salga el sol."),
+            (3, "Set a timer for ten minutes to water the plants."),
+            (4, 'The gardener told me, “continue translating” while we discussed the work.'),
+        )
+        valid_turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        for index, answer in invalid_turns:
+            with self.subTest(turn=index, answer=answer), self.assertRaises(AssertionError):
+                turns = valid_turns.copy()
+                turns[index] = answer
+                evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+        with self.assertRaises(AssertionError):
+            evaluate_scenario(scenario, valid_turns, [{"turn": 4, "kind": "timer", "seconds": 300}], None)
+
+    def test_spanish_interpreter_stays_open_after_switch_back(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertIsNone(scenario.room_close_after)
+        valid_turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+
+        evaluate_scenario(scenario, valid_turns, [], room_closed_after=None)
+        with self.assertRaisesRegex(AssertionError, "expected room close after turn None"):
+            evaluate_scenario(scenario, valid_turns, [], room_closed_after=6)
+
+    def test_spanish_interpreter_accepts_correct_translation_paraphrases(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        valid_turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        paraphrases = (
+            (0, "Estoy listo."),
+            (1, "The ground is not moist enough to grow tomatoes."),
+            (1, "The ground is not moist enough to plant tomatoes."),
+            (2, "Riega las plántulas cada mañana antes de que el sol se vuelva intenso."),
+            (2, "Riegue las plántulas por la mañana antes de que haga mucho sol."),
+            (3, "Set a five-minute reminder for watering the plants."),
+            (4, "The gardener reported, 'stop translating,' while we discussed work."),
+            (4, "The gardener reported saying to stop translating while we discussed the work."),
+            (5, "Okay, we can continue in English."),
+        )
+        for turn_index, answer in paraphrases:
+            with self.subTest(turn=turn_index + 1, answer=answer):
+                turns = valid_turns.copy()
+                turns[turn_index] = answer
+                evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+    def test_spanish_interpreter_accepts_todas_las_mananas_before_sun_and_rejects_after(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riegue las plántulas todas las mañanas antes de que el sol esté fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+        turns[2] = "Riegue las plántulas todas las mañanas después de que el sol esté fuerte."
+        with self.assertRaisesRegex(AssertionError, "before|after|después|antes"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+    def test_spanish_interpreter_rejects_reversed_sun_timing(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana después de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        with self.assertRaisesRegex(AssertionError, "before|after|después|antes"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
 
     def test_complete_evaluator_returns_all_structured_product_failures(self):
         scenario = next(s for s in SCENARIOS if s.name == "place-search-navigation")

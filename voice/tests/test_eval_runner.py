@@ -2826,6 +2826,347 @@ class ScenarioObservationTests(unittest.TestCase):
                         ["en", "es", "en", "en", "es"],
                     )
 
+    def test_spanish_interpreter_trace_requires_stt_modes_voices_reply_ids_and_no_phone_commands(self):
+        scenario = SimpleNamespace(
+            name="spanish-interpreter",
+            caller_lines=(
+                "Please interpret for a Spanish-speaking gardener.",
+                "La planta necesita agua.",
+                "The soil is dry.",
+                "Pon un temporizador de cinco minutos.",
+                "Dijo: deja de traducir.",
+                "I'm done interpreting.",
+            ),
+            caller_languages=("en", "es", "en", "es", "es", "en"),
+            reply_languages=("es", "en", "es", "en", "en", "en"),
+            voice_mode_expectations=("es", "en"),
+        )
+        entries = [
+            {"room": "interpreter-room", "event": "mode", "mode": "interpreter", "language": "es", "voice_id": "spanish-library", "created_at": 101.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": "interpreter-room", "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 106.0, "lookup_ms": 0.0, "selection": "default"},
+            *[
+                {"room": "interpreter-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": timestamp}
+                for index, (language, voice, timestamp) in enumerate(
+                    zip(
+                        scenario.reply_languages,
+                        ("spanish-library", "english-default", "spanish-library", "english-default", "english-default", "english-default"),
+                        (102.0, 103.0, 104.0, 105.0, 105.5, 107.0),
+                        strict=True,
+                    ),
+                    1,
+                )
+            ],
+        ]
+        phone_commands = []
+
+        failures, lookup_ms = runner._spanish_interpreter_evidence_failures(
+            scenario, "interpreter-room", entries, list(scenario.caller_lines), phone_commands
+        )
+        self.assertEqual(failures, [])
+        self.assertEqual(lookup_ms, 24.5)
+
+        invalid_evidence = (
+            ([*entries[:3], *entries[4:]], list(scenario.caller_lines), phone_commands, "reply 2"),
+            (entries, [*scenario.caller_lines[:3], "Set a five minute timer.", *scenario.caller_lines[4:]], phone_commands, "turn 4"),
+            ([*entries[:1], *entries[2:]], list(scenario.caller_lines), phone_commands, "mode transitions"),
+            ([{**entry, "mode": "conversation"} if entry.get("event") == "mode" and entry.get("language") == "es" else entry for entry in entries], list(scenario.caller_lines), phone_commands, "interpreter/es"),
+            ([*entries, {**entries[0], "created_at": 108.0}], list(scenario.caller_lines), phone_commands, "mode transitions"),
+            ([*entries[:1], {**entries[1], "created_at": 105.25}, *entries[2:]], list(scenario.caller_lines), phone_commands, "normal/en transition"),
+            ([*entries[:2], {**entries[2], "language": "en"}, *entries[3:]], list(scenario.caller_lines), phone_commands, "reply 1"),
+            ([*entries[:2], {**entries[2], "voice_id": "english-default"}, *entries[3:]], list(scenario.caller_lines), phone_commands, "reply 1"),
+            ([*entries[:3], {**entries[3], "voice_id": "spanish-library"}, *entries[4:]], list(scenario.caller_lines), phone_commands, "reply 2"),
+            ([*entries[:2], *entries[3:]], list(scenario.caller_lines), phone_commands, "reply 1 is missing"),
+            ([*entries, {**entries[2], "reply": 2, "created_at": 108.0}], list(scenario.caller_lines), phone_commands, "duplicate speech reply order"),
+            ([*entries[:3], entries[4], entries[3], *entries[5:]], list(scenario.caller_lines), phone_commands, "out of order"),
+            ([*entries[:2], {**entries[2], "turn_id": ""}, *entries[3:]], list(scenario.caller_lines), phone_commands, "turn id"),
+            ([*entries[:2], *entries[2:4], {**entries[4], "turn_id": "turn-2"}, *entries[5:]], list(scenario.caller_lines), phone_commands, "turn id is shared"),
+            (entries, list(scenario.caller_lines), [{"kind": "timer", "turn": 4}], "command(s)"),
+        )
+        for changed_entries, sidecars, commands, expected in invalid_evidence:
+            with self.subTest(expected=expected):
+                failures, _ = runner._spanish_interpreter_evidence_failures(
+                    scenario, "interpreter-room", changed_entries, sidecars, commands
+                )
+                self.assertTrue(any(expected in failure.lower() for failure in failures), failures)
+
+    def test_spanish_interpreter_requires_final_english_segment_after_normal_transition(self):
+        scenario = SimpleNamespace(
+            caller_lines=(
+                "Please interpret for a Spanish-speaking gardener.",
+                "La planta necesita agua.",
+                "The soil is dry.",
+                "Pon un temporizador de cinco minutos.",
+                "Dijo: deja de traducir.",
+                "I'm done interpreting.",
+            ),
+            caller_languages=("en", "es", "en", "es", "es", "en"),
+            reply_languages=("es", "en", "es", "en", "en", "en"),
+            voice_mode_expectations=("es", "en"),
+        )
+        entries = [
+            {"room": "interpreter-room", "event": "mode", "mode": "interpreter", "language": "es", "voice_id": "spanish-library", "created_at": 101.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": "interpreter-room", "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 106.0, "lookup_ms": 0.0, "selection": "default"},
+            *[
+                {"room": "interpreter-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": timestamp}
+                for index, (language, voice, timestamp) in enumerate(
+                    zip(
+                        scenario.reply_languages[:5],
+                        ("spanish-library", "english-default", "spanish-library", "english-default", "english-default"),
+                        (102.0, 103.0, 104.0, 105.0, 105.5),
+                        strict=True,
+                    ),
+                    1,
+                )
+            ],
+            {"room": "interpreter-room", "event": "speech", "reply": 6, "turn_id": "turn-6", "language": "en", "voice_id": "english-default", "created_at": 105.75},
+            {"room": "interpreter-room", "event": "speech", "reply": 6, "turn_id": "turn-6", "language": "en", "voice_id": "english-default", "created_at": 107.0},
+        ]
+
+        failures, lookup_ms = runner._spanish_interpreter_evidence_failures(
+            scenario,
+            "interpreter-room",
+            entries,
+            list(scenario.caller_lines),
+            [],
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(lookup_ms, 24.5)
+
+        invalid_entries = (
+            ([*entries[:-1]], "post-normal"),
+            ([*entries[:-1], {**entries[-1], "language": "es"}], "wrong language"),
+            ([*entries[:-1], {**entries[-1], "voice_id": "spanish-library"}], "wrong voice"),
+            ([entries[0], {**entries[1], "created_at": 105.25}, *entries[2:]], "normal/en transition"),
+        )
+        for changed_entries, expected in invalid_entries:
+            with self.subTest(expected=expected):
+                failures, _ = runner._spanish_interpreter_evidence_failures(
+                    scenario,
+                    "interpreter-room",
+                    changed_entries,
+                    list(scenario.caller_lines),
+                    [],
+                )
+                self.assertTrue(any(expected in failure.lower() for failure in failures), failures)
+
+    def test_spanish_interpreter_allows_default_voice_ack_before_translation_in_reply_group(self):
+        scenario = SimpleNamespace(
+            caller_lines=(
+                "Please interpret for a Spanish-speaking gardener.",
+                "La planta necesita agua.",
+                "The soil is dry.",
+                "Pon un temporizador de cinco minutos.",
+                "Dijo: deja de traducir.",
+                "I'm done interpreting.",
+            ),
+            caller_languages=("en", "es", "en", "es", "es", "en"),
+            reply_languages=("es", "en", "es", "en", "en", "en"),
+            voice_mode_expectations=("es", "en"),
+        )
+        entries = [
+            {"room": "interpreter-room", "event": "mode", "mode": "interpreter", "language": "es", "voice_id": "spanish-library", "created_at": 101.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": "interpreter-room", "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 106.0, "lookup_ms": 0.0, "selection": "default"},
+            {"room": "interpreter-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "en", "voice_id": "english-default", "created_at": 100.5},
+            {"room": "interpreter-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "es", "voice_id": "spanish-library", "created_at": 101.5},
+            *[
+                {"room": "interpreter-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": timestamp}
+                for index, (language, voice, timestamp) in enumerate(
+                    zip(
+                        scenario.reply_languages[1:],
+                        ("english-default", "spanish-library", "english-default", "english-default", "english-default"),
+                        (102.5, 103.5, 104.5, 105.5, 107.0),
+                        strict=True,
+                    ),
+                    2,
+                )
+            ],
+        ]
+
+        failures, lookup_ms = runner._spanish_interpreter_evidence_failures(
+            scenario,
+            "interpreter-room",
+            entries,
+            list(scenario.caller_lines),
+            [],
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(lookup_ms, 24.5)
+
+        invalid_entries = (
+            ([*entries[:2], {**entries[2], "voice_id": "spanish-library"}, *entries[3:]], "wrong voice"),
+            (
+                [
+                    *entries[:5],
+                    {
+                        **entries[3],
+                        "language": "en",
+                        "voice_id": "english-default",
+                        "created_at": 101.75,
+                    },
+                    *entries[5:],
+                ],
+                "wrong language",
+            ),
+            ([*entries[:3], *entries[4:]], "no Spanish speech after interpreter mode"),
+        )
+        for changed_entries, expected in invalid_entries:
+            with self.subTest(expected=expected):
+                failures, _ = runner._spanish_interpreter_evidence_failures(
+                    scenario,
+                    "interpreter-room",
+                    changed_entries,
+                    list(scenario.caller_lines),
+                    [],
+                )
+                self.assertTrue(any(expected in failure for failure in failures), failures)
+
+    def test_spanish_interpreter_allows_tagged_english_meta_after_mode_before_spanish_translation(self):
+        scenario = SimpleNamespace(
+            caller_lines=(
+                "Please interpret for a Spanish-speaking gardener.",
+                "La planta necesita agua.",
+                "The soil is dry.",
+                "Pon un temporizador de cinco minutos.",
+                "Dijo: deja de traducir.",
+                "I'm done interpreting.",
+            ),
+            caller_languages=("en", "es", "en", "es", "es", "en"),
+            reply_languages=("es", "en", "es", "en", "en", "en"),
+            voice_mode_expectations=("es", "en"),
+        )
+        entries = [
+            {"room": "interpreter-room", "event": "mode", "mode": "interpreter", "language": "es", "voice_id": "spanish-library", "created_at": 101.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": "interpreter-room", "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 106.0, "lookup_ms": 0.0, "selection": "default"},
+            {"room": "interpreter-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "en", "voice_id": "english-default", "created_at": 100.5},
+            {"room": "interpreter-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "en", "voice_id": "english-default", "created_at": 101.25},
+            {"room": "interpreter-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "es", "voice_id": "spanish-library", "created_at": 101.5},
+            *[
+                {"room": "interpreter-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": timestamp}
+                for index, (language, voice, timestamp) in enumerate(
+                    zip(
+                        scenario.reply_languages[1:],
+                        ("english-default", "spanish-library", "english-default", "english-default", "english-default"),
+                        (102.0, 103.0, 104.0, 105.0, 107.0),
+                        strict=True,
+                    ),
+                    2,
+                )
+            ],
+        ]
+
+        failures, _ = runner._spanish_interpreter_evidence_failures(
+            scenario, "interpreter-room", entries, list(scenario.caller_lines), []
+        )
+
+        self.assertEqual(failures, [])
+
+        invalid_entries = (
+            ([*entries[:3], {**entries[3], "voice_id": "spanish-library"}, *entries[4:]], "wrong voice"),
+            ([*entries[:4], *entries[5:]], "no Spanish speech after interpreter mode"),
+        )
+        for changed_entries, expected in invalid_entries:
+            with self.subTest(expected=expected):
+                failures, _ = runner._spanish_interpreter_evidence_failures(
+                    scenario, "interpreter-room", changed_entries, list(scenario.caller_lines), []
+                )
+                self.assertTrue(any(expected in failure for failure in failures), failures)
+
+    def test_spanish_interpreter_observation_reads_committed_stt_and_fake_phone_log(self):
+        import json
+        import subprocess
+        from subprocess import CompletedProcess
+
+        scenario = SimpleNamespace(
+            name="spanish-interpreter",
+            caller_lines=(
+                "Please interpret for a Spanish-speaking gardener.",
+                "La planta necesita agua.",
+                "The soil is dry.",
+                "Pon un temporizador de cinco minutos.",
+                "Dijo: deja de traducir.",
+                "I'm done interpreting.",
+            ),
+            caller_languages=("en", "es", "en", "es", "es", "en"),
+            reply_languages=("es", "en", "es", "en", "en", "en"),
+            voice_mode_expectations=("es", "en"),
+            turns=tuple(SimpleNamespace(answer_patterns=("ok",), reject_patterns=(), sms_recipient=None, sms_body=None) for _ in range(6)),
+            room_close_after=6,
+            commands=(),
+        )
+        room = "spanish-interpreter-room"
+        traces = [
+            {
+                "turn": index,
+                "room": room,
+                "line": line,
+                "transcript": "Ok.",
+                "speech_started_at": 100.0 + index,
+                "speech_end": 100.3 + index,
+                "speech_end_wall": 1_700_000_000.3 + index,
+                "first_audio": 101.0 + index,
+                "capture_started": 100.0 + index,
+                "overlap": False,
+                "segments": [{"start": 0.6, "end": 0.8, "text": "Ok."}],
+                "room_deleted": 108.0 if index == 6 else None,
+            }
+            for index, line in enumerate(scenario.caller_lines, 1)
+        ]
+        voice_entries = [
+            {"room": room, "event": "mode", "mode": "interpreter", "language": "es", "voice_id": "spanish-library", "created_at": 101.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": room, "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 106.0, "lookup_ms": 0.0, "selection": "default"},
+            *[
+                {"room": room, "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": timestamp}
+                for index, (language, voice, timestamp) in enumerate(
+                    zip(
+                        scenario.reply_languages,
+                        ("spanish-library", "english-default", "spanish-library", "english-default", "english-default", "english-default"),
+                        (102.0, 103.0, 104.0, 105.0, 105.5, 107.0),
+                        strict=True,
+                    ),
+                    1,
+                )
+            ],
+        ]
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, json.dumps({"turns": traces}), "")
+
+            def run_remote(self, command):
+                path = command[-1]
+                if path == "voice/evals/phone.jsonl":
+                    return CompletedProcess(command, 0, "", "")
+                if path == "voice/evals/voice-modes.jsonl":
+                    return CompletedProcess(command, 0, "".join(json.dumps(row) + "\n" for row in voice_entries), "")
+                if path == "voice/evals/delegations.jsonl":
+                    return CompletedProcess(command, 0, "", "")
+                if path == f"records/voice-{room}.jsonl":
+                    raise subprocess.CalledProcessError(1, command, output="", stderr=f"cat: {path}: No such file or directory")
+                prefix = "voice/evals/retained-evidence/input-audio/"
+                if path.startswith(prefix) and path.endswith(".txt"):
+                    index = int(path.rsplit("-", 1)[1][:-4])
+                    return CompletedProcess(command, 0, scenario.caller_lines[index - 1], "")
+                raise AssertionError(f"unexpected remote artifact {path!r}")
+
+        with patch.object(
+            runner,
+            "_voice_token",
+            return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"},
+        ):
+            observation = runner.observe_scenario(scenario, Stack())
+
+        self.assertNotIn("product_failures", observation)
+        self.assertEqual(observation["phone_commands"], [])
+        self.assertEqual(observation["first_spanish_lookup_ms"], 24.5)
+        self.assertEqual(len(observation["turns"]), 6)
+
     def test_spanish_language_evidence_accepts_only_mode_correct_reply_segments(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-language-switch")
         records = [
@@ -4420,6 +4761,8 @@ class LocalEvalCliTests(unittest.TestCase):
             observation = {"turns": turns}
             if scenario.name == "spanish-language-switch":
                 observation["first_spanish_lookup_ms"] = 24.5
+            if scenario.name == "spanish-interpreter":
+                observation["phone_commands"] = []
             return observation
 
         output = []
@@ -4451,6 +4794,87 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertEqual(
             report["cases"][6]["first_spanish_lookup_ms"], [24.5, 24.5]
         )
+        self.assertEqual(report["cases"][7]["phone_commands"], [[], []])
+
+    def test_live_eval_retains_interpreter_phone_commands_and_fails_on_timer(self):
+        from contextlib import contextmanager
+        import json
+
+        scenario = SimpleNamespace(
+            name="spanish-interpreter",
+            turns=tuple(
+                SimpleNamespace(sms_recipient=None, sms_body=None)
+                for _ in range(6)
+            ),
+            room_close_after=6,
+            commands=(),
+            place_query=None,
+        )
+        lifecycle = []
+        run_commands = [
+            [],
+            [{"id": "fake-timer", "kind": "timer", "turn": 4}],
+        ]
+        observations = []
+
+        @contextmanager
+        def dev_stack(**kwargs):
+            lifecycle.append(("enter", kwargs["opt_in"]))
+            try:
+                yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+            finally:
+                lifecycle.append(("exit",))
+
+        def observe(_scenario, _stack):
+            index = len(observations)
+            observations.append(index)
+            phone_commands = run_commands[index]
+            product_failures = []
+            return {
+                "turns": [
+                    {
+                        "kind": "search",
+                        "speech_end": float(turn * 10),
+                        "speech_end_wall": float(turn * 10),
+                        "first_audio": float(turn * 10 + 0.5),
+                        "capture_started": float(turn * 10 + 0.1),
+                        "segments": [{"start": 0.2, "end": 0.4, "text": "Synthetic reply."}],
+                        "command_received_at": None,
+                        "answer_at": float(turn * 10 + 1),
+                        "overlap": False,
+                        "expect_confirmation": False,
+                        "confirmation": None,
+                        "expect_hangup": turn == 6,
+                        "room_deleted": float(turn * 10 + 2) if turn == 6 else None,
+                        "model_calls": [],
+                    }
+                    for turn in range(1, 7)
+                ],
+                "phone_commands": phone_commands,
+                "product_failures": product_failures,
+            }
+
+        output = []
+        with patch.dict(os.environ, {"MENTAT_VOICE_MODEL": "claude-opus-5-5"}), patch.object(
+            runner, "SCENARIOS", [scenario]
+        ), patch.object(
+            runner, "DevStack", side_effect=dev_stack, create=True
+        ), patch.object(
+            runner, "observe_scenario", side_effect=observe
+        ), patch(
+            "builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])
+        ):
+            result = runner.main(["eval", "--live", "--runs", "2"])
+
+        report = json.loads(output[0])
+        self.assertEqual(result, 1)
+        self.assertFalse(report["passed"])
+        self.assertEqual(
+            report["cases"][0]["phone_commands"],
+            [[], [{"id": "fake-timer", "kind": "timer", "turn": 4}]],
+        )
+        self.assertTrue(any("fake phone command log is not empty" in failure for failure in report["failures"]))
+        self.assertEqual(lifecycle, [("enter", True), ("exit",)])
 
     def test_live_eval_requires_opt_in_and_continues_after_case_failure(self):
         from contextlib import contextmanager

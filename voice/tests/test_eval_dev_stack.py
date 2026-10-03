@@ -19,6 +19,8 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
 from unittest.mock import patch
 
+from voice.evals import runner
+from voice.evals.scenarios import SCENARIOS
 from voice.evals.dev_stack import (
     DevStack,
     _MCP_REWRITE_SOURCE,
@@ -245,6 +247,8 @@ class DevStackTest(unittest.TestCase):
             root = Path(temporary)
             dev_dir = root / "stage"
             (dev_dir / "mentat").mkdir(parents=True)
+            (dev_dir / "memory").mkdir(mode=0o700)
+            (dev_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
             production_env = root / "production-mentat.env.json"
             original_production = {
                 "PATH": "/usr/bin",
@@ -321,6 +325,178 @@ class DevStackTest(unittest.TestCase):
             and '"MENTAT_STATE_PATH"' in kwargs.get("input", "")
         )
         self.assertEqual(default_setup_args[-1], default_model)
+
+    def test_candidate_memory_store_is_private_and_overrides_production_path(self):
+        setup = _SETUP_SCRIPT.replace(
+            "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
+        ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
+        self.assertIn('"$DEV_DIR/memory"', setup)
+        self.assertIn('chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat" "$DEV_DIR/records" "$DEV_DIR/memory"', setup)
+        self.assertIn('chmod 700 "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records" "$DEV_DIR/memory"', setup)
+        setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
+        setup_body = setup.split(setup_header + "\n", 1)[1].split("\nPY\n", 1)[0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dev_dir = root / "stage"
+            mentat_dir = dev_dir / "mentat"
+            memory_dir = dev_dir / "memory"
+            mentat_dir.mkdir(parents=True)
+            memory_dir.mkdir(mode=0o700)
+            os.chmod(memory_dir, 0o700)
+            (mentat_dir / "prompt.md").write_text("Synthetic candidate prompt")
+            production_path = root / "synthetic-production-memory"
+            production_env = root / "production-mentat.env.json"
+            production_values = {
+                "PATH": "/usr/bin",
+                "CAPTURE_ENV": os.fspath(root / "captured-env.json"),
+                "MENTAT_LISTEN": "127.0.0.1:8484",
+                "MENTAT_SYSTEM_PROMPT": "Synthetic production prompt",
+                "MENTAT_MEMORY_DIR": os.fspath(production_path),
+            }
+            production_bytes = json.dumps(production_values).encode()
+            production_env.write_bytes(production_bytes)
+            staged_env = dev_dir / "mentat.env.json"
+            staged_env.write_bytes(production_bytes)
+            setpriv = root / "setpriv"
+            setpriv.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os\n"
+                "with open(os.environ['CAPTURE_ENV'], 'w') as output:\n"
+                "    json.dump(dict(os.environ), output)\n"
+            )
+            setpriv.chmod(0o755)
+            setup_path = root / "setup.py"
+            setup_path.write_text(setup_body)
+            env = {
+                **os.environ,
+                "PATH": f"{root}:{os.environ['PATH']}",
+                "MENTAT_VOICE_MODEL": "synthetic-model",
+            }
+            command = [
+                sys.executable, os.fspath(setup_path), os.fspath(dev_dir),
+                "8485", "/nix/bin/node", "/nix/bin/python",
+            ]
+            result = subprocess.run(
+                command, env=env, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            capture_path = Path(production_values["CAPTURE_ENV"])
+            for _ in range(100):
+                if capture_path.exists():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(capture_path.is_file(), "candidate daemon did not launch")
+            candidate_env = json.loads(capture_path.read_text())
+            self.assertEqual(candidate_env["MENTAT_MEMORY_DIR"], os.fspath(memory_dir))
+            self.assertNotEqual(candidate_env["MENTAT_MEMORY_DIR"], os.fspath(production_path))
+            self.assertEqual(list(memory_dir.iterdir()), [])
+            self.assertEqual(stat.S_IMODE(memory_dir.stat().st_mode), 0o700)
+            self.assertEqual(production_env.read_bytes(), production_bytes)
+
+            capture_path.unlink()
+            memory_dir.rmdir()
+            result = subprocess.run(
+                command, env=env, capture_output=True, text=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(capture_path.exists(), "missing staged memory launched the daemon")
+            self.assertEqual(production_env.read_bytes(), production_bytes)
+
+    def test_candidate_prompt_overrides_production_prompt_and_missing_fails_closed(self):
+        calls = []
+
+        def stage_run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.prompttest\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
+            with DevStack(
+                checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=stage_run
+            ):
+                pass
+
+        transfers = [args for args, _ in calls if args and args[0] == "scp"]
+        self.assertTrue(any(os.fspath(CHECKOUT / "prompt.md") in args for args in transfers))
+
+        setup = _SETUP_SCRIPT.replace(
+            "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
+        ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
+        setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
+        setup_body = setup.split(setup_header + "\n", 1)[1].split("\nPY\n", 1)[0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            setup_path = root / "setup.py"
+            setup_path.write_text(setup_body)
+            setpriv = root / "setpriv"
+            capture_path = root / "captured-env.json"
+            setpriv.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os\n"
+                "with open(os.environ['CAPTURE_ENV'], 'w') as output:\n"
+                "    json.dump(dict(os.environ), output)\n"
+            )
+            setpriv.chmod(0o755)
+            candidate_prompt = "Candidate interpreter prompt: [[en]]\n"
+            production_prompt = "Synthetic production prompt without tags"
+            production_values = {
+                "PATH": "/usr/bin",
+                "CAPTURE_ENV": os.fspath(capture_path),
+                "MENTAT_LISTEN": "127.0.0.1:8484",
+                "MENTAT_SYSTEM_PROMPT": production_prompt,
+            }
+            production_bytes = json.dumps(production_values).encode()
+            dev_dir = root / "stage"
+            mentat_dir = dev_dir / "mentat"
+            mentat_dir.mkdir(parents=True)
+            (dev_dir / "memory").mkdir(mode=0o700)
+            staged_prompt = mentat_dir / "prompt.md"
+            staged_prompt.write_bytes(candidate_prompt.encode())
+            production_env = root / "production-mentat.env.json"
+            production_env.write_bytes(production_bytes)
+            staged_env = dev_dir / "mentat.env.json"
+            staged_env.write_bytes(production_bytes)
+
+            env = {
+                **os.environ,
+                "PATH": f"{root}:{os.environ['PATH']}",
+                "MENTAT_VOICE_MODEL": "synthetic-model",
+            }
+            result = subprocess.run(
+                [sys.executable, os.fspath(setup_path), os.fspath(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for _ in range(100):
+                if capture_path.exists():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(capture_path.is_file(), "candidate process did not capture its environment")
+            candidate_env = json.loads(capture_path.read_text())
+            self.assertEqual(candidate_env["MENTAT_SYSTEM_PROMPT"], candidate_prompt)
+            self.assertEqual(production_env.read_bytes(), production_bytes)
+
+            capture_path.unlink()
+            staged_prompt.unlink()
+            staged_env.write_bytes(production_bytes)
+            result = subprocess.run(
+                [sys.executable, os.fspath(setup_path), os.fspath(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(capture_path.exists(), "missing candidate prompt launched the daemon")
+            self.assertEqual(production_env.read_bytes(), production_bytes)
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_controlmaster_handoff_does_not_abort_a_live_forward(self, popen):
@@ -482,6 +658,153 @@ class DevStackTest(unittest.TestCase):
             if args[:2] == ["ssh", "ultraviolet"]
         ))
 
+    def test_successive_worker_starts_preserve_room_scoped_voice_mode_entries(self):
+        scenario = next(item for item in SCENARIOS if item.name == "spanish-interpreter")
+        sidecars = list(scenario.caller_lines)
+
+        def interpreter_trace(room, offset):
+            return [
+                {
+                    "room": room,
+                    "event": "mode",
+                    "mode": "interpreter",
+                    "language": "es",
+                    "voice_id": "spanish-library",
+                    "created_at": offset + 101.0,
+                    "lookup_ms": 24.5,
+                    "selection": "resolved",
+                },
+                {
+                    "room": room,
+                    "event": "mode",
+                    "mode": "normal",
+                    "language": "en",
+                    "voice_id": "english-default",
+                    "created_at": offset + 106.0,
+                    "lookup_ms": 0.0,
+                    "selection": "default",
+                },
+                *[
+                    {
+                        "room": room,
+                        "event": "speech",
+                        "reply": index,
+                        "turn_id": f"{room}-turn-{index}",
+                        "language": language,
+                        "voice_id": voice,
+                        "created_at": offset + timestamp,
+                    }
+                    for index, (language, voice, timestamp) in enumerate(
+                        zip(
+                            scenario.reply_languages,
+                            (
+                                "spanish-library",
+                                "english-default",
+                                "spanish-library",
+                                "english-default",
+                                "english-default",
+                                "english-default",
+                            ),
+                            (102.0, 103.0, 104.0, 105.0, 105.5, 107.0),
+                            strict=True,
+                        ),
+                        1,
+                    )
+                ],
+            ]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evals = root / "voice/evals"
+            evals.mkdir(parents=True)
+            trace = evals / "voice-modes.jsonl"
+            self.assertFalse(trace.exists())
+
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            for command in ("systemctl", "chown", "chmod", "install"):
+                executable = bin_dir / command
+                executable.write_text("#!/bin/sh\nexit 0\n")
+                executable.chmod(0o700)
+
+            setup_script = _START_WORKER_SCRIPT.split(
+                'python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" "$ROOM" <<\'PY\'\n',
+                1,
+            )[0]
+            environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+            def start_worker(room):
+                result = subprocess.run(
+                    ["bash", "-s", "--", str(root), "8485", "8486", room],
+                    input=setup_script,
+                    text=True,
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            start_worker("interpreter-room-one")
+            self.assertEqual(trace.read_text(), "")
+            first_trace = interpreter_trace("interpreter-room-one", 0.0)
+            trace.write_text("".join(json.dumps(entry) + "\n" for entry in first_trace))
+            start_worker("interpreter-room-two")
+            second_trace = interpreter_trace("interpreter-room-two", 10.0)
+            with trace.open("a") as retained:
+                retained.write("".join(json.dumps(entry) + "\n" for entry in second_trace))
+
+            entries = [json.loads(line) for line in trace.read_text().splitlines()]
+            self.assertEqual(len(entries), len(first_trace) + len(second_trace))
+            for room in ("interpreter-room-one", "interpreter-room-two"):
+                with self.subTest(room=room):
+                    failures, _ = runner._spanish_interpreter_evidence_failures(
+                        scenario, room, entries, sidecars, []
+                    )
+                    self.assertEqual(failures, [])
+
+            subprocess.run(
+                ["bash", "-s", "--", str(root)],
+                input=_RETAIN_EVIDENCE_SCRIPT,
+                text=True,
+                check=True,
+                capture_output=True,
+                env={**os.environ, "SUDO_USER": pwd.getpwuid(os.getuid()).pw_name},
+            )
+            with tarfile.open(root / "retained-evidence.tar.gz", "r:gz") as archive:
+                member = archive.extractfile("voice/evals/voice-modes.jsonl")
+                self.assertIsNotNone(member)
+                archived_entries = [
+                    json.loads(line) for line in member.read().decode().splitlines()
+                ]
+            self.assertEqual(
+                {entry["room"] for entry in archived_entries},
+                {"interpreter-room-one", "interpreter-room-two"},
+            )
+            self.assertEqual(archived_entries, entries)
+
+            corrupted_entries = [dict(entry) for entry in entries]
+            for entry in corrupted_entries:
+                if entry["room"] == "interpreter-room-two":
+                    if entry["event"] == "mode" and entry["mode"] == "interpreter":
+                        entry["language"] = "fr"
+                    elif entry["event"] == "speech" and entry["reply"] == 2:
+                        entry["language"] = "es"
+            first_failures, _ = runner._spanish_interpreter_evidence_failures(
+                scenario, "interpreter-room-one", corrupted_entries, sidecars, []
+            )
+            second_failures, _ = runner._spanish_interpreter_evidence_failures(
+                scenario, "interpreter-room-two", corrupted_entries, sidecars, []
+            )
+            self.assertEqual(first_failures, [])
+            self.assertTrue(
+                any("mode transition 1 did not select interpreter/es" in failure for failure in second_failures),
+                second_failures,
+            )
+            self.assertTrue(
+                any("speech reply 2 used the wrong language" in failure for failure in second_failures),
+                second_failures,
+            )
+
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_worker_creates_private_mode_trace_and_sets_only_worker_opt_in(self, popen):
         popen.return_value = unittest.mock.Mock(poll=lambda: None)
@@ -502,7 +825,9 @@ class DevStackTest(unittest.TestCase):
             kwargs["input"] for args, kwargs in calls
             if args[:2] == ["ssh", "ultraviolet"] and "--room" in kwargs.get("input", "")
         )
-        trace_creation = worker_script.index(': > "$DEV_DIR/voice/evals/voice-modes.jsonl"')
+        trace_creation = worker_script.index(
+            'if [ ! -e "$DEV_DIR/voice/evals/voice-modes.jsonl" ]; then'
+        )
         worker_launch = worker_script.index("voice = subprocess.Popen(")
         self.assertLess(trace_creation, worker_launch)
         self.assertIn('chown nobody:nogroup "$DEV_DIR/voice/evals/voice-modes.jsonl"', worker_script)
@@ -883,6 +1208,8 @@ class DevStackTest(unittest.TestCase):
             root = Path(temporary)
             dev_dir = root / "stage"
             (dev_dir / "mentat").mkdir(parents=True)
+            (dev_dir / "memory").mkdir(mode=0o700)
+            (dev_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
             (dev_dir / "voice").mkdir()
             (dev_dir / "voice/evals").mkdir()
             shutil.copy2(
