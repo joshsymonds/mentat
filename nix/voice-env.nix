@@ -315,8 +315,8 @@ let
     pythonImportsCheck = [ "websockets" ];
   };
 
-  # nixpkgs has 2.41.1; the OpenAI realtime plugin requires >=2.50, so this
-  # pure wheel pins the requested 2.54.0 client and supplies its realtime extra.
+  # livekit-agents requires openai>=2. nixpkgs has 2.41.1; this pure wheel keeps
+  # the 2.54.0 client the agent line was validated against, with its realtime extra.
   openai = wheelPackage {
     pname = "openai";
     wheelName = "openai";
@@ -400,20 +400,6 @@ let
     pythonImportsCheck = [ "livekit.plugins.silero" ];
   };
 
-  # The OpenAI plugin is pure Python; pin its wheel with the agent line so the
-  # realtime transport and its model helpers stay in lockstep.
-  livekit-plugins-openai = wheelPackage {
-    pname = "livekit-plugins-openai";
-    wheelName = "livekit_plugins_openai";
-    version = "1.8.1";
-    hash = "sha256-Ftnhwf6qBq/elnhT89KHCb9RCaVh5KwzgWQfFiKoI+k=";
-    dependencies = [
-      livekit-agents
-      openai
-    ];
-    pythonImportsCheck = [ "livekit.plugins.openai.realtime" ];
-  };
-
   livekit-plugins-turn-detector = wheelPackage {
     pname = "livekit-plugins-turn-detector";
     wheelName = "livekit_plugins_turn_detector";
@@ -463,7 +449,6 @@ assert pythonVersionOk;
 (pkgs.python3.withPackages (_: [
   livekit-agents
   livekit-plugins-silero
-  livekit-plugins-openai
   livekit-plugins-dtln
   livekit-plugins-elevenlabs
   livekit-plugins-turn-detector

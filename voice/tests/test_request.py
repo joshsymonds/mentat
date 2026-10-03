@@ -271,9 +271,25 @@ class RequestTest(unittest.TestCase):
         self.assertEqual(parsed.pronunciations, {"Mentat": "men-tat"})
         self.assertEqual(load_private_context(None), PrivateContext())
         with self.assertRaises(ValueError):
-            parse_private_context('keyterms = ["Mentat"]')
-        with self.assertRaises(ValueError):
             parse_private_context('unknown = "x"')
+
+    def test_private_context_keyterms_fit_scribe_limits(self):
+        parsed = parse_private_context('keyterms = ["Mentat", "Symonds"]\n')
+        self.assertEqual(parsed.keyterms, ("Mentat", "Symonds"))
+        self.assertEqual(parse_private_context("").keyterms, ())
+        too_many = "keyterms = [" + ", ".join(f'"t{index}"' for index in range(51)) + "]"
+        fifty = "keyterms = [" + ", ".join(f'"t{index}"' for index in range(50)) + "]"
+        self.assertEqual(len(parse_private_context(fifty).keyterms), 50)
+        self.assertEqual(parse_private_context('keyterms = ["' + "x" * 20 + '"]').keyterms, ("x" * 20,))
+        for bad in (
+            'keyterms = "Mentat"',
+            "keyterms = [3]",
+            'keyterms = [""]',
+            'keyterms = ["' + "x" * 21 + '"]',
+            too_many,
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_private_context(bad)
 
     def test_private_context_places_parse_strictly(self):
         parsed = parse_private_context(

@@ -173,7 +173,7 @@ in {
 
       environmentFile = lib.mkOption {
         type = lib.types.str;
-        description = "EnvironmentFile supplying LIVEKIT_API_KEY/SECRET and OPENAI_API_KEY; it may also carry the optional MENTAT_PLACES_API_KEY. An agenix-decrypted path, never a store path.";
+        description = "EnvironmentFile supplying LIVEKIT_API_KEY/SECRET and ELEVENLABS_API_KEY, plus the OPENAI_API_KEY the live eval caller uses; it may also carry the optional MENTAT_PLACES_API_KEY. An agenix-decrypted path, never a store path.";
       };
 
       privateContextFile = lib.mkOption {
@@ -181,7 +181,8 @@ in {
         default = null;
         description = ''
           TOML file of what the voice knows about its person — `about`
-          (a paragraph folded into the instructions) and `[pronunciations]`
+          (a paragraph folded into the instructions), `keyterms` (names
+          transcription should expect) and `[pronunciations]`
           (word = spoken guidance for the voice model). The repository is public,
           so this never lives in it:
           an agenix-decrypted path, root-readable, handed to the unit as a

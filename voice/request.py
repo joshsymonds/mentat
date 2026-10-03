@@ -57,6 +57,9 @@ CONSULT_HISTORY_CHARS = 6000
 CONSULT_TURN_CHARS = 1500
 VOICE_CARD_MARKER = "---VOICE-CARD---"
 PRIVATE_CONTEXT_ENV = "MENTAT_VOICE_PRIVATE"
+# Scribe v2 realtime accepts at most 50 keyterms of at most 20 characters each.
+MAX_KEYTERMS = 50
+MAX_KEYTERM_CHARS = 20
 CLOSE_TAIL_S = 1.0
 CLOSE_UNSPOKEN_S = 4.0
 IDLE_S = 30.0
@@ -270,6 +273,7 @@ class PrivateContext:
     """Private deployment context kept outside the public repository."""
 
     about: str = ""
+    keyterms: tuple[str, ...] = ()
     pronunciations: Mapping[str, str] = field(default_factory=dict)
     places: Mapping[str, Place] = field(default_factory=dict)
 
@@ -277,7 +281,7 @@ class PrivateContext:
 def parse_private_context(text: str) -> PrivateContext:
     """Parse the strict private-context TOML document."""
     data = tomllib.loads(text)
-    unknown = set(data) - {"about", "pronunciations", "places"}
+    unknown = set(data) - {"about", "keyterms", "pronunciations", "places"}
     if unknown:
         raise ValueError(f"private context has unknown keys: {sorted(unknown)}")
     about = data.get("about", "")
@@ -290,9 +294,23 @@ def parse_private_context(text: str) -> PrivateContext:
         raise ValueError("private context: pronunciations must map strings to strings")
     return PrivateContext(
         about=about.strip(),
+        keyterms=_parse_keyterms(data.get("keyterms", [])),
         pronunciations=dict(pronunciations),
         places=_parse_places(data.get("places", {})),
     )
+
+
+def _parse_keyterms(raw: Any) -> tuple[str, ...]:
+    if not isinstance(raw, list) or not all(isinstance(term, str) for term in raw):
+        raise ValueError("private context: keyterms must be a list of strings")
+    if len(raw) > MAX_KEYTERMS:
+        raise ValueError(f"private context: at most {MAX_KEYTERMS} keyterms")
+    for term in raw:
+        if not 0 < len(term) <= MAX_KEYTERM_CHARS:
+            raise ValueError(
+                f"private context: keyterm {term!r} must be 1 to {MAX_KEYTERM_CHARS} characters"
+            )
+    return tuple(raw)
 
 
 def _parse_places(raw: Any) -> dict[str, Place]:

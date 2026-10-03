@@ -13,6 +13,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
+def _stt_language_helper(tree):
+    return next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "stt_secondary_languages"
+    )
+
+
 class AgentSourceContractTest(unittest.TestCase):
     def test_front_agent_does_not_assign_livekit_agent_reserved_attributes(self):
         agent_path = Path(__file__).resolve().parents[1] / "agent.py"
@@ -69,7 +76,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(len(reserved), 20)
         self.assertFalse(reserved & assigned, sorted(reserved & assigned))
 
-    def test_agent_uses_openai_transcription_and_elevenlabs_http_stream_adapter(self):
+    def test_agent_uses_scribe_transcription_and_elevenlabs_http_stream_adapter(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
         tree = ast.parse(source)
         entrypoint = next(
@@ -96,14 +103,32 @@ class AgentSourceContractTest(unittest.TestCase):
             and any(isinstance(target, ast.Name) and target.id == "stt" for target in node.targets)
         )
         expected_stt_provider = ast.parse(
-            'openai.STT(model="gpt-live-transcribe", api_key=os.environ["OPENAI_API_KEY"], '
-            'vad=ctx.proc.userdata["vad"], language="en")',
+            'build_stt(os.environ["ELEVENLABS_API_KEY"], ctx.proc.userdata["private"].keyterms)',
             mode="eval",
         ).body
         self.assertEqual(
             ast.dump(stt_provider, include_attributes=False),
             ast.dump(expected_stt_provider, include_attributes=False),
         )
+        build_stt = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "build_stt"
+        )
+        scribe = next(
+            node.value for node in build_stt.body if isinstance(node, ast.Return)
+        )
+        expected_scribe = ast.parse(
+            'elevenlabs.STT(model=STT_MODEL, api_key=api_key, language_code="en", '
+            'server_vad=STT_SERVER_VAD, tag_audio_events=False, keyterms=list(keyterms))',
+            mode="eval",
+        ).body
+        self.assertEqual(
+            ast.dump(scribe, include_attributes=False),
+            ast.dump(expected_scribe, include_attributes=False),
+        )
+        self.assertIn('STT_MODEL = "scribe_v2_realtime"', source)
+        self.assertNotIn("openai", source)
+        self.assertNotIn("OPENAI_API_KEY", source)
         default_voice = next(
             node.value for node in entrypoint.body
             if isinstance(node, ast.Assign)
@@ -266,10 +291,6 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertIn("TurnDone", source)
         self.assertIn("TurnFailure", source)
 
-    def test_request_has_no_keyterms_context(self):
-        source = (Path(__file__).resolve().parents[1] / "request.py").read_text()
-        self.assertNotIn("keyterms", source)
-
     def test_policy_cancellation_helpers_return_no_tokens(self):
         source = (Path(__file__).resolve().parents[1] / "request.py").read_text()
         self.assertNotIn('return "cancel"', source)
@@ -285,7 +306,6 @@ class AgentSourceContractTest(unittest.TestCase):
             "Respeller",
             "PhoneActions",
             "_provider_format",
-            "keyterms",
             "_pending",
         ):
             self.assertNotIn(forbidden, source)
@@ -1665,16 +1685,9 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         self.assertEqual(ast.unparse(vad), "ctx.proc.userdata['vad']")
 
-        stt = next(
-            node.value
-            for node in entrypoint.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == "stt" for target in node.targets)
-        )
-        stt_vad = next(
-            keyword.value for keyword in stt.keywords if keyword.arg == "vad"
-        )
-        self.assertEqual(ast.unparse(stt_vad), "ctx.proc.userdata['vad']")
+        # Scribe's server VAD only segments transcripts, committing just before
+        # Silero's 0.55 s end of speech; the turn detector owns turn ends.
+        self.assertIn('STT_SERVER_VAD = {"vad_silence_threshold_secs": 0.5}', source)
 
         turn_handling = next(
             keyword.value for keyword in session_call.keywords
@@ -1690,6 +1703,18 @@ class AgentSourceContractTest(unittest.TestCase):
             source,
         )
         self.assertNotIn("turn_detector.MultilingualModel", source)
+
+    def test_stt_secondary_languages_keep_english_primary(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        namespace = {}
+        tree = ast.parse(agent_path.read_text())
+        exec(
+            compile(ast.Module(body=[_stt_language_helper(tree)], type_ignores=[]), str(agent_path), "exec"),
+            namespace,
+        )
+        self.assertEqual(namespace["stt_secondary_languages"]("en"), [])
+        self.assertEqual(namespace["stt_secondary_languages"]("es"), ["es"])
+        self.assertEqual(namespace["stt_secondary_languages"]("pt-BR"), ["pt-BR"])
 
     def test_input_audio_recording_is_opt_in_committed_and_keeps_real_stt_frames(self):
         agent_path = Path(__file__).resolve().parents[1] / "agent.py"
@@ -1839,7 +1864,7 @@ class AgentSourceContractTest(unittest.TestCase):
             "write_voice_trace": Mock(),
             "logger": Mock(),
         }
-        exec(compile(ast.Module(body=[apply_mode], type_ignores=[]), str(agent_path), "exec"), namespace)
+        exec(compile(ast.Module(body=[apply_mode, _stt_language_helper(tree)], type_ignores=[]), str(agent_path), "exec"), namespace)
 
         def make_agent(tts=None):
             resolver = Resolver()
@@ -1865,7 +1890,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(agent._voice_language, "es")
         self.assertEqual(agent._voice_id, "library-spanish")
         self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")])
-        self.assertEqual(agent._stt_provider.calls, [{"language": "es"}])
+        self.assertEqual(agent._stt_provider.calls, [{"secondary_languages": ["es"]}])
         self.assertEqual(
             agent._tts_provider.calls,
             [{"voice_id": "library-spanish"}],
@@ -1882,7 +1907,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(agent._voice_language, "en")
         self.assertEqual(agent._voice_id, "default-voice")
         self.assertEqual(agent._voice_resolver.calls, [("es", "default-voice")])
-        self.assertEqual(agent._stt_provider.calls[-1], {"language": "en"})
+        self.assertEqual(agent._stt_provider.calls[-1], {"secondary_languages": []})
         self.assertEqual(
             agent._tts_provider.calls[-1], {"voice_id": "default-voice"}
         )
@@ -1909,7 +1934,10 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertFalse(asyncio.run(namespace["_apply_voice_mode"](failed, spanish)))
         self.assertEqual((failed._voice_mode, failed._voice_language, failed._voice_id),
                          ("normal", "en", "default-voice"))
-        self.assertEqual(failed._stt_provider.calls, [{"language": "es"}, {"language": "en"}])
+        self.assertEqual(
+            failed._stt_provider.calls,
+            [{"secondary_languages": ["es"]}, {"secondary_languages": []}],
+        )
         self.assertEqual(
             failing_tts.calls,
             [
@@ -2008,7 +2036,7 @@ class AgentSourceContractTest(unittest.TestCase):
                 "logger": Mock(),
                 "write_voice_trace": trace_namespace["write_voice_trace"],
             }
-            exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+            exec(compile(ast.Module(body=[*methods, _stt_language_helper(tree)], type_ignores=[]), str(agent_path), "exec"), namespace)
             tts_provider = Provider()
             resolver = Resolver()
 
@@ -2715,7 +2743,7 @@ class AgentSourceContractTest(unittest.TestCase):
             "time": time,
             "write_voice_trace": Mock(),
         }
-        exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+        exec(compile(ast.Module(body=[*methods, _stt_language_helper(tree)], type_ignores=[]), str(agent_path), "exec"), namespace)
         agent = SimpleNamespace(
             _sms_consent=False,
             _voice_card="voice card",
@@ -2772,7 +2800,7 @@ class AgentSourceContractTest(unittest.TestCase):
             ["Switching now.", "Continuando en español."],
         )
         self.assertLess(
-            timeline.index(("update", {"language": "es"})),
+            timeline.index(("update", {"secondary_languages": ["es"]})),
             timeline.index(("speech", "Continuando en español.")),
         )
         self.assertEqual(
@@ -2905,7 +2933,7 @@ class AgentSourceContractTest(unittest.TestCase):
             "write_voice_trace": Mock(),
             "logger": Mock(),
         }
-        exec(compile(ast.Module(body=[apply_mode], type_ignores=[]), str(agent_path), "exec"), namespace)
+        exec(compile(ast.Module(body=[apply_mode, _stt_language_helper(tree)], type_ignores=[]), str(agent_path), "exec"), namespace)
         policy = SimpleNamespace(set_interpreter_mode=Mock())
         agent = SimpleNamespace(
             _voice_mode="normal",
@@ -2923,7 +2951,7 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         interpreter = json.dumps({"voice_mode": {"mode": "interpreter", "language": "es"}})
         self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, interpreter)))
-        self.assertEqual(agent._stt_provider.calls, [{"language": ["en", "es"]}])
+        self.assertEqual(agent._stt_provider.calls, [{"secondary_languages": ["es"]}])
         self.assertEqual(
             agent.session.calls,
             [{"endpointing_opts": {"mode": "fixed", "min_delay": 1.0, "max_delay": 5.0}}],
@@ -2934,7 +2962,7 @@ class AgentSourceContractTest(unittest.TestCase):
 
         restore = json.dumps({"voice_mode": {"mode": "normal", "language": "en"}})
         self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, restore)))
-        self.assertEqual(agent._stt_provider.calls[-1], {"language": "en"})
+        self.assertEqual(agent._stt_provider.calls[-1], {"secondary_languages": []})
         self.assertEqual(
             agent.session.calls[-1],
             {"endpointing_opts": {"mode": "fixed", "min_delay": 0.5, "max_delay": 3.0}},
@@ -2952,7 +2980,10 @@ class AgentSourceContractTest(unittest.TestCase):
         policy_calls = policy.set_interpreter_mode.call_count
         self.assertFalse(asyncio.run(namespace["_apply_voice_mode"](agent, interpreter)))
         self.assertEqual((agent._voice_mode, agent._voice_language), ("normal", "en"))
-        self.assertEqual(agent._stt_provider.calls[-2:], [{"language": ["en", "es"]}, {"language": "en"}])
+        self.assertEqual(
+            agent._stt_provider.calls[-2:],
+            [{"secondary_languages": ["es"]}, {"secondary_languages": []}],
+        )
         self.assertEqual(
             agent.session.calls,
             [
@@ -3029,7 +3060,7 @@ class AgentSourceContractTest(unittest.TestCase):
             "logger": Mock(),
             "write_voice_trace": Mock(),
         }
-        exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
+        exec(compile(ast.Module(body=[*methods, _stt_language_helper(tree)], type_ignores=[]), str(agent_path), "exec"), namespace)
         provider = Provider()
         session = Session(provider)
         agent = SimpleNamespace(

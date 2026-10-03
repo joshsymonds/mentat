@@ -28,7 +28,7 @@ from livekit.agents import (
     tts,
 )
 from livekit.agents.voice import room_io
-from livekit.plugins import dtln, elevenlabs, openai, silero
+from livekit.plugins import dtln, elevenlabs, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from request import (
@@ -58,6 +58,10 @@ HERE = Path(__file__).parent
 PERSONA_PATH = HERE / "persona.md"
 EARCON_PATH = HERE / "assets" / "earcon.wav"
 TTS_VOICE = "21m00Tcm4TlvDq8ikWAM"
+STT_MODEL = "scribe_v2_realtime"
+# Scribe commits a transcript segment after this much silence, just under
+# Silero's 0.55 s; the turn detector, not Scribe, decides when a turn ends.
+STT_SERVER_VAD = {"vad_silence_threshold_secs": 0.5}
 SEND_SMS_TOOL = "mcp__mentat__send_sms"
 SET_VOICE_MODE_TOOL = "mcp__mentat__set_voice_mode"
 
@@ -685,7 +689,6 @@ class FrontAgent(Agent):
         previous_language = self._voice_language
         previous_voice = self._voice_id
         previous_interpreter = previous_mode == "interpreter"
-        stt_language = ["en", language] if mode == "interpreter" else language
         endpointing_opts = {
             "mode": "fixed",
             "min_delay": 1.0 if mode == "interpreter" else 0.5,
@@ -706,7 +709,9 @@ class FrontAgent(Agent):
                 else:
                     selection = "resolved"
             lookup_ms = (time.monotonic() - lookup_started) * 1000
-            self._stt_provider.update_options(language=stt_language)
+            self._stt_provider.update_options(
+                secondary_languages=stt_secondary_languages(language)
+            )
             self._tts_provider.update_options(voice_id=voice_id)
             self.session.update_options(endpointing_opts=endpointing_opts)
         except Exception as error:
@@ -719,7 +724,7 @@ class FrontAgent(Agent):
             for provider, options in (
                 (
                     self._stt_provider,
-                    {"language": ["en", previous_language] if previous_interpreter else previous_language},
+                    {"secondary_languages": stt_secondary_languages(previous_language)},
                 ),
                 (self._tts_provider, {"voice_id": previous_voice}),
                 (self.session, {"endpointing_opts": previous_endpointing_opts}),
@@ -898,6 +903,23 @@ class FrontAgent(Agent):
         )
         self._ending_changed()
 
+def build_stt(api_key: str, keyterms: tuple[str, ...]) -> Any:
+    """ElevenLabs Scribe v2 realtime, English-primary, biased toward private names."""
+    return elevenlabs.STT(
+        model=STT_MODEL,
+        api_key=api_key,
+        language_code="en",
+        server_vad=STT_SERVER_VAD,
+        tag_audio_events=False,
+        keyterms=list(keyterms),
+    )
+
+
+def stt_secondary_languages(language: str) -> list[str]:
+    """Scribe's language is fixed per stream, so other languages ride alongside English."""
+    return [] if language == "en" else [language]
+
+
 def log_turn_metrics(session: AgentSession) -> None:
     """Log the duration reported by the voice session."""
 
@@ -915,8 +937,9 @@ def prewarm(proc: agents.JobProcess) -> None:
     private = load_private_context(os.environ.get(PRIVATE_CONTEXT_ENV))
     proc.userdata["private"] = private
     logger.info(
-        "private context: about=%d words, pronunciations=%d, places=%d",
+        "private context: about=%d words, keyterms=%d, pronunciations=%d, places=%d",
         len(private.about.split()),
+        len(private.keyterms),
         len(private.pronunciations),
         len(private.places),
     )
@@ -924,12 +947,7 @@ def prewarm(proc: agents.JobProcess) -> None:
 
 async def entrypoint(ctx: JobContext) -> None:
     """Serve one room until mentatd or the close policy ends it."""
-    stt = openai.STT(
-        model="gpt-live-transcribe",
-        api_key=os.environ["OPENAI_API_KEY"],
-        vad=ctx.proc.userdata["vad"],
-        language="en",
-    )
+    stt = build_stt(os.environ["ELEVENLABS_API_KEY"], ctx.proc.userdata["private"].keyterms)
     default_voice = os.environ.get("MENTAT_VOICE_TTS_VOICE", TTS_VOICE)
     tts_provider = elevenlabs.TTS(
         model="eleven_v4_turbo",

@@ -21,6 +21,10 @@ test-voice:
 eval-voice RUNS='10' MODEL='chatgpt/sol-fast':
     MENTAT_VOICE_MODEL={{quote(MODEL)}} python3 -m voice.evals.runner eval --live --runs {{quote(RUNS)}}
 
+# Opt-in phrase-garble check of the production STT; needs ELEVENLABS_API_KEY.
+eval-stt RUNS='1':
+    "$(nix build .#voice-env --no-link --print-out-paths)/bin/python3" -m voice.evals.stt_phrases --runs {{quote(RUNS)}}
+
 # Public OAuth front (public/): FastMCP and Uvicorn from the flake environment
 test-public:
     "$(nix build .#public-env --no-link --print-out-paths)/bin/python" -m unittest discover -s public/tests

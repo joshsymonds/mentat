@@ -1155,11 +1155,11 @@ class DevStackTest(unittest.TestCase):
         for module in (
             "livekit.plugins.dtln",
             "livekit.plugins.elevenlabs",
-            "livekit.plugins.openai",
             "livekit.plugins.turn_detector",
             "livekit.plugins.silero",
         ):
             self.assertIn(module, setup_script)
+        self.assertNotIn("livekit.plugins.openai", setup_script)
         self.assertIn('voice_python = sys.argv[4]', setup_script)
         self.assertIn(
             '(dev_dir / "voice-python.path").write_text(f"{voice_python}\\n")',
@@ -1196,8 +1196,8 @@ class DevStackTest(unittest.TestCase):
         self.assertEqual(
             observed,
             ["aiohttp", "livekit.api", "livekit.rtc", "livekit.plugins.dtln",
-             "livekit.plugins.elevenlabs", "livekit.plugins.openai",
-             "livekit.plugins.silero", "livekit.plugins.turn_detector"],
+             "livekit.plugins.elevenlabs", "livekit.plugins.silero",
+             "livekit.plugins.turn_detector"],
         )
 
     def test_setpriv_is_resolved_outside_service_path_for_all_launches(self):

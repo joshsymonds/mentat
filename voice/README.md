@@ -1,7 +1,8 @@
 # Voice surface
 
-The voice worker joins a LiveKit room and runs a single cascade: OpenAI live
-transcription with local Silero turn detection captures each user turn, the
+The voice worker joins a LiveKit room and runs a single cascade: ElevenLabs
+Scribe v2 realtime transcription with local Silero and semantic turn detection
+captures each user turn, the
 worker posts it to mentatd, and ElevenLabs v4 Turbo speaks the daemon's text
 stream verbatim as it arrives, using per-sentence HTTP synthesis. There is no
 local LLM reply or second voice. Interruptions stop speech and close the
@@ -10,7 +11,12 @@ goodbye, while follow-ups keep the room open. RoomIO starts before the LiveKit
 connection so speech around the opening chime is captured, and the worker does
 not greet on connect.
 
-The worker reads `OPENAI_API_KEY` and `ELEVENLABS_API_KEY` from its environment.
+The worker reads `ELEVENLABS_API_KEY` from its environment for both
+transcription and speech. Scribe's own silence detection only splits a turn
+into transcript segments; the local turn detector decides when the turn ends.
+Scribe keeps English as its primary language, and a Spanish or interpreter
+voice mode adds that language alongside it. The live eval caller still uses
+`OPENAI_API_KEY` from the same secrets file to synthesize and check speech.
 `MENTAT_VOICE_TTS_VOICE` selects the ElevenLabs voice ID; when unset, it uses
 Rachel (`21m00Tcm4TlvDq8ikWAM`), an ElevenLabs premade voice.
 
@@ -26,6 +32,8 @@ facts. Deployment supplies a TOML file as `MENTAT_VOICE_PRIVATE`:
 about = """
 Who he is: ...one paragraph, folded into the worker instructions.
 """
+# names transcription should expect; at most 50, each at most 20 characters
+keyterms = ["Symonds"]
 [pronunciations]
 Symonds = "Sigh-monds"
 
@@ -50,7 +58,7 @@ environment in step 2.
 ## Testing branch code in a live room
 
 Audio changes need a real room. For this cascade, the four scripted calls
-below exercise the complete OpenAI transcription → mentatd → ElevenLabs path.
+below exercise the complete Scribe transcription → mentatd → ElevenLabs path.
 Calls A, B, and D
 should use `web_search`; call C still reaches mentatd and should answer without
 searching. Compare each printed latency with the eight-second target.
