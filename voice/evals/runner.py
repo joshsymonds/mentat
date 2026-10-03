@@ -2200,6 +2200,7 @@ def _spanish_interpreter_evidence_failures(
         if not segments:
             failures.append(f"spanish-interpreter: speech reply {reply_order} is missing")
             continue
+        post_mode_spanish_seen = False
         for entry in segments:
             created_at = entry.get("created_at")
             before_interpreter = (
@@ -2210,8 +2211,18 @@ def _spanish_interpreter_evidence_failures(
                 and math.isfinite(created_at)
                 and created_at < interpreter_at
             )
-            segment_language = "en" if before_interpreter else expected_language
+            post_mode_english_meta = (
+                reply_order == 1
+                and not before_interpreter
+                and not post_mode_spanish_seen
+                and entry.get("language") == "en"
+            )
+            segment_language = (
+                "en" if before_interpreter or post_mode_english_meta else expected_language
+            )
             expected_voice = spanish_voice if segment_language == "es" else english_voice
+            if reply_order == 1 and not before_interpreter and entry.get("language") == "es":
+                post_mode_spanish_seen = True
             if entry.get("language") != segment_language:
                 failures.append(
                     f"spanish-interpreter: speech reply {reply_order} used the wrong language"

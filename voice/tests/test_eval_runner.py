@@ -2996,7 +2996,19 @@ class ScenarioObservationTests(unittest.TestCase):
 
         invalid_entries = (
             ([*entries[:2], {**entries[2], "voice_id": "spanish-library"}, *entries[3:]], "wrong voice"),
-            ([*entries[:2], {**entries[2], "created_at": 101.25}, *entries[3:]], "wrong language"),
+            (
+                [
+                    *entries[:5],
+                    {
+                        **entries[3],
+                        "language": "en",
+                        "voice_id": "english-default",
+                        "created_at": 101.75,
+                    },
+                    *entries[5:],
+                ],
+                "wrong language",
+            ),
             ([*entries[:3], *entries[4:]], "no Spanish speech after interpreter mode"),
         )
         for changed_entries, expected in invalid_entries:
@@ -3007,6 +3019,57 @@ class ScenarioObservationTests(unittest.TestCase):
                     changed_entries,
                     list(scenario.caller_lines),
                     [],
+                )
+                self.assertTrue(any(expected in failure for failure in failures), failures)
+
+    def test_spanish_interpreter_allows_tagged_english_meta_after_mode_before_spanish_translation(self):
+        scenario = SimpleNamespace(
+            caller_lines=(
+                "Please interpret for a Spanish-speaking gardener.",
+                "La planta necesita agua.",
+                "The soil is dry.",
+                "Pon un temporizador de cinco minutos.",
+                "Dijo: deja de traducir.",
+                "I'm done interpreting.",
+            ),
+            caller_languages=("en", "es", "en", "es", "es", "en"),
+            reply_languages=("es", "en", "es", "en", "en", "en"),
+            voice_mode_expectations=("es", "en"),
+        )
+        entries = [
+            {"room": "interpreter-room", "event": "mode", "mode": "interpreter", "language": "es", "voice_id": "spanish-library", "created_at": 101.0, "lookup_ms": 24.5, "selection": "resolved"},
+            {"room": "interpreter-room", "event": "mode", "mode": "normal", "language": "en", "voice_id": "english-default", "created_at": 106.0, "lookup_ms": 0.0, "selection": "default"},
+            {"room": "interpreter-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "en", "voice_id": "english-default", "created_at": 100.5},
+            {"room": "interpreter-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "en", "voice_id": "english-default", "created_at": 101.25},
+            {"room": "interpreter-room", "event": "speech", "reply": 1, "turn_id": "turn-1", "language": "es", "voice_id": "spanish-library", "created_at": 101.5},
+            *[
+                {"room": "interpreter-room", "event": "speech", "reply": index, "turn_id": f"turn-{index}", "language": language, "voice_id": voice, "created_at": timestamp}
+                for index, (language, voice, timestamp) in enumerate(
+                    zip(
+                        scenario.reply_languages[1:],
+                        ("english-default", "spanish-library", "english-default", "english-default", "english-default"),
+                        (102.0, 103.0, 104.0, 105.0, 107.0),
+                        strict=True,
+                    ),
+                    2,
+                )
+            ],
+        ]
+
+        failures, _ = runner._spanish_interpreter_evidence_failures(
+            scenario, "interpreter-room", entries, list(scenario.caller_lines), []
+        )
+
+        self.assertEqual(failures, [])
+
+        invalid_entries = (
+            ([*entries[:3], {**entries[3], "voice_id": "spanish-library"}, *entries[4:]], "wrong voice"),
+            ([*entries[:4], *entries[5:]], "no Spanish speech after interpreter mode"),
+        )
+        for changed_entries, expected in invalid_entries:
+            with self.subTest(expected=expected):
+                failures, _ = runner._spanish_interpreter_evidence_failures(
+                    scenario, "interpreter-room", changed_entries, list(scenario.caller_lines), []
                 )
                 self.assertTrue(any(expected in failure for failure in failures), failures)
 
