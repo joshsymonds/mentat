@@ -1022,6 +1022,52 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("call ended after turn 1 with 2 follow-ups remaining", failures)
         self.assertNotIn("capture failed", failures)
 
+    def test_report_preserves_batch_and_per_run_timing_without_changing_scores(self):
+        batch_timing = {
+            "started_at": 1_700_000_000.0,
+            "ended_at": 1_700_000_009.0,
+            "wall_seconds": 9.0,
+            "concurrency_cap": 4,
+        }
+        run_timings = [
+            {
+                "started_at": 1_700_000_003.0,
+                "ended_at": 1_700_000_007.0,
+                "concurrency": 2,
+            },
+            {
+                "started_at": 1_700_000_001.0,
+                "ended_at": 1_700_000_005.0,
+                "concurrency": 4,
+            },
+        ]
+        observation = {
+            "batch_timing": batch_timing,
+            "cases": [{
+                "name": "timed case",
+                "runs": [
+                    {"turns": [turn()], "timing": run_timings[0]},
+                    {"turns": [turn()], "timing": run_timings[1]},
+                ] + [{"turns": [turn()]} for _ in range(8)],
+            }],
+        }
+        expected_scores = score_observations({"cases": observation["cases"]})
+
+        result = score_observations(observation)
+
+        self.assertEqual(result["batch_timing"], batch_timing)
+        self.assertEqual(
+            result["cases"][0]["run_timings"],
+            [
+                {"run": 1, **run_timings[0]},
+                {"run": 2, **run_timings[1]},
+            ],
+        )
+        self.assertEqual(result["passed"], expected_scores["passed"])
+        self.assertEqual(result["failures"], expected_scores["failures"])
+        self.assertEqual(result["cases"][0]["turns"], expected_scores["cases"][0]["turns"])
+        self.assertEqual(result["cases"][0]["gates"], expected_scores["cases"][0]["gates"])
+
 
 if __name__ == "__main__":
     unittest.main()

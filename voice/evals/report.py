@@ -269,6 +269,17 @@ def score_observations(
         turns: list[dict[str, Any]] = []
         capture_failures: list[dict[str, Any]] = []
         line_retry_counts: list[dict[str, int]] = []
+        run_timings = [
+            {
+                "run": run_index + 1,
+                "started_at": run["timing"]["started_at"],
+                "ended_at": run["timing"]["ended_at"],
+                "concurrency": run["timing"]["concurrency"],
+            }
+            for run_index, run in enumerate(runs)
+            if isinstance(run, dict) and isinstance(run.get("timing"), dict)
+            and all(field in run["timing"] for field in ("started_at", "ended_at", "concurrency"))
+        ]
         for run_index, run in enumerate(runs):
             if not isinstance(run, dict) or not isinstance(run.get("turns"), list):
                 case_failures.append(f"{name} run {run_index + 1}: missing turn observations")
@@ -602,10 +613,15 @@ def score_observations(
             ),
             "failures": case_failures,
         }
+        if run_timings:
+            report["run_timings"] = run_timings
         reports.append(report)
         failures.extend(case_failures)
 
-    return {"passed": not failures, "failures": failures, "cases": reports}
+    result = {"passed": not failures, "failures": failures, "cases": reports}
+    if isinstance(observations, dict) and "batch_timing" in observations:
+        result["batch_timing"] = observations["batch_timing"]
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
