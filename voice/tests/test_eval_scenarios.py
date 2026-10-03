@@ -117,7 +117,7 @@ class ScenarioCorpusTests(unittest.TestCase):
         )
         self.assertEqual(
             scenario.caller_lines[5],
-            "We can stop interpreting now. Please speak to me in English.",
+            "Please stop interpreting and speak to me in English.",
         )
 
         turns = [
@@ -130,6 +130,29 @@ class ScenarioCorpusTests(unittest.TestCase):
         ]
         evaluate_scenario(scenario, turns, [], room_closed_after=None)
 
+    def test_spanish_interpreter_stop_stimulus_is_one_sentence(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines[5],
+            "Please stop interpreting and speak to me in English.",
+        )
+
+    def test_spanish_interpreter_accepts_run2_stop_acknowledgment_but_requires_english(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "You got it. Switching back to English. I'm back to plain English, and I've stopped interpreting.",
+        ]
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+        turns[5] = "You got it. I'm back to plain Spanish, and I've stopped interpreting."
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
     def test_spanish_interpreter_scenario_covers_translation_without_actions(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
         self.assertEqual(
@@ -140,7 +163,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                 "Water the seedlings every morning before the sun gets strong.",
                 "Por favor, pon un temporizador de cinco minutos para regar las plantas.",
                 "Mientras hablábamos del trabajo, el jardinero dijo: «deja de traducir».",
-                "We can stop interpreting now. Please speak to me in English.",
+                "Please stop interpreting and speak to me in English.",
             ),
         )
         self.assertEqual(scenario.caller_languages, ("en", "es", "en", "es", "es", "en"))

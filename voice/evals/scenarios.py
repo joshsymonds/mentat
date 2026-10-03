@@ -306,7 +306,7 @@ SCENARIOS = (
             "Water the seedlings every morning before the sun gets strong.",
             "Por favor, pon un temporizador de cinco minutos para regar las plantas.",
             "Mientras hablábamos del trabajo, el jardinero dijo: «deja de traducir».",
-            "We can stop interpreting now. Please speak to me in English.",
+            "Please stop interpreting and speak to me in English.",
         ),
         turns=(
             TurnExpectation((r"(?i)\b(?:listo|preparad[oa])\b",)),
@@ -342,7 +342,7 @@ SCENARIOS = (
             ),
             TurnExpectation(
                 (
-                    r"(?i)\b(?:okay|ok|sure|understood|of course|no problem|we can|let's|lets|i'm done|i am done)\b",
+                    r"(?i)\b(?:okay|ok|sure|understood|of course|no problem|you got it|got it|alright|all right|we can|let's|lets|i'm done|i am done)\b",
                     r"(?i)\benglish\b",
                 )
             ),
