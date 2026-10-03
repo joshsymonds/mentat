@@ -212,12 +212,12 @@ for module in (
         ) from error
 PY
 
-mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records"
+mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records" "$DEV_DIR/memory"
 umask 077
 chown root:root "$DEV_DIR"
 chmod 711 "$DEV_DIR" "$DEV_DIR/home"
-chmod 700 "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records"
-chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat" "$DEV_DIR/records"
+chmod 700 "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records" "$DEV_DIR/memory"
+chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat" "$DEV_DIR/records" "$DEV_DIR/memory"
 chown -R nobody:nogroup "$DEV_DIR/voice" "$DEV_DIR/home/voice"
 
 if systemctl is-active --quiet mentat-voice; then
@@ -316,6 +316,9 @@ setpriv_file = dev_dir / "setpriv.path"
 setpriv_file.write_text(setpriv_path)
 setpriv_file.chmod(0o644)
 source_env = json.loads((dev_dir / "mentat.env.json").read_text())
+memory_dir = dev_dir / "memory"
+if not memory_dir.is_dir():
+    raise RuntimeError("candidate memory directory is unavailable")
 production_listen = source_env.get("MENTAT_LISTEN", "127.0.0.1:8484")
 production_port = int(production_listen.rsplit(":", 1)[1])
 
@@ -332,6 +335,7 @@ env.update({
     "MENTAT_LISTEN": f"127.0.0.1:{dev_port}",
     "MENTAT_STATE_PATH": str(dev_dir / "home/mentat/state.json"),
     "MENTAT_RECORD_DIR": str(dev_dir / "records"),
+    "MENTAT_MEMORY_DIR": str(memory_dir),
     "HOME": str(dev_dir / "home/mentat"),
 })
 log = (dev_dir / "agent.log").open("ab", buffering=0)

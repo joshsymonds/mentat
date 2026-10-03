@@ -247,6 +247,7 @@ class DevStackTest(unittest.TestCase):
             root = Path(temporary)
             dev_dir = root / "stage"
             (dev_dir / "mentat").mkdir(parents=True)
+            (dev_dir / "memory").mkdir(mode=0o700)
             (dev_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
             production_env = root / "production-mentat.env.json"
             original_production = {
@@ -325,6 +326,83 @@ class DevStackTest(unittest.TestCase):
         )
         self.assertEqual(default_setup_args[-1], default_model)
 
+    def test_candidate_memory_store_is_private_and_overrides_production_path(self):
+        setup = _SETUP_SCRIPT.replace(
+            "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
+        ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
+        self.assertIn('"$DEV_DIR/memory"', setup)
+        self.assertIn('chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat" "$DEV_DIR/records" "$DEV_DIR/memory"', setup)
+        self.assertIn('chmod 700 "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records" "$DEV_DIR/memory"', setup)
+        setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
+        setup_body = setup.split(setup_header + "\n", 1)[1].split("\nPY\n", 1)[0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dev_dir = root / "stage"
+            mentat_dir = dev_dir / "mentat"
+            memory_dir = dev_dir / "memory"
+            mentat_dir.mkdir(parents=True)
+            memory_dir.mkdir(mode=0o700)
+            os.chmod(memory_dir, 0o700)
+            (mentat_dir / "prompt.md").write_text("Synthetic candidate prompt")
+            production_path = root / "synthetic-production-memory"
+            production_env = root / "production-mentat.env.json"
+            production_values = {
+                "PATH": "/usr/bin",
+                "CAPTURE_ENV": os.fspath(root / "captured-env.json"),
+                "MENTAT_LISTEN": "127.0.0.1:8484",
+                "MENTAT_SYSTEM_PROMPT": "Synthetic production prompt",
+                "MENTAT_MEMORY_DIR": os.fspath(production_path),
+            }
+            production_bytes = json.dumps(production_values).encode()
+            production_env.write_bytes(production_bytes)
+            staged_env = dev_dir / "mentat.env.json"
+            staged_env.write_bytes(production_bytes)
+            setpriv = root / "setpriv"
+            setpriv.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os\n"
+                "with open(os.environ['CAPTURE_ENV'], 'w') as output:\n"
+                "    json.dump(dict(os.environ), output)\n"
+            )
+            setpriv.chmod(0o755)
+            setup_path = root / "setup.py"
+            setup_path.write_text(setup_body)
+            env = {
+                **os.environ,
+                "PATH": f"{root}:{os.environ['PATH']}",
+                "MENTAT_VOICE_MODEL": "synthetic-model",
+            }
+            command = [
+                sys.executable, os.fspath(setup_path), os.fspath(dev_dir),
+                "8485", "/nix/bin/node", "/nix/bin/python",
+            ]
+            result = subprocess.run(
+                command, env=env, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            capture_path = Path(production_values["CAPTURE_ENV"])
+            for _ in range(100):
+                if capture_path.exists():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(capture_path.is_file(), "candidate daemon did not launch")
+            candidate_env = json.loads(capture_path.read_text())
+            self.assertEqual(candidate_env["MENTAT_MEMORY_DIR"], os.fspath(memory_dir))
+            self.assertNotEqual(candidate_env["MENTAT_MEMORY_DIR"], os.fspath(production_path))
+            self.assertEqual(list(memory_dir.iterdir()), [])
+            self.assertEqual(stat.S_IMODE(memory_dir.stat().st_mode), 0o700)
+            self.assertEqual(production_env.read_bytes(), production_bytes)
+
+            capture_path.unlink()
+            memory_dir.rmdir()
+            result = subprocess.run(
+                command, env=env, capture_output=True, text=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(capture_path.exists(), "missing staged memory launched the daemon")
+            self.assertEqual(production_env.read_bytes(), production_bytes)
+
     def test_candidate_prompt_overrides_production_prompt_and_missing_fails_closed(self):
         calls = []
 
@@ -376,6 +454,7 @@ class DevStackTest(unittest.TestCase):
             dev_dir = root / "stage"
             mentat_dir = dev_dir / "mentat"
             mentat_dir.mkdir(parents=True)
+            (dev_dir / "memory").mkdir(mode=0o700)
             staged_prompt = mentat_dir / "prompt.md"
             staged_prompt.write_bytes(candidate_prompt.encode())
             production_env = root / "production-mentat.env.json"
@@ -1129,6 +1208,7 @@ class DevStackTest(unittest.TestCase):
             root = Path(temporary)
             dev_dir = root / "stage"
             (dev_dir / "mentat").mkdir(parents=True)
+            (dev_dir / "memory").mkdir(mode=0o700)
             (dev_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
             (dev_dir / "voice").mkdir()
             (dev_dir / "voice/evals").mkdir()
