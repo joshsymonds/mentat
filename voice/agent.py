@@ -582,6 +582,7 @@ class FrontAgent(Agent):
         async def queue_speech_text(text: str) -> bool:
             nonlocal speech_queue, speech_handle, speech_completion
             nonlocal embedded_tag_buffer, embedded_tag_boundary
+            nonlocal utterance_mode_refreshed
             while True:
                 if text:
                     if speech_queue is None:
@@ -595,6 +596,7 @@ class FrontAgent(Agent):
                 if await finish_speech():
                     return True
                 reset_utterance()
+                utterance_mode_refreshed = True
                 text = resolve_utterance_text(deferred_tag)
 
         backend_iterator = backend_text.__aiter__()
