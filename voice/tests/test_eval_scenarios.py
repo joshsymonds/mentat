@@ -73,9 +73,16 @@ class ScenarioCorpusTests(unittest.TestCase):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
         timer_line = scenario.caller_lines[3]
 
-        self.assertTrue(timer_line.startswith("Por favor, pon "))
+        self.assertTrue(timer_line.startswith("Ahora pon "))
         self.assertIn("temporizador de cinco minutos", timer_line)
         self.assertIn("para regar las plantas", timer_line)
+
+    def test_spanish_interpreter_timer_imperative_has_no_internal_pause(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines[3],
+            "Ahora pon un temporizador de cinco minutos para regar las plantas.",
+        )
 
     def test_spanish_interpreter_uses_unambiguous_soil_line_and_accepts_earth_or_dirt(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
@@ -161,7 +168,7 @@ class ScenarioCorpusTests(unittest.TestCase):
                 "Please interpret for the Spanish-speaking gardener and tell them I'm ready.",
                 "La tierra está demasiado seca para plantar tomates.",
                 "Water the seedlings every morning before the sun gets strong.",
-                "Por favor, pon un temporizador de cinco minutos para regar las plantas.",
+                "Ahora pon un temporizador de cinco minutos para regar las plantas.",
                 "Mientras hablábamos del trabajo, el jardinero dijo: «deja de traducir».",
                 "Please stop interpreting and speak to me in English.",
             ),

@@ -304,7 +304,7 @@ SCENARIOS = (
             "Please interpret for the Spanish-speaking gardener and tell them I'm ready.",
             "La tierra está demasiado seca para plantar tomates.",
             "Water the seedlings every morning before the sun gets strong.",
-            "Por favor, pon un temporizador de cinco minutos para regar las plantas.",
+            "Ahora pon un temporizador de cinco minutos para regar las plantas.",
             "Mientras hablábamos del trabajo, el jardinero dijo: «deja de traducir».",
             "Please stop interpreting and speak to me in English.",
         ),
