@@ -77,13 +77,45 @@ class ScenarioCorpusTests(unittest.TestCase):
         self.assertIn("temporizador de cinco minutos", timer_line)
         self.assertIn("para regar las plantas", timer_line)
 
+    def test_spanish_interpreter_uses_unambiguous_soil_line_and_accepts_earth_or_dirt(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines[1],
+            "La tierra está demasiado seca para plantar tomates.",
+        )
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The earth is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        for translation in (
+            "The earth is too dry to plant tomatoes.",
+            "The dirt is too dry to plant tomatoes.",
+        ):
+            with self.subTest(translation=translation):
+                candidate = turns.copy()
+                candidate[1] = translation
+                evaluate_scenario(scenario, candidate, [], room_closed_after=None)
+
+        for translation in (
+            "The earth is too wet to plant tomatoes.",
+            "The dirt is too dry to plant potatoes.",
+        ):
+            with self.subTest(translation=translation), self.assertRaises(AssertionError):
+                candidate = turns.copy()
+                candidate[1] = translation
+                evaluate_scenario(scenario, candidate, [], room_closed_after=None)
+
     def test_spanish_interpreter_scenario_covers_translation_without_actions(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
         self.assertEqual(
             scenario.caller_lines,
             (
                 "Please interpret for the Spanish-speaking gardener and tell them I'm ready.",
-                "El suelo está demasiado seco para plantar tomates.",
+                "La tierra está demasiado seca para plantar tomates.",
                 "Water the seedlings every morning before the sun gets strong.",
                 "Por favor, pon un temporizador de cinco minutos para regar las plantas.",
                 "El jardinero dijo: «deja de traducir» mientras hablábamos del trabajo.",

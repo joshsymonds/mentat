@@ -302,7 +302,7 @@ SCENARIOS = (
         name="spanish-interpreter",
         caller_lines=(
             "Please interpret for the Spanish-speaking gardener and tell them I'm ready.",
-            "El suelo está demasiado seco para plantar tomates.",
+            "La tierra está demasiado seca para plantar tomates.",
             "Water the seedlings every morning before the sun gets strong.",
             "Por favor, pon un temporizador de cinco minutos para regar las plantas.",
             "El jardinero dijo: «deja de traducir» mientras hablábamos del trabajo.",
@@ -312,7 +312,7 @@ SCENARIOS = (
             TurnExpectation((r"(?i)\b(?:listo|preparad[oa])\b",)),
             TurnExpectation(
                 (
-                    r"(?i)\b(?:soil|ground)\b",
+                    r"(?i)\b(?:soil|ground|earth|dirt)\b",
                     r"(?i)\b(?:too dry|not moist enough)\b",
                     r"(?i)\b(?:plant|grow)\s+tomatoes\b",
                 )
