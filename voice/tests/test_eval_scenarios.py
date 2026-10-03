@@ -2131,6 +2131,26 @@ class ScenarioCorpusTests(unittest.TestCase):
                 room_closed_after=1,
             )
 
+    def test_live10_counted_timer_is_not_a_compound_duration(self):
+        scenario = next(s for s in SCENARIOS if s.name == "timer-300-seconds")
+        evaluate_scenario(
+            scenario,
+            ["Sure. One five-minute timer coming up. Your five minute timer's running."],
+            [{"turn": 1, "kind": "timer", "seconds": 300}],
+            room_closed_after=1,
+        )
+        for reply in (
+            "Sure. One six-minute timer coming up.",
+            "Your twenty-one minute timer is set.",
+        ):
+            with self.subTest(reply=reply), self.assertRaises(AssertionError):
+                evaluate_scenario(
+                    scenario,
+                    [reply],
+                    [{"turn": 1, "kind": "timer", "seconds": 300}],
+                    room_closed_after=1,
+                )
+
     def test_run16_sms_spoken_oh_recipient_requires_exact_readback_and_one_yes_send(self):
         scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
         readback = (

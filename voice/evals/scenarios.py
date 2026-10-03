@@ -514,10 +514,11 @@ _DURATION_NUMBER_TOKEN_PATTERN = (
     r"(?:\d+|" + "|".join(_NUMBER_WORD_VALUES) + r"|hundred|thousand|million|billion|trillion)"
 )
 _NUMBER_WORD_PATTERN = (
-    r"(?:\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"(?:(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+    r"(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?|"
+    r"\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
     r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
-    r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
-    r"(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?"
+    r"nineteen)"
 )
 _TIMER_FILLER_PATTERN = re.compile(
     r"\b(?:starting that now|sure|okay|alright),?\s+one\s+sec(?:ond)?\b(?=$|[.!?,;])",
