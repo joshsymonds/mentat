@@ -109,6 +109,27 @@ class ScenarioCorpusTests(unittest.TestCase):
                 candidate[1] = translation
                 evaluate_scenario(scenario, candidate, [], room_closed_after=None)
 
+    def test_spanish_interpreter_final_stimuli_are_single_clear_sentences(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        self.assertEqual(
+            scenario.caller_lines[4],
+            "Mientras hablábamos del trabajo, el jardinero dijo: «deja de traducir».",
+        )
+        self.assertEqual(
+            scenario.caller_lines[5],
+            "We can stop interpreting now. Please speak to me in English.",
+        )
+
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "Understood. I'll stop interpreting and speak in English.",
+        ]
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
     def test_spanish_interpreter_scenario_covers_translation_without_actions(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
         self.assertEqual(
@@ -118,8 +139,8 @@ class ScenarioCorpusTests(unittest.TestCase):
                 "La tierra está demasiado seca para plantar tomates.",
                 "Water the seedlings every morning before the sun gets strong.",
                 "Por favor, pon un temporizador de cinco minutos para regar las plantas.",
-                "El jardinero dijo: «deja de traducir» mientras hablábamos del trabajo.",
-                "I'm done interpreting now; please speak to me in English.",
+                "Mientras hablábamos del trabajo, el jardinero dijo: «deja de traducir».",
+                "We can stop interpreting now. Please speak to me in English.",
             ),
         )
         self.assertEqual(scenario.caller_languages, ("en", "es", "en", "es", "es", "en"))

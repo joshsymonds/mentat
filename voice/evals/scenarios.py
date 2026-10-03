@@ -305,8 +305,8 @@ SCENARIOS = (
             "La tierra está demasiado seca para plantar tomates.",
             "Water the seedlings every morning before the sun gets strong.",
             "Por favor, pon un temporizador de cinco minutos para regar las plantas.",
-            "El jardinero dijo: «deja de traducir» mientras hablábamos del trabajo.",
-            "I'm done interpreting now; please speak to me in English.",
+            "Mientras hablábamos del trabajo, el jardinero dijo: «deja de traducir».",
+            "We can stop interpreting now. Please speak to me in English.",
         ),
         turns=(
             TurnExpectation((r"(?i)\b(?:listo|preparad[oa])\b",)),
