@@ -59,9 +59,10 @@ PERSONA_PATH = HERE / "persona.md"
 EARCON_PATH = HERE / "assets" / "earcon.wav"
 TTS_VOICE = "21m00Tcm4TlvDq8ikWAM"
 STT_MODEL = "scribe_v2_realtime"
-# Scribe commits a transcript segment after this much silence, just under
-# Silero's 0.55 s; the turn detector, not Scribe, decides when a turn ends.
-STT_SERVER_VAD = {"vad_silence_threshold_secs": 0.5}
+# Scribe commits a transcript segment after this much silence. The turn
+# detector waits for that final before ending a turn, so a shorter window let
+# it end turns at ordinary mid-sentence pauses (0.6-0.8 s in live evals).
+STT_SERVER_VAD = {"vad_silence_threshold_secs": 1.0}
 SEND_SMS_TOOL = "mcp__mentat__send_sms"
 SET_VOICE_MODE_TOOL = "mcp__mentat__set_voice_mode"
 

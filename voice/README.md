@@ -12,8 +12,9 @@ connection so speech around the opening chime is captured, and the worker does
 not greet on connect.
 
 The worker reads `ELEVENLABS_API_KEY` from its environment for both
-transcription and speech. Scribe's own silence detection only splits a turn
-into transcript segments; the local turn detector decides when the turn ends.
+transcription and speech. Scribe commits a transcript after 1 s of silence;
+the local turn detector decides when the turn ends but waits for that commit,
+so the window must outlast ordinary mid-sentence pauses.
 Scribe keeps English as its primary language, and a Spanish or interpreter
 voice mode adds that language alongside it. The live eval caller still uses
 `OPENAI_API_KEY` from the same secrets file to synthesize and check speech.

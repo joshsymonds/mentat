@@ -1685,9 +1685,9 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         self.assertEqual(ast.unparse(vad), "ctx.proc.userdata['vad']")
 
-        # Scribe's server VAD only segments transcripts, committing just before
-        # Silero's 0.55 s end of speech; the turn detector owns turn ends.
-        self.assertIn('STT_SERVER_VAD = {"vad_silence_threshold_secs": 0.5}', source)
+        # Scribe's server VAD only segments transcripts; the turn detector owns
+        # turn ends but waits for Scribe's final, so the window spans pauses.
+        self.assertIn('STT_SERVER_VAD = {"vad_silence_threshold_secs": 1.0}', source)
 
         turn_handling = next(
             keyword.value for keyword in session_call.keywords
