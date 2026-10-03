@@ -160,6 +160,38 @@ class ScenarioCorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
             evaluate_scenario(scenario, turns, [], room_closed_after=None)
 
+    def test_spanish_interpreter_accepts_explicit_stop_acknowledgment(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "I've stopped interpreting. So, we're back in plain English.",
+        ]
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+        turns[5] = "You got it. Switching back to English."
+        evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+    def test_spanish_interpreter_requires_stop_acknowledgment_and_english(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        turns = [
+            "Claro, interpretaré para el jardinero en español. Estoy listo.",
+            "The soil is too dry to plant tomatoes.",
+            "Riega las plántulas cada mañana antes de que el sol sea fuerte.",
+            "Set a timer for five minutes to water the plants.",
+            'The gardener said, “stop translating” while we were discussing the work.',
+            "The garden looks lovely in English.",
+        ]
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
+        turns[5] = "He dejado de interpretar. Volvemos al español."
+        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
+            evaluate_scenario(scenario, turns, [], room_closed_after=None)
+
     def test_spanish_interpreter_scenario_covers_translation_without_actions(self):
         scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
         self.assertEqual(

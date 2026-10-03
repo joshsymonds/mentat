@@ -342,7 +342,7 @@ SCENARIOS = (
             ),
             TurnExpectation(
                 (
-                    r"(?i)\b(?:okay|ok|sure|understood|of course|no problem|you got it|got it|alright|all right|we can|let's|lets|i'm done|i am done)\b",
+                    r"(?i)\b(?:okay|ok|sure|understood|of course|no problem|you got it|got it|alright|all right|we can|let's|lets|i'm done|i am done)\b|\b(?:stopped interpreting|turned off interpreting|done interpreting|back (?:in|to) (?:plain )?english|switch(?:ed|ing)? back to english|return(?:ed|ing)? to english)\b",
                     r"(?i)\benglish\b",
                 )
             ),
