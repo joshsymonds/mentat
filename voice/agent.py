@@ -63,6 +63,11 @@ STT_MODEL = "scribe_v2_realtime"
 # detector waits for that final before ending a turn, so a shorter window let
 # it end turns at ordinary mid-sentence pauses (0.6-0.8 s in live evals).
 STT_SERVER_VAD = {"vad_silence_threshold_secs": 1.0}
+# Scribe can stop answering mid-utterance without closing its socket; the turn
+# then never ends. Past this long after speech with no final transcript, the
+# worker reconnects the transcriber and asks Josh to repeat himself.
+STT_STALL_TIMEOUT = 4.0
+STT_STALL_REPLY = "Sorry, I missed that. Could you say it again?"
 SEND_SMS_TOOL = "mcp__mentat__send_sms"
 SET_VOICE_MODE_TOOL = "mcp__mentat__set_voice_mode"
 
@@ -358,6 +363,24 @@ class FrontAgent(Agent):
                 yield frame
 
         return super().stt_node(recorded_audio(), model_settings)
+
+    def recover_stalled_stt(self, speech_duration: float) -> None:
+        """Reconnect a transcriber that heard speech but never committed it, and ask again."""
+        if self._closed:
+            return
+        logger.warning(
+            "no transcript for %.1f s of speech; reconnecting STT", speech_duration
+        )
+        try:
+            # Re-applying the current language reconnects Scribe's stream.
+            self._stt_provider.update_options(
+                secondary_languages=stt_secondary_languages(self._voice_language)
+            )
+        except Exception:
+            logger.exception("STT reconnect after a stall failed")
+        if self._voice_mode == "interpreter":
+            self._tts_provider.update_options(voice_id=self._default_voice)
+        self.session.say(STT_STALL_REPLY, allow_interruptions=True)
 
     async def on_user_turn_completed(self, chat_ctx: Any, new_message: Any) -> None:
         """Start backend work immediately, merging only a short continuation."""
@@ -964,6 +987,7 @@ async def entrypoint(ctx: JobContext) -> None:
             "turn_detection": MultilingualModel(),
             "endpointing": {"min_delay": 0.5, "max_delay": 3.0},
         },
+        transcription_timeout=STT_STALL_TIMEOUT,
     )
     voice_room_io = room_io.RoomIO(
         agent_session=session,
@@ -1095,6 +1119,11 @@ async def entrypoint(ctx: JobContext) -> None:
         default_voice=default_voice,
         voice_resolver=voice_resolver,
     )
+
+    @session.on("user_transcription_timeout")
+    def _on_transcription_timeout(event: Any) -> None:
+        if agent is not None:
+            agent.recover_stalled_stt(event.speech_duration)
 
     @session.on("user_state_changed")
     def _on_user_state(event: Any) -> None:

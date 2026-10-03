@@ -1704,6 +1704,79 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         self.assertNotIn("turn_detector.MultilingualModel", source)
 
+    def test_session_recovers_a_stalled_transcriber(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        source = agent_path.read_text()
+        tree = ast.parse(source)
+        entrypoint = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "entrypoint"
+        )
+        session_call = next(
+            node for node in ast.walk(entrypoint)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "AgentSession"
+        )
+        timeout = next(
+            keyword.value for keyword in session_call.keywords
+            if keyword.arg == "transcription_timeout"
+        )
+        self.assertEqual(ast.unparse(timeout), "STT_STALL_TIMEOUT")
+        self.assertIn("STT_STALL_TIMEOUT = 4.0", source)
+        entrypoint_source = ast.get_source_segment(source, entrypoint)
+        self.assertIn('@session.on("user_transcription_timeout")', entrypoint_source)
+        self.assertIn("agent.recover_stalled_stt(event.speech_duration)", entrypoint_source)
+
+        front_agent = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        recover = next(
+            node for node in front_agent.body
+            if isinstance(node, ast.FunctionDef) and node.name == "recover_stalled_stt"
+        )
+        namespace = {"logger": Mock(), "STT_STALL_REPLY": "Say it again?"}
+        exec(
+            compile(ast.Module(body=[recover, _stt_language_helper(tree)], type_ignores=[]), str(agent_path), "exec"),
+            namespace,
+        )
+
+        def make_agent(mode, language, *, closed=False, stt_fails=False):
+            stt = Mock()
+            if stt_fails:
+                stt.update_options.side_effect = RuntimeError("reconnect failed")
+            return SimpleNamespace(
+                _closed=closed,
+                _voice_mode=mode,
+                _voice_language=language,
+                _default_voice="default-voice",
+                _stt_provider=stt,
+                _tts_provider=Mock(),
+                session=SimpleNamespace(say=Mock()),
+            )
+
+        spanish = make_agent("conversation", "es")
+        namespace["recover_stalled_stt"](spanish, 2.5)
+        spanish._stt_provider.update_options.assert_called_once_with(secondary_languages=["es"])
+        spanish._tts_provider.update_options.assert_not_called()
+        spanish.session.say.assert_called_once_with("Say it again?", allow_interruptions=True)
+
+        interpreter = make_agent("interpreter", "es")
+        namespace["recover_stalled_stt"](interpreter, 2.5)
+        interpreter._tts_provider.update_options.assert_called_once_with(voice_id="default-voice")
+        interpreter.session.say.assert_called_once()
+
+        english = make_agent("normal", "en", stt_fails=True)
+        namespace["recover_stalled_stt"](english, 1.0)
+        english._stt_provider.update_options.assert_called_once_with(secondary_languages=[])
+        english.session.say.assert_called_once()
+
+        closed = make_agent("normal", "en", closed=True)
+        namespace["recover_stalled_stt"](closed, 1.0)
+        closed._stt_provider.update_options.assert_not_called()
+        closed.session.say.assert_not_called()
+
     def test_stt_secondary_languages_keep_english_primary(self):
         agent_path = Path(__file__).resolve().parents[1] / "agent.py"
         namespace = {}
