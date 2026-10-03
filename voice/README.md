@@ -240,13 +240,27 @@ transcript sidecars. The eval transfers only those files into a private local
 retained-evidence directory (mode 0700, files mode 0600); they are not written
 to the repository. Production workers do not receive the recording setting.
 
-Before starting, account for remote service access and API usage costs. Run the
-default ten observations per scenario, or pass a positive run count explicitly:
+Before starting, account for remote service access and API usage costs. The recipe
+runs the default ten observations per scenario; preserve the positional `RUNS`
+and `MODEL` arguments, then optionally pass a positive concurrency cap as the
+third positional argument. Without it, the runner's named default cap applies.
 
 ```sh
 just eval-voice
 just eval-voice 2
+just eval-voice 2 chatgpt/sol-fast 4
 ```
+
+One candidate build and staging are shared by the batch. Each run gets its own
+candidate daemon, fake phone, worker, ports, state, and logs; runs execute in
+parallel up to the cap, with remaining runs queued. The JSON report records each
+run's start and end times and peak concurrent-run count, plus total batch wall
+time, so concurrency is visible alongside latency results.
+
+On normal exit, errors, or SIGINT/SIGTERM, the runner stops launching work,
+finishes stopping all candidate processes, then restores production
+`mentat-voice`. A later setup reaps leftovers only when their recorded batch
+owner is positively dead; uncertain ownership is left untouched.
 
 To inspect the contracted scenarios without starting services, run:
 

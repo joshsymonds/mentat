@@ -34,12 +34,16 @@ class EvalRecipeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("voice.evals.runner eval", self.output(result))
 
-    def test_eval_recipe_defaults_to_ten_and_accepts_run_count(self):
+    def test_eval_recipe_forwards_optional_concurrency_without_changing_old_arguments(self):
         default = self.dry_run("eval-voice")
         configured = self.dry_run("eval-voice", "2")
+        capped = self.dry_run("eval-voice", "2", "claude-opus-5-5", "4")
+        quoted = self.dry_run(
+            "eval-voice", "2", "chatgpt/sol-fast", "$(touch /tmp/not-run)"
+        )
 
-        self.assertEqual(default.returncode, 0, default.stderr)
-        self.assertEqual(configured.returncode, 0, configured.stderr)
+        for result in (default, configured, capped, quoted):
+            self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "python3 -m voice.evals.runner eval --live --runs '10'",
             self.output(default),
@@ -48,6 +52,14 @@ class EvalRecipeTests(unittest.TestCase):
             "python3 -m voice.evals.runner eval --live --runs '2'",
             self.output(configured),
         )
+        self.assertNotIn("--concurrency", self.output(default))
+        self.assertNotIn("--concurrency", self.output(configured))
+        self.assertIn(
+            "python3 -m voice.evals.runner eval --live --runs '2' --concurrency '4'",
+            self.output(capped),
+        )
+        self.assertIn("'$(touch /tmp/not-run)'", self.output(quoted))
+        self.assertIn("--concurrency", self.output(quoted))
 
     def test_eval_recipe_exports_supported_model_for_each_command_arm(self):
         default = self.dry_run("eval-voice")
@@ -90,6 +102,17 @@ class EvalRecipeTests(unittest.TestCase):
         for required in (
             "just eval-voice",
             "just eval-voice 2",
+            "just eval-voice 2 chatgpt/sol-fast 4",
+            "third positional argument",
+            "runner's named default cap",
+            "One candidate build and staging",
+            "Each run gets its own",
+            "candidate daemon, fake phone, worker, ports, state, and logs",
+            "peak concurrent-run count",
+            "total batch wall",
+            "SIGINT/SIGTERM",
+            "recorded batch",
+            "positively dead",
             "python3 -m voice.evals.runner eval --list",
             "fake phone",
             "normal, error, and signal exits",

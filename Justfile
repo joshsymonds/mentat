@@ -18,8 +18,8 @@ test-voice:
     python3 -m unittest discover -s voice/tests
 
 # Opt-in live voice evaluation; RUNS defaults to 10 observations per scenario.
-eval-voice RUNS='10' MODEL='chatgpt/sol-fast':
-    MENTAT_VOICE_MODEL={{quote(MODEL)}} python3 -m voice.evals.runner eval --live --runs {{quote(RUNS)}}
+eval-voice RUNS='10' MODEL='chatgpt/sol-fast' CONCURRENCY='':
+    MENTAT_VOICE_MODEL={{quote(MODEL)}} python3 -m voice.evals.runner eval --live --runs {{quote(RUNS)}}{{ if CONCURRENCY == "" { "" } else { " --concurrency " + quote(CONCURRENCY) } }}
 
 # Opt-in phrase-garble check of the production STT; needs ELEVENLABS_API_KEY.
 eval-stt RUNS='1':
