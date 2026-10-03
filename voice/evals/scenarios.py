@@ -452,6 +452,10 @@ def _sms_body_tokens(body: str) -> tuple[str, ...]:
     normalized = re.sub(r"\bi'll\b", "i will", body, flags=re.IGNORECASE)
     normalized = re.sub(r"\bsix\b", "6", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\bseven\b", "7", normalized, flags=re.IGNORECASE)
+    # Scribe writes a spoken hour as a clock time ("six" -> "6:00"), and the say-back
+    # follows it ("six o'clock"); both still name exactly the dictated hour.
+    normalized = re.sub(r"\b(\d{1,2}):00\b", r"\1", normalized)
+    normalized = re.sub(r"\b(\d{1,2})\s+o['’]?\s?clock\b", r"\1", normalized, flags=re.IGNORECASE)
     return tuple(re.findall(r"[a-z0-9]+", normalized.lower()))
 
 

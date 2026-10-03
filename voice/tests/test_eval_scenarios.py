@@ -1835,6 +1835,40 @@ class ScenarioCorpusTests(unittest.TestCase):
                     room_closed_after=1,
                 )
 
+    def test_scribe_clock_formatting_names_the_dictated_hour_only(self):
+        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
+        evaluate_scenario(
+            scenario,
+            [
+                "Just to confirm, you want me to text plus 1202. 5 5 5 0142 saying. "
+                "I will be there at six o'clock. Should I send it? Yes or no?",
+                "OK. Sending it now. Sent.",
+            ],
+            [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at 6:00."}],
+            room_closed_after=2,
+        )
+        for body in ("I will be there at 7:00.", "I will be there at 6:30.", "I will be there at 16:00."):
+            with self.subTest(body=body), self.assertRaisesRegex(AssertionError, "expected body="):
+                evaluate_scenario(
+                    scenario,
+                    [
+                        "I can text +1-202-555-0142: I will be there at six. Should I send it?",
+                        "Sent.",
+                    ],
+                    [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": body}],
+                    room_closed_after=2,
+                )
+        with self.assertRaisesRegex(AssertionError, "said back"):
+            evaluate_scenario(
+                scenario,
+                [
+                    "I can text +1-202-555-0142: I will be there at seven o'clock. Should I send it?",
+                    "Sent.",
+                ],
+                [{"turn": 2, "kind": "sms", "to": "+1-202-555-0142", "body": "I will be there at six."}],
+                room_closed_after=2,
+            )
+
     def test_run15_verbatim_sms_readbacks_accept_body_recipient_and_confirmation(self):
         simple_scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
         correction_scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
