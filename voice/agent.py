@@ -500,6 +500,8 @@ class FrontAgent(Agent):
                 return ""
             if utterance_prefix == "[" and not final:
                 return ""
+            utterance_voice = self._default_voice
+            utterance_language = "en"
             utterance_tag_resolved = True
             text = utterance_prefix
             utterance_prefix = ""
