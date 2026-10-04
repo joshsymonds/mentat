@@ -12,6 +12,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+from datetime import datetime, timezone
 import time
 import urllib.request
 from pathlib import Path
@@ -60,6 +61,27 @@ class _SSHTransport:
         self._control_path: str | None = None
         self._connected = False
         self._forwardings: set[str] = set()
+        self.events: list[dict[str, object]] = []
+
+    def _record_event(
+        self,
+        operation: str,
+        *,
+        exit_code: int | None,
+        stderr: str | bytes | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        event: dict[str, object] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "operation": operation,
+            "exit_code": exit_code,
+        }
+        diagnostic = _redact_diagnostics(stderr)
+        if diagnostic:
+            event["stderr"] = diagnostic
+        if error is not None and exit_code is None:
+            event["error_type"] = type(error).__name__
+        self.events.append(event)
 
     def connect(self) -> None:
         if self._connected:
@@ -78,9 +100,16 @@ class _SSHTransport:
                     text=True,
                     timeout=_CLEANUP_TIMEOUT_SECONDS,
                 )
-        except BaseException:
+        except BaseException as error:
+            self._record_event(
+                "ssh_master_start",
+                exit_code=error.returncode if isinstance(error, subprocess.CalledProcessError) else None,
+                stderr=error.stderr if isinstance(error, subprocess.CalledProcessError) else None,
+                error=error,
+            )
             shutil.rmtree(directory, ignore_errors=True)
             raise
+        self._record_event("ssh_master_start", exit_code=0)
         self._directory = directory
         self._control_path = control_path
         self._connected = True
@@ -109,17 +138,42 @@ class _SSHTransport:
         run_options["timeout"] = (
             _CLEANUP_TIMEOUT_SECONDS if timeout is None else timeout
         )
-        result = self._run(
-            ["ssh", "-S", self._control_path, *options, self.remote],
-            **run_options,
+        operation = (
+            "ssh_master_check"
+            if options[:2] == ("-O", "check")
+            else "ssh_master_control"
         )
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                result.args,
-                output=result.stdout,
-                stderr=result.stderr,
+        try:
+            result = self._run(
+                ["ssh", "-S", self._control_path, *options, self.remote],
+                **run_options,
             )
+            if result.returncode != 0:
+                error = subprocess.CalledProcessError(
+                    result.returncode,
+                    result.args,
+                    output=result.stdout,
+                    stderr=result.stderr,
+                )
+                if operation == "ssh_master_check":
+                    self._record_event(operation, exit_code=result.returncode, stderr=result.stderr)
+                raise error
+        except BaseException as error:
+            if operation == "ssh_master_check" and not (
+                isinstance(error, subprocess.CalledProcessError)
+                and error.returncode != 0
+                and self.events
+                and self.events[-1].get("operation") == operation
+            ):
+                self._record_event(
+                    operation,
+                    exit_code=error.returncode if isinstance(error, subprocess.CalledProcessError) else None,
+                    stderr=error.stderr if isinstance(error, subprocess.CalledProcessError) else None,
+                    error=error,
+                )
+            raise
+        if operation == "ssh_master_check":
+            self._record_event(operation, exit_code=result.returncode, stderr=result.stderr)
         return result
 
     def check(self) -> None:
@@ -150,17 +204,35 @@ class _SSHTransport:
             }
             if timeout is not None:
                 run_options["timeout"] = timeout
-            result = self._run(
-                ["ssh", "-S", control_path, "-O", "exit", self.remote],
-                **run_options,
-            )
-            if result.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    result.returncode,
-                    result.args,
-                    output=result.stdout,
-                    stderr=result.stderr,
+            try:
+                result = self._run(
+                    ["ssh", "-S", control_path, "-O", "exit", self.remote],
+                    **run_options,
                 )
+                if result.returncode != 0:
+                    error = subprocess.CalledProcessError(
+                        result.returncode,
+                        result.args,
+                        output=result.stdout,
+                        stderr=result.stderr,
+                    )
+                    self._record_event("ssh_master_close", exit_code=result.returncode, stderr=result.stderr)
+                    raise error
+            except BaseException as error:
+                if not (
+                    isinstance(error, subprocess.CalledProcessError)
+                    and error.returncode != 0
+                    and self.events
+                    and self.events[-1].get("operation") == "ssh_master_close"
+                ):
+                    self._record_event(
+                        "ssh_master_close",
+                        exit_code=error.returncode if isinstance(error, subprocess.CalledProcessError) else None,
+                        stderr=error.stderr if isinstance(error, subprocess.CalledProcessError) else None,
+                        error=error,
+                    )
+                raise
+            self._record_event("ssh_master_close", exit_code=result.returncode, stderr=result.stderr)
         self._directory = None
         self._control_path = None
         self._connected = False
@@ -169,10 +241,22 @@ class _SSHTransport:
 
 
 class RemoteCommandError(subprocess.CalledProcessError):
-    """A remote command failure whose diagnostic includes scrubbed stderr."""
+    """A remote command failure whose diagnostic includes its operation and stderr."""
+
+    def __init__(
+        self,
+        returncode: int,
+        cmd: object,
+        *,
+        output: str | bytes | None = None,
+        stderr: str | bytes | None = None,
+        operation: str = "remote script",
+    ) -> None:
+        super().__init__(returncode, cmd, output=output, stderr=stderr)
+        self.operation = operation
 
     def __str__(self) -> str:
-        message = super().__str__()
+        message = f"Remote operation {self.operation!r}: {super().__str__()}"
         stderr = self.stderr.strip() if isinstance(self.stderr, str) else ""
         return f"{message}: {stderr}" if stderr else message
 
@@ -943,7 +1027,54 @@ class _RunStack:
         self._cleanup_lock = threading.Lock()
         self._cleanup_complete = False
         self._cleanup_error: BaseException | None = None
+        self._call_events: list[dict[str, object]] = []
+        self._diagnostics_lock = threading.Lock()
+        self._diagnostics_finalized = False
         self.retained_evidence_dir: Path | None = None
+
+    def _record_call(
+        self,
+        operation: str,
+        *,
+        exit_code: int | None,
+        stderr: str | bytes | None = None,
+        error: BaseException | None = None,
+        secrets: Sequence[str] = (),
+    ) -> None:
+        event: dict[str, object] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "operation": operation,
+            "exit_code": exit_code,
+        }
+        diagnostic = _redact_diagnostics(stderr, secrets)
+        if diagnostic:
+            event["stderr"] = diagnostic
+        if error is not None and exit_code is None:
+            event["error_type"] = type(error).__name__
+        with self._diagnostics_lock:
+            self._call_events.append(event)
+            finalized = self._diagnostics_finalized
+        if finalized:
+            try:
+                self._write_transport_diagnostics()
+            except OSError as write_error:
+                if error is None:
+                    raise
+                error.add_note(f"Transport diagnostics write also failed: {write_error}")
+
+    def _write_transport_diagnostics(self) -> None:
+        with self._diagnostics_lock:
+            evidence_dir = self.retained_evidence_dir
+            if evidence_dir is None or not evidence_dir.is_dir():
+                return
+            self._diagnostics_finalized = True
+            events = sorted(
+                (*self._transport.events, *self._call_events),
+                key=lambda event: str(event["timestamp"]),
+            )
+            destination = evidence_dir / "transport-diagnostics.json"
+            destination.write_text(json.dumps({"schema_version": 1, "events": events}, indent=2) + "\n")
+            os.chmod(destination, 0o600)
 
     @property
     def url(self) -> str:
@@ -987,14 +1118,36 @@ class _RunStack:
         if not command or any(not isinstance(arg, str) or "\x00" in arg for arg in command):
             raise ValueError("remote command must contain non-empty safe arguments")
         script = f"cd {shlex.quote(self._remote_dir or '')}\nexec {shlex.join(command)}\n"
-        return self._run(
-            self._transport.ssh_command("bash", "-s"),
-            input=script,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=_REMOTE_CALL_TIMEOUT_SECONDS,
-        )
+        try:
+            result = self._run(
+                self._transport.ssh_command("bash", "-s"),
+                input=script,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=_REMOTE_CALL_TIMEOUT_SECONDS,
+            )
+        except subprocess.CalledProcessError as error:
+            stderr = _redact_diagnostics(error.stderr)
+            output = _redact_diagnostics(error.output)
+            self._record_call(
+                "run_remote",
+                exit_code=error.returncode,
+                stderr=stderr,
+                error=error,
+            )
+            raise RemoteCommandError(
+                error.returncode,
+                error.cmd,
+                output=output,
+                stderr=stderr,
+                operation="run_remote",
+            ) from error
+        except BaseException as error:
+            self._record_call("run_remote", exit_code=None, error=error)
+            raise
+        self._record_call("run_remote", exit_code=result.returncode, stderr=result.stderr)
+        return result
 
     def run_voice(
         self, command: Sequence[str], *, token: str, livekit_url: str
@@ -1028,6 +1181,7 @@ class _RunStack:
                 script,
                 redact=(token,),
                 timeout=_REMOTE_CALL_TIMEOUT_SECONDS,
+                operation="run_voice",
             )
         except BaseException as error:
             try:
@@ -1050,6 +1204,7 @@ class _RunStack:
             _STOP_RUN_SCRIPT,
             self._remote_dir,
             timeout=_CLEANUP_TIMEOUT_SECONDS,
+            operation="stop_candidate_producers",
         )
         self._producers_stopped = True
 
@@ -1065,6 +1220,7 @@ class _RunStack:
             str(self.dev_port),
             str(self.health_port),
             room,
+            operation="start_worker",
         )
 
     def _start(self) -> None:
@@ -1084,6 +1240,7 @@ class _RunStack:
             str(self.dev_port),
             str(self.health_port),
             os.environ.get("MENTAT_VOICE_MODEL", "chatgpt/sol-fast"),
+            operation="candidate_setup",
         )
         self._restore_guard_armed = True
         self._forward_spec = f"127.0.0.1:{self._local_port}:127.0.0.1:{self.dev_port}"
@@ -1121,6 +1278,7 @@ class _RunStack:
         *args: str,
         redact: Sequence[str] = (),
         timeout: float | None = None,
+        operation: str = "remote script",
     ) -> subprocess.CompletedProcess[str]:
         try:
             options: dict[str, object] = {
@@ -1132,44 +1290,75 @@ class _RunStack:
             options["timeout"] = (
                 _CLEANUP_TIMEOUT_SECONDS if timeout is None else timeout
             )
-            return self._run(
+            result = self._run(
                 self._transport.ssh_command("sudo", "bash", "-s", "--", *args),
                 **options,
             )
         except subprocess.CalledProcessError as error:
+            output = _redact_diagnostics(error.output, redact)
+            stderr = _redact_diagnostics(error.stderr, redact)
+            self._record_call(
+                operation,
+                exit_code=error.returncode,
+                stderr=stderr,
+                error=error,
+                secrets=redact,
+            )
             raise RemoteCommandError(
                 error.returncode,
                 error.cmd,
-                output=_redact_diagnostics(error.output, redact),
-                stderr=_redact_diagnostics(error.stderr, redact),
+                output=output,
+                stderr=stderr,
+                operation=operation,
             ) from error
+        except BaseException as error:
+            self._record_call(operation, exit_code=None, error=error, secrets=redact)
+            raise
+        self._record_call(
+            operation,
+            exit_code=result.returncode,
+            stderr=result.stderr,
+            secrets=redact,
+        )
+        return result
 
     def _retain_evidence(self) -> None:
-        if self._remote_dir is None or not self._restore_guard_armed:
+        if self._remote_dir is None:
             return
         evidence_dir = Path(tempfile.mkdtemp(prefix="mentat-voice-eval-"))
         os.chmod(evidence_dir, 0o700)
         self.retained_evidence_dir = evidence_dir
+        if not self._restore_guard_armed:
+            return
         self._remote(
             _RETAIN_EVIDENCE_SCRIPT,
             self._remote_dir,
             timeout=_CLEANUP_TIMEOUT_SECONDS,
+            operation="retain_remote_evidence",
         )
         archive = evidence_dir / "retained-evidence.tar.gz"
-        self._run(
-            self._transport.scp_command(
-                "-p",
-                f"{self.remote}:{self._remote_dir}/retained-evidence.tar.gz",
-                str(archive),
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=_CLEANUP_TIMEOUT_SECONDS,
-        )
+        try:
+            result = self._run(
+                self._transport.scp_command(
+                    "-p",
+                    f"{self.remote}:{self._remote_dir}/retained-evidence.tar.gz",
+                    str(archive),
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except BaseException as error:
+            self._record_call(
+                "download_retained_evidence",
+                exit_code=error.returncode if isinstance(error, subprocess.CalledProcessError) else None,
+                stderr=error.stderr if isinstance(error, subprocess.CalledProcessError) else None,
+                error=error,
+            )
+            raise
+        self._record_call("download_retained_evidence", exit_code=result.returncode, stderr=result.stderr)
         if not archive.is_file():
-            evidence_dir.rmdir()
-            self.retained_evidence_dir = None
             return
         try:
             import tarfile
@@ -1304,6 +1493,10 @@ class _RunStack:
             remember(error, "SSH transport shutdown also failed: ")
         else:
             self._forward_spec = None
+        try:
+            self._write_transport_diagnostics()
+        except BaseException as error:
+            remember(error, "Transport diagnostics write also failed: ")
         if cleanup_error is not None:
             raise cleanup_error
 
@@ -1386,6 +1579,7 @@ class DevStack:
                     _REFRESH_RESTORE_GUARD_SCRIPT,
                     remote_dir,
                     timeout=_RESTORE_GUARD_REFRESH_TIMEOUT_SECONDS,
+                    operation="refresh_restore_guard",
                 )
             except (RemoteCommandError, OSError, subprocess.TimeoutExpired):
                 continue
@@ -1461,6 +1655,7 @@ class DevStack:
                 path,
                 str(owner["host"]),
                 str(owner["pid"]),
+                operation="reap_dead_batch",
             )
 
     def _begin_launch(self) -> None:
@@ -1550,6 +1745,7 @@ class DevStack:
             self._remote_dir,
             socket.gethostname(),
             str(os.getpid()),
+            operation="batch_setup",
         )
 
     def _prepare_run(self, run_id: str) -> tuple[str, int, int]:
@@ -1558,7 +1754,11 @@ class DevStack:
         run_dir = f"{self._remote_dir}/runs/{run_id}"
         with self._lock:
             for _ in range(10):
-                ports = self._remote(_REMOTE_PORT_PROBE_SCRIPT, self._remote_dir)
+                ports = self._remote(
+                    _REMOTE_PORT_PROBE_SCRIPT,
+                    self._remote_dir,
+                    operation="allocate_run_ports",
+                )
                 try:
                     available = json.loads(ports.stdout)
                 except (TypeError, json.JSONDecodeError) as error:
@@ -1578,7 +1778,11 @@ class DevStack:
         raise RuntimeError("remote port probe could not allocate distinct run ports")
 
     def _remote(
-        self, script: str, *args: str, timeout: float | None = None
+        self,
+        script: str,
+        *args: str,
+        timeout: float | None = None,
+        operation: str = "remote script",
     ) -> subprocess.CompletedProcess[str]:
         try:
             options: dict[str, object] = {
@@ -1600,6 +1804,7 @@ class DevStack:
                 error.cmd,
                 output=_redact_diagnostics(error.output),
                 stderr=_redact_diagnostics(error.stderr),
+                operation=operation,
             ) from error
 
     def _cleanup(self) -> None:
@@ -1641,6 +1846,7 @@ fi
                     script,
                     remote_dir,
                     timeout=_CLEANUP_TIMEOUT_SECONDS,
+                    operation="batch_cleanup",
                 )
             except BaseException as error:
                 if first_error is None:

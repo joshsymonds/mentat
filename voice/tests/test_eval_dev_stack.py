@@ -566,7 +566,8 @@ class DevStackTest(unittest.TestCase):
                 run=lambda args, **kwargs: subprocess.CompletedProcess(args, 0, json.dumps(response), ""),
             )
 
-            def execute_remote(script, path, owner_host, owner_pid):
+            def execute_remote(script, path, owner_host, owner_pid, *, operation):
+                self.assertEqual(operation, "reap_dead_batch")
                 return subprocess.run(
                     ["bash", "-c", script, "reaper", os.fspath(batch_dir), owner_host, owner_pid],
                     capture_output=True, text=True, check=True,
@@ -798,7 +799,8 @@ class DevStackTest(unittest.TestCase):
                 run=lambda args, **kwargs: subprocess.CompletedProcess(args, 0, json.dumps(response), ""),
             )
 
-            def cleanup_dead(script, _remote_path, host, pid):
+            def cleanup_dead(script, _remote_path, host, pid, *, operation):
+                self.assertEqual(operation, "reap_dead_batch")
                 self.assertEqual(host, socket.gethostname())
                 self.assertEqual(int(pid), dead_owner.pid)
                 self.assertTrue(script.startswith(_REAP_DEAD_BATCH_SCRIPT))
@@ -3179,6 +3181,7 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         self.assertEqual(
             {path.relative_to(retained).as_posix() for path in retained.rglob("*") if path.is_file()},
             {
+                "transport-diagnostics.json",
                 "agent.log", "voice.log", "records/session.jsonl",
                 "voice/evals/delegations.jsonl", "voice/evals/voice-modes.jsonl",
                 "sms-audio/room-turn-001.wav",
@@ -3228,6 +3231,219 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
                 self.fail("build failure should prevent entering the batch")
 
         self.assertFalse(any(args[:2] == ["ssh", "ultraviolet"] for args, _ in calls))
+
+    def test_setup_failure_before_restore_guard_retains_transport_diagnostics(self):
+        calls = []
+        startup_stderr = "candidate setup failed\nVOICE_TOKEN=startup-private-value\nordinary detail"
+        failed_setup = False
+
+        def run(args, **kwargs):
+            nonlocal failed_setup
+            calls.append((args, kwargs))
+            if "-M" in args:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if "-O" in args:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if "sudo" in args and not failed_setup:
+                failed_setup = True
+                raise subprocess.CalledProcessError(255, args, output="", stderr=startup_stderr)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        batch = SimpleNamespace(
+            _begin_launch=lambda: None,
+            _end_launch=lambda: None,
+            _prepare_run=lambda _run_id: ("/tmp/mentat-eval.startup/runs/one", 8485, 8486),
+            _remote_dir="/tmp/mentat-eval.startup",
+        )
+        stack = _RunStack(
+            checkout=CHECKOUT,
+            remote="ultraviolet",
+            run=run,
+            batch=batch,
+            run_id="startup-failure",
+        )
+        with self.assertRaisesRegex(subprocess.CalledProcessError, "candidate_setup") as caught:
+            with stack:
+                self.fail("candidate setup failure should abort entering the run")
+
+        self.assertEqual(caught.exception.returncode, 255)
+        self.assertFalse(stack._restore_guard_armed)
+        evidence_dir = stack.retained_evidence_dir
+        self.assertIsInstance(evidence_dir, Path)
+        evidence_path = evidence_dir / "transport-diagnostics.json"
+        self.assertTrue(evidence_path.is_file())
+        evidence_text = evidence_path.read_text()
+        evidence = json.loads(evidence_text)
+        events = evidence["events"]
+        self.assertEqual(
+            [(event["operation"], event["exit_code"]) for event in events],
+            [
+                ("ssh_master_start", 0),
+                ("candidate_setup", 255),
+                ("stop_candidate_producers", 0),
+                ("ssh_master_close", 0),
+            ],
+        )
+        self.assertTrue(all(event["timestamp"] for event in events))
+        self.assertIn("candidate setup failed", events[1]["stderr"])
+        self.assertIn("ordinary detail", events[1]["stderr"])
+        self.assertNotIn("startup-private-value", evidence_text)
+        self.assertNotIn("VOICE_TOKEN=startup-private-value", evidence_text)
+        self.assertNotIn(_RUN_SETUP_SCRIPT, evidence_text)
+
+    def test_retained_transport_diagnostics_record_run_lifecycle_and_failed_calls(self):
+        calls = []
+
+        def run(args, **kwargs):
+            if "-O" in args and "check" in args:
+                raise subprocess.CalledProcessError(6, args, output="", stderr="master check failed")
+            if "-O" in args and "exit" in args:
+                raise subprocess.CalledProcessError(9, args, output="", stderr="master close failed")
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
+            calls.append((args, kwargs))
+            if "sudo" in args:
+                if kwargs.get("input") == "successful script body":
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                raise subprocess.CalledProcessError(
+                    255, args, output="", stderr="remote diagnostic\\nVOICE_TOKEN=private-value"
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        stack = _RunStack(checkout=CHECKOUT, remote="ultraviolet", run=run, batch=SimpleNamespace())
+        stack._remote_dir = "/tmp/mentat-eval.diagnostics"
+        stack._restore_guard_armed = True
+        stack._producers_stopped = True
+        stack._transport.connect()
+        with self.assertRaises(subprocess.CalledProcessError):
+            stack._transport.check()
+        stack._remote("successful script body", operation="candidate preparation")
+        with self.assertRaises(subprocess.CalledProcessError):
+            stack._remote("secret-bearing script body", operation="candidate setup")
+
+        def retain():
+            stack.retained_evidence_dir = Path(tempfile.mkdtemp(prefix="diagnostics-test-"))
+
+        with patch.object(stack, "_retain_evidence", side_effect=retain):
+            with self.assertRaises(subprocess.CalledProcessError):
+                stack._cleanup()
+
+        evidence_path = stack.retained_evidence_dir / "transport-diagnostics.json"
+        self.assertTrue(evidence_path.is_file())
+        evidence = json.loads(evidence_path.read_text())
+        events = evidence["events"]
+        self.assertEqual(
+            [event["operation"] for event in events],
+            [
+                "ssh_master_start",
+                "ssh_master_check",
+                "candidate preparation",
+                "candidate setup",
+                "ssh_master_close",
+            ],
+        )
+        self.assertEqual([event["exit_code"] for event in events], [0, 6, 0, 255, 9])
+        self.assertIn("master close failed", events[4]["stderr"])
+        self.assertTrue(all(event["timestamp"] for event in events))
+        self.assertIn("remote diagnostic", events[3]["stderr"])
+        self.assertNotIn("private-value", evidence_path.read_text())
+        self.assertNotIn("secret-bearing script body", evidence_path.read_text())
+
+    def test_cleanup_retains_calls_finishing_after_transport_close(self):
+        from threading import Event, Thread
+
+        for exit_code in (0, 255):
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as directory:
+                began = Event()
+                release = Event()
+                failures = []
+
+                def run(args, **kwargs):
+                    if kwargs.get("input") == "late caller script":
+                        began.set()
+                        if not release.wait(timeout=2):
+                            raise TimeoutError("caller was not released")
+                        if exit_code:
+                            raise subprocess.CalledProcessError(exit_code, args, stderr="caller aborted")
+                    return subprocess.CompletedProcess(args, 0, "", "")
+
+                stack = _RunStack(checkout=CHECKOUT, run=run)
+                stack._remote_dir = "/tmp/mentat-eval.synthetic/runs/one"
+                stack._restore_guard_armed = True
+                stack._transport.connect()
+
+                def call():
+                    try:
+                        stack._remote("late caller script", operation="late_voice_call")
+                    except subprocess.CalledProcessError as error:
+                        failures.append(error.returncode)
+
+                def retain():
+                    stack.retained_evidence_dir = Path(directory)
+
+                worker = Thread(target=call)
+                worker.start()
+                try:
+                    self.assertTrue(began.wait(timeout=1))
+                    with patch.object(stack, "_retain_evidence", side_effect=retain):
+                        stack._cleanup()
+                finally:
+                    release.set()
+                    worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(failures, [255] if exit_code else [])
+                stack._cleanup()
+                evidence = json.loads((Path(directory) / "transport-diagnostics.json").read_text())
+                calls = [event for event in evidence["events"] if event["operation"] == "late_voice_call"]
+                self.assertEqual([event["exit_code"] for event in calls], [exit_code])
+                self.assertTrue(calls[0]["timestamp"])
+
+    def test_late_diagnostic_write_failure_keeps_remote_error(self):
+        def run(args, **kwargs):
+            if "-M" in args:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            raise subprocess.CalledProcessError(255, args, stderr="original caller diagnostic")
+
+        stack = _RunStack(checkout=CHECKOUT, run=run)
+        stack._diagnostics_finalized = True
+        with patch.object(stack, "_write_transport_diagnostics", side_effect=OSError("disk full")):
+            with self.assertRaises(subprocess.CalledProcessError) as caught:
+                stack._remote("late caller script", operation="late_voice_call")
+        self.assertIn("original caller diagnostic", caught.exception.stderr)
+        notes = getattr(caught.exception.__cause__, "__notes__", [])
+        self.assertTrue(any("disk full" in note for note in notes))
+
+    def test_remote_failure_names_operation_and_preserves_multiline_stderr(self):
+        diagnostic = "first diagnostic line\nsecond diagnostic line"
+        secret = "VOICE_TOKEN=only-this-value-is-secret"
+
+        def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
+            raise subprocess.CalledProcessError(
+                255,
+                args,
+                output="",
+                stderr=f"{diagnostic}\n{secret}\nordinary context remains",
+            )
+
+        stack = _RunStack(checkout=CHECKOUT, remote="ultraviolet", run=run, batch=SimpleNamespace())
+        stack._entered = True
+        stack._remote_dir = "/tmp/mentat-eval.diagnostics"
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            stack._remote(
+                "# secret-bearing script body",
+                operation="distinctive diagnostic operation",
+            )
+
+        error = caught.exception
+        self.assertIn("distinctive diagnostic operation", str(error))
+        self.assertIn("first diagnostic line\nsecond diagnostic line", error.stderr)
+        self.assertIn("ordinary context remains", error.stderr)
+        self.assertNotIn("only-this-value-is-secret", error.stderr)
+        self.assertNotIn("only-this-value-is-secret", str(error))
 
     def test_remote_setup_error_includes_captured_stderr_without_credentials(self):
         diagnostic = "DISTINCTIVE_SETUP_FAILURE"
