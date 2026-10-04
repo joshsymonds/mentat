@@ -240,6 +240,42 @@ class _SSHTransport:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+_CAPACITY_EVENT_PREFIX = "MENTAT_EVAL_CAPACITY_EVENT_V1"
+_CAPACITY_EVENT_SOURCE_BY_OPERATION = {
+    "candidate_setup": {"candidate daemon start"},
+    "start_worker": {"room dispatch"},
+    "run_voice": {"caller start", "fake phone start"},
+}
+
+
+def _remote_capacity_events(operation: str, stderr: str | bytes | None) -> tuple[dict[str, str], ...]:
+    expected_sources = _CAPACITY_EVENT_SOURCE_BY_OPERATION.get(operation)
+    if expected_sources is None:
+        return ()
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    if not isinstance(stderr, str):
+        return ()
+    events = {}
+    for line in stderr.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3 or parts[0] != _CAPACITY_EVENT_PREFIX:
+            continue
+        _, source, cause = parts
+        if source in expected_sources and cause.strip():
+            event = {"source": source, "cause": cause.strip()}
+            events[(source, event["cause"])] = event
+    return tuple(events[key] for key in sorted(events))
+
+
+class NamedCapacityFailure(RuntimeError):
+    """A failure raised by a named local process-start or room-dispatch producer."""
+
+    def __init__(self, source: str, cause: str) -> None:
+        self.capacity_failure = {"source": source, "cause": cause}
+        super().__init__(f"{source}: {cause}")
+
+
 class RemoteCommandError(subprocess.CalledProcessError):
     """A remote command failure whose diagnostic includes its operation and stderr."""
 
@@ -254,6 +290,7 @@ class RemoteCommandError(subprocess.CalledProcessError):
     ) -> None:
         super().__init__(returncode, cmd, output=output, stderr=stderr)
         self.operation = operation
+        self.capacity_failures = _remote_capacity_events(operation, stderr)
 
     def __str__(self) -> str:
         message = f"Remote operation {self.operation!r}: {super().__str__()}"
@@ -700,11 +737,17 @@ env.update({
     "HOME": str(run_dir / "home/mentat"),
 })
 log = (run_dir / "agent.log").open("ab", buffering=0)
-process = subprocess.Popen(
-    [setpriv_path, "--reuid=mentat", "--regid=mentat", "--init-groups", node_bin, str(run_dir / "mentat/src/main.ts")],
-    cwd=run_dir / "mentat", env=env, stdin=subprocess.DEVNULL,
-    stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-)
+try:
+    process = subprocess.Popen(
+        [setpriv_path, "--reuid=mentat", "--regid=mentat", "--init-groups", node_bin, str(run_dir / "mentat/src/main.ts")],
+        cwd=run_dir / "mentat", env=env, stdin=subprocess.DEVNULL,
+        stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+except OSError as error:
+    log.close()
+    cause = f"{type(error).__name__}: {error}".replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    print(f"MENTAT_EVAL_CAPACITY_EVENT_V1\tcandidate daemon start\t{cause}", file=sys.stderr)
+    sys.exit(127)
 (run_dir / "agent.pid").write_text(f"{process.pid}\n")
 log.close()
 PY
@@ -881,11 +924,17 @@ voice_env.update({
     ),
 })
 voice_log = (dev_dir / "voice.log").open("ab", buffering=0)
-voice = subprocess.Popen(
-    [setpriv_path, "--reuid=nobody", "--regid=nogroup", "--clear-groups", voice_python, str(dev_dir / "voice/agent.py"), "connect", "--room", room],
-    cwd=dev_dir / "voice", env=voice_env, stdin=subprocess.DEVNULL,
-    stdout=voice_log, stderr=subprocess.STDOUT, start_new_session=True,
-)
+try:
+    voice = subprocess.Popen(
+        [setpriv_path, "--reuid=nobody", "--regid=nogroup", "--clear-groups", voice_python, str(dev_dir / "voice/agent.py"), "connect", "--room", room],
+        cwd=dev_dir / "voice", env=voice_env, stdin=subprocess.DEVNULL,
+        stdout=voice_log, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+except OSError as error:
+    voice_log.close()
+    cause = f"candidate worker start failed: {type(error).__name__}: {error}".replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    print(f"MENTAT_EVAL_CAPACITY_EVENT_V1\troom dispatch\t{cause}", file=sys.stderr)
+    sys.exit(127)
 (dev_dir / "voice.pid").write_text(f"{voice.pid}\n")
 voice_log.close()
 PY
@@ -960,17 +1009,26 @@ voice_env.update({
 secret_values = _secret_environment_values(voice_env) + [token]
 fcntl.flock(launch_lock, fcntl.LOCK_UN)
 launch_lock.close()
-result = subprocess.run(
-    [
-        setpriv_path, "--reuid=nobody", "--regid=nogroup", "--clear-groups",
-        voice_python, *command,
-    ],
-    cwd=DEV_DIR / "voice",
-    env=voice_env,
-    stdin=subprocess.DEVNULL,
-    capture_output=True, text=True, check=False,
-)
-sys.stderr.write(_redact_diagnostics(result.stderr, secret_values))
+try:
+    result = subprocess.run(
+        [
+            setpriv_path, "--reuid=nobody", "--regid=nogroup", "--clear-groups",
+            voice_python, *command,
+        ],
+        cwd=DEV_DIR / "voice",
+        env=voice_env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, check=False,
+    )
+except OSError as error:
+    cause = f"{type(error).__name__}: {error}".replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    print(f"MENTAT_EVAL_CAPACITY_EVENT_V1\tcaller start\t{cause}", file=sys.stderr)
+    sys.exit(127)
+caller_stderr = _redact_diagnostics(result.stderr, secret_values)
+for line in caller_stderr.splitlines(keepends=True):
+    sys.stderr.write("caller stderr: " + line)
+if caller_stderr and not caller_stderr.endswith("\n"):
+    sys.stderr.write("\n")
 try:
     machine_output = _redact_machine_json(result.stdout, secret_values)
 except (ValueError, TypeError):
@@ -981,6 +1039,21 @@ except (ValueError, TypeError):
             sys.stderr.write("\n")
     sys.stderr.write("voice caller stdout was not valid JSON\n")
     sys.exit(result.returncode or 1)
+if result.returncode == 127:
+    envelope = json.loads(machine_output)
+    capacity = envelope.get("capacity_failure") if isinstance(envelope, dict) else None
+    if (
+        isinstance(envelope, dict)
+        and set(envelope) == {"turns", "capacity_failure"}
+        and envelope["turns"] == []
+        and isinstance(capacity, dict)
+        and set(capacity) == {"source", "cause"}
+        and capacity["source"] == "fake phone start"
+        and isinstance(capacity["cause"], str)
+        and capacity["cause"].strip()
+    ):
+        cause = capacity["cause"].replace("\t", " ").replace("\r", " ").replace("\n", " ")
+        print(f"MENTAT_EVAL_CAPACITY_EVENT_V1\tfake phone start\t{cause}", file=sys.stderr)
 sys.stdout.write(machine_output)
 sys.exit(result.returncode)
 '''

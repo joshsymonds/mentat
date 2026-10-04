@@ -228,6 +228,33 @@ def _score_turn(
     return report, problems
 
 
+def _capacity_failure_summary(runs: list[Any]) -> tuple[int, list[dict[str, Any]]]:
+    per_run = []
+    total = 0
+    for run_index, run in enumerate(runs):
+        evidence = run.get("capacity_failures") if isinstance(run, dict) else None
+        if not isinstance(evidence, list):
+            evidence = []
+        unique = {}
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            source = item.get("source")
+            cause = item.get("cause")
+            if not isinstance(source, str) or not source.strip():
+                continue
+            if not isinstance(cause, str) or not cause.strip():
+                continue
+            unique[(source.strip(), cause.strip())] = {
+                "source": source.strip(),
+                "cause": cause.strip(),
+            }
+        causes = [unique[key] for key in sorted(unique)]
+        total += len(causes)
+        per_run.append({"run": run_index + 1, "count": len(causes), "causes": causes})
+    return total, per_run
+
+
 def score_observations(
     observations: Any, required_runs: int = RUNS_REQUIRED
 ) -> dict[str, Any]:
@@ -241,13 +268,25 @@ def score_observations(
             "passed": False,
             "failures": ["input: required_runs must be a positive integer"],
             "cases": [],
+            "capacity_failure_count": 0,
         }
     failures: list[str] = []
     reports: list[dict[str, Any]] = []
+    capacity_failure_count = 0
     if not isinstance(observations, dict) or not isinstance(observations.get("cases"), list):
-        return {"passed": False, "failures": ["input: expected an object containing a cases list"], "cases": []}
+        return {
+            "passed": False,
+            "failures": ["input: expected an object containing a cases list"],
+            "cases": [],
+            "capacity_failure_count": 0,
+        }
     if not observations["cases"]:
-        return {"passed": False, "failures": ["input: cases list must not be empty"], "cases": []}
+        return {
+            "passed": False,
+            "failures": ["input: cases list must not be empty"],
+            "cases": [],
+            "capacity_failure_count": 0,
+        }
 
     for case_index, scenario in enumerate(observations["cases"]):
         if not isinstance(scenario, dict):
@@ -261,11 +300,20 @@ def score_observations(
         if not isinstance(runs, list):
             message = f"{name}: missing or invalid runs"
             failures.append(message)
-            reports.append({"name": name, "turns": [], "gates": [], "failures": [message]})
+            reports.append({
+                "name": name,
+                "turns": [],
+                "gates": [],
+                "failures": [message],
+                "capacity_failure_count": 0,
+                "run_capacity_failures": [],
+            })
             continue
         case_failures: list[str] = []
         if len(runs) != required_runs:
             case_failures.append(f"{name}: expected {required_runs} runs, found {len(runs)}")
+        case_capacity_failure_count, run_capacity_failures = _capacity_failure_summary(runs)
+        capacity_failure_count += case_capacity_failure_count
         turns: list[dict[str, Any]] = []
         capture_failures: list[dict[str, Any]] = []
         line_retry_counts: list[dict[str, int]] = []
@@ -621,6 +669,8 @@ def score_observations(
             "turns": turns,
             "gates": gates,
             "capture_failures": capture_failures,
+            "capacity_failure_count": case_capacity_failure_count,
+            "run_capacity_failures": run_capacity_failures,
             "line_retry_counts": sorted(
                 line_retry_counts, key=lambda item: (item["run"], item["line"])
             ),
@@ -631,7 +681,12 @@ def score_observations(
         reports.append(report)
         failures.extend(case_failures)
 
-    result = {"passed": not failures, "failures": failures, "cases": reports}
+    result = {
+        "passed": not failures,
+        "failures": failures,
+        "cases": reports,
+        "capacity_failure_count": capacity_failure_count,
+    }
     if isinstance(observations, dict) and "batch_timing" in observations:
         result["batch_timing"] = observations["batch_timing"]
     return result

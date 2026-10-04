@@ -6,6 +6,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import time
 import unittest
 from contextlib import contextmanager
@@ -91,6 +92,17 @@ class Clock:
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fake_phone_start_failure_is_named_capacity_evidence(self):
+        with patch.object(runner.subprocess, "Popen", side_effect=OSError("process table full")):
+            with self.assertRaises(runner.NamedCapacityFailure) as raised:
+                await runner._run_remote_capture_with_fake_phone(
+                    "private-room", ["Question"], room_close_after=None
+                )
+        self.assertEqual(
+            raised.exception.capacity_failure,
+            {"source": "fake phone start", "cause": "OSError: process table full"},
+        )
+
     async def test_fake_phone_finishes_inside_the_caller_process_group(self):
         events = []
 
@@ -2449,6 +2461,7 @@ class LocalEvalTests(unittest.TestCase):
         report = json.loads(output.getvalue())
         self.assertEqual(result, 1)
         self.assertFalse(report["passed"])
+        self.assertEqual(report["capacity_failure_count"], 0)
         self.assertIn(diagnostic, " ".join(report["failures"]))
         self.assertIn("DevStack setup failed", " ".join(report["failures"]))
         self.assertNotIn("invalid partial capture failure metadata", " ".join(report["failures"]))
@@ -2502,6 +2515,7 @@ class LocalEvalTests(unittest.TestCase):
         self.assertIn("distinctive launch exception", runs[0]["failure"])
         self.assertEqual(runs[1]["failure"], "aborted before launch: case-1-run-1 failed")
         self.assertNotIn("invalid partial capture failure metadata", " ".join(report["failures"]))
+        self.assertEqual(report["capacity_failure_count"], 0)
         timings = report["cases"][0]["run_timings"]
         self.assertEqual([timing["run"] for timing in timings], [1, 2])
         self.assertIsInstance(timings[0]["started_at"], (int, float))
@@ -4853,6 +4867,220 @@ class ScenarioObservationTests(unittest.TestCase):
 
 
 class LocalEvalCliTests(unittest.TestCase):
+    def test_retained_provider_concurrency_refusal_is_counted_once_for_its_run(self):
+        import io
+        import json
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(name="provider-capacity", turns=(), commands=(), place_query=None)
+        captured = {}
+        original_score = runner.score_observations
+        refusal = (
+            "Too many concurrent requests. Your current subscription is associated with a "
+            "maximum of 9 concurrent requests"
+        )
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        retained = tempfile.TemporaryDirectory()
+        self.addCleanup(retained.cleanup)
+        evidence = Path(retained.name)
+        (evidence / "voice.log").write_text(f"ERROR {refusal}\nERROR {refusal}\n")
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                yield SimpleNamespace(run_id=run_id, retained_evidence_dir=evidence)
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield Batch()
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", return_value={"turns": []}),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        run = captured["observations"]["cases"][0]["runs"][0]
+        self.assertEqual(
+            run["capacity_failures"],
+            [{
+                "source": "provider session concurrency refusal",
+                "cause": "provider refused a session: Too many concurrent requests",
+            }],
+        )
+        self.assertEqual(report["capacity_failure_count"], 1)
+        self.assertEqual(report["cases"][0]["run_capacity_failures"][0]["count"], 1)
+
+    def test_scenario_failure_capacity_wording_is_not_capacity_evidence(self):
+        import io
+        import json
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(name="scenario-wording", turns=(), commands=(), place_query=None)
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                yield SimpleNamespace(run_id=run_id, retained_evidence_dir=None)
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield Batch()
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(
+                runner,
+                "observe_scenario",
+                side_effect=RuntimeError(
+                    "scenario check failed: capacity_failure: room dispatch: capacity limit"
+                ),
+            ),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertEqual(report["capacity_failure_count"], 0)
+        self.assertEqual(report["cases"][0]["capacity_failure_count"], 0)
+        self.assertEqual(report["cases"][0]["run_capacity_failures"][0]["count"], 0)
+
+    def test_voice_token_dispatch_rejections_are_classified_by_http_outcome(self):
+        import io
+        import json
+        import urllib.error
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(
+            name="token-dispatch",
+            caller_lines=(),
+            turns=(),
+            commands=(),
+            place_query=None,
+        )
+        cases = ((429, 1), (503, 1), (400, 0), (OSError("connection reset"), 1))
+        for outcome, expected_count in cases:
+            with self.subTest(outcome=outcome):
+                captured = {}
+                original_score = runner.score_observations
+
+                def capture_score(observations, *, required_runs):
+                    captured["observations"] = observations
+                    return original_score(observations, required_runs=required_runs)
+
+                class Batch:
+                    @contextmanager
+                    def run(self, run_id):
+                        yield SimpleNamespace(
+                            run_id=run_id,
+                            base_url="http://127.0.0.1:8485",
+                            retained_evidence_dir=None,
+                        )
+
+                @contextmanager
+                def dev_stack(**_kwargs):
+                    yield Batch()
+
+                failure = (
+                    outcome
+                    if isinstance(outcome, OSError)
+                    else urllib.error.HTTPError(
+                        "http://127.0.0.1:8485/v1/voice/token",
+                        outcome,
+                        "synthetic response",
+                        {},
+                        None,
+                    )
+                )
+                if isinstance(failure, urllib.error.HTTPError):
+                    self.addCleanup(failure.close)
+                output = io.StringIO()
+                with (
+                    patch.object(runner, "SCENARIOS", (scenario,)),
+                    patch.object(runner, "DevStack", side_effect=dev_stack),
+                    patch.object(runner, "urlopen", side_effect=failure),
+                    patch.object(runner, "score_observations", side_effect=capture_score),
+                    redirect_stdout(output),
+                ):
+                    runner._run_local_eval(["--live", "--runs", "1"])
+
+                report = json.loads(output.getvalue())
+                run = captured["observations"]["cases"][0]["runs"][0]
+                self.assertEqual(report["capacity_failure_count"], expected_count)
+                if expected_count:
+                    self.assertEqual(run["capacity_failures"][0]["source"], "room dispatch")
+                else:
+                    self.assertEqual(run["capacity_failures"], [])
+
+    def test_named_candidate_start_and_room_dispatch_failures_reach_report(self):
+        import io
+        import json
+        from contextlib import contextmanager, redirect_stdout
+        from evals.dev_stack import RemoteCommandError
+
+        scenario = SimpleNamespace(name="launch-evidence", turns=(), commands=(), place_query=None)
+        for source, operation, fail_during_dispatch in (
+            ("candidate daemon start", "candidate_setup", False),
+            ("room dispatch", "start_worker", True),
+        ):
+            with self.subTest(source=source):
+                remote_error = RemoteCommandError(
+                    127,
+                    ["ssh", "sudo", "bash"],
+                    stderr=(
+                        f"MENTAT_EVAL_CAPACITY_EVENT_V1\t{source}\tAddress already in use"
+                    ),
+                    operation=operation,
+                )
+
+                @contextmanager
+                def run(_run_id):
+                    if not fail_during_dispatch:
+                        raise remote_error
+                    yield SimpleNamespace(run_id="case-1-run-1", retained_evidence_dir=None)
+
+                run_context = run
+
+                class Batch:
+                    def run(self, run_id):
+                        return run_context(run_id)
+
+                @contextmanager
+                def dev_stack(**_kwargs):
+                    yield Batch()
+
+                output = io.StringIO()
+                with (
+                    patch.object(runner, "SCENARIOS", (scenario,)),
+                    patch.object(runner, "DevStack", side_effect=dev_stack),
+                    patch.object(
+                        runner,
+                        "observe_scenario",
+                        side_effect=remote_error if fail_during_dispatch else None,
+                    ),
+                    redirect_stdout(output),
+                ):
+                    runner._run_local_eval(["--live", "--runs", "1"])
+
+                report = json.loads(output.getvalue())
+                self.assertEqual(report["capacity_failure_count"], 1)
+                self.assertEqual(report["cases"][0]["capacity_failure_count"], 1)
+                self.assertEqual(
+                    report["cases"][0]["run_capacity_failures"][0]["causes"][0]["source"],
+                    source,
+                )
+
     def test_batch_cleanup_failure_is_not_attributed_to_setup(self):
         import io
         import json
@@ -4893,6 +5121,7 @@ class LocalEvalCliTests(unittest.TestCase):
         failures = " ".join(report["failures"])
         self.assertEqual(result, 1)
         self.assertEqual(run["run_id"], "case-1-run-1")
+        self.assertEqual(report["capacity_failure_count"], 0)
         self.assertIn("distinctive batch cleanup exception", failures)
         self.assertIn("DevStack cleanup failed", failures)
         self.assertNotIn("DevStack setup failed", failures)
@@ -4998,6 +5227,7 @@ class LocalEvalCliTests(unittest.TestCase):
         case_report = report["cases"][0]
         failures = " ".join(report["failures"])
         self.assertEqual(result, 1)
+        self.assertEqual(report["capacity_failure_count"], 0)
         self.assertEqual(run["failure"], "run cleanup failed: distinctive run cleanup exception")
         self.assertIn("cleanup run 1", failures)
         self.assertIn("distinctive run cleanup exception", failures)
@@ -5119,6 +5349,9 @@ class LocalEvalCliTests(unittest.TestCase):
         launch_clock = threading.local()
         original_time = runner.time.time
         launch_times = {}
+        retained = tempfile.TemporaryDirectory()
+        self.addCleanup(retained.cleanup)
+        retained_root = Path(retained.name)
 
         def tracked_time():
             now = original_time()
@@ -5135,8 +5368,13 @@ class LocalEvalCliTests(unittest.TestCase):
             def run(self, run_id):
                 launch_times[run_id] = launch_clock.value
                 lifecycle.append(("run-start", run_id))
+                evidence = retained_root / run_id
+                evidence.mkdir()
                 try:
-                    yield SimpleNamespace(run_id=run_id)
+                    yield SimpleNamespace(
+                        run_id=run_id,
+                        retained_evidence_dir=evidence,
+                    )
                 finally:
                     lifecycle.append(("run-cleanup", run_id))
 
@@ -5145,6 +5383,8 @@ class LocalEvalCliTests(unittest.TestCase):
             try:
                 yield Batch()
             finally:
+                refusal_log = retained_root / "case-1-run-2" / "voice.log"
+                refusal_log.write_text("provider refused session: Too many concurrent requests\\n")
                 lifecycle.append(("stop-candidates",))
                 lifecycle.append(("restore",))
                 restored.set()
@@ -5180,6 +5420,19 @@ class LocalEvalCliTests(unittest.TestCase):
             self.assertEqual(pending["timing"]["started_at"], launch_times["case-1-run-2"])
             self.assertEqual(pending["timing"]["concurrency"], 2)
             self.assertIn("worker remained active", pending["failure"])
+            self.assertEqual(
+                pending["capacity_failures"],
+                [{
+                    "source": "provider session concurrency refusal",
+                    "cause": "provider refused a session: Too many concurrent requests",
+                }],
+            )
+            self.assertEqual(
+                captured["observations"]["cases"][0]["runs"][1]["capacity_failures"],
+                pending["capacity_failures"],
+            )
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["capacity_failure_count"], 1)
             exited_before_worker_release = finished.wait(timeout=2)
             release_hung.set()
             coordinator.join(timeout=2)

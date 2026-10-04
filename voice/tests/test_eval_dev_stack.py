@@ -25,6 +25,7 @@ from voice.evals import runner
 from voice.evals.scenarios import SCENARIOS
 from voice.evals.dev_stack import (
     DevStack,
+    RemoteCommandError,
     _RunStack,
     _MCP_REWRITE_SOURCE,
     _BATCH_SETUP_SCRIPT,
@@ -3159,6 +3160,197 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
             )
             with tarfile.open(root / "retained-evidence.tar.gz", "r:gz") as retained:
                 self.assertEqual(retained.getnames(), expected)
+
+    def test_process_start_producers_emit_typed_evidence_across_remote_boundary(self):
+        from contextlib import redirect_stderr
+        import io
+        from evals.dev_stack import RemoteCommandError
+
+        def heredoc_python(script):
+            return script.rsplit(" <<'PY'\n", 1)[1].split("\nPY", 1)[0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            daemon = root / "daemon"
+            (daemon / "mentat").mkdir(parents=True)
+            (daemon / "mentat/prompt.md").write_text("candidate prompt")
+            (daemon / "mentat.env.json").write_text(json.dumps({"MENTAT_LISTEN": "127.0.0.1:8484"}))
+            (daemon / "node.path").write_text("/nix/store/node/bin/node")
+            (daemon / "setpriv.path").write_text("/usr/bin/setpriv")
+            worker = root / "worker"
+            (worker / "voice/evals").mkdir(parents=True)
+            (worker / "voice-python.path").write_text("/nix/store/python/bin/python")
+            (worker / "setpriv.path").write_text("/usr/bin/setpriv")
+            (worker / "voice.env.json").write_text("{}")
+            caller_dir = root / "caller"
+            caller_dir.mkdir()
+            (caller_dir / "launch.lock").touch()
+            (caller_dir / "voice").mkdir()
+            (caller_dir / "voice-python.path").write_text("/nix/store/python/bin/python")
+            (caller_dir / "setpriv.path").write_text("/usr/bin/setpriv")
+            (caller_dir / "voice.env.json").write_text("{}")
+
+            producers = (
+                (
+                    "candidate_setup",
+                    _RUN_SETUP_SCRIPT.replace("__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE),
+                    ["python3", str(daemon), "8485", "8486", "chatgpt/sol-fast"],
+                    "Popen",
+                    "candidate daemon start",
+                ),
+                (
+                    "start_worker",
+                    _START_WORKER_SCRIPT,
+                    ["python3", str(worker), "8485", "8486", "private-room"],
+                    "Popen",
+                    "room dispatch",
+                ),
+                (
+                    "run_voice",
+                    _RUN_VOICE_SCRIPT,
+                    ["python3", "--", str(caller_dir), "8485", "8486"],
+                    "run",
+                    "caller start",
+                ),
+            )
+            for operation, script, arguments, process_call, expected_source in producers:
+                with self.subTest(operation=operation):
+                    source = (
+                        script
+                        if operation == "run_voice"
+                        else heredoc_python(script)
+                    )
+                    stderr = io.StringIO()
+                    inputs = json.dumps({
+                        "command": ["voice-runner", "eval", "--live"],
+                        "token": "header.payload.signature",
+                        "livekit_url": "wss://livekit.invalid",
+                    })
+                    process_error = OSError("process table full")
+                    stdin_context = patch.object(sys, "stdin", io.StringIO(inputs))
+                    with (
+                        patch.object(sys, "argv", arguments),
+                        patch.object(subprocess, process_call, side_effect=process_error),
+                        stdin_context,
+                        redirect_stderr(stderr),
+                        self.assertRaises(SystemExit),
+                    ):
+                        exec(compile(source, f"<{operation}>", "exec"), {})
+                    event = RemoteCommandError(
+                        127,
+                        ["ssh", "sudo", "bash"],
+                        stderr=stderr.getvalue(),
+                        operation=operation,
+                    )
+                    expected_cause = "OSError: process table full"
+                    if operation == "start_worker":
+                        expected_cause = f"candidate worker start failed: {expected_cause}"
+                    self.assertEqual(
+                        event.capacity_failures,
+                        ({
+                            "source": expected_source,
+                            "cause": expected_cause,
+                        },),
+                    )
+                    self.assertEqual(
+                        runner._named_capacity_failures(event),
+                        [{
+                            "source": expected_source,
+                            "cause": expected_cause,
+                        }],
+                    )
+
+            caller_output_spoof = RemoteCommandError(
+                1,
+                ["ssh", "sudo", "bash"],
+                stderr=(
+                    "caller stderr: MENTAT_EVAL_CAPACITY_EVENT_V1\tcaller start"
+                    "\tOSError: counterfeit\n"
+                ),
+                operation="run_voice",
+            )
+            self.assertEqual(caller_output_spoof.capacity_failures, ())
+
+    def test_fake_phone_start_failure_survives_caller_boundary_into_local_report(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        import traceback
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "voice/evals").mkdir(parents=True)
+            (run_dir / "launch.lock").touch()
+            (run_dir / "voice-python.path").write_text("/nix/store/python/bin/python")
+            (run_dir / "setpriv.path").write_text("/usr/bin/setpriv")
+            (run_dir / "voice.env.json").write_text("{}")
+            payload = json.dumps({
+                "command": ["evals/runner.py", "--fake-phone", "private-room", "Question@0::Answer"],
+                "token": "header.payload.signature",
+                "livekit_url": "wss://livekit.invalid",
+            })
+
+            def run_caller(command, **_kwargs):
+                output = io.StringIO()
+                diagnostic = io.StringIO()
+                with (
+                    patch.object(runner, "__file__", str(run_dir / "voice/evals/runner.py")),
+                    patch.object(subprocess, "Popen", side_effect=OSError("process table full")),
+                    redirect_stdout(output),
+                    redirect_stderr(diagnostic),
+                ):
+                    try:
+                        exit_code = runner.main(command[command.index("evals/runner.py") + 1:])
+                    except runner.NamedCapacityFailure:
+                        traceback.print_exc(file=diagnostic)
+                        exit_code = 1
+                return subprocess.CompletedProcess(command, exit_code, output.getvalue(), diagnostic.getvalue())
+
+            output = io.StringIO()
+            diagnostic = io.StringIO()
+            with (
+                patch.object(sys, "argv", ["wrapper", "--", str(run_dir), "8485", "8486"]),
+                patch.object(sys, "stdin", io.StringIO(payload)),
+                patch.object(sys, "path", list(sys.path)),
+                patch.object(subprocess, "run", side_effect=run_caller),
+                redirect_stdout(output),
+                redirect_stderr(diagnostic),
+                self.assertRaises(SystemExit) as exited,
+            ):
+                exec(compile(_RUN_VOICE_SCRIPT, "<caller-wrapper>", "exec"), {})
+            failure = runner.RemoteCommandError(
+                exited.exception.code,
+                ["ssh", "sudo", "bash"],
+                output=output.getvalue(),
+                stderr=diagnostic.getvalue(),
+                operation="run_voice",
+            )
+            expected = {"source": "fake phone start", "cause": "OSError: process table full"}
+
+            class Batch:
+                @contextmanager
+                def run(self, run_id):
+                    yield SimpleNamespace(run_id=run_id)
+
+            @contextmanager
+            def dev_stack(**_kwargs):
+                yield Batch()
+
+            report_output = io.StringIO()
+            scenario = SimpleNamespace(name="phone-start", turns=(), commands=(), place_query=None)
+            with (
+                patch.object(runner, "SCENARIOS", (scenario,)),
+                patch.object(runner, "DevStack", side_effect=dev_stack),
+                patch.object(runner, "observe_scenario", side_effect=failure),
+                redirect_stdout(report_output),
+            ):
+                result = runner._run_local_eval(["--live", "--runs", "1"])
+            report = json.loads(report_output.getvalue())
+            self.assertEqual(result, 1)
+            self.assertEqual(report["capacity_failure_count"], 1)
+            self.assertEqual(report["cases"][0]["run_capacity_failures"], [
+                {"run": 1, "count": 1, "causes": [expected]},
+            ])
+            self.assertEqual(failure.capacity_failures, (expected,))
+            self.assertEqual(exited.exception.code, 127)
 
     def test_retained_archive_is_private_and_owned_by_the_scp_user(self):
         self.assertIn('os.environ["SUDO_USER"]', _RETAIN_EVIDENCE_SCRIPT)

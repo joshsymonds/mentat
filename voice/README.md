@@ -256,7 +256,14 @@ One candidate build and staging are shared by the batch. Each run gets its own
 candidate daemon, fake phone, worker, ports, state, and logs; runs execute in
 parallel up to the cap, with remaining runs queued. The JSON report records each
 run's start and end times and peak concurrent-run count, plus total batch wall
-time, so concurrency is visible alongside latency results.
+time, so concurrency is visible alongside latency results. It also emits a
+batch-level `capacity_failure_count`, each case's `capacity_failure_count`, and
+`run_capacity_failures` entries with the run number and named source/cause.
+Capacity counts include explicitly named candidate process-start or room-dispatch
+failures (including voice-token dispatch HTTP 429/503 or request failures) and a
+provider concurrency refusal found in that run's retained `voice.log`; repeated
+copies of one provider refusal count once per run. Generic setup, cleanup, or
+scenario-check failures do not count as capacity evidence.
 
 On normal exit, errors, or SIGINT/SIGTERM, the runner stops launching work,
 finishes stopping all candidate processes, then restores production

@@ -1022,6 +1022,49 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("call ended after turn 1 with 2 follow-ups remaining", failures)
         self.assertNotIn("capture failed", failures)
 
+    def test_report_counts_only_named_capacity_evidence_per_run_and_batch(self):
+        observation = {"cases": [case(name="capacity", kind="action")]}
+        runs = observation["cases"][0]["runs"]
+        runs[0]["capacity_failures"] = [
+            {"source": "candidate daemon start", "cause": "Address already in use"},
+            {"source": "candidate daemon start", "cause": "Address already in use"},
+        ]
+        runs[1]["capacity_failures"] = [
+            {"source": "room dispatch", "cause": "HTTP 429: capacity limit"},
+        ]
+        runs[2]["failure"] = "scenario failed: provider capacity limit wording"
+
+        result = score_observations(observation)
+
+        report = result["cases"][0]
+        self.assertEqual(result["capacity_failure_count"], 2)
+        self.assertEqual(report["capacity_failure_count"], 2)
+        self.assertEqual(
+            report["run_capacity_failures"],
+            [
+                {"run": 1, "count": 1, "causes": [
+                    {"source": "candidate daemon start", "cause": "Address already in use"}
+                ]},
+                {"run": 2, "count": 1, "causes": [
+                    {"source": "room dispatch", "cause": "HTTP 429: capacity limit"}
+                ]},
+                *[{"run": run_index, "count": 0, "causes": []} for run_index in range(3, 11)],
+            ],
+        )
+
+    def test_clean_report_emits_zero_capacity_count(self):
+        result = score_observations({"cases": [case(name="clean")]})
+
+        self.assertEqual(result["capacity_failure_count"], 0)
+        self.assertEqual(result["cases"][0]["capacity_failure_count"], 0)
+        self.assertEqual(
+            result["cases"][0]["run_capacity_failures"],
+            [
+                {"run": run_index, "count": 0, "causes": []}
+                for run_index in range(1, 11)
+            ],
+        )
+
     def test_report_preserves_batch_and_per_run_timing_without_changing_scores(self):
         batch_timing = {
             "started_at": 1_700_000_000.0,

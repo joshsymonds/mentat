@@ -22,13 +22,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import caller
-from evals.dev_stack import DevStack, RemoteCommandError, _redact_diagnostics
+from evals.dev_stack import (
+    DevStack,
+    NamedCapacityFailure,
+    RemoteCommandError,
+    _redact_diagnostics,
+)
 from evals.report import NO_ANSWER_FAILURE, score_observations
 from evals.scenarios import (
     SCENARIOS,
@@ -55,6 +61,31 @@ SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
 DEFAULT_VOICE_MODEL = "chatgpt/sol-fast"
 DEFAULT_CONCURRENCY = 8
 _SCHEDULER_DRAIN_TIMEOUT_SECONDS = 1.0
+_PROVIDER_CONCURRENCY_REFUSAL = re.compile(r"Too many concurrent requests", re.IGNORECASE)
+
+
+def _named_capacity_failures(error: BaseException | None = None, stack: Any = None) -> list[dict[str, str]]:
+    """Collect typed producer evidence and this run's retained provider log."""
+    found: dict[tuple[str, str], dict[str, str]] = {}
+    if isinstance(error, NamedCapacityFailure):
+        item = error.capacity_failure
+        found[(item["source"], item["cause"])] = item
+    elif isinstance(error, RemoteCommandError):
+        for item in error.capacity_failures:
+            found[(item["source"], item["cause"])] = item
+    evidence_dir = getattr(stack, "retained_evidence_dir", None)
+    if isinstance(evidence_dir, Path):
+        try:
+            voice_log = (evidence_dir / "voice.log").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            voice_log = ""
+        if _PROVIDER_CONCURRENCY_REFUSAL.search(voice_log):
+            item = {
+                "source": "provider session concurrency refusal",
+                "cause": "provider refused a session: Too many concurrent requests",
+            }
+            found[(item["source"], item["cause"])] = item
+    return [found[key] for key in sorted(found)]
 
 
 def _retain_sms_audio(
@@ -2521,9 +2552,26 @@ def _voice_token(base_url: str) -> dict[str, Any]:
     try:
         with urlopen(request, timeout=TOKEN_REQUEST_DEADLINE_SECONDS) as response:
             if response.status != 200:
+                if response.status in (429, 503):
+                    raise NamedCapacityFailure(
+                        "room dispatch",
+                        f"voice-token endpoint returned HTTP {response.status}",
+                    )
                 raise RuntimeError(f"voice-token endpoint returned HTTP {response.status}")
             grant = json.loads(response.read())
-    except (OSError, TimeoutError, json.JSONDecodeError) as error:
+    except HTTPError as error:
+        if error.code in (429, 503):
+            raise NamedCapacityFailure(
+                "room dispatch",
+                f"voice-token endpoint returned HTTP {error.code}",
+            ) from error
+        raise RuntimeError("dev voice-token request failed") from error
+    except (OSError, TimeoutError) as error:
+        raise NamedCapacityFailure(
+            "room dispatch",
+            f"voice-token request failed: {type(error).__name__}: {error}",
+        ) from error
+    except json.JSONDecodeError as error:
         raise RuntimeError("dev voice-token request failed") from error
     if not isinstance(grant, dict):
         raise RuntimeError("voice-token response is not an object")
@@ -2842,13 +2890,19 @@ async def _run_remote_capture_with_fake_phone(
         "import asyncio, sys; from phone import run_fake_phone; "
         "asyncio.run(run_fake_phone(sys.argv[1], sys.argv[2], 'success'))"
     )
-    process = subprocess.Popen(
-        [sys.executable, "-c", phone_script, base_url, str(log_path)],
-        cwd=Path(__file__).resolve().parents[1],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", phone_script, base_url, str(log_path)],
+            cwd=Path(__file__).resolve().parents[1],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise NamedCapacityFailure(
+            "fake phone start",
+            f"{type(error).__name__}: {error}",
+        ) from error
     try:
         await asyncio.sleep(0.2)
         if process.poll() is not None:
@@ -2989,6 +3043,7 @@ def _run_local_eval(argv: list[str]) -> int:
     launch_lock = threading.Lock()
     abort_reason_lock = threading.Lock()
     active_runs: dict[tuple[int, int], dict[str, Any]] = {}
+    active_run_stacks: dict[tuple[int, int], Any] = {}
     run_timing_records: dict[tuple[int, int], dict[str, Any]] = {}
     abort_reason = [""]
 
@@ -3003,15 +3058,18 @@ def _run_local_eval(argv: list[str]) -> int:
         run_id = f"case-{scenario_index + 1}-run-{run_index + 1}"
         key = (scenario_index, run_index)
         manager = None
+        stack = None
         started_at = None
         observation = None
         failure = None
+        capacity_error = None
         with launch_lock:
             if abort_event.is_set():
                 failure = f"aborted before launch: {abort_reason[0]}"
                 return scenario_index, run_index, {
                     "failure": failure,
                     "turns": [],
+                    "capacity_failures": [],
                     "timing": {
                         "started_at": None,
                         "ended_at": time.time(),
@@ -3027,6 +3085,7 @@ def _run_local_eval(argv: list[str]) -> int:
             try:
                 manager = batch.run(run_id)
                 stack = manager.__enter__()
+                active_run_stacks[key] = stack
             except BaseException as error:
                 active = active_runs.pop(key)
                 failure = _redact_diagnostics(f"run launch failed: {error}")
@@ -3034,6 +3093,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 return scenario_index, run_index, {
                     "failure": failure,
                     "turns": [],
+                    "capacity_failures": _named_capacity_failures(error),
                     "timing": {
                         "started_at": started_at,
                         "ended_at": time.time(),
@@ -3043,6 +3103,7 @@ def _run_local_eval(argv: list[str]) -> int:
         try:
             observation = observe_scenario(scenario, stack)
         except BaseException as error:
+            capacity_error = error
             failure = _redact_diagnostics(f"scenario execution failed: {error}")
             request_abort(f"{run_id} failed")
             try:
@@ -3064,12 +3125,19 @@ def _run_local_eval(argv: list[str]) -> int:
                 "ended_at": ended_at,
                 "concurrency": active["concurrency"],
             }
+            capacity_failures = _named_capacity_failures(capacity_error, stack)
             if isinstance(observation, dict):
                 observation["timing"] = timing
+                observation["capacity_failures"] = capacity_failures
                 if failure is not None and "failure" not in observation:
                     observation["failure"] = failure
             elif failure is not None:
-                observation = {"failure": failure, "turns": [], "timing": timing}
+                observation = {
+                    "failure": failure,
+                    "turns": [],
+                    "capacity_failures": capacity_failures,
+                    "timing": timing,
+                }
         return scenario_index, run_index, observation, failure
 
     checkout = Path(__file__).resolve().parents[2]
@@ -3150,6 +3218,7 @@ def _run_local_eval(argv: list[str]) -> int:
                         case["runs"][run_index] = {
                             "failure": message,
                             "turns": [],
+                            "capacity_failures": [],
                             "timing": {
                                 "started_at": None,
                                 "ended_at": ended_at,
@@ -3192,9 +3261,13 @@ def _run_local_eval(argv: list[str]) -> int:
                 failure = _redact_diagnostics(str(error))
             failure = failure or f"aborted before launch: {abort_reason[0] or 'evaluation interrupted'}"
         timing_record = run_timing_records.get((scenario_index, run_index), {})
+        capacity_failures = _named_capacity_failures(
+            stack=active_run_stacks.get((scenario_index, run_index))
+        )
         runs[run_index] = {
             "failure": failure,
             "turns": [],
+            "capacity_failures": capacity_failures,
             "timing": {
                 "started_at": timing_record.get("started_at"),
                 "ended_at": time.time(),
@@ -3213,6 +3286,7 @@ def _run_local_eval(argv: list[str]) -> int:
             case["runs"][run_index] = {
                 "failure": failure,
                 "turns": [],
+                "capacity_failures": [],
                 "timing": {
                     "started_at": None,
                     "ended_at": time.time(),
@@ -3319,6 +3393,10 @@ def main(argv: list[str] | None = None) -> int:
         capture_options["retain_caller_audio_dir"] = retain_caller_audio_dir
     try:
         traces = asyncio.run(capture(room, steps, **capture_options))
+    except NamedCapacityFailure as error:
+        envelope = {"turns": [], "capacity_failure": error.capacity_failure}
+        print(json.dumps(envelope, separators=(",", ":")), flush=True)
+        return 127
     except PartialCaptureFailure as error:
         envelope = {"turns": error.turns, "failure": error.failure}
         print(json.dumps(envelope, separators=(",", ":")), flush=True)
