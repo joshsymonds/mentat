@@ -8,6 +8,7 @@ import struct
 import sys
 import time
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,25 @@ def pcm_windows(*levels, sample_rate=24000, channels=1):
 
 
 RENDERED_PCM_TEXT = {}
+
+
+@contextmanager
+def _run_context(stack):
+    yield stack
+
+
+def _batch_for(stack):
+    class Batch:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def run(self, _run_id):
+            return _run_context(stack)
+
+    return Batch()
 
 
 def rendered_pcm(text, seconds_per_character=0.2):
@@ -71,6 +91,51 @@ class Clock:
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fake_phone_finishes_inside_the_caller_process_group(self):
+        events = []
+
+        class PhoneProcess:
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                events.append("terminate-phone")
+                self.returncode = 0
+
+            def kill(self):
+                events.append("kill-phone")
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                events.append(("wait-phone", timeout))
+                return self.returncode
+
+        process = PhoneProcess()
+
+        async def capture(*_args, **_kwargs):
+            events.append("capture-complete")
+            return [{"turn": 1}]
+
+        async def sleep(_seconds):
+            events.append("phone-started")
+
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=process) as popen,
+            patch.object(runner, "run_remote_capture", capture),
+            patch.object(runner.asyncio, "sleep", sleep),
+        ):
+            result = await runner._run_remote_capture_with_fake_phone(
+                "private-room", ["Question"], room_close_after=None
+            )
+
+        self.assertEqual(result, [{"turn": 1}])
+        self.assertNotIn("start_new_session", popen.call_args.kwargs)
+        self.assertLess(events.index("capture-complete"), events.index("terminate-phone"))
+        self.assertIn(("wait-phone", 5), events)
+
     async def test_capture_deadline_covers_extended_answer_window(self):
         self.assertGreaterEqual(
             runner.ANSWER_CAPTURE_DEADLINE_SECONDS,
@@ -2294,6 +2359,9 @@ class LocalEvalTests(unittest.TestCase):
             def __exit__(self, *_args):
                 return False
 
+            def run(self, _run_id):
+                return _run_context(self)
+
         observation = {
             "turns": [{
                 "turn": 1,
@@ -2408,6 +2476,9 @@ class LocalEvalTests(unittest.TestCase):
 
             def __exit__(self, *_args):
                 return False
+
+            def run(self, _run_id):
+                return _run_context(self)
 
         output = io.StringIO()
         with (
@@ -4071,6 +4142,9 @@ class ScenarioObservationTests(unittest.TestCase):
             def __exit__(self, *_args):
                 pass
 
+            def run(self, _run_id):
+                return _run_context(self)
+
             def start_worker(self, _room):
                 pass
 
@@ -4727,7 +4801,7 @@ class LocalEvalCliTests(unittest.TestCase):
         def dev_stack(**kwargs):
             lifecycle.append(("enter", kwargs["opt_in"]))
             try:
-                yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+                yield _batch_for(SimpleNamespace(base_url="http://127.0.0.1:8485"))
             finally:
                 lifecycle.append(("exit",))
 
@@ -4796,6 +4870,71 @@ class LocalEvalCliTests(unittest.TestCase):
         )
         self.assertEqual(report["cases"][7]["phone_commands"], [[], []])
 
+    def test_failed_run_with_pending_phone_receipt_does_not_pollute_its_sibling(self):
+        import io
+        import json
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(name="isolated-phone", turns=(), commands=(), place_query=None)
+        run_ids = []
+        observed = []
+
+        class Batch:
+            def run(self, run_id):
+                run_ids.append(run_id)
+
+                @contextmanager
+                def context():
+                    yield SimpleNamespace(base_url=f"http://127.0.0.1:{49150 + len(run_ids)}")
+
+                return context()
+
+        @contextmanager
+        def batch_context(**_kwargs):
+            yield Batch()
+
+        def observe(_scenario, stack):
+            observed.append(stack.base_url)
+            if len(observed) == 1:
+                raise RuntimeError("fake phone command result is still pending")
+            return {
+                "turns": [],
+                "phone_commands": [{"id": "same-command-id", "turn": 1, "received_at": 2.0}],
+            }
+
+        scored = {}
+
+        def score_observations(observations, *, required_runs):
+            scored["observations"] = observations
+            scored["required_runs"] = required_runs
+            return {
+                "passed": False,
+                "failures": [],
+                "cases": [{"name": scenario.name, "failures": [], "turns": []}],
+            }
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=batch_context),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            patch.object(runner, "score_observations", side_effect=score_observations),
+            patch.object(runner, "_requested_voice_model", return_value="chatgpt/sol-fast"),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "2"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertEqual(run_ids, ["case-1-run-1", "case-1-run-2"])
+        self.assertNotEqual(observed[0], observed[1])
+        runs = scored["observations"]["cases"][0]["runs"]
+        self.assertEqual(runs[0], {"failure": "fake phone command result is still pending"})
+        self.assertEqual(runs[1]["phone_commands"], [{
+            "id": "same-command-id", "turn": 1, "received_at": 2.0,
+        }])
+        self.assertIn("fake phone command result is still pending", " ".join(report["failures"]))
+
     def test_live_eval_retains_interpreter_phone_commands_and_fails_on_timer(self):
         from contextlib import contextmanager
         import json
@@ -4821,7 +4960,7 @@ class LocalEvalCliTests(unittest.TestCase):
         def dev_stack(**kwargs):
             lifecycle.append(("enter", kwargs["opt_in"]))
             try:
-                yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+                yield _batch_for(SimpleNamespace(base_url="http://127.0.0.1:8485"))
             finally:
                 lifecycle.append(("exit",))
 
@@ -4887,7 +5026,7 @@ class LocalEvalCliTests(unittest.TestCase):
         def dev_stack(**kwargs):
             lifecycle.append(("enter", kwargs["opt_in"]))
             try:
-                yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+                yield _batch_for(SimpleNamespace(base_url="http://127.0.0.1:8485"))
             finally:
                 lifecycle.append(("exit",))
 
@@ -4990,7 +5129,7 @@ class LocalEvalCliTests(unittest.TestCase):
 
         @contextmanager
         def dev_stack(**_kwargs):
-            yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+            yield _batch_for(SimpleNamespace(base_url="http://127.0.0.1:8485"))
 
         output = io.StringIO()
         with (
@@ -5016,7 +5155,7 @@ class LocalEvalCliTests(unittest.TestCase):
 
         @contextmanager
         def dev_stack(**_kwargs):
-            yield SimpleNamespace(base_url="http://127.0.0.1:8485")
+            yield _batch_for(SimpleNamespace(base_url="http://127.0.0.1:8485"))
 
         def observe(scenario, _stack):
             turns = []
@@ -5381,6 +5520,9 @@ class LocalEvalCliTests(unittest.TestCase):
 
             def __exit__(self, *_args):
                 return False
+
+            def run(self, _run_id):
+                return _run_context(self)
 
         scenario = SimpleNamespace(name="synthetic-provenance")
         base_turn = {

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pwd
+import re
 import shlex
 import shutil
 import stat
@@ -13,6 +14,7 @@ import tempfile
 import tarfile
 import time
 import unittest
+from contextlib import contextmanager
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,19 +25,400 @@ from voice.evals import runner
 from voice.evals.scenarios import SCENARIOS
 from voice.evals.dev_stack import (
     DevStack,
+    _RunStack,
     _MCP_REWRITE_SOURCE,
+    _BATCH_SETUP_SCRIPT,
     _PRIVATE_CREDENTIAL_SOURCE,
     _RETAIN_EVIDENCE_SCRIPT,
     _RUN_VOICE_SCRIPT,
-    _SETUP_SCRIPT,
+    _RUN_SETUP_SCRIPT,
     _START_WORKER_SCRIPT,
+    _STOP_RUN_SCRIPT,
 )
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 
 
+def run_setup_environment(run_dir, model):
+    setup = _RUN_SETUP_SCRIPT.replace("__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE)
+    header = 'python3 - "$RUN_DIR" "$DEV_PORT" "$HEALTH_PORT" "$VOICE_MODEL" <<\'PY\''
+    body = setup.split(header + "\n", 1)[1].split("\nPY\n", 1)[0]
+    with patch("sys.argv", ["setup.py", os.fspath(run_dir), "49151", "49152", model]):
+        with patch("subprocess.Popen", return_value=SimpleNamespace(pid=12345)) as popen:
+            exec(body, {})
+    return popen.call_args.kwargs["env"]
+
+
+@contextmanager
+def isolated_run(**kwargs):
+    command_runner = kwargs.pop("run", subprocess.run)
+    run_settings = {
+        key: kwargs.pop(key)
+        for key in ("dev_port", "health_port", "local_port")
+        if key in kwargs
+    }
+    probes = iter((
+        {"dev_port": 49151, "health_port": 49152},
+        {"dev_port": 49153, "health_port": 49154},
+        {"dev_port": 49155, "health_port": 49156},
+        {"dev_port": 49157, "health_port": 49158},
+    ))
+
+    def run(args, **options):
+        result = command_runner(args, **options)
+        if args[:2] == ["ssh", "ultraviolet"] and len(args) > 2 and args[2] == "mktemp":
+            if re.fullmatch(r"/tmp/mentat-eval-batch\.[A-Za-z0-9]+", str(getattr(result, "stdout", "")).strip()):
+                return result
+            return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.test\n", "")
+        if "MENTAT_EVAL_PORT_PROBE" in options.get("input", ""):
+            if isinstance(getattr(result, "stdout", None), str) and result.stdout:
+                return result
+            return subprocess.CompletedProcess(args, 0, json.dumps(next(probes)), "")
+        if "MENTAT_VOICE_GRANT" in options.get("input", "") and not result.stdout:
+            return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', result.stderr)
+        return result
+
+    with DevStack(**{**kwargs, "run": run}) as batch:
+        stack = batch.run("test-run")
+        stack.dev_port = run_settings.get("dev_port")
+        stack.health_port = run_settings.get("health_port")
+        stack._requested_local_port = run_settings.get("local_port")
+        with stack:
+            yield stack
+
+
 class DevStackTest(unittest.TestCase):
+    def test_batch_runs_share_staging_but_keep_independent_run_lifecycles(self):
+        calls = []
+        events = []
+        probe_count = 0
+
+        def run(args, **kwargs):
+            nonlocal probe_count
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.test\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                probe_count += 1
+                return subprocess.CompletedProcess(
+                    args, 0,
+                    json.dumps({"dev_port": 49151 + probe_count * 2, "health_port": 49152 + probe_count * 2}),
+                    "",
+                )
+            if '"MENTAT_STATE_PATH": str(run_dir' in kwargs.get("input", ""):
+                events.append(("setup", args[-4], args[-3:-1]))
+            if args[:2] == ["ssh", "ultraviolet"] and "--room" in kwargs.get("input", ""):
+                events.append(("worker", args[-4], args[-3:-1]))
+            if "MENTAT_VOICE_GRANT" in kwargs.get("input", ""):
+                run_id = "same-scenario-2" if '"token": "second-token"' in kwargs["input"] else "same-scenario-1"
+                events.append(("capture", run_id))
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"turns": [{"receipt": f"{run_id}-receipt"}]}), ""
+                )
+            if "RUN_DIR=$1" in kwargs.get("input", "") and "kill -TERM" in kwargs.get("input", ""):
+                run_id = args[-1].rsplit("/", 1)[-1]
+                events.append(("stop", run_id))
+            if "exec cat voice/evals/phone.jsonl" in kwargs.get("input", ""):
+                run_id = "same-scenario-2" if "same-scenario-2" in kwargs["input"] else "same-scenario-1"
+                events.append(("evidence", run_id))
+                return subprocess.CompletedProcess(
+                    args, 0,
+                    json.dumps({"event": "result", "run_id": run_id, "command_id": "same-command-id"}),
+                    "",
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
+            popen.return_value = unittest.mock.Mock(poll=lambda: None)
+            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+                with batch.run("same-scenario-1") as first:
+                    with batch.run("same-scenario-2") as second:
+                        self.assertNotEqual(first.base_url, second.base_url)
+                        self.assertNotEqual(first.dev_port, second.dev_port)
+                        self.assertNotEqual(first.health_port, second.health_port)
+                        second.start_worker("second-room")
+                        second_receipt = second.run_voice(
+                            ["caller.py"], token="second-token", livekit_url="wss://second.invalid"
+                        )
+                        second_phone = second.run_remote(["cat", "voice/evals/phone.jsonl"])
+                    self.assertTrue(first._entered)
+                    self.assertEqual(json.loads(second_receipt.stdout)["turns"][0]["receipt"], "same-scenario-2-receipt")
+                    self.assertEqual(json.loads(second_phone.stdout)["run_id"], "same-scenario-2")
+                    self.assertFalse(any(
+                        'bash "$BATCH_DIR/cleanup.sh"' in kwargs.get("input", "")
+                        for args, kwargs in calls
+                        if args[:2] == ["ssh", "ultraviolet"]
+                    ))
+                    first.start_worker("first-room")
+                    first_receipt = first.run_voice(
+                        ["caller.py"], token="first-token", livekit_url="wss://first.invalid"
+                    )
+                    first_phone = first.run_remote(["cat", "voice/evals/phone.jsonl"])
+                    self.assertEqual(json.loads(first_receipt.stdout)["turns"][0]["receipt"], "same-scenario-1-receipt")
+                    self.assertEqual(json.loads(first_phone.stdout)["run_id"], "same-scenario-1")
+
+        builds = [args for args, _ in calls if args[:2] == ["nix", "build"]]
+        transfers = [args for args, _ in calls if args and args[0] == "scp" and args[1:2] != ["-p"]]
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(len(transfers), 4)  # package, voice modules, evals, and assets once each
+        remote_scripts = [
+            kwargs.get("input", "")
+            for args, kwargs in calls
+            if args[:2] == ["ssh", "ultraviolet"] and kwargs.get("input")
+        ]
+        stop_run_indices = [
+            index for index, script in enumerate(remote_scripts)
+            if "RUN_DIR=$1" in script and 'kill -TERM -- "-$pid"' in script
+        ]
+        batch_cleanup_indices = [
+            index for index, script in enumerate(remote_scripts)
+            if 'bash "$BATCH_DIR/cleanup.sh"' in script
+        ]
+        self.assertEqual(len(stop_run_indices), 2)
+        self.assertEqual(len(batch_cleanup_indices), 1)
+        self.assertLess(max(stop_run_indices), batch_cleanup_indices[0])
+        batch_cleanup = _BATCH_SETUP_SCRIPT.split(
+            'cat > "$BATCH_DIR/cleanup.sh" <<\'CLEANUP\'\n', 1
+        )[1].split("\nCLEANUP\n", 1)[0]
+        self.assertLess(
+            batch_cleanup.index('for pid_file in "$BATCH_DIR"/runs/*/agent.pid'),
+            batch_cleanup.index("systemctl start mentat-voice"),
+        )
+        setup_invocations = [event for event in events if event[0] == "setup"]
+        setup_counts = {}
+        setup_ports = {}
+        for _kind, run_dir, ports in setup_invocations:
+            setup_counts[run_dir] = setup_counts.get(run_dir, 0) + 1
+            setup_ports[run_dir] = tuple(ports)
+        self.assertEqual(set(setup_counts.values()), {1})
+        worker_events = [event for event in events if event[0] == "worker"]
+        worker_ports = {
+            run_dir: tuple(ports)
+            for _kind, run_dir, ports in worker_events
+        }
+        self.assertEqual(worker_ports, setup_ports)
+        for run_id in ("same-scenario-1", "same-scenario-2"):
+            stop_index = events.index(("stop", run_id))
+            evidence_index = events.index(("evidence", run_id))
+            self.assertLess(stop_index, evidence_index)
+        tunnel_ports = {
+            int(call.args[0][-2].rsplit(":", 1)[1])
+            for call in popen.call_args_list
+        }
+        self.assertEqual(tunnel_ports, {int(ports[0]) for ports in setup_ports.values()})
+        self.assertEqual(popen.call_count, 2)
+
+    def test_concurrent_run_stacks_keep_ports_and_remote_roots_independent(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Lock
+
+        calls = []
+        guard = Lock()
+        probe_count = 0
+
+        def run(args, **kwargs):
+            nonlocal probe_count
+            with guard:
+                calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.parallel\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                with guard:
+                    probe_count += 1
+                    number = probe_count
+                return subprocess.CompletedProcess(
+                    args, 0,
+                    json.dumps({"dev_port": 49150 + number * 2, "health_port": 49151 + number * 2}),
+                    "",
+                )
+            if "MENTAT_VOICE_GRANT" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
+            popen.side_effect = lambda *_args, **_kwargs: unittest.mock.Mock(poll=lambda: None)
+            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+                def launch(run_id):
+                    with batch.run(run_id) as stack:
+                        stack.start_worker(f"{run_id}-room")
+                        stack.run_voice(["caller.py"], token=f"{run_id}-token", livekit_url="wss://lk.invalid")
+                        return stack.dev_port, stack.health_port, stack._remote_dir, stack.base_url
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = list(executor.map(launch, ("parallel-one", "parallel-two")))
+
+        self.assertEqual(len({(dev_port, health_port) for dev_port, health_port, _root, _url in results}), 2)
+        self.assertEqual(len({root for _dev_port, _health_port, root, _url in results}), 2)
+        self.assertEqual(len({url for _dev_port, _health_port, _root, url in results}), 2)
+        self.assertEqual(popen.call_count, 2)
+
+    def test_run_voice_stops_its_daemon_and_worker_before_evidence_reads(self):
+        events = []
+        stack = _RunStack(
+            checkout=CHECKOUT, run=subprocess.run, batch=SimpleNamespace(), run_id="producer-order"
+        )
+        stack._entered = True
+        stack._remote_dir = "/tmp/mentat-eval-batch.synthetic/runs/producer-order"
+        stack.dev_port = 49151
+        stack.health_port = 49152
+
+        def remote(script, *_args, **_kwargs):
+            if "MENTAT_VOICE_GRANT" in script:
+                events.append("capture")
+                return subprocess.CompletedProcess(["ssh"], 0, '{"turns":[]}\n', "")
+            if "RUN_DIR=$1" in script and "agent.pid" in script and "voice.pid" in script:
+                events.append(("stop", script))
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
+            raise AssertionError(f"unexpected remote command: {script[:80]}")
+
+        def run(args, **kwargs):
+            events.append("evidence-read")
+            return subprocess.CompletedProcess(args, 0, "{}\n", "")
+
+        with patch.object(stack, "_remote", side_effect=remote), patch.object(stack, "_run", side_effect=run):
+            stack.run_voice(["caller.py"], token="private-token", livekit_url="wss://lk.invalid")
+            self.assertEqual([event if isinstance(event, str) else event[0] for event in events], ["capture", "stop"])
+            stop_script = events[-1][1]
+            self.assertIn('kill -TERM -- "-$pid"', stop_script)
+            self.assertIn('"$RUN_DIR/agent.pid" "$RUN_DIR/voice.pid"', stop_script)
+            stack.run_remote(["cat", "voice/evals/phone.jsonl"])
+        stop_index = next(index for index, event in enumerate(events) if isinstance(event, tuple) and event[0] == "stop")
+        self.assertLess(stop_index, events.index("evidence-read"))
+
+    def test_concurrent_duplicate_run_ids_are_rejected_atomically(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def run(args, **kwargs):
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.ids\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def slow_stack(**kwargs):
+            time.sleep(0.05)
+            return SimpleNamespace(run_id=kwargs["run_id"], _remote_dir=None, _tunnel=None)
+
+        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+            with patch("voice.evals.dev_stack._RunStack", side_effect=slow_stack):
+                def register():
+                    try:
+                        return batch.run("same-id")
+                    except ValueError:
+                        return None
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    outcomes = list(executor.map(lambda _index: register(), range(2)))
+        self.assertEqual(sum(outcome is not None for outcome in outcomes), 1)
+        self.assertEqual(sum(outcome is None for outcome in outcomes), 1)
+
+    def test_run_ancestors_are_searchable_but_logs_and_state_remain_private(self):
+        batch_permissions = (
+            'install -d -m 700 "$BATCH_DIR/runs"',
+            'chmod 711 "$BATCH_DIR"',
+            'chmod 711 "$BATCH_DIR/runs"',
+        )
+        run_permissions = (
+            'umask 077',
+            'mkdir -m 700 "$RUN_DIR"',
+            'mkdir -m 700 -p "$RUN_DIR/home/mentat" "$RUN_DIR/home/voice/cache" "$RUN_DIR/records" "$RUN_DIR/memory" "$RUN_DIR/voice/evals"',
+            'chmod 711 "$RUN_DIR"',
+            'chmod 711 "$RUN_DIR/home"',
+        )
+        for statement in batch_permissions:
+            self.assertIn(statement, _BATCH_SETUP_SCRIPT)
+        for statement in run_permissions:
+            self.assertIn(statement, _RUN_SETUP_SCRIPT)
+        self.assertIn('chmod 400 "$RUN_DIR/voice-private"', _RUN_SETUP_SCRIPT)
+        self.assertIn('chmod 400 "$RUN_DIR/voice-gateway-key"', _RUN_SETUP_SCRIPT)
+        self.assertIn('chmod 640 "$RUN_DIR/voice.env.json"', _RUN_SETUP_SCRIPT)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            batch = root / "batch"
+            batch.mkdir(mode=0o700)
+            run_dir = batch / "runs/run-one"
+            commands = [*batch_permissions, *run_permissions]
+            setup = "set -euo pipefail\n" + "\n".join(commands) + "\n"
+            setup += f'python3 -c "from pathlib import Path; Path({str(run_dir / "agent.log")!r}).touch()"\n'
+            result = subprocess.run(
+                ["bash", "-c", setup],
+                env={**os.environ, "BATCH_DIR": os.fspath(batch), "RUN_DIR": os.fspath(run_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(stat.S_IMODE(batch.stat().st_mode), 0o711)
+            self.assertEqual(stat.S_IMODE((batch / "runs").stat().st_mode), 0o711)
+            self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o711)
+            self.assertEqual(stat.S_IMODE((run_dir / "home").stat().st_mode), 0o711)
+            for relative in ("home/mentat", "home/voice/cache", "records", "memory", "voice/evals"):
+                self.assertEqual(stat.S_IMODE((run_dir / relative).stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE((run_dir / "agent.log").stat().st_mode), 0o600)
+
+    def test_stop_run_script_waits_for_group_after_kill_and_rejects_live_group(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            (run_dir / "agent.pid").write_text("12345\n")
+            bash_env = root / "bash-env"
+            bash_env.write_text(r'''PHASE=term
+PROBES=0
+kill() {
+  printf '%s\n' "$*" >> "$KILL_LOG"
+  case "$1" in
+    -TERM) PHASE=term; PROBES=0; return 0 ;;
+    -KILL) PHASE=killed; PROBES=0; return 0 ;;
+    -0)
+      if [ "$2" != -- ] || [ "$3" != -12345 ]; then return 1; fi
+      PROBES=$((PROBES + 1))
+      if [ "$PHASE" = killed ] && [ "$MODE" = drain ] && [ "$PROBES" -ge 3 ]; then return 1; fi
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
+''')
+            for mode in ("drain", "live"):
+                with self.subTest(mode=mode):
+                    log = root / (mode + ".log")
+                    result = subprocess.run(
+                        ["bash", "-c", _STOP_RUN_SCRIPT, "stop", os.fspath(run_dir)],
+                        env={**os.environ, "BASH_ENV": os.fspath(bash_env), "KILL_LOG": os.fspath(log), "MODE": mode},
+                        capture_output=True, text=True, check=False,
+                    )
+                    calls = [line for line in log.read_text().splitlines() if line.startswith("-")]
+                    self.assertEqual(calls[0], "-TERM -- -12345")
+                    kill_index = calls.index("-KILL -- -12345")
+                    self.assertEqual(calls[1:kill_index], ["-0 -- -12345"] * 6)
+                    self.assertTrue(calls[kill_index + 1:])
+                    self.assertTrue(all(call == "-0 -- -12345" for call in calls[kill_index + 1:]))
+                    if mode == "drain":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(calls[kill_index + 1:], ["-0 -- -12345"] * 4)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("remains alive after KILL", result.stderr)
+
+    def test_stop_producers_remains_unset_after_failed_group_shutdown(self):
+        from voice.evals.dev_stack import RemoteCommandError
+
+        stack = _RunStack(checkout=CHECKOUT, batch=SimpleNamespace())
+        stack._remote_dir = "/tmp/mentat-eval-batch.synthetic/runs/failure"
+        failure = RemoteCommandError(1, ["ssh"], stderr="producer group remains alive after KILL")
+        with patch.object(stack, "_remote", side_effect=failure) as remote:
+            with self.assertRaises(RemoteCommandError):
+                stack._stop_producers()
+        self.assertEqual(remote.call_args.args[0], _STOP_RUN_SCRIPT)
+        self.assertFalse(stack._producers_stopped)
+
     def setUp(self):
         response = unittest.mock.MagicMock()
         response.__enter__.return_value.status = 200
@@ -75,7 +458,7 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+        with isolated_run(checkout=CHECKOUT, opt_in=True, run=run) as stack:
             self.assertEqual(stack.dev_port, selected_ports["dev_port"])
             self.assertEqual(stack.health_port, selected_ports["health_port"])
             local_port = int(urlsplit(stack.url).port)
@@ -115,7 +498,7 @@ class DevStackTest(unittest.TestCase):
         self.assertNotIn("systemctl stop mentatd", "\n".join(kwargs.get("input", "") for _, kwargs in remote_calls))
         self.assertIn("systemctl start mentat-voice", "\n".join(kwargs.get("input", "") for _, kwargs in remote_calls))
 
-    def test_remote_port_selection_failure_cleans_up_staging_and_restarts_voice(self):
+    def test_remote_port_selection_failure_cleans_up_the_run_without_restoring_siblings(self):
         calls = []
 
         def run(args, **kwargs):
@@ -123,24 +506,28 @@ class DevStackTest(unittest.TestCase):
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
-                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.probefailure\n", "")
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.probefailure\n", "")
             if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
                 return subprocess.CompletedProcess(args, 0, "invalid probe response", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
-        with self.assertRaisesRegex(RuntimeError, "remote port probe"):
-            stack.__enter__()
+        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+            with self.assertRaisesRegex(RuntimeError, "remote port probe"):
+                with batch.run("bad-port-run"):
+                    pass
 
+        probe = [
+            kwargs.get("input", "") for args, kwargs in calls
+            if args[:2] == ["ssh", "ultraviolet"] and "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", "")
+        ]
         cleanup = [
             kwargs.get("input", "") for args, kwargs in calls
-            if args[:2] == ["ssh", "ultraviolet"] and "cleanup.sh" in kwargs.get("input", "")
+            if args[:2] == ["ssh", "ultraviolet"] and 'bash "$BATCH_DIR/cleanup.sh"' in kwargs.get("input", "")
         ]
+        self.assertEqual(len(probe), 1)
         self.assertEqual(len(cleanup), 1)
-        self.assertIn('rm -rf -- "$DEV_DIR"', cleanup[0])
-        self.assertNotIn("systemctl start mentat-voice", cleanup[0])
-        self.assertIsNone(stack._remote_dir)
-        self.assertIsNone(stack._local_port)
+        self.assertIn('rm -rf -- "$BATCH_DIR"', cleanup[0])
+        self.assertNotIn("systemctl start mentat-voice", probe[0])
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_stages_candidate_and_fake_phone_on_isolated_loopback_daemon(self, popen):
@@ -156,7 +543,7 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.test\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with DevStack(checkout=CHECKOUT, opt_in=True, run=run, local_port=0, dev_port=dev_port, health_port=8486) as stack:
+        with isolated_run(checkout=CHECKOUT, opt_in=True, run=run, local_port=0, dev_port=dev_port, health_port=8486) as stack:
             self.assertRegex(stack.url, r"^http://127\.0\.0\.1:\d+$")
             stack.run_remote(["test", "-f", "voice/evals/phone.py"])
             stack.start_worker("android-test-room")
@@ -176,10 +563,10 @@ class DevStackTest(unittest.TestCase):
         setup = "\n".join(script for script in remote_scripts if script)
         self.assertIn("127.0.0.1", setup)
         self.assertIn('"MENTAT_LISTEN": f"127.0.0.1:{dev_port}"', setup)
-        self.assertIn('"MENTAT_STATE_PATH": str(dev_dir / "home/mentat/state.json")', setup)
-        self.assertIn('mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat"', setup)
-        self.assertIn('chmod 700 "$DEV_DIR/home/mentat"', setup)
-        self.assertIn('chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat"', setup)
+        self.assertIn('"MENTAT_STATE_PATH": str(run_dir / "home/mentat/state.json")', setup)
+        self.assertIn('cp -a "$SHARED_DIR/mentat" "$RUN_DIR/mentat"', setup)
+        self.assertIn('mkdir -m 700 -p "$RUN_DIR/home/mentat"', setup)
+        self.assertIn('chown -R mentat:mentat "$RUN_DIR/mentat" "$RUN_DIR/home/mentat"', setup)
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_home = Path(temporary_directory) / "home/mentat"
             state_home.mkdir(parents=True, mode=0o700)
@@ -190,10 +577,10 @@ class DevStackTest(unittest.TestCase):
             os.replace(temporary_state, state_path)
             self.assertEqual(state_path.read_text(), '{"session":"persisted"}')
             self.assertEqual(stat.S_IMODE(state_home.stat().st_mode), 0o700)
-        self.assertIn('"MENTAT_RECORD_DIR": str(dev_dir / "records")', setup)
-        self.assertIn('"HOME": str(dev_dir / "home/mentat")', setup)
+        self.assertIn('"MENTAT_RECORD_DIR": str(run_dir / "records")', setup)
+        self.assertIn('"HOME": str(run_dir / "home/mentat")', setup)
         self.assertIn('"MENTAT_MCP_CONFIG"', setup)
-        self.assertIn('"MENTAT_URL": f"http://127.0.0.1:{dev_port}"', setup)
+        self.assertIn('"MENTAT_LISTEN": f"127.0.0.1:{dev_port}"', setup)
         self.assertIn('"--reuid=nobody"', setup)
         self.assertIn('voice/evals/phone.py', " ".join(transfers[1]))
         self.assertNotIn("systemctl stop mentatd", setup)
@@ -201,7 +588,7 @@ class DevStackTest(unittest.TestCase):
         self.assertIn("systemctl start mentat-voice", setup)
         worker_script = next(script for script in remote_scripts if "--room" in script)
         setup_script = next(script for script in remote_scripts if '"MENTAT_STATE_PATH"' in script)
-        self.assertIn("systemd-run", setup_script)
+        self.assertIn("systemd-run", _BATCH_SETUP_SCRIPT)
         self.assertIn("systemctl stop mentat-voice", worker_script)
         self.assertIn("agent.pid", setup)
 
@@ -213,195 +600,96 @@ class DevStackTest(unittest.TestCase):
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
-                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.modeltest\n", "")
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.modeltest\n", "")
             if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
                 return subprocess.CompletedProcess(
                     args, 0, json.dumps({"dev_port": 49151, "health_port": 49152}), ""
                 )
+            if "MENTAT_VOICE_GRANT" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
         requested_model = "claude-opus-5-5"
         with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
             with patch.dict(os.environ, {"MENTAT_VOICE_MODEL": requested_model}, clear=False):
-                with DevStack(checkout=CHECKOUT, opt_in=True, run=run):
+                with isolated_run(checkout=CHECKOUT, opt_in=True, run=run):
                     pass
 
-        setup_args, setup_kwargs = next(
+        launch_args, launch_kwargs = next(
             (args, kwargs)
             for args, kwargs in calls
             if args[:2] == ["ssh", "ultraviolet"]
             and '"MENTAT_STATE_PATH"' in kwargs.get("input", "")
         )
-        self.assertEqual(setup_args[-1], requested_model)
-        setup_script = _SETUP_SCRIPT.replace(
-            "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
-        ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
-        setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
-        setup_body = setup_script.split(setup_header + "\n", 1)[1].split("\nPY\n", 1)[0]
-        setup_invocation = next(
-            line for line in setup_script.splitlines()
-            if 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY"' in line
-        )
-
+        self.assertEqual(launch_args[-1], requested_model)
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            dev_dir = root / "stage"
-            (dev_dir / "mentat").mkdir(parents=True)
-            (dev_dir / "memory").mkdir(mode=0o700)
-            (dev_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
-            production_env = root / "production-mentat.env.json"
-            original_production = {
+            run_dir = Path(temporary) / "run"
+            (run_dir / "mentat").mkdir(parents=True)
+            (run_dir / "memory").mkdir(mode=0o700)
+            (run_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
+            (run_dir / "mentat.env.json").write_text(json.dumps({
                 "PATH": "/usr/bin",
-                "MENTAT_VOICE_MODEL": "chatgpt/sol-fast",
-                "CAPTURE_ENV": str(root / "candidate-env.json"),
-            }
-            production_bytes = json.dumps(original_production).encode()
-            production_env.write_bytes(production_bytes)
-            setpriv = root / "setpriv"
-            setpriv.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os\n"
-                "with open(os.environ['CAPTURE_ENV'], 'w') as output:\n"
-                "    json.dump(dict(os.environ), output)\n"
-            )
-            setpriv.chmod(0o755)
-            setup_assignments = "\n".join(
-                line for line in setup_script.splitlines()[:6]
-                if line.startswith(("DEV_DIR=", "DEV_PORT=", "HEALTH_PORT=", "VOICE_MODEL="))
-            )
-            setup_shell = (
-                "set -euo pipefail\n"
-                + setup_assignments
-                + "\nNODE_BIN=/nix/bin/node\nVOICE_PY=/nix/bin/python\n"
-                + setup_invocation + "\n" + setup_body + "\nPY\n"
-            )
+                "MENTAT_LISTEN": "127.0.0.1:8484",
+                "MENTAT_SYSTEM_PROMPT": "Production prompt",
+                "MENTAT_MEMORY_DIR": "/production/memory",
+            }))
+            for name, content in (("node.path", "/nix/bin/node"), ("setpriv.path", "/usr/bin/setpriv")):
+                (run_dir / name).write_text(content)
+            candidate_env = run_setup_environment(run_dir, requested_model)
 
-            def run_candidate(model):
-                (dev_dir / "mentat.env.json").write_bytes(production_env.read_bytes())
-                captured_env = Path(original_production["CAPTURE_ENV"])
-                captured_env.unlink(missing_ok=True)
-                result = subprocess.run(
-                    [
-                        "bash", "-c", setup_shell, "setup",
-                        str(dev_dir), "49151", "49152", model,
-                    ],
-                    env={
-                        **os.environ,
-                        "PATH": f"{root}:{os.environ['PATH']}",
-                        "MENTAT_VOICE_MODEL": "chatgpt/sol-fast",
-                    },
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                for _ in range(100):
-                    if captured_env.exists():
-                        break
-                    time.sleep(0.01)
-                self.assertTrue(captured_env.is_file(), "candidate process did not capture its environment")
-                return json.loads(captured_env.read_text())
-
-            candidate_env = run_candidate(requested_model)
-            self.assertEqual(candidate_env["MENTAT_VOICE_MODEL"], requested_model)
-            self.assertEqual(candidate_env["MENTAT_SESSION_TTL"], "90s")
-            self.assertEqual(production_env.read_bytes(), production_bytes)
-            self.assertEqual(json.loads(production_env.read_text()), original_production)
-
-            candidate_env = run_candidate("chatgpt/sol-fast")
-            self.assertEqual(candidate_env["MENTAT_VOICE_MODEL"], "chatgpt/sol-fast")
-            self.assertEqual(production_env.read_bytes(), production_bytes)
+        self.assertEqual(candidate_env["MENTAT_VOICE_MODEL"], requested_model)
+        self.assertEqual(candidate_env["MENTAT_SESSION_TTL"], "90s")
+        self.assertEqual(candidate_env["MENTAT_MEMORY_DIR"], os.fspath(run_dir / "memory"))
+        self.assertEqual(candidate_env["MENTAT_SYSTEM_PROMPT"], "Synthetic candidate prompt")
+        self.assertNotEqual(candidate_env["MENTAT_MEMORY_DIR"], "/production/memory")
+        self.assertEqual(launch_kwargs["input"].count("nix build"), 0)
 
         default_model = "chatgpt/sol-fast"
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MENTAT_VOICE_MODEL", None)
             with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
-                with DevStack(checkout=CHECKOUT, opt_in=True, run=run):
+                with isolated_run(checkout=CHECKOUT, opt_in=True, run=run):
                     pass
-        default_setup_args, _ = next(
+        default_launch_args, _ = next(
             (args, kwargs)
             for args, kwargs in reversed(calls)
             if args[:2] == ["ssh", "ultraviolet"]
             and '"MENTAT_STATE_PATH"' in kwargs.get("input", "")
         )
-        self.assertEqual(default_setup_args[-1], default_model)
+        self.assertEqual(default_launch_args[-1], default_model)
 
     def test_candidate_memory_store_is_private_and_overrides_production_path(self):
-        setup = _SETUP_SCRIPT.replace(
-            "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
-        ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
-        self.assertIn('"$DEV_DIR/memory"', setup)
-        self.assertIn('chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat" "$DEV_DIR/records" "$DEV_DIR/memory"', setup)
-        self.assertIn('chmod 700 "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records" "$DEV_DIR/memory"', setup)
-        setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
-        setup_body = setup.split(setup_header + "\n", 1)[1].split("\nPY\n", 1)[0]
+        setup = _RUN_SETUP_SCRIPT.replace("__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE)
+        self.assertIn('"$RUN_DIR/memory"', setup)
+        self.assertIn('"MENTAT_MEMORY_DIR": str(run_dir / "memory")', setup)
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            dev_dir = root / "stage"
-            mentat_dir = dev_dir / "mentat"
-            memory_dir = dev_dir / "memory"
-            mentat_dir.mkdir(parents=True)
+            run_dir = root / "run"
+            (run_dir / "mentat").mkdir(parents=True)
+            memory_dir = run_dir / "memory"
             memory_dir.mkdir(mode=0o700)
             os.chmod(memory_dir, 0o700)
-            (mentat_dir / "prompt.md").write_text("Synthetic candidate prompt")
-            production_path = root / "synthetic-production-memory"
-            production_env = root / "production-mentat.env.json"
+            (run_dir / "mentat/prompt.md").write_text("Candidate prompt")
+            production_path = root / "production-memory"
             production_values = {
                 "PATH": "/usr/bin",
-                "CAPTURE_ENV": os.fspath(root / "captured-env.json"),
                 "MENTAT_LISTEN": "127.0.0.1:8484",
-                "MENTAT_SYSTEM_PROMPT": "Synthetic production prompt",
+                "MENTAT_SYSTEM_PROMPT": "Production prompt",
                 "MENTAT_MEMORY_DIR": os.fspath(production_path),
             }
             production_bytes = json.dumps(production_values).encode()
-            production_env.write_bytes(production_bytes)
-            staged_env = dev_dir / "mentat.env.json"
-            staged_env.write_bytes(production_bytes)
-            setpriv = root / "setpriv"
-            setpriv.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os\n"
-                "with open(os.environ['CAPTURE_ENV'], 'w') as output:\n"
-                "    json.dump(dict(os.environ), output)\n"
-            )
-            setpriv.chmod(0o755)
-            setup_path = root / "setup.py"
-            setup_path.write_text(setup_body)
-            env = {
-                **os.environ,
-                "PATH": f"{root}:{os.environ['PATH']}",
-                "MENTAT_VOICE_MODEL": "synthetic-model",
-            }
-            command = [
-                sys.executable, os.fspath(setup_path), os.fspath(dev_dir),
-                "8485", "/nix/bin/node", "/nix/bin/python",
-            ]
-            result = subprocess.run(
-                command, env=env, capture_output=True, text=True, check=False
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            capture_path = Path(production_values["CAPTURE_ENV"])
-            for _ in range(100):
-                if capture_path.exists():
-                    break
-                time.sleep(0.01)
-            self.assertTrue(capture_path.is_file(), "candidate daemon did not launch")
-            candidate_env = json.loads(capture_path.read_text())
+            (run_dir / "mentat.env.json").write_bytes(production_bytes)
+            (run_dir / "node.path").write_text("/nix/bin/node")
+            (run_dir / "setpriv.path").write_text("/usr/bin/setpriv")
+
+            candidate_env = run_setup_environment(run_dir, "synthetic-model")
+
             self.assertEqual(candidate_env["MENTAT_MEMORY_DIR"], os.fspath(memory_dir))
             self.assertNotEqual(candidate_env["MENTAT_MEMORY_DIR"], os.fspath(production_path))
             self.assertEqual(list(memory_dir.iterdir()), [])
             self.assertEqual(stat.S_IMODE(memory_dir.stat().st_mode), 0o700)
-            self.assertEqual(production_env.read_bytes(), production_bytes)
-
-            capture_path.unlink()
-            memory_dir.rmdir()
-            result = subprocess.run(
-                command, env=env, capture_output=True, text=True, check=False
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(capture_path.exists(), "missing staged memory launched the daemon")
-            self.assertEqual(production_env.read_bytes(), production_bytes)
+            self.assertEqual((run_dir / "mentat.env.json").read_bytes(), production_bytes)
 
     def test_candidate_prompt_overrides_production_prompt_and_missing_fails_closed(self):
         calls = []
@@ -411,92 +699,41 @@ class DevStackTest(unittest.TestCase):
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
-                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.prompttest\n", "")
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.prompttest\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"dev_port": 49151, "health_port": 49152}), ""
+                )
+            if "MENTAT_VOICE_GRANT" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
         with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
-            with DevStack(
-                checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=stage_run
-            ):
+            with isolated_run(checkout=CHECKOUT, opt_in=True, run=stage_run):
                 pass
-
         transfers = [args for args, _ in calls if args and args[0] == "scp"]
         self.assertTrue(any(os.fspath(CHECKOUT / "prompt.md") in args for args in transfers))
 
-        setup = _SETUP_SCRIPT.replace(
-            "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
-        ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
-        setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
-        setup_body = setup.split(setup_header + "\n", 1)[1].split("\nPY\n", 1)[0]
-
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            setup_path = root / "setup.py"
-            setup_path.write_text(setup_body)
-            setpriv = root / "setpriv"
-            capture_path = root / "captured-env.json"
-            setpriv.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os\n"
-                "with open(os.environ['CAPTURE_ENV'], 'w') as output:\n"
-                "    json.dump(dict(os.environ), output)\n"
-            )
-            setpriv.chmod(0o755)
+            run_dir = Path(temporary) / "run"
+            mentat = run_dir / "mentat"
+            mentat.mkdir(parents=True)
+            (run_dir / "memory").mkdir(mode=0o700)
             candidate_prompt = "Candidate interpreter prompt: [[en]]\n"
-            production_prompt = "Synthetic production prompt without tags"
-            production_values = {
+            (mentat / "prompt.md").write_text(candidate_prompt)
+            (run_dir / "mentat.env.json").write_text(json.dumps({
                 "PATH": "/usr/bin",
-                "CAPTURE_ENV": os.fspath(capture_path),
                 "MENTAT_LISTEN": "127.0.0.1:8484",
-                "MENTAT_SYSTEM_PROMPT": production_prompt,
-            }
-            production_bytes = json.dumps(production_values).encode()
-            dev_dir = root / "stage"
-            mentat_dir = dev_dir / "mentat"
-            mentat_dir.mkdir(parents=True)
-            (dev_dir / "memory").mkdir(mode=0o700)
-            staged_prompt = mentat_dir / "prompt.md"
-            staged_prompt.write_bytes(candidate_prompt.encode())
-            production_env = root / "production-mentat.env.json"
-            production_env.write_bytes(production_bytes)
-            staged_env = dev_dir / "mentat.env.json"
-            staged_env.write_bytes(production_bytes)
-
-            env = {
-                **os.environ,
-                "PATH": f"{root}:{os.environ['PATH']}",
-                "MENTAT_VOICE_MODEL": "synthetic-model",
-            }
-            result = subprocess.run(
-                [sys.executable, os.fspath(setup_path), os.fspath(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            for _ in range(100):
-                if capture_path.exists():
-                    break
-                time.sleep(0.01)
-            self.assertTrue(capture_path.is_file(), "candidate process did not capture its environment")
-            candidate_env = json.loads(capture_path.read_text())
+                "MENTAT_SYSTEM_PROMPT": "Production prompt without tags",
+            }))
+            (run_dir / "node.path").write_text("/nix/bin/node")
+            (run_dir / "setpriv.path").write_text("/usr/bin/setpriv")
+            candidate_env = run_setup_environment(run_dir, "synthetic-model")
             self.assertEqual(candidate_env["MENTAT_SYSTEM_PROMPT"], candidate_prompt)
-            self.assertEqual(production_env.read_bytes(), production_bytes)
 
-            capture_path.unlink()
-            staged_prompt.unlink()
-            staged_env.write_bytes(production_bytes)
-            result = subprocess.run(
-                [sys.executable, os.fspath(setup_path), os.fspath(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(capture_path.exists(), "missing candidate prompt launched the daemon")
-            self.assertEqual(production_env.read_bytes(), production_bytes)
+            (mentat / "prompt.md").unlink()
+            with self.assertRaisesRegex(RuntimeError, "candidate system prompt"):
+                run_setup_environment(run_dir, "synthetic-model")
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_controlmaster_handoff_does_not_abort_a_live_forward(self, popen):
@@ -542,7 +779,7 @@ class DevStackTest(unittest.TestCase):
 
         popen.side_effect = start_ssh
         with patch("urllib.request.urlopen", side_effect=urlopen), patch("time.sleep") as sleep:
-            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
+            with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
                 self.assertEqual(len(health_calls), 3)
                 self.assertEqual(health_calls[-1][0], f"{stack.url}/healthz")
                 sleep.assert_called()
@@ -587,7 +824,7 @@ class DevStackTest(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, "", "")
 
         with patch("urllib.request.urlopen", side_effect=urlopen), patch("time.sleep") as sleep:
-            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
+            with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
                 self.assertEqual(len(calls), 3)
                 self.assertEqual(calls[-1][0], f"{stack.url}/healthz")
                 self.assertTrue(all(timeout > 0 for _, timeout in calls))
@@ -616,9 +853,12 @@ class DevStackTest(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")) as urlopen:
             with patch("time.monotonic", side_effect=lambda: now[0]), patch("time.sleep", side_effect=sleep):
                 with patch("voice.evals.dev_stack._READINESS_TIMEOUT_SECONDS", 0.5, create=True):
-                    stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
                     with self.assertRaisesRegex(TimeoutError, "health endpoint"):
-                        stack.__enter__()
+                        with isolated_run(
+                            checkout=CHECKOUT, opt_in=True, dev_port=8485,
+                            health_port=8486, run=run,
+                        ):
+                            pass
 
         self.assertGreater(urlopen.call_count, 1)
         self.assertLessEqual(now[0], 0.7)
@@ -628,8 +868,6 @@ class DevStackTest(unittest.TestCase):
             for args, kwargs in calls
             if args[:2] == ["ssh", "ultraviolet"]
         ))
-        self.assertFalse(stack._entered)
-        self.assertIsNone(stack._local_port)
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_interruption_during_health_wait_cleans_up(self, popen):
@@ -647,9 +885,12 @@ class DevStackTest(unittest.TestCase):
 
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")):
             with patch("time.sleep", side_effect=KeyboardInterrupt):
-                stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
                 with self.assertRaises(KeyboardInterrupt):
-                    stack.__enter__()
+                    with isolated_run(
+                        checkout=CHECKOUT, opt_in=True, dev_port=8485,
+                        health_port=8486, run=run,
+                    ):
+                        pass
 
         tunnel.terminate.assert_called_once()
         self.assertTrue(any(
@@ -818,7 +1059,7 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.trace\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
+        with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
             stack.start_worker("trace-room")
 
         worker_script = next(
@@ -836,7 +1077,7 @@ class DevStackTest(unittest.TestCase):
             '"MENTAT_EVAL_VOICE_LOG": str(dev_dir / "voice/evals/voice-modes.jsonl")',
             worker_script,
         )
-        self.assertNotIn("MENTAT_EVAL_VOICE_LOG", _SETUP_SCRIPT)
+        self.assertNotIn("MENTAT_EVAL_VOICE_LOG", _RUN_SETUP_SCRIPT)
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_worker_joins_the_room_returned_by_the_voice_token(self, popen):
@@ -852,7 +1093,7 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.room\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
+        with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
             stack.start_worker(room)
 
         scripts = [kwargs.get("input", "") for args, kwargs in calls if args[:2] == ["ssh", "ultraviolet"]]
@@ -865,7 +1106,7 @@ class DevStackTest(unittest.TestCase):
         worker_script = worker_kwargs["input"]
         self.assertIn(room, worker_args)
         self.assertIn('"$ROOM"', worker_script)
-        self.assertIn("systemd-run", daemon_script)
+        self.assertIn("systemd-run", _BATCH_SETUP_SCRIPT)
         self.assertIn("systemctl stop mentat-voice", worker_script)
         self.assertIn('"MENTAT_EVAL_DELEGATION_LOG": str(dev_dir / "voice/evals/delegations.jsonl")', worker_script)
         self.assertIn('voice/evals/delegations.jsonl', worker_script)
@@ -889,7 +1130,7 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.repeat\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
+        with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
             stack.start_worker("first-token-room")
             stack.start_worker("second-token-room")
 
@@ -929,7 +1170,7 @@ class DevStackTest(unittest.TestCase):
                 f"caller warning {token}",
             )
 
-        stack = DevStack(checkout=CHECKOUT, run=run)
+        stack = _RunStack(checkout=CHECKOUT, remote="ultraviolet", run=run, batch=SimpleNamespace())
         stack._entered = True
         stack._remote_dir = "/tmp/mentat-eval.test"
         result = stack.run_voice(
@@ -949,7 +1190,7 @@ class DevStackTest(unittest.TestCase):
             },
         )
         self.assertEqual(result.stderr, "caller warning [REDACTED]")
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         args, kwargs = calls[0]
         self.assertEqual(args[:2], ["ssh", "ultraviolet"])
         self.assertNotIn(token, " ".join(args))
@@ -963,6 +1204,8 @@ class DevStackTest(unittest.TestCase):
         self.assertIn('"LIVEKIT_URL": livekit_url', kwargs["input"])
         self.assertIn('"voice.env.json"', kwargs["input"])
         self.assertNotIn("ws://127.0.0.1:7880", kwargs["input"])
+        self.assertIn('RUN_DIR=$1', calls[1][1]["input"])
+        self.assertIn('"$RUN_DIR/agent.pid" "$RUN_DIR/voice.pid"', calls[1][1]["input"])
 
     def test_remote_and_run_voice_scrub_credential_forms_and_retain_cause(self):
         token = "issued-token.header.signature"
@@ -1004,7 +1247,7 @@ class DevStackTest(unittest.TestCase):
                     self.assertTrue(kwargs["check"])
                     raise failure
 
-                stack = DevStack(checkout=CHECKOUT, run=run)
+                stack = _RunStack(checkout=CHECKOUT, remote="ultraviolet", run=run, batch=SimpleNamespace())
                 stack._entered = True
                 stack._remote_dir = "/tmp/mentat-eval.test"
                 with self.assertRaises(subprocess.CalledProcessError) as raised:
@@ -1026,20 +1269,20 @@ class DevStackTest(unittest.TestCase):
                     self.assertNotIn(secret, error.output)
 
     def test_candidate_voice_environment_is_gc_rooted_until_cleanup(self):
-        setup_script = _SETUP_SCRIPT
-        cleanup_script = setup_script.split("cat > \"$DEV_DIR/cleanup.sh\" <<'CLEANUP'\n", 1)[1].split(
+        setup_script = _BATCH_SETUP_SCRIPT
+        cleanup_script = setup_script.split("cat > \"$BATCH_DIR/cleanup.sh\" <<'CLEANUP'\n", 1)[1].split(
             "\nCLEANUP\n", 1
         )[0]
 
-        self.assertIn('--out-link "$DEV_DIR/voice-env-root"', setup_script)
+        self.assertIn('--out-link "$SHARED_DIR/voice-env-root"', setup_script)
         self.assertIn("--print-out-paths", setup_script)
-        self.assertIn('  /nix/store/*) ;;', setup_script)
+        self.assertIn('/nix/store/*)', setup_script)
         self.assertIn('test -x "$VOICE_PY"', setup_script)
         self.assertIn('VOICE_PY="$VOICE_ENV_PATH/bin/python"', setup_script)
-        self.assertIn('rm -f -- "$DEV_DIR/voice-env-root"', cleanup_script)
+        self.assertIn('rm -f -- "$BATCH_DIR/shared/voice-env-root"', cleanup_script)
         self.assertLess(
-            cleanup_script.index('rm -f -- "$DEV_DIR/voice-env-root"'),
-            cleanup_script.index('rm -rf -- "$DEV_DIR"'),
+            cleanup_script.index('rm -f -- "$BATCH_DIR/shared/voice-env-root"'),
+            cleanup_script.index('rm -rf -- "$BATCH_DIR"'),
         )
         self.assertIn("systemctl start mentat-voice", cleanup_script)
         self.assertIn("systemctl stop mentat-voice", cleanup_script)
@@ -1053,7 +1296,7 @@ class DevStackTest(unittest.TestCase):
             systemctl.write_text(
                 "#!/bin/sh\n"
                 'if [ "$2" = mentat-voice ]; then\n'
-                '  if [ -L "$DEV_DIR/voice-env-root" ]; then state=root-present; else state=root-missing; fi\n'
+                '  if [ -L "$BATCH_DIR/shared/voice-env-root" ]; then state=root-present; else state=root-missing; fi\n'
                 '  printf "%s %s %s\\n" "$1" "$2" "$state" >> "$SYSTEMCTL_LOG"\n'
                 'else\n'
                 '  printf "%s\\n" "$*" >> "$SYSTEMCTL_LOG"\n'
@@ -1071,23 +1314,26 @@ class DevStackTest(unittest.TestCase):
 
             for action in ("start", "stop"):
                 dev_dir = root / f"dev-stack-{action}"
-                dev_dir.mkdir()
-                root_link = dev_dir / "voice-env-root"
+                shared = dev_dir / "shared"
+                run_dir = dev_dir / "runs" / "one"
+                shared.mkdir(parents=True)
+                run_dir.mkdir(parents=True)
+                root_link = shared / "voice-env-root"
                 root_link.symlink_to("/nix/store/candidate")
                 (dev_dir / "restore-action").write_text(f"{action}\n")
                 (dev_dir / "restore-unit").write_text("mentat-eval-restore-test\n")
-                (dev_dir / "agent.pid").write_text("12345\n")
-                (dev_dir / "voice.pid").write_text("12346\n")
+                (run_dir / "agent.pid").write_text("12345\n")
+                (run_dir / "voice.pid").write_text("12346\n")
                 cleanup_path = dev_dir / "cleanup.sh"
                 cleanup_path.write_text(cleanup_script)
                 result = subprocess.run(
-                    ["bash", os.fspath(cleanup_path)],
+                    ["bash", os.fspath(cleanup_path), os.fspath(dev_dir)],
                     capture_output=True,
                     text=True,
                     check=False,
                     env={
                         **os.environ,
-                        "DEV_DIR": os.fspath(dev_dir),
+                        "BATCH_DIR": os.fspath(dev_dir),
                         "SYSTEMCTL_LOG": os.fspath(systemctl_log),
                         "KILL_LOG": os.fspath(root / "kill.log"),
                         "BASH_ENV": os.fspath(bash_env),
@@ -1110,7 +1356,7 @@ class DevStackTest(unittest.TestCase):
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
-                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.voiceenv\n", "")
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.voiceenv\n", "")
             if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
                 return subprocess.CompletedProcess(
                     args, 0, json.dumps({"dev_port": 49151, "health_port": 49152}), ""
@@ -1119,63 +1365,35 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
-            popen.return_value = unittest.mock.Mock(poll=lambda: None)
-            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+        with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
+            with isolated_run(checkout=CHECKOUT, opt_in=True, run=run) as stack:
                 stack.start_worker("candidate-env-room")
-                stack.run_voice(
-                    ["caller.py"], token="test-token", livekit_url="wss://lk.invalid"
-                )
+                stack.run_voice(["caller.py"], token="test-token", livekit_url="wss://lk.invalid")
 
         scp_calls = [args for args, _ in calls if args and args[0] == "scp"]
         self.assertTrue(any(str(CHECKOUT / "nix/voice-env.nix") in args for args in scp_calls))
-        setup_index, (setup_args, setup_script) = next(
-            (index, (args, kwargs["input"])) for index, (args, kwargs) in enumerate(calls)
-            if args[:2] == ["ssh", "ultraviolet"]
-            and '"MENTAT_LISTEN"' in kwargs.get("input", "")
+        batch_script = _BATCH_SETUP_SCRIPT.replace(
+            "__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE
         )
-        self.assertIn('builtins.getFlake \\\"nixpkgs\\\"', setup_script)
-        self.assertIn("nix build \\\n    --impure", setup_script)
-        self.assertIn("/voice/voice-env.nix", setup_script)
-        self.assertIn('VOICE_PY="$VOICE_ENV_PATH/bin/python"', setup_script)
-        self.assertEqual(setup_args[-1], "chatgpt/sol-fast")
-        self.assertLess(
-            setup_script.index("candidate voice environment missing"),
-            setup_script.index("systemd-run"),
-        )
-        worker_index = next(
-            index for index, (_, kwargs) in enumerate(calls)
-            if "--room" in kwargs.get("input", "")
-        )
-        self.assertLess(setup_index, worker_index)
-        self.assertLess(
-            setup_script.index("candidate voice environment missing"),
-            setup_script.index("systemctl stop mentat-voice"),
-        )
+        run_script = _RUN_SETUP_SCRIPT.replace("__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE)
+        self.assertIn("builtins.getFlake", batch_script)
+        self.assertEqual(batch_script.count("nix build"), 1)
+        self.assertIn("$SHARED_DIR/voice/voice-env.nix", batch_script)
+        self.assertIn('"$SHARED_DIR/voice-env-root"', batch_script)
+        self.assertIn('"voice-python.path"', batch_script)
+        self.assertNotIn("nix build", run_script)
         for module in (
-            "livekit.plugins.dtln",
-            "livekit.plugins.elevenlabs",
-            "livekit.plugins.turn_detector",
-            "livekit.plugins.silero",
+            "livekit.plugins.dtln", "livekit.plugins.elevenlabs",
+            "livekit.plugins.turn_detector", "livekit.plugins.silero",
         ):
-            self.assertIn(module, setup_script)
-        self.assertNotIn("livekit.plugins.openai", setup_script)
-        self.assertIn('voice_python = sys.argv[4]', setup_script)
-        self.assertIn(
-            '(dev_dir / "voice-python.path").write_text(f"{voice_python}\\n")',
-            setup_script,
-        )
-        self.assertIn(
-            'voice_python = (dev_dir / "voice-python.path").read_text().strip()',
-            _START_WORKER_SCRIPT,
-        )
-        self.assertIn(
-            'voice_python = (DEV_DIR / "voice-python.path").read_text().strip()',
-            _RUN_VOICE_SCRIPT,
-        )
+            self.assertIn(module, batch_script)
+        self.assertNotIn("livekit.plugins.openai", batch_script)
+        self.assertIn('voice_python = (dev_dir / "voice-python.path").read_text().strip()', _START_WORKER_SCRIPT)
+        self.assertIn('voice_python = (DEV_DIR / "voice-python.path").read_text().strip()', _RUN_VOICE_SCRIPT)
+        self.assertEqual(stack.run_id, "test-run")
 
     def test_candidate_voice_python_preflight_reports_the_missing_plugin_by_name(self):
-        preflight = _SETUP_SCRIPT.split('"$VOICE_PY" - <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
+        preflight = _BATCH_SETUP_SCRIPT.split('"$VOICE_PY" - <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
         observed = []
 
         def import_module(module):
@@ -1204,57 +1422,54 @@ class DevStackTest(unittest.TestCase):
         def python_block(script, header):
             return script.split(header + chr(10), 1)[1].split(chr(10) + "PY" + chr(10), 1)[0]
 
+        self.assertIn('setpriv_path = shutil.which("setpriv")', _BATCH_SETUP_SCRIPT)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            dev_dir = root / "stage"
-            (dev_dir / "mentat").mkdir(parents=True)
-            (dev_dir / "memory").mkdir(mode=0o700)
-            (dev_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
-            (dev_dir / "voice").mkdir()
-            (dev_dir / "voice/evals").mkdir()
-            shutil.copy2(
-                Path(__file__).resolve().parents[1] / "evals/dev_stack.py",
-                dev_dir / "voice/evals/dev_stack.py",
-            )
+            run_dir = root / "run"
+            (run_dir / "mentat").mkdir(parents=True)
+            (run_dir / "voice/evals").mkdir(parents=True)
+            (run_dir / "memory").mkdir(mode=0o700)
+            (run_dir / "mentat/prompt.md").write_text("Synthetic candidate prompt")
             service_path = str(root / "service-bin")
-            (dev_dir / "mentat.env.json").write_text(json.dumps({
+            production_env = {
                 "PATH": service_path,
                 "MENTAT_LISTEN": "127.0.0.1:8484",
-            }))
-            (dev_dir / "voice.env.json").write_text(json.dumps({
+            }
+            (run_dir / "mentat.env.json").write_text(json.dumps(production_env))
+            (run_dir / "voice.env.json").write_text(json.dumps({
                 "PATH": service_path,
                 "LIVEKIT_API_SECRET": "private-env-secret",
             }))
-            (dev_dir / "voice-python.path").write_text("/nix/store/python/bin/python3")
-
             setup_bin = root / "setup-bin"
             setup_bin.mkdir()
             setpriv = setup_bin / "setpriv"
             setpriv.write_text("fake setpriv executable")
             setpriv.chmod(0o755)
             resolved_setpriv = str(setpriv.resolve())
+            (run_dir / "setpriv.path").write_text(resolved_setpriv)
+            (run_dir / "node.path").write_text("/usr/bin/node")
+            (run_dir / "voice-python.path").write_text("/nix/store/python/bin/python3")
 
-            setup = _SETUP_SCRIPT.replace(
-                "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
-            ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
-            setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
-            setup_body = python_block(setup, setup_header)
+            setup = _RUN_SETUP_SCRIPT.replace("__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE)
+            setup_body = python_block(
+                setup,
+                'python3 - "$RUN_DIR" "$DEV_PORT" "$HEALTH_PORT" "$VOICE_MODEL" <<\'PY\'',
+            )
             with patch.dict(os.environ, {"PATH": str(setup_bin)}):
-                with patch("sys.argv", ["setup.py", str(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"]):
+                with patch("sys.argv", ["setup.py", str(run_dir), "8485", "8486", "synthetic-model"]):
                     with patch("subprocess.Popen", return_value=SimpleNamespace(pid=1234)) as popen:
                         exec(setup_body, {})
             daemon_argv = popen.call_args.args[0]
             self.assertEqual(daemon_argv[0], resolved_setpriv)
             self.assertEqual(popen.call_args.kwargs["env"]["PATH"], service_path)
-            self.assertEqual((dev_dir / "setpriv.path").read_text(), resolved_setpriv)
-            self.assertEqual(stat.S_IMODE((dev_dir / "setpriv.path").stat().st_mode), 0o644)
+            self.assertEqual((run_dir / "setpriv.path").read_text(), resolved_setpriv)
 
             worker_body = python_block(
                 _START_WORKER_SCRIPT,
                 'python3 - "$DEV_DIR" "$DEV_PORT" "$HEALTH_PORT" "$ROOM" <<\'PY\'',
             )
-            with patch("sys.argv", ["worker.py", str(dev_dir), "8485", "8486", "worker-room"]):
-                with patch("subprocess.Popen") as popen:
+            with patch("sys.argv", ["worker.py", str(run_dir), "8485", "8486", "worker-room"]):
+                with patch("subprocess.Popen", return_value=SimpleNamespace(pid=1235)) as popen:
                     exec(worker_body, {})
             worker_argv = popen.call_args.args[0]
             self.assertEqual(worker_argv[0], resolved_setpriv)
@@ -1273,26 +1488,19 @@ class DevStackTest(unittest.TestCase):
             )
             caller_stdout = io.StringIO()
             caller_stderr = io.StringIO()
-            with patch("sys.argv", ["-c", "--", str(dev_dir), "8485", "8486"]):
+            with patch("sys.argv", ["-c", "--", str(run_dir), "8485", "8486"]):
                 with patch("sys.stdin", io.StringIO(caller_payload)):
                     with patch("sys.stdout", caller_stdout), patch("sys.stderr", caller_stderr):
-                        with patch("subprocess.run", return_value=result) as run:
+                        with patch("subprocess.run", return_value=result) as remote_run:
                             with patch("sys.exit") as exit_process:
                                 exec(_RUN_VOICE_SCRIPT, {})
             exit_process.assert_called_once_with(0)
-            self.assertIn("DISTINCTIVE-CAUSE", caller_stdout.getvalue())
             self.assertNotIn("private-env-secret", caller_stdout.getvalue())
             self.assertNotIn(token, caller_stdout.getvalue())
-            self.assertNotIn("private-env-secret", caller_stderr.getvalue())
-            self.assertNotIn(token, caller_stderr.getvalue())
-            caller_argv = run.call_args.args[0]
+            caller_argv = remote_run.call_args.args[0]
             self.assertEqual(caller_argv[0], resolved_setpriv)
-            self.assertEqual(run.call_args.kwargs["env"]["PATH"], service_path)
-            self.assertEqual(run.call_args.kwargs["env"]["MENTAT_VOICE_TOKEN"], token)
-            self.assertEqual(
-                run.call_args.kwargs["env"]["LIVEKIT_URL"],
-                "wss://issued-livekit.invalid",
-            )
+            self.assertEqual(remote_run.call_args.kwargs["env"]["PATH"], service_path)
+            self.assertEqual(remote_run.call_args.kwargs["env"]["MENTAT_VOICE_TOKEN"], token)
 
     def test_voice_caller_redacts_json_values_without_corrupting_machine_output(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1374,26 +1582,29 @@ class DevStackTest(unittest.TestCase):
             self.assertNotIn(token, caller_stderr.getvalue())
 
     def test_setup_fails_if_setpriv_cannot_be_resolved(self):
+        setup = _BATCH_SETUP_SCRIPT.replace(
+            "__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE
+        )
+        header = 'python3 - "$BATCH_DIR" "$MENTAT_PID" "$VOICE_PID" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
+        body = setup.split(header + "\n", 1)[1].split("\nPY\n", 1)[0]
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            dev_dir = root / "stage"
-            (dev_dir / "mentat").mkdir(parents=True)
-            setup = _SETUP_SCRIPT.replace(
-                "__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE
-            ).replace("__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE)
-            setup_header = 'python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
-            setup_body = setup.split(setup_header + chr(10), 1)[1].split(chr(10) + "PY" + chr(10), 1)[0]
-            with patch.dict(os.environ, {"PATH": str(root / "empty-bin")}):
-                with patch("sys.argv", ["setup.py", str(dev_dir), "8485", "/nix/bin/node", "/nix/bin/python"]):
+            with patch.dict(os.environ, {"PATH": str(Path(temporary) / "empty-bin")}):
+                with patch("sys.argv", ["setup.py", temporary, "123", "456", "/nix/bin/node", "/nix/bin/python"]):
                     with patch("subprocess.Popen") as popen:
                         with self.assertRaisesRegex(RuntimeError, "setpriv executable is unavailable"):
-                            exec(setup_body, {})
+                            exec(body, {})
             popen.assert_not_called()
 
     def test_run_voice_requires_entered_stack_and_propagates_remote_failure(self):
         run = unittest.mock.Mock()
-        stack = DevStack(checkout=CHECKOUT, run=run)
+        batch = DevStack(checkout=CHECKOUT, run=run)
+        with self.assertRaisesRegex(RuntimeError, "batch is not running"):
+            batch.run("before-enter")
+        run.assert_not_called()
 
+        stack = _RunStack(
+            checkout=CHECKOUT, remote="ultraviolet", run=run, batch=SimpleNamespace()
+        )
         grant = {"token": "issued-token.header.signature", "livekit_url": "wss://issued.invalid"}
         with self.assertRaisesRegex(RuntimeError, "dev stack is not running"):
             stack.run_voice(["voice/evals/caller.py"], **grant)
@@ -1422,9 +1633,8 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.permissions\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
         with patch("voice.evals.dev_stack.subprocess.Popen", return_value=unittest.mock.Mock(poll=lambda: None)):
-            with stack:
+            with isolated_run(checkout=CHECKOUT, opt_in=True, run=run):
                 pass
 
         first_scp = next(i for i, (args, _) in enumerate(calls) if args[0] == "scp")
@@ -1433,7 +1643,7 @@ class DevStackTest(unittest.TestCase):
         self.assertFalse(any(args[:3] == ["ssh", "ultraviolet", "sudo"] for args in before_scp))
 
     def test_private_voice_credential_is_copied_before_stopping_production_worker(self):
-        setup = _SETUP_SCRIPT.replace(
+        setup = _BATCH_SETUP_SCRIPT.replace(
             "__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE
         )
         self.assertIn("MENTAT_VOICE_PRIVATE", setup)
@@ -1476,18 +1686,17 @@ class DevStackTest(unittest.TestCase):
             self.assertEqual(identity_lookups, [("user", "nobody"), ("group", "nogroup")])
 
     def test_setup_captures_gateway_url_and_staged_key_for_candidate(self):
-        setup_header = 'python3 - "$DEV_DIR" "$MENTAT_PID" "$VOICE_PID" <<\'PY\''
-        setup_script = _SETUP_SCRIPT.replace(
+        setup_script = _BATCH_SETUP_SCRIPT.replace(
             "__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE
         )
-        setup_body = setup_script.split(setup_header, 1)[1].split("\nPY\n", 1)[0]
-        setup_body = setup_body.replace(
-            'Path(f"/proc/{pid}/environ")', 'Path(environ_dir / pid)'
-        )
+        header = 'python3 - "$BATCH_DIR" "$MENTAT_PID" "$VOICE_PID" "$NODE_BIN" "$VOICE_PY" <<\'PY\''
+        setup_body = setup_script.split(header + "\n", 1)[1].split("\nPY\n", 1)[0]
+        setup_body = setup_body.replace('Path(f"/proc/{pid}/environ")', 'Path(environ_dir / pid)')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            staging = root / "stage"
-            staging.mkdir()
+            batch = root / "batch"
+            shared = batch / "shared"
+            shared.mkdir(parents=True)
             environ_dir = root / "environ"
             environ_dir.mkdir()
             source = root / "production-key"
@@ -1498,20 +1707,17 @@ class DevStackTest(unittest.TestCase):
                 f"MENTAT_VOICE_GATEWAY_KEY_FILE={source}\0".encode()
             )
             (environ_dir / "456").write_bytes(b"")
-            namespace = {
-                "environ_dir": environ_dir,
-                "pwd": SimpleNamespace(getpwnam=lambda _: SimpleNamespace(pw_uid=os.getuid())),
-                "grp": SimpleNamespace(getgrnam=lambda _: SimpleNamespace(gr_gid=os.getgid())),
-            }
-            with patch("sys.argv", ["setup.py", str(staging), "123", "456"]):
-                with patch("pwd.getpwnam", return_value=SimpleNamespace(pw_uid=os.getuid())):
+            namespace = {"environ_dir": environ_dir}
+            with patch("sys.argv", ["setup.py", str(batch), "123", "456", "/nix/bin/node", "/nix/bin/python"]):
+                with patch("pwd.getpwnam", return_value=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())):
                     with patch("grp.getgrnam", return_value=SimpleNamespace(gr_gid=os.getgid())):
-                        exec(setup_body, namespace)
+                        with patch("shutil.which", return_value="/usr/bin/setpriv"):
+                            exec(setup_body, namespace)
 
-            candidate_env = json.loads((staging / "mentat.env.json").read_text())
+            candidate_env = json.loads((shared / "mentat.env.json").read_text())
             self.assertEqual(candidate_env["MENTAT_VOICE_GATEWAY_URL"], gateway_url)
             staged = Path(candidate_env["MENTAT_VOICE_GATEWAY_KEY_FILE"])
-            self.assertEqual(staged, staging / "voice-gateway-key")
+            self.assertEqual(staged, shared / "voice-gateway-key")
             self.assertEqual(staged.read_bytes(), b"synthetic-setup-gateway-key")
             self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o400)
             self.assertEqual(staged.stat().st_uid, os.getuid())
@@ -1620,7 +1826,7 @@ class DevStackTest(unittest.TestCase):
 
         with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
             popen.return_value = unittest.mock.Mock(poll=lambda: None)
-            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
+            with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
                 stack.start_worker("guard-test-room")
 
         remote_scripts = [
@@ -1628,7 +1834,7 @@ class DevStackTest(unittest.TestCase):
             for args, kwargs in calls
             if args[:2] == ["ssh", "ultraviolet"] and kwargs.get("input")
         ]
-        setup = next(script for script in remote_scripts if "MENTAT_LISTEN" in script)
+        setup = next(script for script in remote_scripts if "systemd-run" in script)
         worker = next(script for script in remote_scripts if "--room" in script)
         self.assertIn("systemd-run", setup)
         self.assertIn("systemctl stop mentat-voice", worker)
@@ -1649,7 +1855,7 @@ class DevStackTest(unittest.TestCase):
             calls.append((args, kwargs))
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        stack = DevStack(checkout=CHECKOUT, run=run)
+        stack = _RunStack(checkout=CHECKOUT, remote="ultraviolet", run=run, batch=SimpleNamespace())
         stack._remote_dir = "/tmp/mentat-eval.heartbeat"
         stack._restore_guard_armed = True
 
@@ -1691,7 +1897,7 @@ class DevStackTest(unittest.TestCase):
             _START_WORKER_SCRIPT.index('"$DEV_DIR/voice/evals/retained-evidence"'),
             _START_WORKER_SCRIPT.index('"$DEV_DIR/voice/evals/retained-evidence/input-audio"'),
         )
-        self.assertNotIn("MENTAT_VOICE_INPUT_RECORD_DIR", _SETUP_SCRIPT)
+        self.assertNotIn("MENTAT_VOICE_INPUT_RECORD_DIR", _RUN_SETUP_SCRIPT)
         self.assertNotIn("MENTAT_VOICE_INPUT_RECORD_DIR", _RUN_VOICE_SCRIPT)
 
     def test_input_audio_retention_allowlists_wav_and_matching_transcript_sidecars(self):
@@ -1917,7 +2123,7 @@ class DevStackTest(unittest.TestCase):
 
         with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
             popen.return_value = unittest.mock.Mock(poll=lambda: None)
-            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
+            with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
                 pass
 
         retained = getattr(stack, "retained_evidence_dir", None)
@@ -1967,15 +2173,12 @@ class DevStackTest(unittest.TestCase):
                 return result
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
+        stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
         with self.assertRaises(subprocess.CalledProcessError):
             with stack:
-                self.fail("setup failure should prevent entering the context")
+                self.fail("build failure should prevent entering the batch")
 
-        scripts = [kwargs.get("input", "") for args, kwargs in calls if args[:2] == ["ssh", "ultraviolet"]]
-        cleanup = "\n".join(script for script in scripts if script)
-        self.assertIn('rm -rf -- "$DEV_DIR"', cleanup)
-        self.assertNotIn("systemctl start mentat-voice", cleanup)
+        self.assertFalse(any(args[:2] == ["ssh", "ultraviolet"] for args, _ in calls))
 
     def test_remote_setup_error_includes_captured_stderr_without_credentials(self):
         diagnostic = "DISTINCTIVE_SETUP_FAILURE"
@@ -1994,32 +2197,26 @@ class DevStackTest(unittest.TestCase):
             )
             raise error
 
-        stack = DevStack(checkout=CHECKOUT, run=run)
+        stack = _RunStack(checkout=CHECKOUT, remote="ultraviolet", run=run, batch=SimpleNamespace())
         with self.assertRaisesRegex(subprocess.CalledProcessError, diagnostic) as caught:
             stack._remote("set -euo pipefail", "/tmp/mentat-eval.test")
 
         for secret in secrets:
             self.assertNotIn(secret, str(caught.exception))
 
-    def test_interruption_during_setup_attempts_production_voice_restart(self):
+    def test_interruption_before_batch_staging_launches_no_candidate_processes(self):
         calls = []
 
         def run(args, **kwargs):
             calls.append((args, kwargs))
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        stack = DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run)
+        stack = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
         with patch.object(DevStack, "_start", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 stack.__enter__()
 
-        cleanup = "\n".join(
-            kwargs.get("input", "")
-            for args, kwargs in calls
-            if args[:2] == ["ssh", "ultraviolet"]
-        )
-        self.assertIn("cleanup.sh", cleanup)
-        self.assertNotIn("systemctl start mentat-voice", cleanup)
+        self.assertEqual(calls, [])
 
     @patch("voice.evals.dev_stack.subprocess.Popen")
     def test_production_voice_restarts_after_body_exception(self, popen):
@@ -2035,17 +2232,20 @@ class DevStackTest(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, "", "")
 
         with self.assertRaisesRegex(ValueError, "scenario failed"):
-            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run):
+            with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run):
                 raise ValueError("scenario failed")
 
-        cleanup = "\n".join(
+        cleanup = next(
             kwargs.get("input", "")
             for args, kwargs in calls
-            if args[:2] == ["ssh", "ultraviolet"]
+            if args[:2] == ["ssh", "ultraviolet"] and 'cat > "$BATCH_DIR/cleanup.sh"' in kwargs.get("input", "")
         )
-        self.assertIn('trap restore_voice EXIT', cleanup)
-        self.assertIn("systemctl start mentat-voice", cleanup)
-        self.assertIn("systemctl stop mentat-voice", cleanup)
+        self.assertIn('systemctl start mentat-voice', cleanup)
+        self.assertIn('systemctl stop mentat-voice', cleanup)
+        self.assertLess(
+            cleanup.index('for pid_file in "$BATCH_DIR"/runs/*/agent.pid'),
+            cleanup.index('systemctl start mentat-voice'),
+        )
 
     def test_staged_remote_runner_imports_from_the_uploaded_voice_files(self):
         calls = []
@@ -2055,23 +2255,23 @@ class DevStackTest(unittest.TestCase):
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
-                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.imports\n", "")
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.imports\n", "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
         with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
             popen.return_value = unittest.mock.Mock(poll=lambda: None)
-            with DevStack(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run):
+            with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run):
                 pass
 
         with tempfile.TemporaryDirectory() as temporary:
             remote = Path(temporary)
-            voice_root = remote / "voice"
+            voice_root = remote / "shared/voice"
             for args, _ in calls:
                 if not args or args[0] != "scp" or args[1:2] == ["-p"]:
                     continue
                 remote_target = args[-1].split(":", 1)[1]
                 target_is_directory = remote_target.endswith("/")
-                target = remote / Path(remote_target).relative_to("/tmp/mentat-eval.imports")
+                target = remote / Path(remote_target).relative_to("/tmp/mentat-eval-batch.imports")
                 for source in args[1:-1]:
                     candidate = Path(source)
                     if not candidate.is_relative_to(CHECKOUT / "voice"):

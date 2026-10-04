@@ -159,196 +159,197 @@ def stage_gateway_key(values, dev_dir):
 '''
 
 
-_SETUP_SCRIPT = r'''set -euo pipefail
-DEV_DIR=$1
-DEV_PORT=$2
-HEALTH_PORT=$3
-VOICE_MODEL=$4
-
-# Find the running production executables before stopping only the voice worker.
+_BATCH_SETUP_SCRIPT = r'''set -euo pipefail
+BATCH_DIR=$1
+umask 077
+SHARED_DIR="$BATCH_DIR/shared"
 MENTAT_PID=$(systemctl show mentatd --property=MainPID --value)
 VOICE_PID=$(systemctl show mentat-voice --property=MainPID --value)
 test "$MENTAT_PID" -gt 0
 test "$VOICE_PID" -gt 0
 NODE_BIN=$(readlink -f "/proc/$MENTAT_PID/exe")
-VOICE_ENV_PATH=$(
-  nix build \
-    --impure \
-    --expr "let pkgs = import (builtins.getFlake \"nixpkgs\").outPath {}; in import $DEV_DIR/voice/voice-env.nix { inherit pkgs; }" \
-    --out-link "$DEV_DIR/voice-env-root" \
-    --print-out-paths
-)
-case "$VOICE_ENV_PATH" in
-  /nix/store/*) ;;
-  *) echo "candidate voice environment build did not return one Nix store path" >&2; exit 1 ;;
-esac
-case "$VOICE_ENV_PATH" in
-  *$'\n'*) echo "candidate voice environment build returned multiple store paths" >&2; exit 1 ;;
-esac
+VOICE_ENV_PATH=$(nix build --impure --expr "let pkgs = import (builtins.getFlake \"nixpkgs\").outPath {}; in import $SHARED_DIR/voice/voice-env.nix { inherit pkgs; }" --out-link "$SHARED_DIR/voice-env-root" --print-out-paths)
+case "$VOICE_ENV_PATH" in /nix/store/*) ;; *) echo "candidate voice environment build did not return one Nix store path" >&2; exit 1 ;; esac
 VOICE_PY="$VOICE_ENV_PATH/bin/python"
 test -x "$VOICE_PY"
-case "$VOICE_PY" in
-  /*) test -x "$VOICE_PY" ;;
-  *) echo "candidate voice Python executable must be an absolute path" >&2; exit 1 ;;
-esac
 "$VOICE_PY" - <<'PY'
 import importlib
 
 for module in (
-    "aiohttp",
-    "livekit.api",
-    "livekit.rtc",
-    "livekit.plugins.dtln",
-    "livekit.plugins.elevenlabs",
-    "livekit.plugins.silero",
+    "aiohttp", "livekit.api", "livekit.rtc", "livekit.plugins.dtln",
+    "livekit.plugins.elevenlabs", "livekit.plugins.silero",
     "livekit.plugins.turn_detector",
 ):
     try:
         importlib.import_module(module)
     except ImportError as error:
-        raise SystemExit(
-            f"candidate voice environment missing required module {module}: {error}"
-        ) from error
+        raise SystemExit(f"candidate voice environment missing required module {module}: {error}") from error
 PY
-
-mkdir -p "$DEV_DIR/mentat" "$DEV_DIR/voice/assets" "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records" "$DEV_DIR/memory"
-umask 077
-chown root:root "$DEV_DIR"
-chmod 711 "$DEV_DIR" "$DEV_DIR/home"
-chmod 700 "$DEV_DIR/home/mentat" "$DEV_DIR/home/voice" "$DEV_DIR/home/voice/cache" "$DEV_DIR/records" "$DEV_DIR/memory"
-chown -R mentat:mentat "$DEV_DIR/mentat" "$DEV_DIR/home/mentat" "$DEV_DIR/records" "$DEV_DIR/memory"
-chown -R nobody:nogroup "$DEV_DIR/voice" "$DEV_DIR/home/voice"
-
-if systemctl is-active --quiet mentat-voice; then
-  RESTORE_ACTION=start
-else
-  RESTORE_ACTION=stop
-fi
-RESTORE_UNIT="mentat-eval-restore-${DEV_DIR##*.}"
-printf '%s\n' "$RESTORE_ACTION" > "$DEV_DIR/restore-action"
-printf '%s\n' "$RESTORE_UNIT" > "$DEV_DIR/restore-unit"
-
-# The transient timer runs outside this shell and survives runner death.
-cat > "$DEV_DIR/cleanup.sh" <<'CLEANUP'
+install -d -m 700 "$BATCH_DIR/runs"
+chown root:root "$BATCH_DIR"
+chmod 711 "$BATCH_DIR"
+chmod 711 "$BATCH_DIR/runs"
+if systemctl is-active --quiet mentat-voice; then RESTORE_ACTION=start; else RESTORE_ACTION=stop; fi
+RESTORE_UNIT="mentat-eval-restore-${BATCH_DIR##*.}"
+printf '%s\n' "$RESTORE_ACTION" > "$BATCH_DIR/restore-action"
+printf '%s\n' "$RESTORE_UNIT" > "$BATCH_DIR/restore-unit"
+cat > "$BATCH_DIR/cleanup.sh" <<'CLEANUP'
 set +e
-RESTORE_ACTION=$(cat "$DEV_DIR/restore-action" 2>/dev/null)
-RESTORE_UNIT=$(cat "$DEV_DIR/restore-unit" 2>/dev/null)
-restore_voice() {
-  if [ -n "$RESTORE_UNIT" ]; then
-    systemctl stop "$RESTORE_UNIT.timer" "$RESTORE_UNIT.service" >/dev/null 2>&1
-  fi
-  if [ "$RESTORE_ACTION" = start ]; then
-    systemctl start mentat-voice
-  elif [ "$RESTORE_ACTION" = stop ]; then
-    systemctl stop mentat-voice
-  fi
-}
-trap restore_voice EXIT
-for pid_file in "$DEV_DIR/agent.pid" "$DEV_DIR/voice.pid"; do
+BATCH_DIR=$1
+RESTORE_ACTION=$(cat "$BATCH_DIR/restore-action" 2>/dev/null)
+RESTORE_UNIT=$(cat "$BATCH_DIR/restore-unit" 2>/dev/null)
+for pid_file in "$BATCH_DIR"/runs/*/agent.pid "$BATCH_DIR"/runs/*/voice.pid; do
   if [ -f "$pid_file" ]; then
     pid=$(cat "$pid_file")
     kill -TERM -- "-$pid" 2>/dev/null || true
-    for _ in 1 2 3 4 5; do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 1
-    done
+    for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
     kill -KILL -- "-$pid" 2>/dev/null || true
   fi
 done
-restore_voice
-trap - EXIT
-rm -f -- "$DEV_DIR/voice-env-root"
-rm -rf -- "$DEV_DIR"
+if [ -n "$RESTORE_UNIT" ]; then systemctl stop "$RESTORE_UNIT.timer" "$RESTORE_UNIT.service" >/dev/null 2>&1; fi
+if [ "$RESTORE_ACTION" = start ]; then systemctl start mentat-voice; elif [ "$RESTORE_ACTION" = stop ]; then systemctl stop mentat-voice; fi
+rm -f -- "$BATCH_DIR/shared/voice-env-root"
+rm -rf -- "$BATCH_DIR"
 CLEANUP
-chmod 700 "$DEV_DIR/cleanup.sh"
+chmod 700 "$BATCH_DIR/cleanup.sh"
 systemd-run --quiet --unit="$RESTORE_UNIT" --on-active=30m "$(command -v systemctl)" "$RESTORE_ACTION" mentat-voice
-
-# Preserve service environments in private files before stopping the worker.
-python3 - "$DEV_DIR" "$MENTAT_PID" "$VOICE_PID" <<'PY'
+python3 - "$BATCH_DIR" "$MENTAT_PID" "$VOICE_PID" "$NODE_BIN" "$VOICE_PY" <<'PY'
 import grp
 import json
 import os
 import pwd
+import shutil
 import sys
 from pathlib import Path
 
 __PRIVATE_CREDENTIAL_SOURCE__
-
-dev_dir = Path(sys.argv[1])
+batch_dir = Path(sys.argv[1])
+shared = batch_dir / "shared"
+setpriv_path = shutil.which("setpriv")
+if setpriv_path is None: raise RuntimeError("setpriv executable is unavailable in the setup environment")
 for name, pid in (("mentat", sys.argv[2]), ("voice", sys.argv[3])):
     values = {}
     for field in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
         if b"=" in field:
             key, value = field.split(b"=", 1)
             values[key.decode()] = value.decode()
-    if name == "voice":
-        stage_voice_private(values, dev_dir)
-    elif name == "mentat":
-        stage_gateway_key(values, dev_dir)
-    (dev_dir / f"{name}.env.json").write_text(json.dumps(values))
-    os.chmod(dev_dir / f"{name}.env.json", 0o600)
+    if name == "voice": stage_voice_private(values, shared)
+    else: stage_gateway_key(values, shared)
+    (shared / f"{name}.env.json").write_text(json.dumps(values))
+    os.chmod(shared / f"{name}.env.json", 0o600)
+for name, value in (("setpriv.path", str(Path(setpriv_path).resolve())), ("node.path", sys.argv[4]), ("voice-python.path", sys.argv[5])):
+    destination = shared / name
+    destination.write_text(value)
+    destination.chmod(0o600)
 PY
+'''
 
-# Start only the candidate daemon; the worker waits for the room from the
-# token returned by this daemon's voice-token endpoint.
-MENTAT_VOICE_MODEL="$VOICE_MODEL" python3 - "$DEV_DIR" "$DEV_PORT" "$NODE_BIN" "$VOICE_PY" <<'PY'
+_RUN_SETUP_SCRIPT = r'''set -euo pipefail
+BATCH_DIR=$1
+RUN_DIR=$2
+DEV_PORT=$3
+HEALTH_PORT=$4
+VOICE_MODEL=$5
+umask 077
+SHARED_DIR="$BATCH_DIR/shared"
+mkdir -m 700 "$RUN_DIR"
+cp -a "$SHARED_DIR/mentat" "$RUN_DIR/mentat"
+cp -a "$SHARED_DIR/voice" "$RUN_DIR/voice"
+for name in mentat.env.json voice.env.json setpriv.path node.path voice-python.path; do cp "$SHARED_DIR/$name" "$RUN_DIR/$name"; done
+cp "$BATCH_DIR/restore-unit" "$RUN_DIR/restore-unit"
+if [ -f "$SHARED_DIR/voice-private" ]; then
+  cp "$SHARED_DIR/voice-private" "$RUN_DIR/voice-private"
+  chown nobody:nogroup "$RUN_DIR/voice-private"
+  chmod 400 "$RUN_DIR/voice-private"
+fi
+if [ -f "$SHARED_DIR/voice-gateway-key" ]; then
+  cp "$SHARED_DIR/voice-gateway-key" "$RUN_DIR/voice-gateway-key"
+  chown mentat:mentat "$RUN_DIR/voice-gateway-key"
+  chmod 400 "$RUN_DIR/voice-gateway-key"
+fi
+mkdir -m 700 -p "$RUN_DIR/home/mentat" "$RUN_DIR/home/voice/cache" "$RUN_DIR/records" "$RUN_DIR/memory" "$RUN_DIR/voice/evals"
+chmod 711 "$RUN_DIR/home"
+chown root:nogroup "$RUN_DIR/voice.env.json"
+chmod 640 "$RUN_DIR/voice.env.json"
+chmod 711 "$RUN_DIR"
+chown -R mentat:mentat "$RUN_DIR/mentat" "$RUN_DIR/home/mentat" "$RUN_DIR/records" "$RUN_DIR/memory"
+chown -R nobody:nogroup "$RUN_DIR/voice" "$RUN_DIR/home/voice"
+python3 - "$RUN_DIR" <<'PY'
 import json
 import os
-import shutil
+import sys
+from pathlib import Path
+
+run_dir = Path(sys.argv[1])
+for env_name, field in (("mentat.env.json", "MENTAT_VOICE_GATEWAY_KEY_FILE"), ("voice.env.json", "MENTAT_VOICE_PRIVATE")):
+    path = run_dir / env_name
+    values = json.loads(path.read_text())
+    source = values.get(field)
+    if source:
+        destination = run_dir / Path(source).name
+        if not destination.is_file():
+            raise RuntimeError("candidate voice credential is unavailable")
+        values[field] = str(destination)
+        path.write_text(json.dumps(values))
+        os.chmod(path, 0o600 if env_name == "mentat.env.json" else 0o640)
+PY
+python3 - "$RUN_DIR" "$DEV_PORT" "$HEALTH_PORT" "$VOICE_MODEL" <<'PY'
+import json
 import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 __MCP_REWRITE_SOURCE__
-
-dev_dir = Path(sys.argv[1])
+run_dir = Path(sys.argv[1])
 dev_port = int(sys.argv[2])
-node_bin = sys.argv[3]
-voice_python = sys.argv[4]
-voice_model = os.environ.get("MENTAT_VOICE_MODEL", "chatgpt/sol-fast")
-setpriv_path = shutil.which("setpriv")
-if setpriv_path is None:
-    raise RuntimeError("setpriv executable is unavailable in the setup environment")
-setpriv_path = str(Path(setpriv_path).resolve())
-setpriv_file = dev_dir / "setpriv.path"
-setpriv_file.write_text(setpriv_path)
-setpriv_file.chmod(0o644)
-source_env = json.loads((dev_dir / "mentat.env.json").read_text())
-memory_dir = dev_dir / "memory"
-if not memory_dir.is_dir():
-    raise RuntimeError("candidate memory directory is unavailable")
-production_listen = source_env.get("MENTAT_LISTEN", "127.0.0.1:8484")
-production_port = int(production_listen.rsplit(":", 1)[1])
-
+voice_model = sys.argv[4]
+node_bin = (run_dir / "node.path").read_text().strip()
+setpriv_path = (run_dir / "setpriv.path").read_text().strip()
+source_env = json.loads((run_dir / "mentat.env.json").read_text())
+production_port = int(source_env.get("MENTAT_LISTEN", "127.0.0.1:8484").rsplit(":", 1)[1])
 env = {key: value for key, value in source_env.items() if key != "OPENAI_API_KEY"}
-candidate_prompt = dev_dir / "mentat/prompt.md"
-if not candidate_prompt.is_file():
-    raise RuntimeError("candidate system prompt is unavailable")
-env["MENTAT_SYSTEM_PROMPT"] = candidate_prompt.read_text(encoding="utf-8")
+prompt = run_dir / "mentat/prompt.md"
+if not prompt.is_file(): raise RuntimeError("candidate system prompt is unavailable")
+env["MENTAT_SYSTEM_PROMPT"] = prompt.read_text(encoding="utf-8")
 env["MENTAT_VOICE_MODEL"] = voice_model
 env["MENTAT_SESSION_TTL"] = "90s"
-if "MENTAT_MCP_CONFIG" in env:
-    env["MENTAT_MCP_CONFIG"] = rewrite_mcp_config(env["MENTAT_MCP_CONFIG"], production_port, dev_port)
+if "MENTAT_MCP_CONFIG" in env: env["MENTAT_MCP_CONFIG"] = rewrite_mcp_config(env["MENTAT_MCP_CONFIG"], production_port, dev_port)
 env.update({
     "MENTAT_LISTEN": f"127.0.0.1:{dev_port}",
-    "MENTAT_STATE_PATH": str(dev_dir / "home/mentat/state.json"),
-    "MENTAT_RECORD_DIR": str(dev_dir / "records"),
-    "MENTAT_MEMORY_DIR": str(memory_dir),
-    "HOME": str(dev_dir / "home/mentat"),
+    "MENTAT_STATE_PATH": str(run_dir / "home/mentat/state.json"),
+    "MENTAT_RECORD_DIR": str(run_dir / "records"),
+    "MENTAT_MEMORY_DIR": str(run_dir / "memory"),
+    "HOME": str(run_dir / "home/mentat"),
 })
-log = (dev_dir / "agent.log").open("ab", buffering=0)
+log = (run_dir / "agent.log").open("ab", buffering=0)
 process = subprocess.Popen(
-    [setpriv_path, "--reuid=mentat", "--regid=mentat", "--init-groups", node_bin, str(dev_dir / "mentat/src/main.ts")],
-    cwd=dev_dir / "mentat", env=env, stdin=subprocess.DEVNULL,
+    [setpriv_path, "--reuid=mentat", "--regid=mentat", "--init-groups", node_bin, str(run_dir / "mentat/src/main.ts")],
+    cwd=run_dir / "mentat", env=env, stdin=subprocess.DEVNULL,
     stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
 )
-(dev_dir / "agent.pid").write_text(f"{process.pid}\n")
+(run_dir / "agent.pid").write_text(f"{process.pid}\n")
 log.close()
-(dev_dir / "voice-python.path").write_text(f"{voice_python}\n")
-(dev_dir / "voice-python.path").chmod(0o600)
-(dev_dir / "mentat.env.json").unlink()
 PY
+'''
+
+_STOP_RUN_SCRIPT = r'''set +e
+RUN_DIR=$1
+for pid_file in "$RUN_DIR/agent.pid" "$RUN_DIR/voice.pid"; do
+  if [ -f "$pid_file" ]; then
+    pid=$(cat "$pid_file")
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do kill -0 -- "-$pid" 2>/dev/null || break; sleep 1; done
+    if kill -0 -- "-$pid" 2>/dev/null; then
+      kill -KILL -- "-$pid" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do kill -0 -- "-$pid" 2>/dev/null || break; sleep 1; done
+      if kill -0 -- "-$pid" 2>/dev/null; then
+        printf 'candidate producer group -%s remains alive after KILL\n' "$pid" >&2
+        exit 1
+      fi
+    fi
+  fi
+done
 '''
 
 
@@ -443,6 +444,7 @@ PY
 
 
 _START_WORKER_SCRIPT = r'''set -euo pipefail
+umask 077
 DEV_DIR=$1
 DEV_PORT=$2
 HEALTH_PORT=$3
@@ -517,10 +519,12 @@ systemctl restart "$RESTORE_UNIT.timer"
 
 
 _RUN_VOICE_SCRIPT = r'''import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+os.umask(0o077)
 if len(sys.argv) != 5 or sys.argv[1] != "--":
     raise RuntimeError("remote caller received invalid staging arguments")
 DEV_DIR = Path(sys.argv[2])
@@ -588,29 +592,25 @@ sys.exit(result.returncode)
 '''
 
 
-class DevStack:
-    """Start candidate mentatd and join a token-selected room on ultraviolet.
-
-    Construct with ``opt_in=True`` only from a deliberately invoked live run.
-    Offline callers should inject ``run`` and exercise this lifecycle without
-    making network calls. Call ``start_worker(room)`` after the dev daemon mints
-    a voice token so the worker joins that token's room.
-    """
+class _RunStack:
+    """A single candidate run inside a staged DevStack batch."""
 
     def __init__(
         self,
         *,
         checkout: Path,
-        opt_in: bool = False,
         remote: str = "ultraviolet",
         dev_port: int | None = None,
         health_port: int | None = None,
         local_port: int | None = None,
         run: CommandRunner = subprocess.run,
+        batch: DevStack | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.checkout = Path(checkout).resolve()
-        self.opt_in = opt_in
         self.remote = remote
+        self._batch = batch
+        self.run_id = run_id
         if (
             (dev_port is not None and not 1 <= dev_port <= 65535)
             or (health_port is not None and not 1 <= health_port <= 65535)
@@ -626,9 +626,9 @@ class DevStack:
         self._local_port: int | None = None
         self._remote_dir: str | None = None
         self._tunnel: subprocess.Popen[bytes] | None = None
-        self._signal_handlers: dict[int, signal.Handlers] = {}
         self._entered = False
         self._restore_guard_armed = False
+        self._producers_stopped = False
         self.retained_evidence_dir: Path | None = None
 
     @property
@@ -641,26 +641,24 @@ class DevStack:
     def base_url(self) -> str:
         return self.url
 
-    def __enter__(self) -> DevStack:
-        if not self.opt_in:
-            raise RuntimeError("DevStack requires explicit opt-in for a live run")
-        self._install_signal_handlers()
+    def __enter__(self) -> _RunStack:
+        if self._batch is None:
+            raise RuntimeError("run stacks must be created by DevStack.run")
         try:
             self._start()
             self._entered = True
             return self
-        except BaseException:
+        except BaseException as error:
             try:
                 self._cleanup()
-            finally:
-                self._restore_signal_handlers()
+            except BaseException as cleanup_error:
+                error.add_note(f"candidate run cleanup also failed: {cleanup_error}")
             raise
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         try:
             self._cleanup()
         finally:
-            self._restore_signal_handlers()
             self._entered = False
         return False
 
@@ -706,13 +704,27 @@ class DevStack:
             f"{payload}\n"
             "MENTAT_VOICE_GRANT\n"
         )
-        result = self._remote(script, redact=(token,))
+        try:
+            result = self._remote(script, redact=(token,))
+        except BaseException as error:
+            try:
+                self._stop_producers()
+            except BaseException as cleanup_error:
+                error.add_note(f"candidate producer shutdown also failed: {cleanup_error}")
+            raise
+        self._stop_producers()
         return subprocess.CompletedProcess(
             result.args,
             result.returncode,
             _redact_machine_json(result.stdout, (token,)),
             _redact_diagnostics(result.stderr, (token,)),
         )
+
+    def _stop_producers(self) -> None:
+        if self._producers_stopped or self._remote_dir is None:
+            return
+        self._remote(_STOP_RUN_SCRIPT, self._remote_dir)
+        self._producers_stopped = True
 
     def start_worker(self, room: str) -> None:
         """Join the room minted by the dev daemon's voice-token endpoint."""
@@ -729,120 +741,28 @@ class DevStack:
         )
 
     def _start(self) -> None:
-        built = self._run(
-            ["nix", "build", ".#mentatd", "--no-link", "--print-out-paths"],
-            cwd=self.checkout,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        store_paths = [line.strip() for line in built.stdout.splitlines() if line.strip()]
-        if len(store_paths) != 1:
-            raise RuntimeError("candidate package build did not return exactly one store path")
-        package = Path(store_paths[0]) / "lib/mentat"
-        staged = self._run(
-            ["ssh", self.remote, "mktemp", "-d", "/tmp/mentat-eval.XXXXXX"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self._remote_dir = staged.stdout.strip()
-        if re.fullmatch(r"/tmp/mentat-eval\.[A-Za-z0-9]+", self._remote_dir) is None:
-            self._remote_dir = None
-            raise RuntimeError("remote staging returned an unsafe directory")
-
-        self._run(
-            [
-                "ssh", self.remote, "mkdir", "-m", "700", "-p", "--",
-                f"{self._remote_dir}/mentat",
-                f"{self._remote_dir}/voice/assets",
-                f"{self._remote_dir}/voice/evals",
-                f"{self._remote_dir}/home/mentat",
-                f"{self._remote_dir}/home/voice/cache",
-                f"{self._remote_dir}/records",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self._run(
-            [
-                "scp", "-r",
-                str(package / "src"),
-                str(package / "node_modules"),
-                str(package / "package.json"),
-                str(self.checkout / "prompt.md"),
-                f"{self.remote}:{self._remote_dir}/mentat/",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        voice_files = [
-            "agent.py", "persona.md", "request.py", "stream.py", "voices.py", "caller.py",
-        ]
-        self._run(
-            [
-                "scp", "-r",
-                *(str(self.checkout / "voice" / name) for name in voice_files),
-                str(self.checkout / "voice" / "evals" / "phone.py"),
-                str(self.checkout / "nix" / "voice-env.nix"),
-                f"{self.remote}:{self._remote_dir}/voice/",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self._run(
-            [
-                "scp", "-r",
-                *(str(self.checkout / "voice" / "evals" / name) for name in (
-                    "runner.py", "dev_stack.py", "report.py", "scenarios.py",
-                )),
-                f"{self.remote}:{self._remote_dir}/voice/evals/",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self._run(
-            [
-                "scp", "-r", str(self.checkout / "voice" / "assets"),
-                f"{self.remote}:{self._remote_dir}/voice/",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        self._select_remote_ports()
-
+        if self._batch is None or self.run_id is None:
+            raise RuntimeError("run stack is not attached to a staging batch")
+        self._remote_dir, self.dev_port, self.health_port = self._batch._prepare_run(self.run_id)
         local_port = self._requested_local_port
         if local_port in (None, 0):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.bind(("127.0.0.1", 0))
                 local_port = sock.getsockname()[1]
         self._local_port = local_port
-
-        setup_script = _SETUP_SCRIPT.replace("__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE).replace(
-            "__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE
-        )
-        requested_model = os.environ.get("MENTAT_VOICE_MODEL", "chatgpt/sol-fast")
         self._remote(
-            setup_script,
+            _RUN_SETUP_SCRIPT.replace("__MCP_REWRITE_SOURCE__", _MCP_REWRITE_SOURCE),
+            self._batch._remote_dir or "",
             self._remote_dir,
             str(self.dev_port),
             str(self.health_port),
-            requested_model,
+            os.environ.get("MENTAT_VOICE_MODEL", "chatgpt/sol-fast"),
         )
         self._restore_guard_armed = True
         self._tunnel = subprocess.Popen(
             [
-                "ssh",
-                "-o", "ControlMaster=no",
-                "-o", "ControlPath=none",
-                "-o", "ExitOnForwardFailure=yes",
-                "-N", "-L",
+                "ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                "-o", "ExitOnForwardFailure=yes", "-N", "-L",
                 f"127.0.0.1:{self._local_port}:127.0.0.1:{self.dev_port}",
                 self.remote,
             ],
@@ -854,34 +774,6 @@ class DevStack:
         if self._tunnel.poll() is not None:
             raise RuntimeError("SSH port-forward exited before the dev stack became available")
         self._wait_until_ready()
-
-    def _select_remote_ports(self) -> None:
-        if self.dev_port is not None and self.health_port is not None:
-            return
-        result = self._remote(_REMOTE_PORT_PROBE_SCRIPT, self._remote_dir or "")
-        try:
-            ports = json.loads(result.stdout)
-        except (TypeError, json.JSONDecodeError) as error:
-            raise RuntimeError("remote port probe returned invalid port data") from error
-        if not isinstance(ports, dict):
-            raise RuntimeError("remote port probe returned invalid port data")
-        dev_port = ports.get("dev_port")
-        health_port = ports.get("health_port")
-        if (
-            isinstance(dev_port, bool)
-            or not isinstance(dev_port, int)
-            or not 1 <= dev_port <= 65535
-            or isinstance(health_port, bool)
-            or not isinstance(health_port, int)
-            or not 1 <= health_port <= 65535
-        ):
-            raise RuntimeError("remote port probe returned invalid port data")
-        selected_dev_port = self.dev_port if self.dev_port is not None else dev_port
-        selected_health_port = self.health_port if self.health_port is not None else health_port
-        if selected_dev_port == selected_health_port:
-            raise RuntimeError("remote port probe returned invalid port data")
-        self.dev_port = selected_dev_port
-        self.health_port = selected_health_port
 
     def _wait_until_ready(self) -> None:
         deadline = time.monotonic() + _READINESS_TIMEOUT_SECONDS
@@ -1051,31 +943,230 @@ class DevStack:
                     self._tunnel.wait()
                 self._tunnel = None
         finally:
-            script = r'''set +e
-DEV_DIR=$1
-if [ -n "$DEV_DIR" ] && [ -f "$DEV_DIR/cleanup.sh" ]; then
-  DEV_DIR="$DEV_DIR" bash "$DEV_DIR/cleanup.sh"
-elif [ -n "$DEV_DIR" ]; then
-  rm -rf -- "$DEV_DIR"
-fi
-'''
-            retention_error: BaseException | None = None
             try:
-                self._retain_evidence()
-            except BaseException as error:
-                retention_error = error
-            try:
-                self._remote(
-                    script,
-                    self._remote_dir or "",
-                    refresh_guard=False,
-                )
+                self._stop_producers()
             finally:
+                retention_error: BaseException | None = None
+                try:
+                    self._retain_evidence()
+                except BaseException as error:
+                    retention_error = error
                 self._remote_dir = None
                 self._local_port = None
                 self._restore_guard_armed = False
-            if retention_error is not None:
-                raise retention_error
+                if retention_error is not None:
+                    raise retention_error
+
+class DevStack:
+    """Build and stage shared voice-eval dependencies for isolated runs."""
+
+    def __init__(
+        self,
+        *,
+        checkout: Path,
+        opt_in: bool = False,
+        remote: str = "ultraviolet",
+        run: CommandRunner = subprocess.run,
+    ) -> None:
+        self.checkout = Path(checkout).resolve()
+        self.opt_in = opt_in
+        self.remote = remote
+        self._run = run
+        self._remote_dir: str | None = None
+        self._entered = False
+        self._signal_handlers: dict[int, signal.Handlers] = {}
+        self._run_stacks: dict[str, _RunStack] = {}
+        self._ports: set[int] = set()
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> DevStack:
+        if not self.opt_in:
+            raise RuntimeError("DevStack requires explicit opt-in for a live run")
+        self._install_signal_handlers()
+        try:
+            self._start()
+            self._entered = True
+            return self
+        except BaseException as error:
+            try:
+                self._cleanup()
+            except BaseException as cleanup_error:
+                error.add_note(f"DevStack batch cleanup also failed: {cleanup_error}")
+            finally:
+                self._restore_signal_handlers()
+            raise
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        try:
+            self._cleanup()
+        finally:
+            self._restore_signal_handlers()
+            self._entered = False
+        return False
+
+    def run(self, run_id: str) -> _RunStack:
+        if not isinstance(run_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", run_id) is None:
+            raise ValueError("run id must be a safe path component")
+        with self._lock:
+            if not self._entered:
+                raise RuntimeError("DevStack batch is not running")
+            if run_id in self._run_stacks:
+                raise ValueError(f"run id is already in use: {run_id}")
+            stack = _RunStack(
+                checkout=self.checkout,
+                remote=self.remote,
+                run=self._run,
+                batch=self,
+                run_id=run_id,
+            )
+            self._run_stacks[run_id] = stack
+            return stack
+
+    def _start(self) -> None:
+        built = self._run(
+            ["nix", "build", ".#mentatd", "--no-link", "--print-out-paths"],
+            cwd=self.checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        store_paths = [line.strip() for line in built.stdout.splitlines() if line.strip()]
+        if len(store_paths) != 1:
+            raise RuntimeError("candidate package build did not return exactly one store path")
+        package = Path(store_paths[0]) / "lib/mentat"
+        staged = self._run(
+            ["ssh", self.remote, "mktemp", "-d", "/tmp/mentat-eval-batch.XXXXXX"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self._remote_dir = staged.stdout.strip()
+        if re.fullmatch(r"/tmp/mentat-eval-batch\.[A-Za-z0-9]+", self._remote_dir) is None:
+            self._remote_dir = None
+            raise RuntimeError("remote staging returned an unsafe directory")
+        shared = f"{self._remote_dir}/shared"
+        self._run(
+            [
+                "ssh", self.remote, "mkdir", "-m", "700", "-p", "--",
+                f"{shared}/mentat", f"{shared}/voice/assets", f"{shared}/voice/evals",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self._run(
+            [
+                "scp", "-r", str(package / "src"), str(package / "node_modules"),
+                str(package / "package.json"), str(self.checkout / "prompt.md"),
+                f"{self.remote}:{shared}/mentat/",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        voice_files = [
+            "agent.py", "persona.md", "request.py", "stream.py", "voices.py", "caller.py",
+        ]
+        self._run(
+            [
+                "scp", "-r", *(str(self.checkout / "voice" / name) for name in voice_files),
+                str(self.checkout / "voice" / "evals" / "phone.py"),
+                str(self.checkout / "nix" / "voice-env.nix"),
+                f"{self.remote}:{shared}/voice/",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        self._run(
+            [
+                "scp", "-r",
+                *(str(self.checkout / "voice" / "evals" / name) for name in (
+                    "runner.py", "dev_stack.py", "report.py", "scenarios.py",
+                )),
+                f"{self.remote}:{shared}/voice/evals/",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        self._run(
+            ["scp", "-r", str(self.checkout / "voice" / "assets"), f"{self.remote}:{shared}/voice/"],
+            check=True, capture_output=True, text=True,
+        )
+        self._remote(
+            _BATCH_SETUP_SCRIPT.replace(
+                "__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE
+            ),
+            self._remote_dir,
+        )
+
+    def _prepare_run(self, run_id: str) -> tuple[str, int, int]:
+        if not self._entered or self._remote_dir is None:
+            raise RuntimeError("DevStack batch is not running")
+        run_dir = f"{self._remote_dir}/runs/{run_id}"
+        with self._lock:
+            for _ in range(10):
+                ports = self._remote(_REMOTE_PORT_PROBE_SCRIPT, self._remote_dir)
+                try:
+                    available = json.loads(ports.stdout)
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise RuntimeError("remote port probe returned invalid port data") from error
+                if not isinstance(available, dict):
+                    raise RuntimeError("remote port probe returned invalid port data")
+                dev_port, health_port = available.get("dev_port"), available.get("health_port")
+                if (
+                    isinstance(dev_port, bool) or not isinstance(dev_port, int) or not 1 <= dev_port <= 65535
+                    or isinstance(health_port, bool) or not isinstance(health_port, int)
+                    or not 1 <= health_port <= 65535 or dev_port == health_port
+                ):
+                    raise RuntimeError("remote port probe returned invalid port data")
+                if dev_port not in self._ports and health_port not in self._ports:
+                    self._ports.update((dev_port, health_port))
+                    return run_dir, dev_port, health_port
+        raise RuntimeError("remote port probe could not allocate distinct run ports")
+
+    def _remote(self, script: str, *args: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return self._run(
+                ["ssh", self.remote, "sudo", "bash", "-s", "--", *args],
+                input=script,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as error:
+            raise RemoteCommandError(
+                error.returncode,
+                error.cmd,
+                output=_redact_diagnostics(error.output),
+                stderr=_redact_diagnostics(error.stderr),
+            ) from error
+
+    def _cleanup(self) -> None:
+        first_error: BaseException | None = None
+        with self._lock:
+            run_stacks = tuple(self._run_stacks.values())
+        for stack in run_stacks:
+            if stack._remote_dir is not None or stack._tunnel is not None:
+                try:
+                    stack._cleanup()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+        remote_dir = self._remote_dir
+        if remote_dir is not None:
+            try:
+                script = '''set +e
+BATCH_DIR=$1
+if [ -f "$BATCH_DIR/cleanup.sh" ]; then
+  bash "$BATCH_DIR/cleanup.sh" "$BATCH_DIR"
+elif [ -n "$BATCH_DIR" ]; then
+  rm -rf -- "$BATCH_DIR"
+fi
+'''
+                self._remote(script, remote_dir)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            finally:
+                self._remote_dir = None
+        if first_error is not None:
+            raise first_error
 
     def _install_signal_handlers(self) -> None:
         if threading.current_thread() is not threading.main_thread():

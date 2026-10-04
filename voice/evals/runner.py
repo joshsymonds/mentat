@@ -2843,7 +2843,6 @@ async def _run_remote_capture_with_fake_phone(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
     )
     try:
         await asyncio.sleep(0.2)
@@ -2952,12 +2951,13 @@ def _run_local_eval(argv: list[str]) -> int:
     capture_failures: list[tuple[int, int, str]] = []
     checkout = Path(__file__).resolve().parents[2]
     try:
-        with DevStack(checkout=checkout, opt_in=True) as stack:
+        with DevStack(checkout=checkout, opt_in=True) as batch:
             for scenario_index, scenario in enumerate(SCENARIOS):
                 runs = []
                 for run_index in range(arguments.runs):
                     try:
-                        runs.append(observe_scenario(scenario, stack))
+                        with batch.run(f"case-{scenario_index + 1}-run-{run_index + 1}") as stack:
+                            runs.append(observe_scenario(scenario, stack))
                     except Exception as error:
                         message = _redact_diagnostics(
                             f"{scenario.name} run {run_index + 1}: {error}"
