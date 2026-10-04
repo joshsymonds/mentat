@@ -307,7 +307,11 @@ must clear the same bar on their own.
 
 The command prints one JSON report with per-run and per-family correct/wrong
 counts, each fixture's built question and probability/verdict evidence, and
-unavailable outcomes. Every sweep must pass at least 95% of retained correct
+unavailable outcomes. The voice eval report preserves each captured turn's
+judge questions, verdicts, probabilities, and unavailable reason alongside its
+transcript evidence; an unavailable judge result fails that turn as a product
+failure while earlier turns and phone-command evidence remain in the report.
+Every sweep must pass at least 95% of retained correct
 fixtures and, separately, of scripted correct fixtures,
 judge every known-wrong fixture no, and have zero unavailable results; any
 failed bar returns a nonzero exit. Offline coverage is `just test-voice`; it

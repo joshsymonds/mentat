@@ -225,6 +225,8 @@ def _score_turn(
     }
     if "raw_segments" in turn:
         report["segments"] = _transcript_segments(turn["raw_segments"])
+    if "judge" in turn:
+        report["judge"] = turn["judge"]
     return report, problems
 
 
@@ -678,6 +680,11 @@ def score_observations(
         }
         if run_timings:
             report["run_timings"] = run_timings
+        if any(isinstance(run, dict) and "phone_commands" in run for run in runs):
+            report["phone_commands"] = [
+                run.get("phone_commands") if isinstance(run, dict) else None
+                for run in runs
+            ]
         reports.append(report)
         failures.extend(case_failures)
 

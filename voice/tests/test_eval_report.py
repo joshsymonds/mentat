@@ -295,6 +295,76 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("product failure", " ".join(result["cases"][0]["failures"]))
         self.assertIn("missing answer pattern", " ".join(result["failures"]))
 
+    def test_scored_turn_preserves_judge_questions_verdicts_probabilities_and_status(self):
+        judge = {
+            "context": "",
+            "questions": [{
+                "id": "place_lookup",
+                "question": "Did the assistant identify the requested place?",
+                "verdict": True,
+                "probability": 0.93,
+            }],
+            "unavailable": None,
+        }
+        scored_turn = turn(kind="search")
+        scored_turn["judge"] = judge
+
+        result = score_observations({
+            "cases": [{"name": "place lookup", "runs": [{"turns": [scored_turn]}]}],
+        }, required_runs=1)
+
+        self.assertEqual(result["cases"][0]["turns"][0]["judge"], judge)
+
+    def test_later_judge_unavailable_keeps_prior_verdict_raw_evidence_and_phone_commands(self):
+        prior_judge = {
+            "context": "",
+            "questions": [{
+                "id": "sms_recipient",
+                "question": "Did the assistant repeat the recipient correctly?",
+                "verdict": True,
+                "probability": 0.91,
+            }],
+            "unavailable": None,
+        }
+        unavailable_judge = {
+            "context": "verified recipient: 5550100",
+            "questions": [{
+                "id": "sms_body",
+                "question": "Did the assistant read back the message correctly?",
+                "verdict": None,
+                "probability": None,
+            }],
+            "unavailable": "judge transport failed after retries",
+        }
+        first = turn(first_audio=2.0, confirmation=None, room_deleted=None)
+        first.update({"turn": 1, "kind": "search", "judge": prior_judge,
+                      "raw_segments": [{"start": 0.0, "end": 0.3, "text": "I have Alex."}],
+                      "expect_confirmation": False, "expect_hangup": False})
+        second = turn(first_audio=2.0, confirmation=None, room_deleted=None)
+        second.update({"turn": 2, "kind": "search", "judge": unavailable_judge,
+                       "raw_segments": [{"start": 0.0, "end": 0.4, "text": "What should I say?"}],
+                       "expect_confirmation": False, "expect_hangup": False})
+        phone_commands = [{
+            "id": "fake-sms-1", "turn": 1, "kind": "sms",
+            "recipient": "5550100", "body": "Meet at six.",
+        }]
+        observation = {"cases": [{"name": "sms say-back", "runs": [{
+            "turns": [first, second],
+            "product_failures": [{"turn": 2, "message": "judge unavailable: transport failed"}],
+            "phone_commands": phone_commands,
+        }]}]}
+
+        result = score_observations(observation, required_runs=1)
+
+        report = result["cases"][0]
+        self.assertFalse(result["passed"])
+        self.assertIn("product failure", " ".join(report["failures"]))
+        self.assertEqual([item["judge"] for item in report["turns"]], [prior_judge, unavailable_judge])
+        self.assertEqual([item["segments"] for item in report["turns"]], [
+            first["raw_segments"], second["raw_segments"],
+        ])
+        self.assertEqual(report["phone_commands"], [phone_commands])
+
     def test_complete_product_failure_metadata_fails_closed(self):
         captured = turn()
         captured["turn"] = 1
