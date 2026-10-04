@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from http.client import HTTPException
 import threading
 import time
 import urllib.error
@@ -142,7 +143,7 @@ class JevJudge:
                     raise JudgeUnavailable("judge rejected the request") from None
                 if attempt + 1 == self._max_attempts:
                     raise JudgeUnavailable("judge request failed after retries") from None
-            except (TimeoutError, OSError, urllib.error.URLError):
+            except (TimeoutError, OSError, urllib.error.URLError, HTTPException):
                 if attempt + 1 == self._max_attempts:
                     raise JudgeUnavailable("judge transport failed after retries") from None
             time.sleep(0.1 * (2 ** attempt))
