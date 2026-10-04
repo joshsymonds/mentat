@@ -5087,12 +5087,29 @@ class LocalEvalCliTests(unittest.TestCase):
         both_started = threading.Barrier(2)
         release_hung = threading.Event()
         restored = threading.Event()
+        pending_observed = threading.Event()
         finished = threading.Event()
         lifecycle = []
+        captured = {}
+        original_score = runner.score_observations
+        launch_clock = threading.local()
+        original_time = runner.time.time
+        launch_times = {}
+
+        def tracked_time():
+            now = original_time()
+            launch_clock.value = now
+            return now
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            pending_observed.set()
+            return original_score(observations, required_runs=required_runs)
 
         class Batch:
             @contextmanager
             def run(self, run_id):
+                launch_times[run_id] = launch_clock.value
                 lifecycle.append(("run-start", run_id))
                 try:
                     yield SimpleNamespace(run_id=run_id)
@@ -5128,10 +5145,17 @@ class LocalEvalCliTests(unittest.TestCase):
             patch.object(runner, "SCENARIOS", (scenario,)),
             patch.object(runner, "DevStack", side_effect=dev_stack),
             patch.object(runner, "observe_scenario", side_effect=observe),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            patch.object(runner.time, "time", side_effect=tracked_time),
         ):
             coordinator = threading.Thread(target=run_eval)
             coordinator.start()
             self.assertTrue(restored.wait(timeout=2))
+            self.assertTrue(pending_observed.wait(timeout=3))
+            pending = captured["observations"]["cases"][0]["runs"][1]
+            self.assertEqual(pending["timing"]["started_at"], launch_times["case-1-run-2"])
+            self.assertEqual(pending["timing"]["concurrency"], 2)
+            self.assertIn("worker remained active", pending["failure"])
             exited_before_worker_release = finished.wait(timeout=2)
             release_hung.set()
             coordinator.join(timeout=2)

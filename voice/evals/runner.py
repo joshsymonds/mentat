@@ -2989,6 +2989,7 @@ def _run_local_eval(argv: list[str]) -> int:
     launch_lock = threading.Lock()
     abort_reason_lock = threading.Lock()
     active_runs: dict[tuple[int, int], dict[str, Any]] = {}
+    run_timing_records: dict[tuple[int, int], dict[str, Any]] = {}
     abort_reason = [""]
 
     def request_abort(reason: str) -> None:
@@ -3018,7 +3019,9 @@ def _run_local_eval(argv: list[str]) -> int:
                     },
                 }, failure
             started_at = time.time()
-            active_runs[key] = {"concurrency": 1}
+            timing_record = {"started_at": started_at, "concurrency": 1}
+            active_runs[key] = timing_record
+            run_timing_records[key] = timing_record
             for record in active_runs.values():
                 record["concurrency"] = max(record["concurrency"], len(active_runs))
             try:
@@ -3188,13 +3191,14 @@ def _run_local_eval(argv: list[str]) -> int:
             except BaseException as error:
                 failure = _redact_diagnostics(str(error))
             failure = failure or f"aborted before launch: {abort_reason[0] or 'evaluation interrupted'}"
+        timing_record = run_timing_records.get((scenario_index, run_index), {})
         runs[run_index] = {
             "failure": failure,
             "turns": [],
             "timing": {
-                "started_at": None,
+                "started_at": timing_record.get("started_at"),
                 "ended_at": time.time(),
-                "concurrency": 0,
+                "concurrency": timing_record.get("concurrency", 0),
             },
         }
         capture_failures.append((scenario_index, run_index, _redact_diagnostics(
