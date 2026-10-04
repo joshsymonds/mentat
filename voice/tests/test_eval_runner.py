@@ -2411,6 +2411,16 @@ class LocalEvalTests(unittest.TestCase):
         from evals.dev_stack import RemoteCommandError
 
         diagnostic = "DISTINCTIVE_REMOTE_SETUP_FAILURE"
+        scenarios = (
+            SimpleNamespace(name="setup-one", turns=(), commands=(), place_query=None),
+            SimpleNamespace(name="setup-two", turns=(), commands=(), place_query=None),
+        )
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
 
         class FailingStack:
             def __init__(self, **_kwargs):
@@ -2428,14 +2438,76 @@ class LocalEvalTests(unittest.TestCase):
                 raise AssertionError("failed __enter__ must clean up its own stack")
 
         output = io.StringIO()
-        with patch.object(runner, "DevStack", FailingStack), redirect_stdout(output):
-            result = runner._run_local_eval(["--live", "--runs", "1"])
+        with (
+            patch.object(runner, "SCENARIOS", scenarios),
+            patch.object(runner, "DevStack", FailingStack),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "2"])
 
         report = json.loads(output.getvalue())
         self.assertEqual(result, 1)
         self.assertFalse(report["passed"])
         self.assertIn(diagnostic, " ".join(report["failures"]))
-        self.assertIn(diagnostic, " ".join(report["cases"][0]["failures"]))
+        self.assertNotIn("invalid partial capture failure metadata", " ".join(report["failures"]))
+        for case, report_case in zip(captured["observations"]["cases"], report["cases"], strict=True):
+            self.assertEqual(len(case["runs"]), 2)
+            self.assertEqual(len(report_case["run_timings"]), 2)
+            for run, timing in zip(case["runs"], report_case["run_timings"], strict=True):
+                self.assertIn(diagnostic, run["failure"])
+                self.assertEqual(run["turns"], [])
+                self.assertIsNone(timing["started_at"])
+                self.assertIsInstance(timing["ended_at"], (int, float))
+                self.assertEqual(timing["concurrency"], 0)
+
+    def test_run_launch_failure_keeps_cause_and_timing(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        scenario = SimpleNamespace(name="launch", turns=(), commands=(), place_query=None)
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                if run_id == "case-1-run-1":
+                    raise RuntimeError("distinctive launch exception")
+                yield SimpleNamespace(run_id=run_id)
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield Batch()
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "2"])
+
+        report = json.loads(output.getvalue())
+        runs = captured["observations"]["cases"][0]["runs"]
+        self.assertEqual(result, 1)
+        self.assertIn("distinctive launch exception", runs[0]["failure"])
+        self.assertEqual(runs[1]["failure"], "aborted before launch: case-1-run-1 failed")
+        self.assertNotIn("invalid partial capture failure metadata", " ".join(report["failures"]))
+        timings = report["cases"][0]["run_timings"]
+        self.assertEqual([timing["run"] for timing in timings], [1, 2])
+        self.assertIsInstance(timings[0]["started_at"], (int, float))
+        self.assertIsInstance(timings[0]["ended_at"], (int, float))
+        self.assertGreaterEqual(timings[0]["concurrency"], 1)
+        self.assertIsNone(timings[1]["started_at"])
+        self.assertIsInstance(timings[1]["ended_at"], (int, float))
+        self.assertEqual(timings[1]["concurrency"], 0)
 
     def test_eval_json_scrubs_assignment_json_and_header_credentials(self):
         import io
@@ -4872,6 +4944,87 @@ class LocalEvalCliTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(SystemExit):
                 runner._parse_local_eval_arguments(["--live", "--concurrency", invalid])
 
+    def test_scheduler_submit_failure_preserves_active_and_unsubmitted_run_positions(self):
+        import concurrent.futures
+        import io
+        import json
+        import threading
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(name="scheduler", turns=(), commands=(), place_query=None)
+        first_run_started = threading.Event()
+        release_first_run = threading.Event()
+        captured = {}
+        original_score = runner.score_observations
+        real_executor = concurrent.futures.ThreadPoolExecutor
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                yield SimpleNamespace(run_id=run_id)
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield Batch()
+
+        def observe(_scenario, stack):
+            first_run_started.set()
+            self.assertTrue(release_first_run.wait(timeout=2))
+            return {"run_id": stack.run_id, "turns": []}
+
+        class FailingExecutor:
+            def __init__(self, *, max_workers):
+                self.delegate = real_executor(max_workers=max_workers)
+                self.submissions = 0
+
+            def submit(self, *args):
+                self.submissions += 1
+                if self.submissions == 2:
+                    self.assert_first_run_started()
+                    release_first_run.set()
+                    raise RuntimeError("distinctive scheduler submit failure")
+                return self.delegate.submit(*args)
+
+            @staticmethod
+            def assert_first_run_started():
+                if not first_run_started.wait(timeout=2):
+                    raise AssertionError("first run did not start before scheduler failure")
+
+            def shutdown(self, **kwargs):
+                self.delegate.shutdown(**kwargs)
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            patch.object(runner.concurrent.futures, "ThreadPoolExecutor", FailingExecutor),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "3", "--concurrency", "1"])
+
+        report = json.loads(output.getvalue())
+        runs = captured["observations"]["cases"][0]["runs"]
+        self.assertEqual(result, 1)
+        self.assertEqual([run.get("run_id") for run in runs], ["case-1-run-1", None, None])
+        self.assertNotIn("failure", runs[0])
+        self.assertIn("distinctive scheduler submit failure", " ".join(report["failures"]))
+        self.assertNotIn("invalid partial capture failure metadata", " ".join(report["failures"]))
+        timings = report["cases"][0]["run_timings"]
+        self.assertEqual([timing["run"] for timing in timings], [1, 2, 3])
+        self.assertIsInstance(timings[0]["started_at"], (int, float))
+        self.assertIsInstance(timings[0]["ended_at"], (int, float))
+        self.assertGreaterEqual(timings[0]["concurrency"], 1)
+        for timing in timings[1:]:
+            self.assertIsNone(timing["started_at"])
+            self.assertIsInstance(timing["ended_at"], (int, float))
+            self.assertEqual(timing["concurrency"], 0)
+
     def test_harness_error_stops_queued_launches_and_keeps_original_positions(self):
         import io
         import json
@@ -4929,6 +5082,17 @@ class LocalEvalCliTests(unittest.TestCase):
             "aborted before launch: case-1-run-1 failed",
             "aborted before launch: case-1-run-1 failed",
         ])
+        self.assertNotIn("invalid partial capture failure metadata", " ".join(report["failures"]))
+        timings = report["cases"][0]["run_timings"]
+        self.assertEqual([timing["run"] for timing in timings], [1, 2, 3, 4])
+        for timing in timings[:2]:
+            self.assertIsInstance(timing["started_at"], (int, float))
+            self.assertIsInstance(timing["ended_at"], (int, float))
+            self.assertGreaterEqual(timing["concurrency"], 1)
+        for timing in timings[2:]:
+            self.assertIsNone(timing["started_at"])
+            self.assertIsInstance(timing["ended_at"], (int, float))
+            self.assertEqual(timing["concurrency"], 0)
 
     def test_sigterm_stops_queued_launches_when_dev_stack_overrides_signal_handler(self):
         import concurrent.futures

@@ -3006,7 +3006,16 @@ def _run_local_eval(argv: list[str]) -> int:
         failure = None
         with launch_lock:
             if abort_event.is_set():
-                return scenario_index, run_index, None, f"aborted before launch: {abort_reason[0]}"
+                failure = f"aborted before launch: {abort_reason[0]}"
+                return scenario_index, run_index, {
+                    "failure": failure,
+                    "turns": [],
+                    "timing": {
+                        "started_at": None,
+                        "ended_at": time.time(),
+                        "concurrency": 0,
+                    },
+                }, failure
             started_at = time.time()
             active_runs[key] = {"concurrency": 1}
             for record in active_runs.values():
@@ -3096,8 +3105,10 @@ def _run_local_eval(argv: list[str]) -> int:
                 except KeyboardInterrupt as error:
                     request_abort(str(error) or "received interrupt")
                     raise
-                except Exception:
-                    request_abort("scheduler failed")
+                except Exception as error:
+                    request_abort(
+                        f"scheduler failed: {_redact_diagnostics(str(error))}"
+                    )
                     raise
                 finally:
                     for future in futures:
@@ -3111,7 +3122,22 @@ def _run_local_eval(argv: list[str]) -> int:
         except Exception as error:
             message = _redact_diagnostics(f"DevStack setup failed: {error}")
             capture_failures.append((0, 0, message))
-            request_abort("DevStack setup failed")
+            request_abort(message)
+            if not futures:
+                ended_at = time.time()
+                for scenario_index, case in enumerate(observations["cases"]):
+                    for run_index, observation in enumerate(case["runs"]):
+                        if observation is not None:
+                            continue
+                        case["runs"][run_index] = {
+                            "failure": message,
+                            "turns": [],
+                            "timing": {
+                                "started_at": None,
+                                "ended_at": ended_at,
+                                "concurrency": 0,
+                            },
+                        }
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
@@ -3141,10 +3167,36 @@ def _run_local_eval(argv: list[str]) -> int:
             except BaseException as error:
                 failure = _redact_diagnostics(str(error))
             failure = failure or f"aborted before launch: {abort_reason[0] or 'evaluation interrupted'}"
-        runs[run_index] = {"failure": failure, "turns": []}
+        runs[run_index] = {
+            "failure": failure,
+            "turns": [],
+            "timing": {
+                "started_at": None,
+                "ended_at": time.time(),
+                "concurrency": 0,
+            },
+        }
         capture_failures.append((scenario_index, run_index, _redact_diagnostics(
             f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
         )))
+
+    for scenario_index, case in enumerate(observations["cases"]):
+        for run_index, observation in enumerate(case["runs"]):
+            if observation is not None:
+                continue
+            failure = f"aborted before launch: {abort_reason[0] or 'run was not submitted'}"
+            case["runs"][run_index] = {
+                "failure": failure,
+                "turns": [],
+                "timing": {
+                    "started_at": None,
+                    "ended_at": time.time(),
+                    "concurrency": 0,
+                },
+            }
+            capture_failures.append((scenario_index, run_index, _redact_diagnostics(
+                f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
+            )))
 
     observations["batch_timing"] = {
         "started_at": batch_started_at,

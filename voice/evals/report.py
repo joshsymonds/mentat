@@ -285,6 +285,17 @@ def score_observations(
                 case_failures.append(f"{name} run {run_index + 1}: missing turn observations")
                 continue
             valid_failure = False
+            if isinstance(run.get("failure"), str):
+                failure = run["failure"]
+                if failure.strip() and not run["turns"]:
+                    case_failures.append(
+                        f"{name} run {run_index + 1}: eval infrastructure failure: {failure}"
+                    )
+                    continue
+                case_failures.append(
+                    f"{name} run {run_index + 1}: invalid partial capture failure metadata"
+                )
+                continue
             if "failure" in run:
                 failure = run["failure"]
                 preflight_tts_failure = (
