@@ -369,10 +369,16 @@ class DevStackTest(unittest.TestCase):
                             self.addCleanup(stop_test_group, leader)
                             if with_phone:
                                 deadline = time.monotonic() + 3
-                                while not child_pid_path.exists() and time.monotonic() < deadline:
+                                child_pid_text = ""
+                                while time.monotonic() < deadline:
+                                    if child_pid_path.exists():
+                                        child_pid_text = child_pid_path.read_text().strip()
+                                        if child_pid_text:
+                                            break
                                     time.sleep(0.001)
                                 self.assertTrue(child_pid_path.exists())
-                                phones.append(int(child_pid_path.read_text()))
+                                self.assertTrue(child_pid_text)
+                                phones.append(int(child_pid_text))
                             (run_dir / f"{name}.pid").write_text(f"{leader.pid}\n")
                         if phase == "launch":
                             interrupt("launch")
