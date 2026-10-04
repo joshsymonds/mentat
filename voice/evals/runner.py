@@ -2326,7 +2326,7 @@ def _confirmation_time(
     judge: Judge,
     context: str = "",
 ) -> float | None:
-    """Return the first segment end where the accumulated SMS confirmation passes."""
+    """Return the first segment end where the full accumulated SMS turn passes."""
     segments = trace.get("segments")
     capture_started = _finite_timestamp(trace.get("capture_started"), "capture start")
     speech_end = _finite_timestamp(trace.get("speech_end"), "speech end")
@@ -2348,11 +2348,7 @@ def _confirmation_time(
         evidence = judge_turn(expectation, "".join(transcript_parts), judge, context=context)
         if evidence["unavailable"] is not None:
             raise _JudgeTimingUnavailable(evidence)
-        confirmation = next(
-            (question for question in evidence["questions"] if question["id"] == "sms_confirmation"),
-            None,
-        )
-        if confirmation is not None and confirmation["verdict"] is True:
+        if all(question["verdict"] is True for question in evidence["questions"]):
             return capture_started + segment_end
     return None
 

@@ -3865,11 +3865,46 @@ class ScenarioObservationTests(unittest.TestCase):
             ["Timer set for", "Timer set for five minutes."],
         )
 
-    def test_confirmation_timing_uses_the_judged_sms_confirmation_question(self):
+    def test_confirmation_timing_waits_for_every_sms_confirmation_question(self):
+        scenario = next(item for item in SCENARIOS if item.name == "sms-say-back-yes")
+        judge = ScriptedSequenceJudge(
+            lambda question_id, reply: 1.0
+            if (
+                question_id == "sms_confirmation"
+                and "Should I send it?" in reply
+            )
+            or (
+                question_id in {"sms_recipient", "sms_body"}
+                and "+1-202-555-0142" in reply
+                and "I will be there at six" in reply
+            )
+            else 0.0
+        )
+        trace = {
+            "capture_started": 10.0,
+            "speech_end": 10.0,
+            "segments": [
+                {"start": 0.2, "end": 0.4, "text": "Should I send it?"},
+                {
+                    "start": 1.2,
+                    "end": 1.6,
+                    "text": "I will text +1-202-555-0142: I will be there at six.",
+                },
+            ],
+        }
+        self.assertEqual(
+            runner._confirmation_time(trace, scenario.turns[0], judge=judge),
+            11.6,
+        )
+
+    def test_confirmation_timing_uses_the_full_judged_sms_confirmation_turn(self):
         scenario = next(item for item in SCENARIOS if item.name == "sms-say-back-yes")
         judge = ScriptedSequenceJudge(
             lambda question_id, reply: 1.0
             if question_id == "sms_confirmation" and "confirm" in reply.lower()
+            or question_id in {"sms_recipient", "sms_body"}
+            and "202-555-0142" in reply
+            and "I will be there at six" in reply
             else 0.0
         )
         trace = {
@@ -3877,7 +3912,11 @@ class ScenarioObservationTests(unittest.TestCase):
             "speech_end": 20.0,
             "segments": [
                 {"start": 0.2, "end": 0.3, "text": "I will text the message."},
-                {"start": 0.6, "end": 0.9, "text": "Please confirm."},
+                {
+                    "start": 0.6,
+                    "end": 0.9,
+                    "text": "Text +1-202-555-0142: I will be there at six. Please confirm.",
+                },
             ],
         }
         self.assertEqual(
