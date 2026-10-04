@@ -12,6 +12,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      # Voice and HA tests run on the Python the voice env ships (3.14), and the
+      # recipe tests shell out to `just`.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
       - run: npm ci
       - run: npm run lint
       - run: npm test

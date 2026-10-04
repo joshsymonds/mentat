@@ -20,7 +20,7 @@
     # hand out a different toolchain over time. 20.0 is what this lock
     # resolves to today.
     cmdLineToolsVersion = "20.0";
-    platformToolsVersion = "36.0.0";
+    platformToolsVersion = "37.0.1";
     buildToolsVersion = "36.0.0";
     platformVersion = "36";
 
@@ -37,7 +37,7 @@
 
     androidComposition = androidPackages {
       includeEmulator = true;
-      emulatorVersion = "36.1.9";
+      emulatorVersion = "37.2.4";
       includeSystemImages = true;
       systemImageTypes = [ "google_apis" ];
       abiVersions = [ "x86_64" ];
