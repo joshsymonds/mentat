@@ -5069,8 +5069,8 @@ class LocalEvalCliTests(unittest.TestCase):
                 self.assertLessEqual(timing["concurrency"], 2)
 
     def test_concurrency_default_and_positive_override_validation(self):
-        self.assertEqual(runner.DEFAULT_CONCURRENCY, 16)
-        self.assertEqual(runner._parse_local_eval_arguments(["--live", "--runs", "1"])["concurrency"], 16)
+        self.assertEqual(runner.DEFAULT_CONCURRENCY, 8)
+        self.assertEqual(runner._parse_local_eval_arguments(["--live", "--runs", "1"])["concurrency"], 8)
         self.assertEqual(runner._parse_local_eval_arguments(
             ["--live", "--runs", "1", "--concurrency", "3"]
         )["concurrency"], 3)

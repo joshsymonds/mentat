@@ -53,7 +53,7 @@ TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
 DEFAULT_VOICE_MODEL = "chatgpt/sol-fast"
-DEFAULT_CONCURRENCY = 16
+DEFAULT_CONCURRENCY = 8
 _SCHEDULER_DRAIN_TIMEOUT_SECONDS = 1.0
 
 

@@ -243,7 +243,8 @@ to the repository. Production workers do not receive the recording setting.
 Before starting, account for remote service access and API usage costs. The recipe
 runs the default ten observations per scenario; preserve the positional `RUNS`
 and `MODEL` arguments, then optionally pass a positive concurrency cap as the
-third positional argument. Without it, the runner's named default cap applies.
+third positional argument. Without it, the runner's named default cap of 8 applies,
+fitting within ElevenLabs' limit of 9 concurrent requests.
 
 ```sh
 just eval-voice

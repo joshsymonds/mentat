@@ -17,7 +17,7 @@ test-ha:
 test-voice:
     python3 -m unittest discover -s voice/tests
 
-# Opt-in live voice evaluation; RUNS defaults to 10 observations per scenario.
+# Opt-in live voice evaluation; RUNS defaults to 10 observations per scenario and concurrency to 8 (within ElevenLabs' 9-request limit).
 eval-voice RUNS='10' MODEL='chatgpt/sol-fast' CONCURRENCY='':
     MENTAT_VOICE_MODEL={{quote(MODEL)}} python3 -m voice.evals.runner eval --live --runs {{quote(RUNS)}}{{ if CONCURRENCY == "" { "" } else { " --concurrency " + quote(CONCURRENCY) } }}
 
