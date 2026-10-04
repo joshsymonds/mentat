@@ -972,15 +972,15 @@ class ScoringTests(unittest.TestCase):
 
     def test_first_speech_gate_uses_first_nonempty_segment_after_capture_started(self):
         observation = {"cases": [case()]}
-        expected_latency = 1.75
+        expected_latency = 4.9
         for run in observation["cases"][0]["runs"]:
             scored_turn = run["turns"][0]
             scored_turn["first_audio"] = scored_turn["speech_end"] + 0.1
             scored_turn["capture_started"] = scored_turn["speech_end"] + 0.25
             scored_turn["segments"] = [
                 {"start": 0.1, "end": 0.2, "text": "  "},
-                {"start": 1.5, "end": 1.8, "text": "First transcribed response."},
-                {"start": 2.0, "end": 2.2, "text": "Later response."},
+                {"start": 4.65, "end": 4.8, "text": "First transcribed response."},
+                {"start": 5.0, "end": 5.2, "text": "Later response."},
             ]
 
         result = score_observations(observation)
@@ -999,18 +999,18 @@ class ScoringTests(unittest.TestCase):
             expected_latency,
         )
 
-    def test_first_speech_p50_over_two_seconds_fails(self):
+    def test_first_speech_p50_over_five_seconds_fails(self):
         observation = {"cases": [case()]}
         for run in observation["cases"][0]["runs"]:
             run["turns"][0]["capture_started"] = 0.0
             run["turns"][0]["segments"] = [
-                {"start": 2.01, "end": 2.2, "text": "Late response."},
+                {"start": 5.1, "end": 5.2, "text": "Late response."},
             ]
 
         result = score_observations(observation)
 
         self.assertFalse(result["passed"])
-        self.assertIn("first-speech p50 2.01s", " ".join(result["failures"]))
+        self.assertIn("first-speech p50 5.1s", " ".join(result["failures"]))
 
     def test_missing_first_speech_evidence_fails_closed(self):
         for missing in ("segments", "capture_started"):
