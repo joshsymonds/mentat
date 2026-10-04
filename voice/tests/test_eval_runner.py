@@ -4946,6 +4946,23 @@ class LocalEvalCliTests(unittest.TestCase):
 
         scenario = SimpleNamespace(name="cleanup", turns=(), commands=(), place_query=None)
         captured = {}
+        captured_turn = {
+            "turn": 1,
+            "kind": "action",
+            "speech_end": 1.0,
+            "speech_end_wall": 1.0,
+            "first_audio": 2.0,
+            "capture_started": 1.5,
+            "segments": [{"start": 1.0, "end": 1.2, "text": "completed response"}],
+            "command_received_at": 2.0,
+            "answer_at": 2.0,
+            "overlap": False,
+            "confirmation": 2.5,
+            "room_deleted": 5.0,
+            "expect_confirmation": True,
+            "expect_hangup": True,
+            "model_calls": ["test-model"],
+        }
         original_score = runner.score_observations
 
         def capture_score(observations, *, required_runs):
@@ -4969,7 +4986,7 @@ class LocalEvalCliTests(unittest.TestCase):
             patch.object(runner, "SCENARIOS", (scenario,)),
             patch.object(runner, "DevStack", side_effect=dev_stack),
             patch.object(runner, "observe_scenario", side_effect=lambda _scenario, stack: {
-                "run_id": stack.run_id, "turns": [],
+                "run_id": stack.run_id, "turns": [captured_turn],
             }),
             patch.object(runner, "score_observations", side_effect=capture_score),
             redirect_stdout(output),
@@ -4978,12 +4995,19 @@ class LocalEvalCliTests(unittest.TestCase):
 
         report = json.loads(output.getvalue())
         run = captured["observations"]["cases"][0]["runs"][0]
+        case_report = report["cases"][0]
         failures = " ".join(report["failures"])
         self.assertEqual(result, 1)
-        self.assertIn("run cleanup failed", run["failure"])
-        self.assertIn("distinctive run cleanup exception", run["failure"])
+        self.assertEqual(run["failure"], "run cleanup failed: distinctive run cleanup exception")
         self.assertIn("cleanup run 1", failures)
-        self.assertEqual([item["run"] for item in report["cases"][0]["run_timings"]], [1])
+        self.assertIn("distinctive run cleanup exception", failures)
+        self.assertNotIn("invalid partial capture failure metadata", failures)
+        self.assertEqual(
+            [(item["run"], item["turn"]) for item in case_report["turns"]],
+            [(1, 1)],
+        )
+        self.assertEqual(case_report["gates"][0]["run_count"], 1)
+        self.assertEqual([item["run"] for item in case_report["run_timings"]], [1])
 
     def test_concurrent_batch_schedules_full_cartesian_product_with_indexed_timing(self):
         import io

@@ -287,16 +287,18 @@ def score_observations(
             valid_failure = False
             if isinstance(run.get("failure"), str):
                 failure = run["failure"]
-                if failure.strip() and not run["turns"]:
+                if failure.strip():
                     case_failures.append(
                         f"{name} run {run_index + 1}: eval infrastructure failure: {failure}"
                     )
+                    if not run["turns"]:
+                        continue
+                else:
+                    case_failures.append(
+                        f"{name} run {run_index + 1}: invalid partial capture failure metadata"
+                    )
                     continue
-                case_failures.append(
-                    f"{name} run {run_index + 1}: invalid partial capture failure metadata"
-                )
-                continue
-            if "failure" in run:
+            elif "failure" in run:
                 failure = run["failure"]
                 preflight_tts_failure = (
                     isinstance(failure, dict)
