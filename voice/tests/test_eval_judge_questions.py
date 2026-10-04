@@ -51,6 +51,11 @@ class QuestionBuilderTests(unittest.TestCase):
         action = build_questions("action_ack", {"action": "navigate", "expected": "Alice Keck Park Memorial Garden"})
         self.assertIn("navigate", action["action_completed"].lower())
         self.assertIn("Alice Keck Park Memorial Garden", action["action_completed"])
+        self.assertIn("not only a description of the place", action["action_completed"])
+        timer = build_questions("action_ack", {"action": "timer", "expected": "a five-minute timer"})
+        self.assertIn("a timer, not an alarm or a reminder", timer["action_completed"])
+        with self.assertRaises(ValueError):
+            build_questions("action_ack", {"action": "dance", "expected": "a dance"})
 
         place = build_questions("place_lookup", {"place_name": "Alice Keck Park Memorial Garden", "locality": "Santa Barbara"})
         self.assertIn("Alice Keck Park Memorial Garden", place["place_named"])
@@ -61,18 +66,20 @@ class QuestionBuilderTests(unittest.TestCase):
             "sms_say_back",
             {"recipient": "+1-202-555-0142", "body": "I will be there at 6:00."},
         )
-        question = direct["sms_readback"]
-        self.assertIn("+1-202-555-0142", question)
-        self.assertIn("I will be there at 6:00.", question)
-        self.assertIn("spoken number or clock-time equivalent", question)
-        self.assertIn("recipient +1-202-555-0142, stated in the reply", question)
-        self.assertNotIn("previously verified recipient", question)
-        self.assertIn("spoken digits", question)
-        self.assertIn("ten-digit national number", question)
+        self.assertEqual(set(direct), {"sms_recipient", "sms_body"})
+        recipient = direct["sms_recipient"]
+        self.assertIn("202-555-0142, with or without a leading +1 or 1", recipient)
+        self.assertIn("spoken digits do not matter", recipient)
+        self.assertIn("words like the same number are not digits", recipient)
+        self.assertNotIn("previously verified", recipient)
+        body = direct["sms_body"]
+        self.assertIn("I will be there at 6:00.", body)
+        self.assertIn("six, 6, 6:00, six o'clock", body)
+        self.assertIn("must be the same time", body)
         confirmation = build_questions(
             "sms_confirmation", {"recipient": "+1-202-555-0142", "body": "I will be there at six."},
         )
-        self.assertIn("sms_readback", confirmation)
+        self.assertEqual(set(confirmation), {"sms_recipient", "sms_body", "sms_confirmation"})
         self.assertIn("explicitly ask", confirmation["sms_confirmation"])
         self.assertIn("before sending", confirmation["sms_confirmation"])
 
@@ -83,9 +90,9 @@ class QuestionBuilderTests(unittest.TestCase):
                 "body": "I will be there at seven.",
                 "verified_recipient": "+1-202-555-0142",
             },
-        )["sms_readback"]
-        self.assertIn("previously verified recipient +1-202-555-0142", inherited)
-        self.assertIn("I will be there at seven.", inherited)
+        )["sms_recipient"]
+        self.assertIn("previously verified number 202-555-0142", inherited)
+        self.assertIn("calling it the same number", inherited)
         with self.assertRaises(ValueError):
             build_questions(
                 "sms_say_back",
@@ -140,7 +147,7 @@ class QuestionBuilderTests(unittest.TestCase):
             2: ("soil", "too dry", "plant tomatoes"),
             3: ("water", "every morning", "before the sun", "strong"),
             4: ("timer", "five-minute", "water the plants"),
-            5: ("gardener", "quoted speech", "rather than an instruction to stop", "continue interpreting"),
+            5: ("gardener", "quoted speech", "rather than as an instruction to stop"),
             6: ("stop interpreting", "English"),
         }
         for turn, facts in interpreter_facts.items():

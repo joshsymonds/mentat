@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -49,7 +51,10 @@ class QualificationTests(unittest.TestCase):
                 self.assertIsInstance(fixture["source"], dict)
                 self.assertEqual(build_questions(fixture["family"], fixture["inputs"]), fixture["questions"])
                 if fixture["expected"]:
-                    self.assertIn(fixture["source"]["kind"], {"transcript", "trace_segment_join", "record_segment"})
+                    self.assertIn(
+                        fixture["source"]["kind"],
+                        {"transcript", "trace_segment_join", "record_segment", "scripted"},
+                    )
                 else:
                     self.assertEqual(fixture["source"]["kind"], "scenario_corruption")
                     self.assertIn(fixture["source"]["based_on"], by_id)
@@ -194,7 +199,10 @@ class QualificationTests(unittest.TestCase):
         result = qualify_fixtures(fixtures, judge_factory=factory, runs=3)
         self.assertEqual(result["run_count"], 3)
         self.assertEqual([run["counts"] for run in result["runs"]], [
-            {"correct": 1, "correct_total": 1, "wrong": 1, "wrong_total": 1, "passed": 2, "failed": 0, "unavailable": 0},
+            {
+                "correct": 1, "correct_total": 1, "scripted_correct": 0, "scripted_total": 0,
+                "wrong": 1, "wrong_total": 1, "passed": 2, "failed": 0, "unavailable": 0,
+            },
         ] * 3)
         self.assertEqual(len(factory_calls), len(fixtures) * 3)
         self.assertEqual(len(judges), len(factory_calls))
@@ -291,7 +299,7 @@ class QualificationTests(unittest.TestCase):
             "sms_confirmation",
             {"recipient": "+1-202-555-0142", "body": "I will be there at 6:00."},
         )
-        self.assertEqual(set(questions), {"sms_readback", "sms_confirmation"})
+        self.assertEqual(set(questions), {"sms_recipient", "sms_body", "sms_confirmation"})
         fixtures = [{
             "id": "confirmation", "family": "sms_confirmation",
             "inputs": {"recipient": "+1-202-555-0142", "body": "I will be there at 6:00."},
@@ -301,12 +309,65 @@ class QualificationTests(unittest.TestCase):
         result = qualify_fixtures(
             fixtures,
             judge_factory=lambda _fixture, _run: ScriptedJudge({
-                "sms_readback": 0.9,
+                "sms_recipient": 0.9,
+                "sms_body": 0.9,
                 "sms_confirmation": 0.1,
             }),
             runs=3,
         )
         self.assertEqual([run["counts"]["failed"] for run in result["runs"]], [1, 1, 1])
+
+    def test_scripted_correct_fixtures_are_scored_apart_from_retained_replies(self):
+        inputs = {"action": "timer", "expected": "a five-minute timer"}
+        questions = build_questions("action_ack", inputs)
+        retained = [{
+            "id": f"retained-{index}", "family": "action_ack", "inputs": inputs,
+            "reply": "Your timer is set.", "expected": True,
+            "source": {"kind": "test"}, "questions": questions,
+        } for index in range(20)]
+        scripted = {
+            "id": "scripted", "family": "action_ack", "inputs": inputs,
+            "reply": "Five minutes on the timer.", "expected": True,
+            "source": {"kind": "scripted", "reason": "shape absent from retained replies"},
+            "questions": questions,
+        }
+        verdicts = {"scripted": 0.1}
+        result = qualify_fixtures(
+            [*retained, scripted],
+            judge_factory=lambda fixture, _run: ScriptedJudge(
+                {"action_completed": verdicts.get(fixture["id"], 0.9)}
+            ),
+            runs=1,
+        )
+        run = result["runs"][0]
+        self.assertEqual(run["counts"]["correct_total"], 20)
+        self.assertEqual(run["counts"]["scripted_total"], 1)
+        self.assertEqual(run["correct_rate"], 1.0)
+        self.assertEqual(run["scripted_correct_rate"], 0.0)
+        self.assertEqual(run["status"], "fail")
+
+        verdicts["scripted"] = 0.9
+        passed = qualify_fixtures(
+            [*retained, scripted],
+            judge_factory=lambda fixture, _run: ScriptedJudge(
+                {"action_completed": verdicts.get(fixture["id"], 0.9)}
+            ),
+            runs=1,
+        )["runs"][0]
+        self.assertEqual(passed["counts"]["scripted_correct"], 1)
+        self.assertEqual(passed["status"], "pass")
+
+    def test_scripted_fixture_must_give_its_reason(self):
+        fixture = {
+            "id": "scripted", "family": "action_ack",
+            "inputs": {"action": "timer", "expected": "a five-minute timer"},
+            "reply": "Five minutes on the timer.", "expected": True, "source": {"kind": "scripted"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixtures.json"
+            path.write_text(json.dumps([fixture]), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must give its reason"):
+                load_fixtures(path)
 
     def test_all_runs_are_concurrent_and_unavailable_does_not_stop_other_fixture_evidence(self):
         fixtures = [

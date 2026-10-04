@@ -91,10 +91,20 @@ def _validate_source(fixture_id: str, expected: bool, source: Mapping[str, objec
             block = source.get("block")
             if isinstance(block, bool) or not isinstance(block, int) or block < 0:
                 raise ValueError(f"fixture {fixture_id} needs a non-negative retained text block index")
+        elif kind == "scripted":
+            # A correct shape no retained eval reply exhibits (DL14); scored apart
+            # from the retained replies so it never pads their rate.
+            if not isinstance(source.get("reason"), str) or not source["reason"].strip():
+                raise ValueError(f"scripted fixture {fixture_id} must give its reason")
         else:
             raise ValueError(f"correct fixture {fixture_id} must cite retained scripted source")
     elif kind != "scenario_corruption" or not isinstance(source.get("based_on"), str) or not isinstance(source.get("change"), str):
         raise ValueError(f"wrong fixture {fixture_id} must cite an explicit scenario corruption")
+
+
+def _is_scripted_correct(fixture: Mapping[str, object]) -> bool:
+    source = fixture.get("source")
+    return fixture.get("expected") is True and isinstance(source, Mapping) and source.get("kind") == "scripted"
 
 
 def _positive_int(value: object) -> bool:
@@ -156,10 +166,13 @@ def qualify_fixtures(
         fixture_order = {str(fixture["id"]): index for index, fixture in enumerate(fixtures)}
         evidence = sorted(evidence_by_run[run_number], key=lambda item: fixture_order[str(item["id"])])
         counts, family_counts = _score_run(fixtures, evidence)
-        correct_total = sum(1 for fixture in fixtures if fixture["expected"] is True)
-        correct_rate = counts["correct"] / correct_total
+        correct_rate = counts["correct"] / counts["correct_total"]
+        scripted_rate = (
+            counts["scripted_correct"] / counts["scripted_total"] if counts["scripted_total"] else 1.0
+        )
         passed = (
             correct_rate >= _CORRECT_THRESHOLD
+            and scripted_rate >= _CORRECT_THRESHOLD
             and counts["wrong"] == counts["wrong_total"]
             and counts["unavailable"] == 0
         )
@@ -167,6 +180,7 @@ def qualify_fixtures(
             "run": run_number,
             "status": "pass" if passed else "fail",
             "correct_rate": correct_rate,
+            "scripted_correct_rate": scripted_rate,
             "counts": counts,
             "family_counts": family_counts,
             "fixtures": evidence,
@@ -243,7 +257,11 @@ def _score_run(
     by_id = {str(item["id"]): item for item in evidence}
     counts = {
         "correct": 0,
-        "correct_total": sum(1 for fixture in fixtures if fixture["expected"] is True),
+        "correct_total": sum(
+            1 for fixture in fixtures if fixture["expected"] is True and not _is_scripted_correct(fixture)
+        ),
+        "scripted_correct": 0,
+        "scripted_total": sum(1 for fixture in fixtures if _is_scripted_correct(fixture)),
         "wrong": 0,
         "wrong_total": sum(1 for fixture in fixtures if fixture["expected"] is False),
         "passed": 0,
@@ -267,7 +285,10 @@ def _score_run(
         if result["status"] == "pass":
             counts["passed"] += 1
             family_count["passed"] += 1
-            counts["correct" if expected else "wrong"] += 1
+            if _is_scripted_correct(fixture):
+                counts["scripted_correct"] += 1
+            else:
+                counts["correct" if expected else "wrong"] += 1
             family_count["correct" if expected else "wrong"] += 1
         else:
             counts["failed"] += 1

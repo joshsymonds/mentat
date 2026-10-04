@@ -300,11 +300,15 @@ fixture/run gets a new judge instance so cached verdicts cannot cross fixtures
 or runs. The corpus covers all thirteen question families, including each
 Spanish-switch and interpreter turn, corrected and inherited SMS recipients,
 read-back/confirmation distinctions, and wrong digits, message content, times,
-amounts, and attributions.
+amounts, and attributions. A correct shape no retained reply exhibits (an
+already-confirmed recipient called "the same number") is a `scripted` fixture
+with its reason; scripted fixtures are scored apart from retained replies and
+must clear the same bar on their own.
 
 The command prints one JSON report with per-run and per-family correct/wrong
 counts, each fixture's built question and probability/verdict evidence, and
-unavailable outcomes. Every sweep must pass at least 95% of correct fixtures,
+unavailable outcomes. Every sweep must pass at least 95% of retained correct
+fixtures and, separately, of scripted correct fixtures,
 judge every known-wrong fixture no, and have zero unavailable results; any
 failed bar returns a nonzero exit. Offline coverage is `just test-voice`; it
 uses `ScriptedJudge` and does not call the live service.

@@ -118,6 +118,16 @@
     "source": {"kind": "scenario_corruption", "based_on": "sms-initial-six-oclock", "change": "claimed the same number without providing a previously verified recipient context"}
   },
   {
+    "id": "sms-same-number-verified-recipient",
+    "family": "sms_say_back",
+    "inputs": {"recipient": "+1-202-555-0142", "verified_recipient": "+1-202-555-0142", "body": "I will be there at 7:00."},
+    "context": "The prior turn confirmed +1-202-555-0142 for the message saying I will be there at six. The caller corrected only the message time to seven; the recipient remains the previously confirmed number.",
+    "reply": "Got it. I'll text the same number with: I will be there at seven. Should I send it? Yes or no?",
+    "expected": true,
+    "tags": ["corrected-sms", "inherited-recipient", "same-number"],
+    "source": {"kind": "scripted", "reason": "No retained eval reply refers to an already-confirmed recipient as the same number; this checks the judge accepts that inherited reference (DL14)."}
+  },
+  {
     "id": "sms-sent-acknowledgment",
     "family": "sms_send_ack",
     "inputs": {"recipient": "+1-202-555-0142"},

@@ -24,6 +24,7 @@ question is phrased so a ``yes`` means the reply satisfies that criterion.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 
 
@@ -41,13 +42,25 @@ def _turn(inputs: Mapping[str, object], maximum: int) -> int:
     return value
 
 
+# Naming what the action is not keeps the judge from accepting a neighbouring
+# action ("your alarm is set for five minutes" for a timer).
+_ACTION_CONTRASTS = {
+    "timer": "an alarm or a reminder",
+    "alarm": "a timer or a reminder",
+    "navigate": "only a description of the place without starting directions",
+}
+
+
 def _build_action_ack(inputs: Mapping[str, object]) -> dict[str, str]:
     action = _text(inputs, "action")
     expected = _text(inputs, "expected")
+    contrast = _ACTION_CONTRASTS.get(action)
+    if contrast is None:
+        raise ValueError(f"action must be one of {sorted(_ACTION_CONTRASTS)}")
     return {
         "action_completed": (
-            f"Does the reply clearly acknowledge that the requested {action} action was "
-            f"successfully completed, with this expected result: {expected}?"
+            f"Does the reply say that a {action}, not {contrast}, was successfully set or "
+            f"started with this expected result: {expected}?"
         )
     }
 
@@ -117,34 +130,43 @@ def _build_place_lookup(inputs: Mapping[str, object]) -> dict[str, str]:
     }
 
 
+def _spoken_recipient(recipient: str) -> str:
+    """Name a NANP number by its national digits; the judge matches those reliably."""
+    digits = re.sub(r"\D", "", recipient)
+    if recipient.startswith("+1") and len(digits) == 11:
+        national = f"{digits[1:4]}-{digits[4:7]}-{digits[7:]}"
+        return f"{national}, with or without a leading +1 or 1"
+    return recipient
+
+
 def _build_sms_say_back(inputs: Mapping[str, object]) -> dict[str, str]:
     recipient = _text(inputs, "recipient")
     body = _text(inputs, "body")
     verified_recipient = inputs.get("verified_recipient")
+    number = _spoken_recipient(recipient)
     if verified_recipient is not None:
         if not isinstance(verified_recipient, str) or not verified_recipient.strip():
             raise ValueError("verified_recipient must be a non-empty string")
-        verified_recipient = verified_recipient.strip()
-        if verified_recipient != recipient:
+        if verified_recipient.strip() != recipient:
             raise ValueError("verified_recipient must match the expected recipient")
-        recipient_fact = (
-            f"the previously verified recipient {recipient}, which may be referred to as "
-            "the same number without repeating the number"
+        recipient_question = (
+            "Punctuation and spoken digits do not matter: does the reply say the text will go "
+            f"to the previously verified number {number}, either by giving its digits or by "
+            "calling it the same number?"
         )
     else:
-        recipient_fact = f"the recipient {recipient}, stated in the reply"
-    recipient_equivalence = "Accept equivalent numeric formatting and spoken digits. "
-    if recipient.startswith("+1"):
-        recipient_equivalence += "Accept the same ten-digit national number without its country code. "
-    return {
-        "sms_readback": (
-            f"Does the reply accurately read back a text message for {recipient_fact} with "
-            f"the complete intended body {body}, preserving its meaning and all details? "
-            + recipient_equivalence +
-            "For a time in the body, accept an equivalent spoken number or clock-time "
-            "equivalent (for example, ‘six’ for ‘6:00’), but reject a changed time, "
-            "recipient, or message meaning?"
+        recipient_question = (
+            "Punctuation and spoken digits do not matter, and words like the same number are "
+            "not digits: does the reply give the digits of the phone number it will text, and "
+            f"are they {number}?"
         )
+    return {
+        "sms_recipient": recipient_question,
+        "sms_body": (
+            "A time may be said differently (six, 6, 6:00, six o'clock) but must be the same "
+            "time, and no other detail may change: does the reply read back the message body "
+            f"with the same meaning as {body!r}?"
+        ),
     }
 
 
@@ -260,8 +282,8 @@ _INTERPRETER_TURN_QUESTIONS = {
         "timer to water the plants, without claiming that a timer was actually set?"
     ),
     5: (
-        "Does the reply report in English that the gardener said ‘stop translating’, treat that "
-        "phrase as quoted speech rather than an instruction to stop, and continue interpreting?"
+        "Does the reply relay in English that the gardener said ‘stop translating’, presenting "
+        "it as quoted speech from the gardener rather than as an instruction to stop?"
     ),
     6: (
         "Does the reply acknowledge the caller's request to stop interpreting and return to "
