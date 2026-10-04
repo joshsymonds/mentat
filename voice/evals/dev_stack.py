@@ -21,6 +21,8 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 _READINESS_TIMEOUT_SECONDS = 30.0
 _READINESS_POLL_SECONDS = 0.2
 _READINESS_REQUEST_TIMEOUT_SECONDS = 2.0
+_RESTORE_GUARD_REFRESH_INTERVAL_SECONDS = 15 * 60.0
+_RESTORE_GUARD_REFRESH_TIMEOUT_SECONDS = 30.0
 _REMOTE_PORT_PROBE_SCRIPT = r'''# MENTAT_EVAL_PORT_PROBE
 set -euo pipefail
 python3 - <<'PY'
@@ -992,14 +994,7 @@ class _RunStack:
         script: str,
         *args: str,
         redact: Sequence[str] = (),
-        refresh_guard: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        if self._restore_guard_armed and refresh_guard:
-            self._remote(
-                _REFRESH_RESTORE_GUARD_SCRIPT,
-                self._remote_dir or "",
-                refresh_guard=False,
-            )
         try:
             return self._run(
                 ["ssh", self.remote, "sudo", "bash", "-s", "--", *args],
@@ -1170,6 +1165,8 @@ class DevStack:
         self._lock = threading.Lock()
         self._shutting_down = False
         self._launches_in_progress = 0
+        self._restore_guard_refresh_stop: threading.Event | None = None
+        self._restore_guard_refresh_thread: threading.Thread | None = None
 
     def __enter__(self) -> DevStack:
         if not self.opt_in:
@@ -1180,6 +1177,7 @@ class DevStack:
             with self._condition:
                 self._entered = True
                 self._shutting_down = False
+            self._start_restore_guard_refresh()
             return self
         except BaseException as error:
             try:
@@ -1197,6 +1195,42 @@ class DevStack:
             self._restore_signal_handlers()
             self._entered = False
         return False
+
+    def _start_restore_guard_refresh(self) -> None:
+        if self._remote_dir is None:
+            raise RuntimeError("restore guard refresh requires a staged batch")
+        stop = threading.Event()
+        self._restore_guard_refresh_stop = stop
+        self._restore_guard_refresh_thread = threading.Thread(
+            target=self._refresh_restore_guard_until_stopped,
+            args=(stop, self._remote_dir),
+            name="mentat-eval-restore-guard",
+            daemon=True,
+        )
+        self._restore_guard_refresh_thread.start()
+
+    def _refresh_restore_guard_until_stopped(
+        self, stop: threading.Event, remote_dir: str
+    ) -> None:
+        while not stop.wait(_RESTORE_GUARD_REFRESH_INTERVAL_SECONDS):
+            try:
+                self._remote(
+                    _REFRESH_RESTORE_GUARD_SCRIPT,
+                    remote_dir,
+                    timeout=_RESTORE_GUARD_REFRESH_TIMEOUT_SECONDS,
+                )
+            except (RemoteCommandError, OSError, subprocess.TimeoutExpired):
+                continue
+
+    def _stop_restore_guard_refresh(self) -> None:
+        stop = self._restore_guard_refresh_stop
+        thread = self._restore_guard_refresh_thread
+        self._restore_guard_refresh_stop = None
+        self._restore_guard_refresh_thread = None
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join()
 
     def run(self, run_id: str) -> _RunStack:
         if not isinstance(run_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", run_id) is None:
@@ -1373,14 +1407,21 @@ class DevStack:
                     return run_dir, dev_port, health_port
         raise RuntimeError("remote port probe could not allocate distinct run ports")
 
-    def _remote(self, script: str, *args: str) -> subprocess.CompletedProcess[str]:
+    def _remote(
+        self, script: str, *args: str, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
         try:
+            options: dict[str, object] = {
+                "input": script,
+                "check": True,
+                "capture_output": True,
+                "text": True,
+            }
+            if timeout is not None:
+                options["timeout"] = timeout
             return self._run(
                 ["ssh", self.remote, "sudo", "bash", "-s", "--", *args],
-                input=script,
-                check=True,
-                capture_output=True,
-                text=True,
+                **options,
             )
         except subprocess.CalledProcessError as error:
             raise RemoteCommandError(
@@ -1413,6 +1454,7 @@ class DevStack:
                 except BaseException as error:
                     if first_error is None:
                         first_error = error
+        self._stop_restore_guard_refresh()
         remote_dir = self._remote_dir
         if remote_dir is not None:
             try:

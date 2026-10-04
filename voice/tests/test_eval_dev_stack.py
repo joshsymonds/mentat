@@ -36,6 +36,7 @@ from voice.evals.dev_stack import (
     _RUN_SETUP_SCRIPT,
     _START_WORKER_SCRIPT,
     _STOP_RUN_SCRIPT,
+    _REFRESH_RESTORE_GUARD_SCRIPT,
 )
 
 
@@ -2338,33 +2339,132 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         self.assertIn("systemctl stop mentat-voice", setup)
         self.assertLess(remote_scripts.index(setup), remote_scripts.index(worker))
 
-    def test_live_remote_work_rearms_restore_guard_without_restoring_voice(self):
+    def test_concurrent_run_activity_does_not_storm_shared_restore_guard(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Lock
+
         calls = []
+        calls_lock = Lock()
 
         def run(args, **kwargs):
-            calls.append((args, kwargs))
+            with calls_lock:
+                calls.append((args, kwargs))
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        stack = _RunStack(checkout=CHECKOUT, remote="ultraviolet", run=run, batch=SimpleNamespace())
-        stack._remote_dir = "/tmp/mentat-eval.heartbeat"
-        stack._restore_guard_armed = True
+        batch = DevStack(checkout=CHECKOUT, remote="ultraviolet", run=run)
+        stacks = []
+        for index in range(16):
+            stack = _RunStack(
+                checkout=CHECKOUT, remote="ultraviolet", run=run,
+                batch=batch, run_id=f"run-{index}",
+            )
+            stack._remote_dir = f"/tmp/mentat-eval-batch.shared/runs/run-{index}"
+            stack._restore_guard_armed = True
+            stacks.append(stack)
 
-        stack._remote("capture attempt one")
-        stack._remote("capture attempt two")
+        def remote_work(stack):
+            stack._remote("capture attempt")
+
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            list(executor.map(remote_work, stacks))
 
         refreshes = [
             kwargs["input"]
             for args, kwargs in calls
-            if args[:2] == ["ssh", "ultraviolet"] and "systemctl restart" in kwargs.get("input", "")
+            if args[:2] == ["ssh", "ultraviolet"]
+            and "systemctl restart" in kwargs.get("input", "")
         ]
-        self.assertEqual(len(refreshes), 2)
+        self.assertLessEqual(len(refreshes), 1)
         for script in refreshes:
             self.assertIn('systemctl restart "$RESTORE_UNIT.timer"', script)
             self.assertNotIn("systemctl start mentat-voice", script)
-        self.assertEqual(
-            [kwargs["input"] for _, kwargs in calls if kwargs.get("input") and "systemctl restart" not in kwargs["input"]],
-            ["capture attempt one", "capture attempt two"],
+
+    def test_restore_guard_refreshes_periodically_without_run_work_and_stops_on_teardown(self):
+        from threading import Event, Lock
+
+        batch = DevStack(checkout=CHECKOUT, remote="ultraviolet")
+        remote_dir = "/tmp/mentat-eval-batch.heartbeat"
+        batch._remote_dir = remote_dir
+        batch._entered = True
+        calls = []
+        calls_lock = Lock()
+        first_refresh = Event()
+
+        def remote(script, remote_dir, **_kwargs):
+            with calls_lock:
+                calls.append((script, remote_dir, time.monotonic()))
+            first_refresh.set()
+            return subprocess.CompletedProcess(["ssh"], 0, "", "")
+
+        with patch.object(batch, "_remote", side_effect=remote), patch(
+            "voice.evals.dev_stack._RESTORE_GUARD_REFRESH_INTERVAL_SECONDS", 0.05
+        ):
+            started = time.monotonic()
+            batch._start_restore_guard_refresh()
+            self.assertTrue(first_refresh.wait(timeout=2))
+            batch._cleanup()
+            time.sleep(0.12)
+
+        refreshes = [call for call in calls if call[0] == _REFRESH_RESTORE_GUARD_SCRIPT]
+        self.assertGreaterEqual(refreshes[0][2] - started, 0.04)
+        self.assertEqual(len(refreshes), 1)
+        self.assertEqual(refreshes[0][1], remote_dir)
+
+    def test_batch_cleanup_stops_candidates_before_waiting_for_guard_refresh(self):
+        from threading import Event, Thread
+
+        refresh_started = Event()
+        release_refresh = Event()
+        run_stopped = Event()
+        cleanup_finished = Event()
+        events = []
+        refresh_timeouts = []
+        batch = DevStack(checkout=CHECKOUT, remote="ultraviolet")
+        batch._remote_dir = "/tmp/mentat-eval-batch.blocked-refresh"
+        batch._entered = True
+
+        def run(args, **kwargs):
+            script = kwargs.get("input", "")
+            if script == _REFRESH_RESTORE_GUARD_SCRIPT:
+                refresh_timeouts.append(kwargs.get("timeout"))
+                events.append("refresh-started")
+                refresh_started.set()
+                release_refresh.wait(timeout=kwargs.get("timeout", 2))
+                events.append("refresh-finished")
+            else:
+                events.append("batch-restore")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def stop_run():
+            events.append("candidate-stopped")
+            run_stopped.set()
+
+        batch._run_stacks["run-1"] = SimpleNamespace(
+            _remote_dir="/tmp/mentat-eval-batch.blocked-refresh/runs/run-1",
+            _tunnel=None,
+            _cleanup=stop_run,
         )
+
+        with patch.object(batch, "_run", side_effect=run), patch(
+            "voice.evals.dev_stack._RESTORE_GUARD_REFRESH_INTERVAL_SECONDS", 0.01
+        ):
+            batch._start_restore_guard_refresh()
+            self.assertTrue(refresh_started.wait(timeout=1))
+            cleanup = Thread(
+                target=lambda: (batch._cleanup_batch(), cleanup_finished.set()), daemon=True
+            )
+            cleanup.start()
+            stopped_while_refresh_blocked = run_stopped.wait(timeout=0.2)
+            release_refresh.set()
+            cleanup.join(timeout=2)
+
+        self.assertTrue(cleanup_finished.is_set())
+        self.assertTrue(stopped_while_refresh_blocked)
+        self.assertEqual(len(refresh_timeouts), 1)
+        self.assertIsNotNone(refresh_timeouts[0])
+        self.assertLess(refresh_timeouts[0], 60)
+        self.assertLess(events.index("candidate-stopped"), events.index("refresh-finished"))
+        self.assertLess(events.index("refresh-finished"), events.index("batch-restore"))
 
     def test_candidate_worker_alone_receives_private_input_audio_directory(self):
         self.assertIn(
