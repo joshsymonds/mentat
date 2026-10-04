@@ -1448,6 +1448,7 @@ class _RunStack:
                 if self._cleanup_error is not None:
                     raise self._cleanup_error
                 return
+            self._entered = False
             try:
                 self._cleanup_once()
             except BaseException as error:

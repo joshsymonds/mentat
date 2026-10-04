@@ -402,6 +402,71 @@ class DevStackTest(unittest.TestCase):
         self.assertFalse(cleanup.is_alive())
         self.assertEqual(len(restored), 1)
 
+    def test_batch_takeover_rejects_delayed_worker_and_remote_operations(self):
+        from threading import Event, Thread
+
+        calls = []
+        grant_ready = Event()
+        resume_worker = Event()
+        worker_errors = []
+
+        def run(args, **kwargs):
+            calls.append((list(args), kwargs.get("input", "")))
+            if "MENTAT_VOICE_GRANT" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(args, 0, '{"turns": []}', "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        batch = DevStack(checkout=CHECKOUT, opt_in=True, run=run)
+        batch._entered = True
+        batch._remote_dir = "/tmp/mentat-eval-batch.takeover"
+        stack = batch.run("case-1")
+        stack._entered = True
+        stack._remote_dir = f"{batch._remote_dir}/runs/case-1"
+        stack._restore_guard_armed = True
+
+        def delayed_worker():
+            stack.run_voice(
+                ["caller.py"], token="private-grant", livekit_url="wss://voice.invalid"
+            )
+            grant_ready.set()
+            self.assertTrue(resume_worker.wait(timeout=2))
+            for operation in (
+                lambda: stack.start_worker("late-room"),
+                lambda: stack.run_remote(["cat", "voice/evals/phone.jsonl"]),
+                lambda: stack.run_voice(
+                    ["caller.py"], token="late-grant", livekit_url="wss://voice.invalid"
+                ),
+            ):
+                try:
+                    operation()
+                except RuntimeError as error:
+                    worker_errors.append(str(error))
+                else:
+                    worker_errors.append("operation was admitted")
+            stack.__exit__(None, None, None)
+
+        with patch.object(stack, "_retain_evidence"):
+            worker = Thread(target=delayed_worker)
+            worker.start()
+            self.assertTrue(grant_ready.wait(timeout=2))
+            batch._cleanup()
+            calls_after_takeover = len(calls)
+            masters_after_takeover = sum("-M" in args for args, _script in calls)
+            resume_worker.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(worker_errors), 3)
+        self.assertTrue(all("not running" in error for error in worker_errors))
+        resumed_calls = calls[calls_after_takeover:]
+        self.assertEqual(sum("-M" in args for args, _script in resumed_calls), 0)
+        self.assertFalse(any(script == _START_WORKER_SCRIPT for _args, script in resumed_calls))
+        self.assertGreater(masters_after_takeover, 0)
+        self.assertTrue(any('bash "$BATCH_DIR/cleanup.sh"' in script for _args, script in calls))
+        self.assertIn("systemctl start mentat-voice", _BATCH_CLEANUP_SCRIPT)
+        self.assertFalse(stack._transport._connected)
+        self.assertIsNone(stack._transport._control_path)
+
     def test_run_cleanup_is_serialized_and_executes_once(self):
         from threading import Event, Thread
 
