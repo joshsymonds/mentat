@@ -372,10 +372,10 @@
     "id": "correction-initial-confirmation",
     "scenario": "sms-correction-new-yes",
     "turn": 1,
-    "reply": "I will text +1-202-555-0142 saying I will be there at six. Should I send it?",
+    "reply": "Sure thing. I'll text plus 1202. 5 5 5 0142 saying I will be there at six o'clock. Want me to send it. Yes or no?",
     "expected": true,
-    "tags": ["scripted-correction"],
-    "source": {"kind": "scripted","reason": "No retained correction-scenario reply covers its initial confirmation turn."}
+    "tags": ["initial-sms", "retained-2026-10-04"],
+    "source": {"kind": "transcript","artifact": "mentat-voice-eval-04arqtz3/sms-audio/transcripts.jsonl","line": 1}
   },
   {
     "id": "correction-initial-no-confirmation",

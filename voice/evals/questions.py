@@ -263,7 +263,7 @@ def _build_alice_wealth(inputs: Mapping[str, object]) -> dict[str, str]:
 _SPANISH_SWITCH_QUESTIONS = {
     1: "Does the reply acknowledge the request and switch to responding in Spanish?",
     2: "Does the reply answer that the capital of France is Paris, in Spanish?",
-    3: "Does the reply acknowledge the request and switch back to responding in English?",
+    3: "Is the reply itself written in English, and does it acknowledge switching back to English?",
     4: "Does the reply acknowledge the request and switch to responding in Spanish again?",
     5: "Does the reply answer that a clear daytime sky is blue, in Spanish?",
 }

@@ -146,7 +146,7 @@ class QuestionBuilderTests(unittest.TestCase):
         switch_facts = {
             1: ("switch to responding in Spanish", "acknowledge the request"),
             2: ("Paris", "Spanish"),
-            3: ("switch back to responding in English", "acknowledge the request"),
+            3: ("itself written in English", "acknowledge switching back to English"),
             4: ("switch to responding in Spanish again", "acknowledge the request"),
             5: ("blue", "Spanish"),
         }

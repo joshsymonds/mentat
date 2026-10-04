@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import sys
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Mapping
 
-from .judge import Judge, JudgeUnavailable, JevJudge, Verdict
-from .scenarios import SCENARIOS, ScenarioTurn, scenario_turns
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from evals.judge import Judge, JudgeUnavailable, JevJudge, Verdict
+from evals.scenarios import SCENARIOS, ScenarioTurn, scenario_turns
 
 
 FIXTURE_PATH = Path(__file__).with_name("judge_fixtures.json")

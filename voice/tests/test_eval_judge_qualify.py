@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -23,6 +25,24 @@ from evals.scenarios import SCENARIOS, evaluate_scenario_failures
 
 
 class QualificationTests(unittest.TestCase):
+    def test_recipe_module_imports_and_loads_fixtures_in_a_clean_interpreter(self):
+        # `just eval-judge` runs `python3 -m voice.evals.judge_qualify` from the
+        # repository root, without the test suite's sys.path setup.
+        repository = Path(__file__).resolve().parents[2]
+        completed = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import voice.evals.judge_qualify as qualify; print(len(qualify.load_fixtures()))",
+            ],
+            cwd=repository,
+            env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertGreater(int(completed.stdout.strip()), 0)
+
     def test_corpus_has_both_polarities_for_every_runtime_question_and_context(self):
         from evals.scenarios import scenario_turns
 
