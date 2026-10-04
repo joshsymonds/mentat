@@ -28,6 +28,8 @@ from voice.evals.dev_stack import (
     _RunStack,
     _MCP_REWRITE_SOURCE,
     _BATCH_SETUP_SCRIPT,
+    _BATCH_CLEANUP_SCRIPT,
+    _REAP_DEAD_BATCH_SCRIPT,
     _PRIVATE_CREDENTIAL_SOURCE,
     _RETAIN_EVIDENCE_SCRIPT,
     _RUN_VOICE_SCRIPT,
@@ -89,6 +91,489 @@ def isolated_run(**kwargs):
 
 
 class DevStackTest(unittest.TestCase):
+    def test_batch_shutdown_closes_launch_gate_before_restoring(self):
+        batch = DevStack(checkout=CHECKOUT, opt_in=True, run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+        batch._entered = True
+        batch._remote_dir = "/tmp/mentat-eval-batch.synthetic"
+        batch._cleanup()
+        with self.assertRaisesRegex(RuntimeError, "shutting down"):
+            batch.run("late-run")
+        with self.assertRaisesRegex(RuntimeError, "shutting down"):
+            batch._begin_launch()
+
+    def test_cleanup_waits_for_in_flight_launch_before_restoration(self):
+        from threading import Thread
+
+        batch = DevStack(checkout=CHECKOUT, opt_in=True)
+        batch._entered = True
+        batch._remote_dir = "/tmp/mentat-eval-batch.synthetic"
+        batch._begin_launch()
+        restored = []
+        with patch.object(batch, "_remote", side_effect=lambda *args: restored.append(args)):
+            cleanup = Thread(target=batch._cleanup)
+            cleanup.start()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with batch._condition:
+                    if batch._shutting_down:
+                        break
+                time.sleep(0.001)
+            self.assertTrue(batch._shutting_down)
+            self.assertTrue(cleanup.is_alive())
+            self.assertEqual(restored, [])
+            with self.assertRaisesRegex(RuntimeError, "shutting down"):
+                batch.run("late-run")
+            batch._end_launch()
+            cleanup.join(timeout=2)
+        self.assertFalse(cleanup.is_alive())
+        self.assertEqual(len(restored), 1)
+
+    def test_signal_during_shutdown_does_not_abort_cleanup(self):
+        import signal
+
+        batch = DevStack(checkout=CHECKOUT, opt_in=True)
+        batch._shutting_down = True
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                interrupted = False
+                try:
+                    batch._interrupted(signum, None)
+                except KeyboardInterrupt:
+                    interrupted = True
+                self.assertFalse(interrupted)
+
+    def test_cleanup_suppresses_and_restores_active_scheduler_signal_handler(self):
+        import signal
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                original = signal.getsignal(signum)
+                received = []
+
+                def scheduler_handler(received_signal, _frame):
+                    received.append(received_signal)
+                    raise KeyboardInterrupt("scheduler abort")
+
+                signal.signal(signum, scheduler_handler)
+                batch = DevStack(checkout=CHECKOUT, opt_in=True)
+                batch._entered = True
+                batch._remote_dir = "/tmp/mentat-eval-batch.synthetic"
+                restored = []
+
+                def remote(_script, path):
+                    os.kill(os.getpid(), signum)
+                    restored.append(path)
+                    return subprocess.CompletedProcess(["ssh"], 0, "", "")
+
+                try:
+                    with patch.object(batch, "_remote", side_effect=remote):
+                        aborted = False
+                        try:
+                            batch._cleanup()
+                        except KeyboardInterrupt:
+                            aborted = True
+                    active_after_cleanup = signal.getsignal(signum)
+                finally:
+                    signal.signal(signum, original)
+                self.assertFalse(aborted)
+                self.assertEqual(received, [])
+                self.assertIs(active_after_cleanup, scheduler_handler)
+                self.assertEqual(restored, ["/tmp/mentat-eval-batch.synthetic"])
+
+    def test_exit_preserves_scheduler_handler_installed_after_batch_enter(self):
+        import signal
+
+        original = signal.getsignal(signal.SIGTERM)
+        batch = DevStack(checkout=CHECKOUT, opt_in=True)
+
+        def scheduler_handler(_signum, _frame):
+            return
+
+        try:
+            batch._install_signal_handlers()
+            signal.signal(signal.SIGTERM, scheduler_handler)
+            batch._restore_signal_handlers()
+            self.assertIs(signal.getsignal(signal.SIGTERM), scheduler_handler)
+        finally:
+            signal.signal(signal.SIGTERM, original)
+
+    def test_real_cleanup_shell_acquires_lock_and_restores_voice(self):
+        cleanup = _BATCH_CLEANUP_SCRIPT
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            batch_dir = root / "batch"
+            run_dir = batch_dir / "runs" / "one"
+            (run_dir).mkdir(parents=True)
+            (batch_dir / "shared").mkdir()
+            (batch_dir / "restore-action").write_text("start\n")
+            (batch_dir / "restore-unit").write_text("mentat-eval-restore-test\n")
+            (run_dir / "launch.lock").touch()
+            events = root / "systemctl.log"
+            bindir = root / "bin"
+            bindir.mkdir()
+            systemctl = bindir / "systemctl"
+            systemctl.write_text("#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\n")
+            systemctl.chmod(0o700)
+            result = subprocess.run(
+                ["bash", "-c", cleanup, "cleanup", os.fspath(batch_dir)],
+                env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "SYSTEMCTL_LOG": os.fspath(events)},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("start mentat-voice", events.read_text())
+
+    def test_recovery_preserves_untrusted_cleanup_and_process_records(self):
+        import signal
+        import socket
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            batch_dir = root / "untrusted-batch"
+            runs_dir = batch_dir / "runs"
+            run_dir = runs_dir / "one"
+            run_dir.mkdir(parents=True)
+            batch_dir.chmod(0o711)
+            runs_dir.chmod(0o711)
+            run_dir.chmod(0o711)
+            marker = root / "executed"
+            unrelated = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+            )
+
+            def stop_unrelated():
+                try:
+                    os.killpg(unrelated.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                unrelated.wait(timeout=2)
+
+            self.addCleanup(stop_unrelated)
+            dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead_owner.wait()
+            owner = {"host": socket.gethostname(), "pid": dead_owner.pid}
+            (batch_dir / "shared").mkdir()
+            (batch_dir / "owner.json").write_text(json.dumps(owner) + "\n")
+            (batch_dir / "owner.json").chmod(0o600)
+            (batch_dir / "restore-action").write_text("start\n")
+            (batch_dir / "restore-action").chmod(0o600)
+            (batch_dir / "restore-unit").write_text("mentat-eval-restore-fake\n")
+            (batch_dir / "restore-unit").chmod(0o600)
+            (run_dir / "launch.lock").touch(mode=0o600)
+            (batch_dir / "cleanup.sh").write_text(
+                f"kill -TERM {unrelated.pid}\ntouch {shlex.quote(os.fspath(marker))}\n"
+            )
+            (batch_dir / "cleanup.sh").chmod(0o700)
+            (run_dir / "agent.pid").write_text(f"{unrelated.pid}\n")
+            (run_dir / "agent.pid").chmod(0o600)
+            response = [{"path": "/tmp/mentat-eval-batch.untrusted", "owner": json.dumps(owner)}]
+            batch = DevStack(
+                checkout=CHECKOUT,
+                opt_in=True,
+                run=lambda args, **kwargs: subprocess.CompletedProcess(args, 0, json.dumps(response), ""),
+            )
+
+            def execute_remote(script, path, owner_host, owner_pid):
+                return subprocess.run(
+                    ["bash", "-c", script, "reaper", os.fspath(batch_dir), owner_host, owner_pid],
+                    capture_output=True, text=True, check=True,
+                )
+
+            with patch.object(batch, "_remote", side_effect=execute_remote):
+                batch._reap_dead_batches()
+            self.assertFalse(marker.exists())
+            self.assertIsNone(unrelated.poll())
+
+    def test_owned_process_groups_stop_before_restore_after_launch_capture_abort(self):
+        import signal
+        from threading import Event, Thread
+
+        cleanup = _BATCH_CLEANUP_SCRIPT
+        for phase in ("launch", "capture"):
+            for outcome in ("error", signal.SIGINT, signal.SIGTERM):
+                with self.subTest(phase=phase, outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    batch_dir = root / "batch"
+                    run_dir = batch_dir / "runs" / "one"
+                    run_dir.mkdir(parents=True)
+                    (batch_dir / "shared").mkdir()
+                    (batch_dir / "restore-action").write_text("start\n")
+                    (batch_dir / "restore-unit").write_text("mentat-eval-restore-test\n")
+                    (batch_dir / "cleanup.sh").write_text(cleanup)
+                    (run_dir / "launch.lock").touch()
+                    bindir = root / "bin"
+                    bindir.mkdir()
+                    events = root / "events"
+                    systemctl = bindir / "systemctl"
+                    systemctl.write_text(
+                        "#!/usr/bin/env bash\n"
+                        "if [ \"$*\" = 'start mentat-voice' ]; then\n"
+                        "  for record in \"$CHECK_RUN_DIR\"/*.pid; do\n"
+                        "    [ -f \"$record\" ] || continue\n"
+                        "    if kill -0 -- \"-$(cat \"$record\")\" 2>/dev/null; then exit 1; fi\n"
+                        "  done\n"
+                        "fi\n"
+                        "printf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\n"
+                    )
+                    systemctl.chmod(0o700)
+                    leaders = []
+                    phones = []
+                    phase_entries = []
+                    batch = DevStack(checkout=CHECKOUT, opt_in=True)
+                    batch._entered = True
+                    batch._remote_dir = os.fspath(batch_dir)
+                    stack = batch.run("one")
+
+                    def stop_test_group(process):
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait(timeout=2)
+
+                    def interrupt(active_phase):
+                        phase_entries.append(active_phase)
+                        self.assertEqual(active_phase, phase)
+                        if active_phase == "launch":
+                            self.assertEqual(batch._launches_in_progress, 1)
+                            self.assertFalse(stack._entered)
+                        else:
+                            self.assertEqual(batch._launches_in_progress, 0)
+                            self.assertTrue(stack._entered)
+                        if outcome == "error":
+                            raise RuntimeError(f"{active_phase} failed")
+                        os.kill(os.getpid(), outcome)
+                        self.fail("signal did not interrupt the active run")
+
+                    def start_run():
+                        stack._remote_dir = os.fspath(run_dir)
+                        for name, with_phone in (("agent", False), ("voice", True), ("caller", True)):
+                            child_pid_path = root / f"{name}.child"
+                            code = (
+                                "import pathlib,signal,subprocess,sys,time\n"
+                                "child=None\n"
+                                "if sys.argv[1] != '-':\n"
+                                " child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+                                " pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
+                                "def stop(*args):\n"
+                                " if child is not None: child.terminate(); child.wait()\n"
+                                " raise SystemExit(0)\n"
+                                "signal.signal(signal.SIGTERM,stop)\n"
+                                "time.sleep(60)\n"
+                            )
+                            child_path = os.fspath(child_pid_path) if with_phone else "-"
+                            leader = subprocess.Popen(
+                                [sys.executable, "-c", code, child_path],
+                                start_new_session=True,
+                            )
+                            leaders.append(leader)
+                            self.addCleanup(stop_test_group, leader)
+                            if with_phone:
+                                deadline = time.monotonic() + 3
+                                while not child_pid_path.exists() and time.monotonic() < deadline:
+                                    time.sleep(0.001)
+                                self.assertTrue(child_pid_path.exists())
+                                phones.append(int(child_pid_path.read_text()))
+                            (run_dir / f"{name}.pid").write_text(f"{leader.pid}\n")
+                        if phase == "launch":
+                            interrupt("launch")
+
+                    def remote(script, *args, **_kwargs):
+                        if "MENTAT_VOICE_GRANT" in script:
+                            interrupt("capture")
+                        return subprocess.run(
+                            ["bash", "-c", script, "cleanup", *args],
+                            env={
+                                **os.environ,
+                                "PATH": f"{bindir}:{os.environ['PATH']}",
+                                "SYSTEMCTL_LOG": os.fspath(events),
+                                "CHECK_RUN_DIR": os.fspath(run_dir),
+                            },
+                            capture_output=True, text=True, check=True,
+                        )
+
+                    poll_stop = Event()
+
+                    def reap_leaders():
+                        while not poll_stop.is_set():
+                            for leader in tuple(leaders):
+                                leader.poll()
+                            time.sleep(0.001)
+
+                    reaper = Thread(target=reap_leaders)
+                    reaper.start()
+                    batch._install_signal_handlers()
+                    try:
+                        with (
+                            patch.object(stack, "_start", side_effect=start_run),
+                            patch.object(stack, "_remote", side_effect=remote),
+                            patch.object(batch, "_remote", side_effect=remote),
+                        ):
+                            expected_error = RuntimeError if outcome == "error" else KeyboardInterrupt
+                            with self.assertRaises(expected_error):
+                                try:
+                                    with stack:
+                                        stack.run_voice(
+                                            ["-m", "evals.runner"], token="offline-token",
+                                            livekit_url="ws://127.0.0.1:7880",
+                                        )
+                                finally:
+                                    batch.__exit__(*sys.exc_info())
+                    finally:
+                        batch._restore_signal_handlers()
+                        poll_stop.set()
+                        reaper.join(timeout=2)
+                    self.assertEqual(phase_entries, [phase])
+                    self.assertEqual(batch._launches_in_progress, 0)
+                    self.assertFalse(batch._entered)
+                    for leader in leaders:
+                        leader.wait(timeout=2)
+                        self.assertIsNotNone(leader.returncode)
+                    for pid in phones:
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(pid, 0)
+                    self.assertEqual(events.read_text().splitlines()[-1], "start mentat-voice")
+                    with self.assertRaisesRegex(RuntimeError, "shutting down"):
+                        batch.run("late")
+
+    def test_owner_death_requires_local_host_and_positive_absence(self):
+        owner = {"host": "runner-host", "pid": 321}
+        with patch("voice.evals.dev_stack.socket.gethostname", return_value="runner-host"), patch(
+            "voice.evals.dev_stack.os.kill", side_effect=ProcessLookupError
+        ):
+            self.assertTrue(DevStack._owner_process_is_dead(owner))
+        with patch("voice.evals.dev_stack.socket.gethostname", return_value="other-host"):
+            self.assertFalse(DevStack._owner_process_is_dead(owner))
+        with patch("voice.evals.dev_stack.socket.gethostname", return_value="runner-host"), patch(
+            "voice.evals.dev_stack.os.kill", side_effect=PermissionError
+        ):
+            self.assertFalse(DevStack._owner_process_is_dead(owner))
+        self.assertFalse(DevStack._owner_process_is_dead({"host": "runner-host", "pid": "bad"}))
+
+    def test_dead_owner_reaping_kills_only_dead_owned_candidate_processes(self):
+        import signal
+        import socket
+        from threading import Event, Thread
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bindir = root / "bin"
+            bindir.mkdir()
+            events = root / "events"
+            systemctl = bindir / "systemctl"
+            systemctl.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\n"
+            )
+            systemctl.chmod(0o700)
+            dead_batch = root / "dead-batch"
+            dead_run = dead_batch / "runs" / "one"
+            (dead_run).mkdir(parents=True)
+            (dead_batch / "shared").mkdir()
+            (dead_batch / "restore-action").write_text("start\n")
+            (dead_batch / "restore-unit").write_text("mentat-eval-restore-test\n")
+            (dead_run / "launch.lock").touch()
+
+            def sleeper():
+                return subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    start_new_session=True,
+                )
+
+            dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead_owner.wait()
+            live_owner = sleeper()
+            dead_candidate = sleeper()
+            live_candidate = sleeper()
+            unrelated = sleeper()
+            (dead_run / "agent.pid").write_text(f"{dead_candidate.pid}\n")
+            response = [
+                {"path": "/tmp/mentat-eval-batch.dead", "owner": json.dumps({"host": socket.gethostname(), "pid": dead_owner.pid})},
+                {"path": "/tmp/mentat-eval-batch.live", "owner": json.dumps({"host": socket.gethostname(), "pid": live_owner.pid})},
+                {"path": "/tmp/mentat-eval-batch.foreign", "owner": json.dumps({"host": "foreign-host", "pid": dead_owner.pid})},
+                {"path": "/tmp/mentat-eval-batch.malformed", "owner": "not-json"},
+            ]
+            batch = DevStack(
+                checkout=CHECKOUT,
+                opt_in=True,
+                run=lambda args, **kwargs: subprocess.CompletedProcess(args, 0, json.dumps(response), ""),
+            )
+
+            def cleanup_dead(script, _remote_path, host, pid):
+                self.assertEqual(host, socket.gethostname())
+                self.assertEqual(int(pid), dead_owner.pid)
+                self.assertTrue(script.startswith(_REAP_DEAD_BATCH_SCRIPT))
+                return subprocess.run(
+                    ["bash", "-c", _BATCH_CLEANUP_SCRIPT, "cleanup", os.fspath(dead_batch)],
+                    env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "SYSTEMCTL_LOG": os.fspath(events)},
+                    capture_output=True, text=True, check=True,
+                )
+
+            def stop_test_group(child):
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait(timeout=2)
+
+            for process in (live_owner, dead_candidate, live_candidate, unrelated):
+                self.addCleanup(stop_test_group, process)
+            poll_complete = Event()
+
+            def reap_dead_candidate():
+                while not poll_complete.is_set():
+                    dead_candidate.poll()
+                    if dead_candidate.returncode is not None:
+                        return
+                    time.sleep(0.001)
+
+            process_reaper = Thread(target=reap_dead_candidate)
+            process_reaper.start()
+            try:
+                with patch.object(batch, "_remote", side_effect=cleanup_dead):
+                    batch._reap_dead_batches()
+            finally:
+                poll_complete.set()
+                process_reaper.join(timeout=2)
+            dead_candidate.wait(timeout=2)
+            self.assertIsNone(live_candidate.poll())
+            self.assertIsNone(unrelated.poll())
+            self.assertEqual(events.read_text().splitlines()[-1], "start mentat-voice")
+            for process in (live_owner, live_candidate, unrelated):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=2)
+
+    def test_candidate_shutdown_records_and_stops_caller_process_group(self):
+        self.assertIn('"$RUN_DIR/caller.pid"', _STOP_RUN_SCRIPT)
+        self.assertIn("caller_pid_file = DEV_DIR / \"caller.pid\"", _RUN_VOICE_SCRIPT)
+        self.assertIn("flock(launch_lock, fcntl.LOCK_SH)", _RUN_VOICE_SCRIPT)
+        cleanup = _BATCH_CLEANUP_SCRIPT
+        self.assertIn('"$BATCH_DIR"/runs/*/caller.pid', cleanup)
+        self.assertIn('touch "$run_dir/shutdown"', cleanup)
+        self.assertLess(cleanup.index('caller.pid'), cleanup.index('systemctl start mentat-voice'))
+
+    def test_recovery_reaps_only_a_positively_dead_owned_batch(self):
+        owners = [
+            {"path": "/tmp/mentat-eval-batch.dead1", "owner": '{"host":"local","pid":101}'},
+            {"path": "/tmp/mentat-eval-batch.live1", "owner": '{"host":"local","pid":102}'},
+            {"path": "/tmp/mentat-eval-batch.foreign", "owner": '{"host":"remote","pid":103}'},
+            {"path": "/tmp/mentat-eval-batch.bad", "owner": "not-json"},
+            {"path": "/tmp/not-an-eval-batch", "owner": '{"host":"local","pid":104}'},
+        ]
+        batch = DevStack(
+            checkout=CHECKOUT,
+            opt_in=True,
+            run=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, json.dumps(owners), ""),
+        )
+        with patch.object(batch, "_owner_process_is_dead", side_effect=[True, False, False]), patch.object(
+            batch, "_remote"
+        ) as remote:
+            batch._reap_dead_batches()
+        remote.assert_called_once()
+        self.assertEqual(remote.call_args.args[1], "/tmp/mentat-eval-batch.dead1")
+
     def test_batch_runs_share_staging_but_keep_independent_run_lifecycles(self):
         calls = []
         events = []
@@ -180,9 +665,7 @@ class DevStackTest(unittest.TestCase):
         self.assertEqual(len(stop_run_indices), 2)
         self.assertEqual(len(batch_cleanup_indices), 1)
         self.assertLess(max(stop_run_indices), batch_cleanup_indices[0])
-        batch_cleanup = _BATCH_SETUP_SCRIPT.split(
-            'cat > "$BATCH_DIR/cleanup.sh" <<\'CLEANUP\'\n', 1
-        )[1].split("\nCLEANUP\n", 1)[0]
+        batch_cleanup = _BATCH_CLEANUP_SCRIPT
         self.assertLess(
             batch_cleanup.index('for pid_file in "$BATCH_DIR"/runs/*/agent.pid'),
             batch_cleanup.index("systemctl start mentat-voice"),
@@ -1270,9 +1753,7 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
 
     def test_candidate_voice_environment_is_gc_rooted_until_cleanup(self):
         setup_script = _BATCH_SETUP_SCRIPT
-        cleanup_script = setup_script.split("cat > \"$BATCH_DIR/cleanup.sh\" <<'CLEANUP'\n", 1)[1].split(
-            "\nCLEANUP\n", 1
-        )[0]
+        cleanup_script = _BATCH_CLEANUP_SCRIPT
 
         self.assertIn('--out-link "$SHARED_DIR/voice-env-root"', setup_script)
         self.assertIn("--print-out-paths", setup_script)
@@ -1446,6 +1927,7 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
             setpriv.write_text("fake setpriv executable")
             setpriv.chmod(0o755)
             resolved_setpriv = str(setpriv.resolve())
+            (run_dir / "launch.lock").touch()
             (run_dir / "setpriv.path").write_text(resolved_setpriv)
             (run_dir / "node.path").write_text("/usr/bin/node")
             (run_dir / "voice-python.path").write_text("/nix/store/python/bin/python3")
@@ -1505,6 +1987,7 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
     def test_voice_caller_redacts_json_values_without_corrupting_machine_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             dev_dir = Path(temporary)
+            (dev_dir / "launch.lock").touch()
             (dev_dir / "voice-python.path").write_text("/nix/store/python/bin/python3")
             (dev_dir / "setpriv.path").write_text("/usr/bin/setpriv")
             (dev_dir / "voice.env.json").write_text(json.dumps({
@@ -1552,6 +2035,7 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
     def test_voice_caller_rejects_malformed_machine_json_and_scrubs_diagnostic(self):
         with tempfile.TemporaryDirectory() as temporary:
             dev_dir = Path(temporary)
+            (dev_dir / "launch.lock").touch()
             (dev_dir / "voice-python.path").write_text("/nix/store/python/bin/python3")
             (dev_dir / "setpriv.path").write_text("/usr/bin/setpriv")
             (dev_dir / "voice.env.json").write_text(json.dumps({

@@ -159,10 +159,194 @@ def stage_gateway_key(values, dev_dir):
 '''
 
 
+_BATCH_CLEANUP_SCRIPT = r'''set -euo pipefail
+umask 077
+BATCH_DIR=$1
+RESTORE_ACTION=$(cat "$BATCH_DIR/restore-action")
+RESTORE_UNIT=$(cat "$BATCH_DIR/restore-unit")
+for run_dir in "$BATCH_DIR"/runs/*; do
+  [ -d "$run_dir" ] || continue
+  touch "$run_dir/shutdown"
+  if [ -f "$run_dir/launch.lock" ]; then
+    flock -x "$run_dir/launch.lock" -c ':'
+  fi
+done
+FAILED=0
+for pid_file in "$BATCH_DIR"/runs/*/agent.pid "$BATCH_DIR"/runs/*/voice.pid "$BATCH_DIR"/runs/*/caller.pid; do
+  if [ -f "$pid_file" ]; then
+    pid=$(cat "$pid_file")
+    case "$pid" in ''|*[!0-9]*|0) echo "invalid candidate process id in $pid_file" >&2; FAILED=1; continue ;; esac
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do kill -0 -- "-$pid" 2>/dev/null || break; sleep 1; done
+    if kill -0 -- "-$pid" 2>/dev/null; then
+      echo "candidate process group -$pid remains alive after KILL" >&2
+      FAILED=1
+    fi
+  fi
+done
+if [ "$FAILED" -ne 0 ]; then exit 1; fi
+if [ -n "$RESTORE_UNIT" ]; then systemctl stop "$RESTORE_UNIT.timer" "$RESTORE_UNIT.service" >/dev/null 2>&1 || true; fi
+if [ "$RESTORE_ACTION" = start ]; then systemctl start mentat-voice; elif [ "$RESTORE_ACTION" = stop ]; then systemctl stop mentat-voice; else echo "invalid production restore action" >&2; exit 1; fi
+rm -f -- "$BATCH_DIR/shared/voice-env-root"
+rm -rf -- "$BATCH_DIR"
+'''
+
+_REAP_BATCHES_SCRIPT = r'''set -euo pipefail
+python3 - <<'PY'
+import json
+import os
+import stat
+from pathlib import Path
+
+def trusted(path, kind, mode):
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    file_type = stat.S_ISDIR(info.st_mode) if kind == "dir" else stat.S_ISREG(info.st_mode)
+    return file_type and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == mode
+
+def trusted_run_tree(runs):
+    for run_dir in runs.iterdir():
+        if not trusted(run_dir, "dir", 0o711):
+            return False
+        for name in ("launch.lock", "shutdown", "agent.pid", "voice.pid", "caller.pid"):
+            path = run_dir / name
+            if path.exists() or path.is_symlink():
+                if not trusted(path, "file", 0o600):
+                    return False
+                if name.endswith(".pid"):
+                    try:
+                        if int(path.read_text()) <= 0:
+                            return False
+                    except (OSError, ValueError):
+                        return False
+    return True
+
+def read_owner(path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+            return None
+        with os.fdopen(descriptor, "r", closefd=False) as source:
+            return source.read()
+    finally:
+        os.close(descriptor)
+
+batches = []
+for path in sorted(Path("/tmp").glob("mentat-eval-batch.*")):
+    if not trusted(path, "dir", 0o711):
+        continue
+    if not trusted(path / "runs", "dir", 0o711):
+        continue
+    if not trusted_run_tree(path / "runs"):
+        continue
+    if not trusted(path / "cleanup.sh", "file", 0o700):
+        continue
+    if not trusted(path / "restore-action", "file", 0o600):
+        continue
+    if not trusted(path / "restore-unit", "file", 0o600):
+        continue
+    try:
+        owner = read_owner(path / "owner.json")
+    except OSError:
+        owner = None
+    batches.append({"path": str(path), "owner": owner})
+print(json.dumps(batches))
+PY
+'''
+
+_REAP_DEAD_BATCH_SCRIPT = r'''set -euo pipefail
+BATCH_DIR=$1
+EXPECTED_HOST=$2
+EXPECTED_PID=$3
+if ! python3 - "$BATCH_DIR" "$EXPECTED_HOST" "$EXPECTED_PID" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+def trusted(path, kind, mode):
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    file_type = stat.S_ISDIR(info.st_mode) if kind == "dir" else stat.S_ISREG(info.st_mode)
+    return file_type and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == mode
+
+def trusted_run_tree(runs):
+    for run_dir in runs.iterdir():
+        if not trusted(run_dir, "dir", 0o711): return False
+        for name in ("launch.lock", "shutdown", "agent.pid", "voice.pid", "caller.pid"):
+            path = run_dir / name
+            if path.exists() or path.is_symlink():
+                if not trusted(path, "file", 0o600): return False
+                if name.endswith(".pid"):
+                    try:
+                        if int(path.read_text()) <= 0: return False
+                    except (OSError, ValueError):
+                        return False
+    return True
+
+if not trusted(root, "dir", 0o711): raise SystemExit(1)
+for name, kind, mode in (
+    ("runs", "dir", 0o711),
+    ("owner.json", "file", 0o600),
+    ("cleanup.sh", "file", 0o700),
+    ("restore-action", "file", 0o600),
+    ("restore-unit", "file", 0o600),
+):
+    if not trusted(root / name, kind, mode): raise SystemExit(1)
+if not trusted_run_tree(root / "runs"): raise SystemExit(1)
+try:
+    owner = json.loads((root / "owner.json").read_text())
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+if owner.get("host") != sys.argv[2] or owner.get("pid") != int(sys.argv[3]):
+    raise SystemExit(1)
+PY
+then
+  echo "preserving batch with uncertain ownership: $BATCH_DIR" >&2
+  exit 0
+fi
+'''
 _BATCH_SETUP_SCRIPT = r'''set -euo pipefail
 BATCH_DIR=$1
+OWNER_HOST=$2
+OWNER_PID=$3
 umask 077
+test -d "$BATCH_DIR"
+test ! -L "$BATCH_DIR"
+chown root:root "$BATCH_DIR"
+chmod 711 "$BATCH_DIR"
+for name in owner.json cleanup.sh restore-action restore-unit; do
+  rm -f -- "$BATCH_DIR/$name"
+done
+if [ -L "$BATCH_DIR/runs" ] || { [ -e "$BATCH_DIR/runs" ] && [ ! -d "$BATCH_DIR/runs" ]; }; then
+  rm -f -- "$BATCH_DIR/runs"
+fi
+if [ -d "$BATCH_DIR/runs" ]; then rmdir "$BATCH_DIR/runs"; fi
+install -d -m 700 "$BATCH_DIR/runs"
+chown root:root "$BATCH_DIR/runs"
+chmod 711 "$BATCH_DIR/runs"
 SHARED_DIR="$BATCH_DIR/shared"
+chown -R root:root "$SHARED_DIR"
+python3 - "$BATCH_DIR" "$OWNER_HOST" "$OWNER_PID" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+owner = {"host": sys.argv[2], "pid": int(sys.argv[3])}
+path = Path(sys.argv[1]) / "owner.json"
+path.write_text(json.dumps(owner, separators=(",", ":")) + "\n")
+os.chmod(path, 0o600)
+PY
 MENTAT_PID=$(systemctl show mentatd --property=MainPID --value)
 VOICE_PID=$(systemctl show mentat-voice --property=MainPID --value)
 test "$MENTAT_PID" -gt 0
@@ -185,31 +369,12 @@ for module in (
     except ImportError as error:
         raise SystemExit(f"candidate voice environment missing required module {module}: {error}") from error
 PY
-install -d -m 700 "$BATCH_DIR/runs"
-chown root:root "$BATCH_DIR"
-chmod 711 "$BATCH_DIR"
-chmod 711 "$BATCH_DIR/runs"
 if systemctl is-active --quiet mentat-voice; then RESTORE_ACTION=start; else RESTORE_ACTION=stop; fi
 RESTORE_UNIT="mentat-eval-restore-${BATCH_DIR##*.}"
 printf '%s\n' "$RESTORE_ACTION" > "$BATCH_DIR/restore-action"
 printf '%s\n' "$RESTORE_UNIT" > "$BATCH_DIR/restore-unit"
 cat > "$BATCH_DIR/cleanup.sh" <<'CLEANUP'
-set +e
-BATCH_DIR=$1
-RESTORE_ACTION=$(cat "$BATCH_DIR/restore-action" 2>/dev/null)
-RESTORE_UNIT=$(cat "$BATCH_DIR/restore-unit" 2>/dev/null)
-for pid_file in "$BATCH_DIR"/runs/*/agent.pid "$BATCH_DIR"/runs/*/voice.pid; do
-  if [ -f "$pid_file" ]; then
-    pid=$(cat "$pid_file")
-    kill -TERM -- "-$pid" 2>/dev/null || true
-    for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-    kill -KILL -- "-$pid" 2>/dev/null || true
-  fi
-done
-if [ -n "$RESTORE_UNIT" ]; then systemctl stop "$RESTORE_UNIT.timer" "$RESTORE_UNIT.service" >/dev/null 2>&1; fi
-if [ "$RESTORE_ACTION" = start ]; then systemctl start mentat-voice; elif [ "$RESTORE_ACTION" = stop ]; then systemctl stop mentat-voice; fi
-rm -f -- "$BATCH_DIR/shared/voice-env-root"
-rm -rf -- "$BATCH_DIR"
+__BATCH_CLEANUP_SCRIPT__
 CLEANUP
 chmod 700 "$BATCH_DIR/cleanup.sh"
 systemd-run --quiet --unit="$RESTORE_UNIT" --on-active=30m "$(command -v systemctl)" "$RESTORE_ACTION" mentat-voice
@@ -268,6 +433,8 @@ if [ -f "$SHARED_DIR/voice-gateway-key" ]; then
   chmod 400 "$RUN_DIR/voice-gateway-key"
 fi
 mkdir -m 700 -p "$RUN_DIR/home/mentat" "$RUN_DIR/home/voice/cache" "$RUN_DIR/records" "$RUN_DIR/memory" "$RUN_DIR/voice/evals"
+: > "$RUN_DIR/launch.lock"
+chmod 600 "$RUN_DIR/launch.lock"
 chmod 711 "$RUN_DIR/home"
 chown root:nogroup "$RUN_DIR/voice.env.json"
 chmod 640 "$RUN_DIR/voice.env.json"
@@ -333,9 +500,12 @@ log.close()
 PY
 '''
 
-_STOP_RUN_SCRIPT = r'''set +e
+_STOP_RUN_SCRIPT = r'''set -euo pipefail
 RUN_DIR=$1
-for pid_file in "$RUN_DIR/agent.pid" "$RUN_DIR/voice.pid"; do
+umask 077
+touch "$RUN_DIR/shutdown"
+if [ -f "$RUN_DIR/launch.lock" ]; then flock -x "$RUN_DIR/launch.lock" -c ':'; fi
+for pid_file in "$RUN_DIR/agent.pid" "$RUN_DIR/voice.pid" "$RUN_DIR/caller.pid"; do
   if [ -f "$pid_file" ]; then
     pid=$(cat "$pid_file")
     kill -TERM -- "-$pid" 2>/dev/null || true
@@ -449,6 +619,9 @@ DEV_DIR=$1
 DEV_PORT=$2
 HEALTH_PORT=$3
 ROOM=$4
+exec 9>"$DEV_DIR/launch.lock"
+flock -s 9
+if [ -e "$DEV_DIR/shutdown" ]; then exit 1; fi
 systemctl stop mentat-voice
 if [ -f "$DEV_DIR/voice.pid" ]; then
   previous_pid=$(cat "$DEV_DIR/voice.pid")
@@ -518,7 +691,8 @@ systemctl restart "$RESTORE_UNIT.timer"
 '''
 
 
-_RUN_VOICE_SCRIPT = r'''import json
+_RUN_VOICE_SCRIPT = r'''import atexit
+import json
 import os
 import subprocess
 import sys
@@ -530,6 +704,14 @@ if len(sys.argv) != 5 or sys.argv[1] != "--":
 DEV_DIR = Path(sys.argv[2])
 DEV_PORT = sys.argv[3]
 HEALTH_PORT = sys.argv[4]
+import fcntl
+caller_pid_file = DEV_DIR / "caller.pid"
+atexit.register(lambda: caller_pid_file.unlink(missing_ok=True))
+launch_lock = (DEV_DIR / "launch.lock").open("rb")
+fcntl.flock(launch_lock, fcntl.LOCK_SH)
+if (DEV_DIR / "shutdown").exists():
+    raise RuntimeError("candidate batch is shutting down")
+(DEV_DIR / "caller.pid").write_text(f"{os.getpid()}\n")
 sys.path.insert(0, str(DEV_DIR / "voice"))
 from evals.dev_stack import (
     _redact_diagnostics,
@@ -566,6 +748,8 @@ voice_env.update({
     ),
 })
 secret_values = _secret_environment_values(voice_env) + [token]
+fcntl.flock(launch_lock, fcntl.LOCK_UN)
+launch_lock.close()
 result = subprocess.run(
     [
         setpriv_path, "--reuid=nobody", "--regid=nogroup", "--clear-groups",
@@ -645,8 +829,12 @@ class _RunStack:
         if self._batch is None:
             raise RuntimeError("run stacks must be created by DevStack.run")
         try:
-            self._start()
-            self._entered = True
+            self._batch._begin_launch()
+            try:
+                self._start()
+                self._entered = True
+            finally:
+                self._batch._end_launch()
             return self
         except BaseException as error:
             try:
@@ -695,7 +883,7 @@ class _RunStack:
             "livekit_url": livekit_url,
         })
         python_command = shlex.join([
-            "python3", "-c", _RUN_VOICE_SCRIPT, "--",
+            "setsid", "python3", "-c", _RUN_VOICE_SCRIPT, "--",
             self._remote_dir or "", str(self.dev_port), str(self.health_port),
         ])
         script = (
@@ -975,9 +1163,13 @@ class DevStack:
         self._remote_dir: str | None = None
         self._entered = False
         self._signal_handlers: dict[int, signal.Handlers] = {}
+        self._installed_signal_handlers: dict[int, signal.Handlers] = {}
         self._run_stacks: dict[str, _RunStack] = {}
         self._ports: set[int] = set()
+        self._condition = threading.Condition()
         self._lock = threading.Lock()
+        self._shutting_down = False
+        self._launches_in_progress = 0
 
     def __enter__(self) -> DevStack:
         if not self.opt_in:
@@ -985,7 +1177,9 @@ class DevStack:
         self._install_signal_handlers()
         try:
             self._start()
-            self._entered = True
+            with self._condition:
+                self._entered = True
+                self._shutting_down = False
             return self
         except BaseException as error:
             try:
@@ -1007,9 +1201,9 @@ class DevStack:
     def run(self, run_id: str) -> _RunStack:
         if not isinstance(run_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", run_id) is None:
             raise ValueError("run id must be a safe path component")
-        with self._lock:
-            if not self._entered:
-                raise RuntimeError("DevStack batch is not running")
+        with self._condition:
+            if not self._entered or self._shutting_down:
+                raise RuntimeError("DevStack batch is not running or is shutting down")
             if run_id in self._run_stacks:
                 raise ValueError(f"run id is already in use: {run_id}")
             stack = _RunStack(
@@ -1021,6 +1215,62 @@ class DevStack:
             )
             self._run_stacks[run_id] = stack
             return stack
+
+    @staticmethod
+    def _owner_process_is_dead(owner: object) -> bool:
+        if not isinstance(owner, dict):
+            return False
+        host, pid = owner.get("host"), owner.get("pid")
+        if host != socket.gethostname() or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError):
+            return False
+        return False
+
+    def _reap_dead_batches(self) -> None:
+        listed = self._run(
+            ["ssh", self.remote, "sudo", "bash", "-s"], input=_REAP_BATCHES_SCRIPT,
+            check=True, capture_output=True, text=True,
+        )
+        try:
+            batches = json.loads(listed.stdout)
+        except (TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(batches, list):
+            return
+        for item in batches:
+            if not isinstance(item, dict):
+                continue
+            path, raw_owner = item.get("path"), item.get("owner")
+            if not isinstance(path, str) or re.fullmatch(r"/tmp/mentat-eval-batch\.[A-Za-z0-9]+", path) is None:
+                continue
+            try:
+                owner = json.loads(raw_owner) if isinstance(raw_owner, str) else None
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not self._owner_process_is_dead(owner):
+                continue
+            self._remote(
+                _REAP_DEAD_BATCH_SCRIPT + _BATCH_CLEANUP_SCRIPT,
+                path,
+                str(owner["host"]),
+                str(owner["pid"]),
+            )
+
+    def _begin_launch(self) -> None:
+        with self._condition:
+            if not self._entered or self._shutting_down:
+                raise RuntimeError("DevStack batch is shutting down")
+            self._launches_in_progress += 1
+
+    def _end_launch(self) -> None:
+        with self._condition:
+            self._launches_in_progress -= 1
+            self._condition.notify_all()
 
     def _start(self) -> None:
         built = self._run(
@@ -1088,11 +1338,14 @@ class DevStack:
             ["scp", "-r", str(self.checkout / "voice" / "assets"), f"{self.remote}:{shared}/voice/"],
             check=True, capture_output=True, text=True,
         )
+        self._reap_dead_batches()
         self._remote(
             _BATCH_SETUP_SCRIPT.replace(
                 "__PRIVATE_CREDENTIAL_SOURCE__", _PRIVATE_CREDENTIAL_SOURCE
-            ),
+            ).replace("__BATCH_CLEANUP_SCRIPT__", _BATCH_CLEANUP_SCRIPT),
             self._remote_dir,
+            socket.gethostname(),
+            str(os.getpid()),
         )
 
     def _prepare_run(self, run_id: str) -> tuple[str, int, int]:
@@ -1138,8 +1391,20 @@ class DevStack:
             ) from error
 
     def _cleanup(self) -> None:
+        active_handlers = self._suppress_cleanup_signals()
+        try:
+            self._cleanup_batch()
+        finally:
+            self._restore_cleanup_signals(active_handlers)
+
+    def _cleanup_batch(self) -> None:
         first_error: BaseException | None = None
-        with self._lock:
+        with self._condition:
+            self._shutting_down = True
+            self._entered = False
+            while self._launches_in_progress:
+                self._condition.wait()
+        with self._condition:
             run_stacks = tuple(self._run_stacks.values())
         for stack in run_stacks:
             if stack._remote_dir is not None or stack._tunnel is not None:
@@ -1151,7 +1416,7 @@ class DevStack:
         remote_dir = self._remote_dir
         if remote_dir is not None:
             try:
-                script = '''set +e
+                script = '''set -euo pipefail
 BATCH_DIR=$1
 if [ -f "$BATCH_DIR/cleanup.sh" ]; then
   bash "$BATCH_DIR/cleanup.sh" "$BATCH_DIR"
@@ -1172,15 +1437,44 @@ fi
         if threading.current_thread() is not threading.main_thread():
             return
         for signum in (signal.SIGINT, signal.SIGTERM):
+            handler = self._interrupted
             self._signal_handlers[signum] = signal.getsignal(signum)
-            signal.signal(signum, self._interrupted)
+            self._installed_signal_handlers[signum] = handler
+            signal.signal(signum, handler)
 
-    @staticmethod
-    def _interrupted(signum: int, frame: FrameType | None) -> None:
+    def _interrupted(self, signum: int, frame: FrameType | None) -> None:
+        if self._shutting_down:
+            return
         raise KeyboardInterrupt(f"received signal {signum}")
+
+    def _ignore_cleanup_signal(self, _signum: int, _frame: FrameType | None) -> None:
+        return
+
+    def _suppress_cleanup_signals(
+        self,
+    ) -> dict[int, tuple[signal.Handlers, signal.Handlers]]:
+        if threading.current_thread() is not threading.main_thread():
+            return {}
+        handlers = {}
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            active = signal.getsignal(signum)
+            cleanup_handler = self._ignore_cleanup_signal
+            handlers[signum] = (active, cleanup_handler)
+            signal.signal(signum, cleanup_handler)
+        return handlers
+
+    def _restore_cleanup_signals(
+        self, handlers: dict[int, tuple[signal.Handlers, signal.Handlers]]
+    ) -> None:
+        if threading.current_thread() is threading.main_thread():
+            for signum, (active, cleanup_handler) in handlers.items():
+                if signal.getsignal(signum) == cleanup_handler:
+                    signal.signal(signum, active)
 
     def _restore_signal_handlers(self) -> None:
         if threading.current_thread() is threading.main_thread():
             for signum, handler in self._signal_handlers.items():
-                signal.signal(signum, handler)
+                if signal.getsignal(signum) == self._installed_signal_handlers[signum]:
+                    signal.signal(signum, handler)
         self._signal_handlers.clear()
+        self._installed_signal_handlers.clear()
