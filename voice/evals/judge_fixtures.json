@@ -99,6 +99,24 @@
     "source": {"kind": "scenario_corruption","based_on": "sms-initial-six-oclock","change": "changed the recipient digits"}
   },
   {
+    "id": "sms-spelled-digits-correct",
+    "scenario": "sms-say-back-yes",
+    "turn": 1,
+    "reply": "Sure thing. I'll text plus one two zero two five five five zero one four two saying, \"I will be there at six o'clock.\" Want me to send it? Yes or no?",
+    "expected": true,
+    "tags": ["initial-sms", "spelled-digits", "scribe-transcript"],
+    "source": {"kind": "transcript","artifact": "voice-eval-scribe/evidence/scribe-retained-transcripts.jsonl","line": 3}
+  },
+  {
+    "id": "sms-spelled-digits-wrong",
+    "scenario": "sms-say-back-yes",
+    "turn": 1,
+    "reply": "Sure thing. I'll text plus one eight zero zero five five five zero one four two saying, \"I will be there at six o'clock.\" Want me to send it? Yes or no?",
+    "expected": false,
+    "tags": ["wrong-digits", "spelled-digits"],
+    "source": {"kind": "scenario_corruption","based_on": "sms-spelled-digits-correct","change": "changed the spelled-out area code from two zero two to eight zero zero"}
+  },
+  {
     "id": "sms-wrong-body-time",
     "scenario": "sms-say-back-yes",
     "turn": 1,

@@ -82,8 +82,8 @@ class QuestionBuilderTests(unittest.TestCase):
         )
         self.assertEqual(set(direct), {"sms_recipient", "sms_body"})
         recipient = direct["sms_recipient"]
-        self.assertIn("202-555-0142, with or without a leading +1 or 1", recipient)
-        self.assertIn("spoken digits do not matter", recipient)
+        self.assertIn("exactly 2 0 2 5 5 5 0 1 4 2 with or without a leading +1 or 1", recipient)
+        self.assertIn("eight zero zero is 800", recipient)
         self.assertIn("words like the same number are not digits", recipient)
         self.assertNotIn("previously verified", recipient)
         body = direct["sms_body"]
@@ -105,7 +105,8 @@ class QuestionBuilderTests(unittest.TestCase):
                 "verified_recipient": "+1-202-555-0142",
             },
         )["sms_recipient"]
-        self.assertIn("previously verified number 202-555-0142", inherited)
+        self.assertIn("previously verified number, exactly 2 0 2 5 5 5 0 1 4 2", inherited)
+        self.assertIn("spoken digit words count as digits", inherited)
         self.assertIn("calling it the same number", inherited)
         with self.assertRaises(ValueError):
             build_questions(

@@ -140,13 +140,17 @@ def _build_place_lookup(inputs: Mapping[str, object]) -> dict[str, str]:
     }
 
 
+# Scribe writes numbers as numerals or as spoken digit words; without the
+# examples the judge accepted "eight zero zero" where 202 was expected.
+_DIGIT_WORDS = "Punctuation does not matter, and spoken digit words count as digits (two zero two is 202, eight zero zero is 800)"
+
+
 def _spoken_recipient(recipient: str) -> str:
-    """Name a NANP number by its national digits; the judge matches those reliably."""
+    """Name a NANP number digit by digit; the judge compares those reliably."""
     digits = re.sub(r"\D", "", recipient)
     if recipient.startswith("+1") and len(digits) == 11:
-        national = f"{digits[1:4]}-{digits[4:7]}-{digits[7:]}"
-        return f"{national}, with or without a leading +1 or 1"
-    return recipient
+        return f"exactly {' '.join(digits[1:])} with or without a leading +1 or 1"
+    return f"exactly {' '.join(digits)}"
 
 
 def _build_sms_say_back(inputs: Mapping[str, object]) -> dict[str, str]:
@@ -160,15 +164,13 @@ def _build_sms_say_back(inputs: Mapping[str, object]) -> dict[str, str]:
         if verified_recipient.strip() != recipient:
             raise ValueError("verified_recipient must match the expected recipient")
         recipient_question = (
-            "Punctuation and spoken digits do not matter: does the reply say the text will go "
-            f"to the previously verified number {number}, either by giving its digits or by "
-            "calling it the same number?"
+            f"{_DIGIT_WORDS}: does the reply say the text will go to the previously verified "
+            f"number, {number}, either by giving those digits or by calling it the same number?"
         )
     else:
         recipient_question = (
-            "Punctuation and spoken digits do not matter, and words like the same number are "
-            "not digits: does the reply give the digits of the phone number it will text, and "
-            f"are they {number}?"
+            f"{_DIGIT_WORDS}, and words like the same number are not digits: does the reply "
+            f"give the digits of the phone number it will text, and are they {number}?"
         )
     return {
         "sms_recipient": recipient_question,
