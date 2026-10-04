@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from evals.judge import JudgeUnavailable, ScriptedJudge
+from evals.judge import JudgeUnavailable, ScriptedJudge, Verdict
 from evals.judge_qualify import (
     FIXTURE_PATH,
     load_fixtures,
@@ -19,19 +19,90 @@ from evals.judge_qualify import (
     qualification_exit_code,
 )
 from evals.questions import build_questions
+from evals.scenarios import SCENARIOS, evaluate_scenario_failures
 
 
 class QualificationTests(unittest.TestCase):
-    def test_public_corpus_covers_registered_families_and_required_turns(self):
+    def test_corpus_has_both_polarities_for_every_runtime_question_and_context(self):
+        from evals.scenarios import scenario_turns
+
         fixtures = load_fixtures(FIXTURE_PATH)
+        fixture_polarities = {}
+        for fixture in fixtures:
+            key = (fixture["scenario"], fixture["turn"])
+            fixture_polarities.setdefault(key, set()).add(fixture["expected"])
+
+        for scenario in SCENARIOS:
+            runtime_turns = scenario_turns(scenario)
+            for runtime_turn in runtime_turns:
+                key = (scenario.name, runtime_turn.turn)
+                with self.subTest(scenario=key[0], turn=key[1]):
+                    self.assertEqual(fixture_polarities.get(key), {False, True})
+                    signature = (runtime_turn.questions, runtime_turn.context)
+                    matching = [
+                        fixture for fixture in fixtures
+                        if (fixture["scenario"], fixture["turn"]) == key
+                        and (fixture["questions"], fixture["context"]) == signature
+                    ]
+                    self.assertEqual(
+                        {fixture["expected"] for fixture in matching},
+                        {False, True},
+                    )
+
+    def test_every_runtime_judge_request_has_correct_and_wrong_fixture(self):
+        class CaptureJudge:
+            def __init__(self):
+                self.calls = []
+
+            def evaluate(self, reply, questions, *, context=""):
+                del reply
+                self.calls.append((dict(questions), context))
+                return {
+                    question_id: Verdict(question, 0.9)
+                    for question_id, question in questions.items()
+                }
+
+        fixture_polarities = {}
+        for fixture in load_fixtures(FIXTURE_PATH):
+            context = str(fixture.get("context", ""))
+            for question_id, question in fixture["questions"].items():
+                signature = (question_id, question, context)
+                fixture_polarities.setdefault(signature, set()).add(fixture["expected"])
+
+        missing = []
+        for scenario in SCENARIOS:
+            judge = CaptureJudge()
+            evidence = []
+            evaluate_scenario_failures(
+                scenario,
+                [f"captured runtime reply for turn {turn}" for turn in range(1, len(scenario.turns) + 1)],
+                [dict(command) for command in scenario.commands],
+                scenario.room_close_after,
+                judge=judge,
+                judge_evidence=evidence,
+            )
+            self.assertEqual(len(judge.calls), len(scenario.turns))
+            self.assertEqual(len(evidence), len(scenario.turns))
+            for turn, (questions, context) in enumerate(judge.calls, 1):
+                self.assertEqual(evidence[turn - 1]["context"], context)
+                for question_id, question in questions.items():
+                    signature = (question_id, question, context)
+                    if fixture_polarities.get(signature) != {False, True}:
+                        missing.append((scenario.name, turn, *signature))
+        self.assertEqual(missing, [])
+
+    def test_public_corpus_covers_runtime_turns_and_required_languages(self):
+        from evals.scenarios import scenario_turns
+
+        fixtures = load_fixtures(FIXTURE_PATH)
+        runtime_turns = {
+            (scenario.name, runtime.turn): runtime
+            for scenario in SCENARIOS
+            for runtime in scenario_turns(scenario)
+        }
         self.assertEqual(
-            {fixture["family"] for fixture in fixtures},
-            {
-                "action_ack", "timer_duration", "alarm_time", "place_lookup",
-                "sms_say_back", "sms_send_ack", "sms_confirmation", "claims",
-                "alice_donor", "alice_father", "alice_wealth", "spanish_switch",
-                "interpreter_turn",
-            },
+            {(fixture["scenario"], fixture["turn"]) for fixture in fixtures},
+            set(runtime_turns),
         )
         for family, first, last in (("spanish_switch", 1, 5), ("interpreter_turn", 1, 6)):
             self.assertEqual(
@@ -43,13 +114,17 @@ class QualificationTests(unittest.TestCase):
                 set(range(first, last + 1)),
             )
         by_id = {fixture["id"]: fixture for fixture in fixtures}
+        raw_corpus = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        self.assertTrue(all("inputs" not in item and "context" not in item for item in raw_corpus))
         for fixture in fixtures:
             with self.subTest(fixture=fixture["id"]):
                 self.assertIn("reply", fixture)
                 self.assertTrue(fixture["reply"].strip())
                 self.assertIsInstance(fixture["expected"], bool)
                 self.assertIsInstance(fixture["source"], dict)
-                self.assertEqual(build_questions(fixture["family"], fixture["inputs"]), fixture["questions"])
+                runtime = runtime_turns[(fixture["scenario"], fixture["turn"])]
+                self.assertEqual(fixture["questions"], dict(runtime.questions))
+                self.assertEqual(fixture["context"], runtime.context)
                 if fixture["expected"]:
                     self.assertIn(
                         fixture["source"]["kind"],
@@ -103,7 +178,9 @@ class QualificationTests(unittest.TestCase):
             inherited["inputs"]["verified_recipient"],
             inherited["inputs"]["recipient"],
         )
-        self.assertIn("previously confirmed", inherited["context"].lower())
+        self.assertEqual(inherited["scenario"], "sms-correction-new-yes")
+        self.assertEqual(inherited["turn"], 2)
+        self.assertIn("previously verified", inherited["context"].lower())
         self.assertIn("same number", unanchored["reply"].lower())
         self.assertFalse(unanchored.get("context", ""))
         self.assertNotIn("verified_recipient", unanchored["inputs"])
@@ -134,11 +211,10 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(run["counts"]["correct"], run["counts"]["correct_total"])
             self.assertEqual(run["counts"]["wrong"], run["counts"]["wrong_total"])
             self.assertEqual(run["counts"]["unavailable"], 0)
-            self.assertEqual(set(run["family_counts"]), {
-                "action_ack", "timer_duration", "alarm_time", "place_lookup", "sms_say_back",
-                "sms_send_ack", "sms_confirmation", "claims", "alice_donor", "alice_father",
-                "alice_wealth", "spanish_switch", "interpreter_turn",
-            })
+            self.assertEqual(
+                set(run["family_counts"]),
+                {fixture["family"] for fixture in fixtures},
+            )
             for counts in run["family_counts"].values():
                 self.assertEqual(counts["correct"], counts["correct_total"])
                 self.assertEqual(counts["wrong"], counts["wrong_total"])
@@ -359,8 +435,7 @@ class QualificationTests(unittest.TestCase):
 
     def test_scripted_fixture_must_give_its_reason(self):
         fixture = {
-            "id": "scripted", "family": "action_ack",
-            "inputs": {"action": "timer", "expected": "a five-minute timer"},
+            "id": "scripted", "scenario": "timer-300-seconds", "turn": 1,
             "reply": "Five minutes on the timer.", "expected": True, "source": {"kind": "scripted"},
         }
         with tempfile.TemporaryDirectory() as directory:

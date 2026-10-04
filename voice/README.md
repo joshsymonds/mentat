@@ -294,16 +294,18 @@ failure; a successful process exit means every strict gate passed.
 ### Semantic reply-judge qualification
 
 `just eval-judge` is a separate, opt-in live call to the semantic judge. It
-requires `TYPESAFE_API_KEY` and sends all retained-reply and deliberate
+requires `TYPESAFE_API_KEY` and sends retained-reply, scripted, and deliberate
 scenario-corruption fixtures to the judge in three concurrent sweeps. Each
 fixture/run gets a new judge instance so cached verdicts cannot cross fixtures
-or runs. The corpus covers all thirteen question families, including each
-Spanish-switch and interpreter turn, corrected and inherited SMS recipients,
-read-back/confirmation distinctions, and wrong digits, message content, times,
-amounts, and attributions. A correct shape no retained reply exhibits (an
-already-confirmed recipient called "the same number") is a `scripted` fixture
-with its reason; scripted fixtures are scored apart from retained replies and
-must clear the same bar on their own.
+or runs. Every fixture names a live scenario and one-based turn; its complete
+question set and verified-recipient context are derived through the same
+runtime scenario path used by the voice eval. The corpus has a correct and a
+known-wrong fixture for every runtime turn, including each Spanish-switch and
+interpreter turn, corrected and inherited SMS recipients, navigation, and
+read-back/confirmation distinctions. A correct shape no retained reply
+exhibits (an already-confirmed recipient called "the same number") is a
+`scripted` fixture with its reason; scripted fixtures are scored apart from
+retained replies and must clear the same bar on their own.
 
 The command prints one JSON report with per-run and per-family correct/wrong
 counts, each fixture's built question and probability/verdict evidence, and

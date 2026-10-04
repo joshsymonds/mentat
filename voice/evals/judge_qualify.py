@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from .judge import Judge, JudgeUnavailable, JevJudge, Verdict
-from .questions import build_questions
+from .scenarios import SCENARIOS, ScenarioTurn, scenario_turns
 
 
 FIXTURE_PATH = Path(__file__).with_name("judge_fixtures.json")
@@ -27,6 +27,11 @@ def load_fixtures(path: Path = FIXTURE_PATH) -> list[dict[str, object]]:
     if not isinstance(payload, list) or not payload:
         raise ValueError("qualification corpus must be a non-empty JSON array")
 
+    runtime_turns: dict[tuple[str, int], ScenarioTurn] = {
+        (scenario.name, runtime_turn.turn): runtime_turn
+        for scenario in SCENARIOS
+        for runtime_turn in scenario_turns(scenario)
+    }
     fixtures: list[dict[str, object]] = []
     seen_ids: set[str] = set()
     for index, raw_fixture in enumerate(payload):
@@ -34,16 +39,21 @@ def load_fixtures(path: Path = FIXTURE_PATH) -> list[dict[str, object]]:
             raise ValueError(f"fixture {index} must be an object")
         fixture = dict(raw_fixture)
         fixture_id = fixture.get("id")
-        family = fixture.get("family")
-        inputs = fixture.get("inputs")
+        scenario_name = fixture.get("scenario")
+        turn = fixture.get("turn")
         reply = fixture.get("reply")
         expected = fixture.get("expected")
         source = fixture.get("source")
         if not isinstance(fixture_id, str) or not fixture_id.strip() or fixture_id in seen_ids:
             raise ValueError(f"fixture {index} must have a unique non-empty id")
         seen_ids.add(fixture_id)
-        if not isinstance(family, str) or not isinstance(inputs, Mapping):
-            raise ValueError(f"fixture {fixture_id} must define family and inputs")
+        if "inputs" in fixture or "context" in fixture:
+            raise ValueError(f"fixture {fixture_id} must derive inputs and context from its scenario turn")
+        if not isinstance(scenario_name, str) or isinstance(turn, bool) or not isinstance(turn, int):
+            raise ValueError(f"fixture {fixture_id} must name a scenario and one-based turn")
+        runtime = runtime_turns.get((scenario_name, turn))
+        if runtime is None:
+            raise ValueError(f"fixture {fixture_id} names an unknown scenario turn")
         if not isinstance(reply, str) or not reply.strip():
             raise ValueError(f"fixture {fixture_id} must define a non-empty reply")
         if not isinstance(expected, bool):
@@ -51,16 +61,19 @@ def load_fixtures(path: Path = FIXTURE_PATH) -> list[dict[str, object]]:
         if not isinstance(source, Mapping):
             raise ValueError(f"fixture {fixture_id} must include source provenance")
         _validate_source(fixture_id, expected, source)
-        context = fixture.get("context", "")
-        if not isinstance(context, str):
-            raise ValueError(f"fixture {fixture_id} context must be text")
-        questions = build_questions(family, inputs)
-        if not questions:
-            raise ValueError(f"fixture {fixture_id} produced no judge questions")
-        fixture["questions"] = questions
+        runtime_turn = runtime
+        families = tuple(spec.family for spec in runtime_turn.expectation.question_specs)
+        fixture["family"] = "+".join(families)
+        fixture["inputs"] = {
+            key: value
+            for spec in runtime_turn.expectation.question_specs
+            for key, value in spec.inputs.items()
+        }
+        fixture["context"] = runtime_turn.context
+        fixture["questions"] = dict(runtime_turn.questions)
         fixtures.append(fixture)
 
-    _validate_corpus_coverage(fixtures)
+    _validate_corpus_coverage(fixtures, runtime_turns)
     return fixtures
 
 
@@ -111,31 +124,22 @@ def _positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _validate_corpus_coverage(fixtures: list[dict[str, object]]) -> None:
-    by_family: dict[str, list[dict[str, object]]] = {}
+def _validate_corpus_coverage(
+    fixtures: list[dict[str, object]],
+    runtime_turns: Mapping[tuple[str, int], ScenarioTurn],
+) -> None:
+    by_turn: dict[tuple[str, int], list[dict[str, object]]] = {}
     for fixture in fixtures:
-        by_family.setdefault(str(fixture["family"]), []).append(fixture)
-    expected_families = {
-        "action_ack", "timer_duration", "alarm_time", "place_lookup", "sms_say_back",
-        "sms_send_ack", "sms_confirmation", "claims", "alice_donor", "alice_father",
-        "alice_wealth", "spanish_switch", "interpreter_turn",
-    }
-    if set(by_family) != expected_families:
-        raise ValueError("qualification corpus must cover all thirteen registered question families")
-    for family, fixtures_for_family in by_family.items():
-        if not any(fixture["expected"] is True for fixture in fixtures_for_family):
-            raise ValueError(f"qualification corpus has no correct fixture for {family}")
-        if not any(fixture["expected"] is False for fixture in fixtures_for_family):
-            raise ValueError(f"qualification corpus has no wrong fixture for {family}")
-
-    for family, maximum in (("spanish_switch", 5), ("interpreter_turn", 6)):
-        turns = {
-            fixture["inputs"].get("turn")
-            for fixture in by_family[family]
-            if isinstance(fixture["inputs"], Mapping) and fixture["expected"] is True
-        }
-        if turns != set(range(1, maximum + 1)):
-            raise ValueError(f"qualification corpus must cover every correct {family} turn")
+        key = (str(fixture["scenario"]), int(fixture["turn"]))
+        by_turn.setdefault(key, []).append(fixture)
+    for scenario_name, turn in runtime_turns:
+        fixtures_for_turn = by_turn.get((scenario_name, turn), [])
+        if not any(fixture["expected"] is True for fixture in fixtures_for_turn):
+            raise ValueError(f"qualification corpus has no correct fixture for {scenario_name} turn {turn}")
+        if not any(fixture["expected"] is False for fixture in fixtures_for_turn):
+            raise ValueError(f"qualification corpus has no wrong fixture for {scenario_name} turn {turn}")
+    if set(by_turn) != set(runtime_turns):
+        raise ValueError("qualification corpus must contain only registered scenario turns")
 
 
 def qualify_fixtures(

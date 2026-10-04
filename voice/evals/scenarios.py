@@ -42,6 +42,16 @@ class Scenario:
     voice_mode_expectations: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ScenarioTurn:
+    """Runtime-derived questions and context for one one-based scenario turn."""
+
+    turn: int
+    expectation: TurnExpectation
+    questions: Mapping[str, str]
+    context: str
+
+
 def _question(family: str, **inputs: Any) -> QuestionSpec:
     return QuestionSpec(family, inputs)
 
@@ -201,6 +211,46 @@ def build_turn_questions(expectation: TurnExpectation) -> dict[str, str]:
             raise ValueError(f"duplicate judge question ids: {sorted(duplicate_ids)}")
         questions.update(built)
     return questions
+
+
+def _derive_turn(
+    scenario: Scenario,
+    turn_number: int,
+    expectation: TurnExpectation,
+    accepted_sms: Mapping[int, tuple[str, str]],
+) -> tuple[TurnExpectation, str]:
+    sms = _expectation_sms(expectation)
+    context = ""
+    if sms is not None and scenario.name == "sms-correction-new-yes":
+        prior = [accepted_sms[index] for index in sorted(accepted_sms) if index < turn_number]
+        if prior and prior[-1][0] == sms[0]:
+            context = f"Previously verified SMS recipient: {sms[0]}."
+            expectation = TurnExpectation(tuple(
+                QuestionSpec(spec.family, {**spec.inputs, "verified_recipient": sms[0]})
+                if spec.family in {"sms_say_back", "sms_confirmation"}
+                and "verified_recipient" not in spec.inputs
+                else spec
+                for spec in expectation.question_specs
+            ))
+    return expectation, context
+
+
+def scenario_turns(scenario: Scenario) -> tuple[ScenarioTurn, ...]:
+    """Return the runtime question/context derivation for every scenario turn."""
+    accepted_sms: dict[int, tuple[str, str]] = {}
+    result = []
+    for turn_number, expectation in enumerate(scenario.turns, 1):
+        derived, context = _derive_turn(scenario, turn_number, expectation, accepted_sms)
+        result.append(ScenarioTurn(
+            turn=turn_number,
+            expectation=derived,
+            questions=build_turn_questions(derived),
+            context=context,
+        ))
+        sms = _expectation_sms(expectation)
+        if sms is not None:
+            accepted_sms[turn_number] = sms
+    return tuple(result)
 
 
 def judge_turn(
@@ -365,18 +415,7 @@ def _scenario_failures(
             fail(turn_number, f"{scenario.name}: turn {turn_number} has no transcript text")
             continue
         sms = _expectation_sms(expectation)
-        context = ""
-        if sms is not None and scenario.name == "sms-correction-new-yes":
-            prior = [accepted_sms[index] for index in sorted(accepted_sms) if index < turn_number]
-            if prior and prior[-1][0] == sms[0]:
-                context = f"Previously verified SMS recipient: {sms[0]}."
-                expectation = TurnExpectation(tuple(
-                    QuestionSpec(spec.family, {**spec.inputs, "verified_recipient": sms[0]})
-                    if spec.family in {"sms_say_back", "sms_confirmation"}
-                    and "verified_recipient" not in spec.inputs
-                    else spec
-                    for spec in expectation.question_specs
-                ))
+        expectation, context = _derive_turn(scenario, turn_number, expectation, accepted_sms)
         evidence = judge_turn(expectation, text, judge, context=context)
         if judge_evidence is not None:
             judge_evidence.append(evidence)
