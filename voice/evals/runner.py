@@ -21,7 +21,7 @@ import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -35,16 +35,16 @@ from evals.dev_stack import (
     RemoteCommandError,
     _redact_diagnostics,
 )
+if TYPE_CHECKING:
+    from evals.judge import Judge
+
 from evals.report import NO_ANSWER_FAILURE, score_observations
 from evals.scenarios import (
     SCENARIOS,
-    SMS_CONFIRMATION_PATTERN,
-    _SPOKEN_SMS_RECIPIENT,
-    _sms_body_tokens,
-    _spoken_sms_body,
-    _spoken_sms_correction_body,
+    _expectation_sms,
     _spoken_number,
-    _uncertain_without_alice_attribution,
+    build_turn_questions,
+    judge_turn,
 )
 
 RATE = caller.RATE
@@ -1797,23 +1797,27 @@ def _match_phone_tools(
     return matched
 
 
+class _JudgeTimingUnavailable(RuntimeError):
+    """Preserve one accumulated-reply judge failure for the captured turn."""
+
+    def __init__(self, evidence: dict[str, Any]):
+        self.evidence = evidence
+        super().__init__(evidence["unavailable"] or "judge unavailable")
+
+
 def _answer_time(
     trace: dict[str, Any],
     expectation: Any,
     *,
-    scenario_name: str | None = None,
-    turn_index: int | None = None,
+    judge: Judge,
+    context: str = "",
 ) -> float | None:
+    """Return the first post-speech segment whose accumulated reply passes the judge."""
     capture_started = _finite_timestamp(trace.get("capture_started"), "capture start")
     speech_end = _finite_timestamp(trace.get("speech_end"), "speech end")
     segments = trace.get("segments")
-    patterns = getattr(expectation, "answer_patterns", None)
-    reject_patterns = getattr(expectation, "reject_patterns", ())
     if not isinstance(segments, list) or not segments:
         raise RuntimeError("answer segment timestamp evidence is missing")
-    if not isinstance(patterns, tuple) or not patterns or not isinstance(reject_patterns, tuple):
-        raise RuntimeError("answer expectation patterns are missing or invalid")
-
     transcript_parts = []
     for index, segment in enumerate(segments):
         if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
@@ -1825,48 +1829,15 @@ def _answer_time(
         segment_start = _finite_timestamp(segment.get("start"), "answer segment timestamp")
         if segment_start < 0 or segment_end < segment_start:
             raise RuntimeError("answer segment timestamp bounds are invalid")
-        text = "".join(transcript_parts)
-        try:
-            matches = all(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
-            rejected = any(re.search(pattern, text, re.IGNORECASE) for pattern in reject_patterns)
-        except (TypeError, re.error) as error:
-            raise RuntimeError("answer expectation contains an invalid pattern") from error
-        if not matches or rejected or segment_start < speech_end - capture_started:
+        if segment_start < speech_end - capture_started:
             continue
-        if (
-            scenario_name == "alice-keck-context-chain"
-            and turn_index == 1
-            and _uncertain_without_alice_attribution(text)
+        evidence = judge_turn(expectation, "".join(transcript_parts), judge, context=context)
+        if evidence["unavailable"] is not None:
+            raise _JudgeTimingUnavailable(evidence)
+        if all(
+            question["verdict"] is True for question in evidence["questions"]
         ):
-            continue
-        sms_recipient = getattr(expectation, "sms_recipient", None)
-        sms_body = getattr(expectation, "sms_body", None)
-        if sms_recipient is not None or sms_body is not None:
-            if not isinstance(sms_recipient, str) or not isinstance(sms_body, str):
-                raise RuntimeError("answer expectation has an incomplete SMS say-back")
-            try:
-                spoken_body = (
-                    _spoken_sms_correction_body(
-                        text,
-                        scenario_name or "scenario",
-                        turn_index or 1,
-                    )
-                    if scenario_name == "sms-correction-new-yes"
-                    and turn_index == 2
-                    and _SPOKEN_SMS_RECIPIENT.search(text) is None
-                    else _spoken_sms_body(
-                        text,
-                        sms_recipient,
-                        sms_body,
-                        scenario_name or "scenario",
-                        turn_index or 1,
-                    )
-                )
-            except AssertionError:
-                continue
-            if _sms_body_tokens(spoken_body) != _sms_body_tokens(sms_body):
-                continue
-        return capture_started + segment_start
+            return capture_started + segment_start
     return None
 
 
@@ -2320,9 +2291,12 @@ def _scenario_steps(scenario: Any) -> list[str]:
         raise RuntimeError("scenario has invalid scripted-caller languages")
     raw_steps = []
     for index, (line, expectation) in enumerate(zip(caller_lines, expectations, strict=True)):
-        patterns = getattr(expectation, "answer_patterns", None)
-        if not isinstance(line, str) or not line or not isinstance(patterns, tuple) or not patterns:
-            raise RuntimeError("scenario has a missing caller line or answer pattern")
+        if not isinstance(line, str) or not line:
+            raise RuntimeError("scenario has a missing caller line")
+        try:
+            build_turn_questions(expectation)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("scenario has invalid judge question declarations") from error
         language = caller_languages[index] if caller_languages else "en"
         prefix = f"[[{language}]]" if language != "en" else ""
         raw_step = f"{prefix}{line}@0::.*"
@@ -2345,32 +2319,42 @@ def _turn_kind(scenario: Any, turn_index: int) -> str:
     return "search"
 
 
-def _confirmation_time(trace: dict[str, Any]) -> float | None:
+def _confirmation_time(
+    trace: dict[str, Any],
+    expectation: Any,
+    *,
+    judge: Judge,
+    context: str = "",
+) -> float | None:
+    """Return the first segment end where the accumulated SMS confirmation passes."""
     segments = trace.get("segments")
     capture_started = _finite_timestamp(trace.get("capture_started"), "capture start")
+    speech_end = _finite_timestamp(trace.get("speech_end"), "speech end")
     if not isinstance(segments, list) or not segments:
         raise RuntimeError("SMS confirmation has no transcript segment timestamps")
     transcript_parts = []
-    ranges = []
-    cursor = 0
-    for segment in segments:
+    for index, segment in enumerate(segments):
         if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
             raise RuntimeError("SMS confirmation has an invalid transcript segment")
-        if cursor:
+        if index:
             transcript_parts.append(" ")
-            cursor += 1
-        start = cursor
         transcript_parts.append(segment["text"])
-        cursor += len(segment["text"])
-        end = _finite_timestamp(segment.get("end"), "transcription segment end")
-        ranges.append((start, cursor, end))
-    match = SMS_CONFIRMATION_PATTERN.search("".join(transcript_parts))
-    if match is None:
-        return None
-    for start, end, segment_end in ranges:
-        if start < match.end() <= end:
+        segment_start = _finite_timestamp(segment.get("start"), "transcription segment start")
+        segment_end = _finite_timestamp(segment.get("end"), "transcription segment end")
+        if segment_end < segment_start:
+            raise RuntimeError("SMS confirmation segment timestamp bounds are invalid")
+        if segment_start < speech_end - capture_started:
+            continue
+        evidence = judge_turn(expectation, "".join(transcript_parts), judge, context=context)
+        if evidence["unavailable"] is not None:
+            raise _JudgeTimingUnavailable(evidence)
+        confirmation = next(
+            (question for question in evidence["questions"] if question["id"] == "sms_confirmation"),
+            None,
+        )
+        if confirmation is not None and confirmation["verdict"] is True:
             return capture_started + segment_end
-    raise RuntimeError("SMS confirmation prompt has no matching transcript segment timestamp")
+    return None
 
 
 def _completed_stdout(result: Any, label: str) -> str:
@@ -2619,8 +2603,17 @@ def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str
     return command
 
 
-def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
+def observe_scenario(
+    scenario: Any,
+    stack: Any,
+    *,
+    judge: Judge | None = None,
+) -> dict[str, Any]:
     """Run and strictly evaluate one scenario against the isolated DevStack."""
+    if judge is None:
+        from evals.judge import JevJudge
+
+        judge = JevJudge()
     raw_steps = _scenario_steps(scenario)
     close_after = getattr(scenario, "room_close_after", None)
     if close_after is not None and (
@@ -2788,17 +2781,9 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
             raise RuntimeError(f"captured turn {index} has invalid raw transcript segment evidence")
         trace["kind"] = _turn_kind(scenario, index)
         trace["command_received_at"] = command_receipts.get(index)
-        trace["answer_at"] = _answer_time(
-            trace,
-            expected,
-            scenario_name=scenario.name,
-            turn_index=index,
-        )
-        trace["expect_confirmation"] = getattr(expected, "sms_recipient", None) is not None
+        question_ids = set(build_turn_questions(expected))
+        trace["expect_confirmation"] = "sms_confirmation" in question_ids
         trace["expect_hangup"] = close_after == index
-        trace["confirmation"] = (
-            _confirmation_time(trace) if trace["expect_confirmation"] else None
-        )
         if trace.get("room_deleted") is not None:
             _finite_timestamp(trace["room_deleted"], "room deletion")
             room_deleted_turns.append(index)
@@ -2818,12 +2803,15 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
     from evals.scenarios import evaluate_scenario_failures, evaluate_scenario_prefix
 
     transcripts = [trace["transcript"] for trace in traces]
+    judge_evidence: list[dict[str, Any]] = []
     if capture_failure is None:
         failures = evaluate_scenario_failures(
             scenario,
             transcripts,
             phone_commands,
             room_closed_after,
+            judge=judge,
+            judge_evidence=judge_evidence,
         )
     else:
         failures = evaluate_scenario_prefix(
@@ -2831,6 +2819,8 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
             transcripts,
             phone_commands,
             None if early_close else room_closed_after,
+            judge=judge,
+            judge_evidence=judge_evidence,
             failed_turn=(
                 None
                 if early_close
@@ -2839,10 +2829,43 @@ def observe_scenario(scenario: Any, stack: Any) -> dict[str, Any]:
                 else None
             ),
         )
+    timing_failures: list[dict[str, Any]] = []
+    for trace, expectation, evidence in zip(
+        traces, scenario.turns, judge_evidence, strict=False
+    ):
+        trace["judge"] = evidence
+        try:
+            trace["answer_at"] = _answer_time(
+                trace, expectation, judge=judge, context=evidence["context"]
+            )
+            trace["confirmation"] = (
+                _confirmation_time(
+                    trace, expectation, judge=judge, context=evidence["context"]
+                )
+                if trace["expect_confirmation"]
+                else None
+            )
+        except _JudgeTimingUnavailable as error:
+            trace["judge"] = error.evidence
+            trace["answer_at"] = None
+            trace["confirmation"] = None
+            already_unavailable = any(
+                failure.turn == trace["turn"]
+                and "judge unavailable" in failure.message
+                for failure in failures
+            )
+            if not already_unavailable:
+                timing_failures.append({
+                    "turn": trace["turn"],
+                    "message": (
+                        f"{scenario.name}: turn {trace['turn']} judge unavailable: "
+                        f"{error.evidence['unavailable']}"
+                    ),
+                })
     product_failures = [
         {"turn": failure.turn, "message": failure.message}
         for failure in failures
-    ]
+    ] + timing_failures
     if early_close:
         follow_ups = len(raw_steps) - early_close_after
         product_failures.append({

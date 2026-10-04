@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evals import runner
 from evals.runner import CaptureDependencies, capture_script
-from evals.scenarios import SCENARIOS
+from evals.scenarios import QuestionSpec, SCENARIOS, TurnExpectation
 
 
 TEST_VOICE_ENV = {
@@ -37,6 +37,20 @@ def pcm_windows(*levels, sample_rate=24000, channels=1):
 
 
 RENDERED_PCM_TEXT = {}
+
+
+def scripted_yes_judge():
+    from evals.judge import ScriptedJudge
+
+    return ScriptedJudge({
+        question_id: 1.0
+        for question_id in (
+            "action_completed", "timer_duration", "alarm_time", "place_named",
+            "sms_recipient", "sms_body", "sms_confirmation", "sms_sent",
+            "required_1", "rejected_1", "alice_donor", "alice_father",
+            "alice_wealth", "spanish_switch", "interpreter_turn",
+        )
+    })
 
 
 @contextmanager
@@ -74,6 +88,21 @@ def rendered_aware_transcriber(transcribe):
         return await transcribe(http, pcm, sample_rate, channels)
 
     return wrapped
+
+
+class ScriptedSequenceJudge:
+    def __init__(self, answer):
+        self.answer = answer
+        self.calls = []
+
+    def evaluate(self, reply, questions, *, context=""):
+        from evals.judge import Verdict
+
+        self.calls.append((reply, dict(questions), context))
+        return {
+            question_id: Verdict(question, float(self.answer(question_id, reply)))
+            for question_id, question in questions.items()
+        }
 
 
 class Clock:
@@ -637,7 +666,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             runner._answer_time(
                 trace,
-                SimpleNamespace(answer_patterns=(r"timer set for 5 minutes",), reject_patterns=()),
+                SCENARIOS[0].turns[0],
+                judge=ScriptedSequenceJudge(lambda _id, _reply: 1.0),
             ),
             110.0,
         )
@@ -1565,22 +1595,19 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trace["transcript"], "I am still listening.")
         self.assertEqual(trace["segments"], [{"start": 0.1, "end": 0.14, "text": "I am still listening."}])
         self.assertEqual(trace["raw_segments"], raw_segments)
-        self.assertIsNone(
-            runner._answer_time(
-                trace,
-                SimpleNamespace(answer_patterns=(r"Should I send it",)),
-            )
-        )
-        self.assertIsNone(runner._confirmation_time(trace))
+        from evals.judge import ScriptedJudge
         from evals.scenarios import evaluate_scenario_failures
 
+        judge = ScriptedJudge({"action_completed": 0.0, "timer_duration": 0.0})
+        self.assertIsNone(runner._answer_time(trace, SCENARIOS[0].turns[0], judge=judge))
         failures = evaluate_scenario_failures(
             SCENARIOS[0],
             [trace["transcript"]],
             [{"turn": 1, "kind": "timer", "seconds": 300}],
             1,
+            judge=judge,
         )
-        self.assertTrue(any("missing answer pattern" in failure.message for failure in failures))
+        self.assertTrue(any("judge questions" in failure.message for failure in failures))
 
     async def test_all_silent_transcript_segments_keep_named_no_answer_and_raw_evidence(self):
         dependencies = self.dependencies_for_failure("other")
@@ -1701,8 +1728,13 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(traces[0]["transcript"], "wrong response")
         self.assertEqual(len(traces[0]["segments"]), 1)
-        with self.assertRaisesRegex(AssertionError, "missing answer pattern"):
-            evaluate_scenario(SCENARIOS[0], [traces[0]["transcript"]], [], None)
+        from evals.judge import ScriptedJudge
+
+        with self.assertRaisesRegex(AssertionError, "judge questions"):
+            evaluate_scenario(
+                SCENARIOS[0], [traces[0]["transcript"]], [], None,
+                judge=ScriptedJudge({"action_completed": 0.0, "timer_duration": 0.0}),
+            )
 
     async def test_partial_capture_preserves_turn_one_and_names_turn_two_failure(self):
         cases = ("early deletion", "no post-playout audio", "tts timeout")
@@ -2591,7 +2623,9 @@ class ScenarioObservationTests(unittest.TestCase):
         import subprocess
         from subprocess import CompletedProcess
 
-        expectation = type(SCENARIOS[0].turns[0])(("forty-two",))
+        expectation = TurnExpectation((QuestionSpec(
+            "claims", {"required": ["the answer is forty-two"], "rejected": []}
+        ),))
         scenario = type(SCENARIOS[0])(
             name="direct-answer",
             caller_lines=("What is the answer?",),
@@ -2645,7 +2679,9 @@ class ScenarioObservationTests(unittest.TestCase):
             "_voice_token",
             return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"},
         ):
-            observation = runner.observe_scenario(scenario, Stack())
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
 
         self.assertEqual(observation["turns"][0]["transcript"], "The answer is forty-two.")
         self.assertEqual(observation["turns"][0]["model_calls"], [])
@@ -2656,7 +2692,9 @@ class ScenarioObservationTests(unittest.TestCase):
         import subprocess
         from subprocess import CompletedProcess
 
-        expectation = type(SCENARIOS[0].turns[0])(("forty-two",))
+        expectation = TurnExpectation((QuestionSpec(
+            "claims", {"required": ["the answer is forty-two"], "rejected": []}
+        ),))
         scenario = type(SCENARIOS[0])(
             name="direct-answer",
             caller_lines=("What is the answer?",),
@@ -2823,8 +2861,12 @@ class ScenarioObservationTests(unittest.TestCase):
                     raise AssertionError(f"unexpected remote command {command!r}")
                 return CompletedProcess(command, 0, output, "")
 
+        from evals.judge import ScriptedJudge
+
         with patch.object(runner, "_voice_token", return_value=grant):
-            observation = runner.observe_scenario(scenario, Stack())
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=ScriptedJudge({"place_named": 0.0})
+            )
 
         self.assertEqual(observation["turns"][0]["model_calls"], [{
             "id": "m1", "model": "claude-opus-5", "service_tier": None,
@@ -2833,13 +2875,14 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertEqual(observation["failure"], capture["failure"])
         product_failures = observation["product_failures"]
         self.assertTrue(any(failure["turn"] == 1 for failure in product_failures))
-        self.assertTrue(any("missing answer pattern" in failure["message"] for failure in product_failures))
+        self.assertTrue(any("judge questions" in failure["message"] for failure in product_failures))
 
     def test_complete_wrong_place_and_missing_sms_confirmation_keep_full_evidence(self):
         import json
         from subprocess import CompletedProcess
+        from evals.judge import ScriptedJudge
 
-        def observe_fixture(scenario, transcripts, phone_payloads, tool_payloads):
+        def observe_fixture(scenario, transcripts, phone_payloads, tool_payloads, judge):
             room = "complete-product-room"
             traces = []
             for index, transcript in enumerate(transcripts, 1):
@@ -2904,7 +2947,7 @@ class ScenarioObservationTests(unittest.TestCase):
             with patch.object(
                 runner, "_voice_token", return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"}
             ):
-                return runner.observe_scenario(scenario, Stack())
+                return runner.observe_scenario(scenario, Stack(), judge=judge)
 
         place = SCENARIOS[2]
         wrong_place = observe_fixture(
@@ -2918,6 +2961,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 ("find_places", {"query": place.place_query}),
                 ("navigate_to", {"name": "Wrong Park", "address": "1 Main St", "place_id": "wrong", "lat": 34.4, "lng": -119.7}),
             ],
+            scripted_yes_judge(),
         )
         self.assertEqual(len(wrong_place["turns"]), 2)
         self.assertEqual([len(turn["model_calls"]) for turn in wrong_place["turns"]], [1, 1])
@@ -2941,10 +2985,16 @@ class ScenarioObservationTests(unittest.TestCase):
             ["I can text +1-202-555-0142: I will be there at six.", "Sent that message."],
             [],
             [None, None],
+            ScriptedJudge({
+                "sms_recipient": 1.0,
+                "sms_body": 1.0,
+                "sms_confirmation": 0.0,
+                "sms_sent": 1.0,
+            }),
         )
         self.assertEqual(len(missing_prompt["turns"]), 2)
         self.assertIsNone(missing_prompt["turns"][0]["confirmation"])
-        self.assertTrue(any(item["turn"] == 1 and "say-back" in item["message"] for item in missing_prompt["product_failures"]))
+        self.assertTrue(any(item["turn"] == 1 and "judge questions" in item["message"] for item in missing_prompt["product_failures"]))
         sms_report = score_observations(
             {"cases": [{"name": sms.name, "runs": [missing_prompt]}]},
             required_runs=1,
@@ -2953,7 +3003,7 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertEqual(len(sms_report["cases"][0]["turns"]), 2)
         self.assertEqual(sms_report["cases"][0]["turns"][0]["model_call_count"], 1)
         sms_failures = " ".join(sms_report["failures"])
-        self.assertIn("say-back", sms_failures)
+        self.assertIn("judge questions", sms_failures)
         self.assertIn("confirmation observation is missing", sms_failures)
 
     def test_spanish_caller_rendering_matches_accented_transcription(self):
@@ -3250,7 +3300,10 @@ class ScenarioObservationTests(unittest.TestCase):
             caller_languages=("en", "es", "en", "es", "es", "en"),
             reply_languages=("es", "en", "es", "en", "en", "en"),
             voice_mode_expectations=("es", "en"),
-            turns=tuple(SimpleNamespace(answer_patterns=("ok",), reject_patterns=(), sms_recipient=None, sms_body=None) for _ in range(6)),
+            turns=tuple(
+                TurnExpectation((QuestionSpec("interpreter_turn", {"turn": index}),))
+                for index in range(1, 7)
+            ),
             room_close_after=6,
             commands=(),
         )
@@ -3319,7 +3372,9 @@ class ScenarioObservationTests(unittest.TestCase):
             "_voice_token",
             return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"},
         ):
-            observation = runner.observe_scenario(scenario, Stack())
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
 
         self.assertNotIn("product_failures", observation)
         self.assertEqual(observation["phone_commands"], [])
@@ -3490,7 +3545,9 @@ class ScenarioObservationTests(unittest.TestCase):
             "_voice_token",
             return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"},
         ):
-            observation = runner.observe_scenario(scenario, Stack())
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
 
         self.assertNotIn("product_failures", observation)
         self.assertEqual(observation["first_spanish_lookup_ms"], 24.5)
@@ -3573,7 +3630,9 @@ class ScenarioObservationTests(unittest.TestCase):
                 return CompletedProcess(command, 0, output, "")
 
         with patch.object(runner, "_voice_token", return_value=grant):
-            observation = runner.observe_scenario(scenario, Stack())
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
 
         self.assertEqual(observation["failure"], capture["failure"])
         self.assertEqual(observation["turns"][0]["transcript"], "Your timer is set for five minutes.")
@@ -3725,407 +3784,244 @@ class ScenarioObservationTests(unittest.TestCase):
             ])
         self.assertEqual(runner._recorded_turns([{"type": "system", "subtype": "init"}]), [])
         with self.assertRaisesRegex(RuntimeError, "no transcript segment timestamps"):
-            runner._confirmation_time({"capture_started": 5.0, "segments": []})
-
-    def test_run15_confirmation_timestamp_uses_post_readback_request(self):
-        from evals import scenarios
-
-        self.assertIs(runner.SMS_CONFIRMATION_PATTERN, scenarios.SMS_CONFIRMATION_PATTERN)
-        cases = (
-            (
-                "Just to confirm, I'm texting 202-  555-0142 saying I will be there at 6.",
-                "Say the word, and I'll send it.",
-            ),
-            (
-                "OK, so text him, plus 1, 202-555-0142, saying, I will be there at 6.",
-                "Sound right?",
-            ),
-            (
-                "Got it, texting plus one, 202-555-0142. I will be there at 7.",
-                "Good to send.",
-            ),
-        )
-        for readback, question in cases:
-            with self.subTest(question=question):
-                self.assertEqual(
-                    runner._confirmation_time({
-                        "capture_started": 10.0,
-                        "segments": [
-                            {"start": 0.0, "end": 0.3, "text": readback},
-                            {"start": 0.4, "end": 0.8, "text": question},
-                        ],
-                    }),
-                    10.8,
-                )
-
-    def test_run17_confirmation_timing_recognizes_live_prompt_forms_from_shared_pattern(self):
-        from evals import scenarios
-
-        self.assertIs(runner.SMS_CONFIRMATION_PATTERN, scenarios.SMS_CONFIRMATION_PATTERN)
-        prompts = (
-            "Just say when and I'll send it.",
-            "Say when and I'll send it.",
-            "Sound good?",
-        )
-        for prompt in prompts:
-            with self.subTest(prompt=prompt):
-                self.assertEqual(
-                    runner._confirmation_time({
-                        "capture_started": 10.0,
-                        "segments": [
-                            {"start": 0.0, "end": 0.3, "text": "Texting 202-555-0142, I will be there at six."},
-                            {"start": 0.4, "end": 0.8, "text": prompt},
-                        ],
-                    }),
-                    10.8,
-                )
-
-    def test_run17_answer_timing_requires_live_sms_readback_and_confirmation(self):
-        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
-        cases = (
-            [
-                "Texting 202-555-0142, I will be there at six.",
-                "Just say when and I'll send it.",
-            ],
-            [
-                "Texting plus 1, 2, 0, 2, 5, 5, 5, 0, 1, 4, 2, I will be there at six.",
-                "Say when and I'll send it.",
-            ],
-            [
-                "Texting plus 1202.",
-                "5-5-5.",
-                "0142. I will be there at six.",
-                "Sound good?",
-            ],
-        )
-        for texts in cases:
-            with self.subTest(texts=texts):
-                self.assertEqual(
-                    runner._answer_time(
-                        {
-                            "capture_started": 10.0,
-                            "speech_end": 10.0,
-                            "segments": [
-                                {
-                                    "start": index * 0.2,
-                                    "end": index * 0.2 + 0.1,
-                                    "text": text,
-                                }
-                                for index, text in enumerate(texts)
-                            ],
-                        },
-                        scenario.turns[0],
-                        scenario_name=scenario.name,
-                        turn_index=1,
-                    ),
-                    10.0 + (len(texts) - 1) * 0.2,
-                )
-
-    def test_sms_readback_observed_message_prefixes_receive_answer_timestamps(self):
-        cases = (
-            (
-                "sms-say-back-yes",
-                1,
-                "I'll text +1-202-555-0142. The exact message is. I will be there at six. Should I send it?",
-            ),
-            (
-                "sms-say-back-yes",
-                1,
-                "I'll text +1-202-555-0142. Message. I will be there at six. Should I send it?",
-            ),
-            (
-                "sms-say-back-yes",
-                1,
-                "I'll text +1-202-555-0142. The message reads... I will be there at six. Should I send it?",
-            ),
-            (
-                "sms-correction-new-yes",
-                2,
-                "I'll text +1-202-555-0142. The exact message is, I will be there at 7. Should I send it?",
-            ),
-        )
-        for scenario_name, turn_index, transcript in cases:
-            with self.subTest(transcript=transcript):
-                scenario = next(s for s in SCENARIOS if s.name == scenario_name)
-                self.assertEqual(
-                    runner._answer_time(
-                        {
-                            "capture_started": 10.0,
-                            "speech_end": 10.0,
-                            "segments": [{"start": 0.25, "end": 2.0, "text": transcript}],
-                        },
-                        scenario.turns[turn_index - 1],
-                        scenario_name=scenario.name,
-                        turn_index=turn_index,
-                    ),
-                    10.25,
-                )
-
-    def test_sms_body_content_connectors_receive_runner_answer_timestamps(self):
-        scenario = next(s for s in SCENARIOS if s.name == "sms-say-back-yes")
-        for body_clause in (
-            "The message would say, I will be there at six.",
-            "The exact message is. I will be there at six.",
-            "Message. I will be there at 6.",
-            "The message reads... I will be there at six.",
-            "Draft: I will be there at 6.",
-            "The words I plan to send are, I will be there at six.",
-            "Here is what I will send: I will be there at six.",
-            "For your approval, I will be there at six.",
-        ):
-            transcript = (
-                f"I'll text +1-202-555-0142. {body_clause} Should I send it?"
+            runner._confirmation_time(
+                {"capture_started": 5.0, "speech_end": 5.0, "segments": []},
+                SCENARIOS[3].turns[0],
+                judge=scripted_yes_judge(),
             )
-            with self.subTest(body_clause=body_clause):
-                self.assertEqual(
-                    runner._answer_time(
-                        {
-                            "capture_started": 10.0,
-                            "speech_end": 10.0,
-                            "segments": [{"start": 0.25, "end": 2.0, "text": transcript}],
-                        },
-                        scenario.turns[0],
-                        scenario_name=scenario.name,
-                        turn_index=1,
-                    ),
-                    10.25,
-                )
 
-        for invalid_body in (
-            "The message would say, I will be there at seven.",
-            "The message would say, Please tell Alice I will be there at six.",
-            "Correction. I will be there at seven.",
-            "Please include this too. I will be there at six.",
-            "Send pizza instead. I will be there at six.",
-            "The message would say,",
-        ):
-            transcript = (
-                f"I'll text +1-202-555-0142. {invalid_body} Should I send it?"
-            )
-            with self.subTest(invalid_body=invalid_body):
-                self.assertIsNone(
-                    runner._answer_time(
-                        {
-                            "capture_started": 10.0,
-                            "speech_end": 10.0,
-                            "segments": [{"start": 0.25, "end": 2.0, "text": transcript}],
-                        },
-                        scenario.turns[0],
-                        scenario_name=scenario.name,
-                        turn_index=1,
-                    )
-                )
+    def test_answer_timing_uses_first_post_speech_judged_accumulated_segment(self):
+        scenario = SCENARIOS[0]
+        judge = ScriptedSequenceJudge(
+            lambda _question_id, reply: 1.0
+            if "timer" in reply.lower() and "five minutes" in reply.lower()
+            else 0.0
+        )
+        trace = {
+            "capture_started": 100.0,
+            "speech_end": 101.0,
+            "segments": [
+                {"start": 0.8, "end": 1.0, "text": "Timer set for"},
+                {"start": 1.2, "end": 1.4, "text": "five minutes."},
+                {"start": 1.5, "end": 1.7, "text": " Anything else?"},
+            ],
+        }
+        self.assertEqual(
+            runner._answer_time(trace, scenario.turns[0], judge=judge),
+            101.2,
+        )
+        self.assertEqual([call[0] for call in judge.calls], ["Timer set for five minutes."])
 
-    def test_correction_preamble_is_not_the_exact_body_answer(self):
-        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
-        self.assertIsNone(runner._answer_time(
-            {
-                "capture_started": 10.0,
-                "speech_end": 10.0,
-                "segments": [{
-                    "start": 0.25,
-                    "end": 2.0,
-                    "text": "I'll text +1-202-555-0142. Correction. I will be there at seven. Should I send it?",
-                }],
-            },
-            scenario.turns[1],
-            scenario_name=scenario.name,
-            turn_index=2,
-        ))
+    def test_answer_timing_surfaces_unavailable_prefix_even_if_a_later_prefix_could_pass(self):
+        from evals.judge import JudgeUnavailable, ScriptedJudge
 
-    def test_run17_exact_sms_correction_segments_get_answer_and_confirmation_timestamps(self):
-        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
+        class FailFirstPrefix(ScriptedJudge):
+            def __init__(self):
+                super().__init__({"action_completed": 1.0, "timer_duration": 1.0})
+                self.calls = 0
+
+            def evaluate(self, reply, questions, *, context=""):
+                self.calls += 1
+                if self.calls == 1:
+                    raise JudgeUnavailable("prefix timeout")
+                return super().evaluate(reply, questions, context=context)
+
+        judge = FailFirstPrefix()
         trace = {
             "capture_started": 10.0,
             "speech_end": 10.0,
             "segments": [
-                {"start": 0.0, "end": 0.8399999737739563, "text": " Okay, hang on."},
-                {
-                    "start": 0.0,
-                    "end": 6.559999942779541,
-                    "text": " OK, so to plus 1, 2, 0, 2, 5, 5, 5, 0, 1, 4, 2, I'll say.",
-                },
-                {"start": 0.0, "end": 2.0, "text": " I will be there at six."},
-                {
-                    "start": 0.0,
-                    "end": 1.600000023841858,
-                    "text": " just say when and I'll send it.",
-                },
+                {"start": 0.2, "end": 0.3, "text": "Timer set for"},
+                {"start": 0.5, "end": 0.7, "text": "five minutes."},
+            ],
+        }
+        with self.assertRaisesRegex(RuntimeError, "prefix timeout") as raised:
+            runner._answer_time(trace, SCENARIOS[0].turns[0], judge=judge)
+        self.assertEqual(judge.calls, 1)
+        self.assertEqual(raised.exception.evidence["unavailable"], "prefix timeout")
+        self.assertTrue(all(
+            question["verdict"] is None and question["probability"] is None
+            for question in raised.exception.evidence["questions"]
+        ))
+
+    def test_answer_timing_waits_for_accumulated_reply_to_pass(self):
+        judge = ScriptedSequenceJudge(
+            lambda _question_id, reply: 1.0 if "five minutes" in reply.lower() else 0.0
+        )
+        trace = {
+            "capture_started": 10.0,
+            "speech_end": 10.0,
+            "segments": [
+                {"start": 0.2, "end": 0.3, "text": "Timer set for"},
+                {"start": 0.5, "end": 0.7, "text": "five minutes."},
             ],
         }
         self.assertEqual(
-            runner._answer_time(
-                trace,
-                scenario.turns[0],
-                scenario_name=scenario.name,
-                turn_index=1,
-            ),
-            10.0,
+            runner._answer_time(trace, SCENARIOS[0].turns[0], judge=judge),
+            10.5,
         )
-        self.assertEqual(runner._confirmation_time(trace), 11.600000023841858)
+        self.assertEqual(
+            [call[0] for call in judge.calls],
+            ["Timer set for", "Timer set for five minutes."],
+        )
 
-    def test_run17_live_sms_yes_or_no_and_same_number_have_matching_timestamps(self):
-        scenario = next(s for s in SCENARIOS if s.name == "sms-correction-new-yes")
-        initial = {
+    def test_confirmation_timing_uses_the_judged_sms_confirmation_question(self):
+        scenario = next(item for item in SCENARIOS if item.name == "sms-say-back-yes")
+        judge = ScriptedSequenceJudge(
+            lambda question_id, reply: 1.0
+            if question_id == "sms_confirmation" and "confirm" in reply.lower()
+            else 0.0
+        )
+        trace = {
             "capture_started": 20.0,
             "speech_end": 20.0,
             "segments": [
-                {"start": 0.1, "end": 4.0, "text": " I've got the number as plus-one-two-zero-two-five-five-five."},
-                {"start": 0.2, "end": 1.0, "text": " 0142."},
-                {"start": 0.3, "end": 2.0, "text": " And the message is, I will be there at six."},
-                {"start": 0.7, "end": 0.8, "text": " Yes or no?"},
-                {"start": 0.8, "end": 0.8, "text": " Should I send it?"},
-            ],
-        }
-        correction = {
-            "capture_started": 30.0,
-            "speech_end": 30.0,
-            "segments": [
-                {"start": 0.1, "end": 1.0, "text": " Okay."},
-                {"start": 0.2, "end": 3.2, "text": " I've updated it to say I will be there at 7."},
-                {"start": 0.7, "end": 1.44, "text": " Same number, yes or no?"},
+                {"start": 0.2, "end": 0.3, "text": "I will text the message."},
+                {"start": 0.6, "end": 0.9, "text": "Please confirm."},
             ],
         }
         self.assertEqual(
-            runner._answer_time(initial, scenario.turns[0], scenario_name=scenario.name, turn_index=1),
-            20.7,
+            runner._confirmation_time(trace, scenario.turns[0], judge=judge),
+            20.9,
         )
-        self.assertEqual(runner._confirmation_time(initial), 20.8)
-        self.assertEqual(
-            runner._answer_time(correction, scenario.turns[1], scenario_name=scenario.name, turn_index=2),
-            30.7,
-        )
-        self.assertEqual(runner._confirmation_time(correction), 31.44)
 
-    def test_alice_oil_heiress_funding_answer_gets_live_answer_timestamp(self):
-        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
-        answer = (
-            "Alice Keck Park was an oil heiress, daughter of Superior Oil founder William Keck. "
-            "In the mid-70s, the block was slated for a hotel, and she put up the money "
-            "for the city to buy it instead, on the condition it became a public park."
-        )
-        trace = {
-            "capture_started": 40.0,
-            "speech_end": 40.0,
-            "segments": [
-                {"start": 0.2, "end": 8.4, "text": answer},
-            ],
-        }
-        self.assertEqual(
-            runner._answer_time(
-                trace,
-                scenario.turns[0],
-                scenario_name=scenario.name,
-                turn_index=1,
+    def test_observation_and_report_keep_neighbor_evidence_when_timing_prefix_is_unavailable(self):
+        import json
+        import subprocess
+        from subprocess import CompletedProcess
+
+        from evals.judge import JudgeUnavailable, ScriptedJudge
+        from evals.report import score_observations
+        from evals.scenarios import Scenario
+
+        scenario = Scenario(
+            name="timing-unavailable-neighbors",
+            caller_lines=("First question?", "Second question?", "Third question?"),
+            turns=tuple(
+                TurnExpectation((QuestionSpec(
+                    "claims", {"required": [f"fact for turn {turn}"], "rejected": []}
+                ),))
+                for turn in range(1, 4)
             ),
-            40.2,
+            commands=({"turn": 1, "kind": "timer", "seconds": 300},),
+            room_close_after=None,
         )
-        trace["segments"][0]["text"] += " However, John Smith put up the money for the city to buy it instead."
-        self.assertIsNone(
-            runner._answer_time(
-                trace,
-                scenario.turns[0],
-                scenario_name=scenario.name,
-                turn_index=1,
-            )
-        )
+        room = "timing-unavailable-room"
+        traces = []
+        for turn, line in enumerate(scenario.caller_lines, 1):
+            started = 100.0 + (turn - 1) * 10.0
+            traces.append({
+                "turn": turn,
+                "room": room,
+                "line": line,
+                "transcript": f"fact for turn {turn}",
+                "speech_started_at": started - 1.0,
+                "speech_end": started,
+                "speech_end_wall": 1_700_000_000.0 + started,
+                "first_audio": started + 0.2,
+                "overlap": False,
+                "capture_started": started + 0.2,
+                "segments": [{
+                    "start": 0.2, "end": 0.6, "text": f"fact for turn {turn}"
+                }],
+                "model_calls": [],
+                "room_deleted": None,
+            })
+        phone_log = "".join(json.dumps(item) + "\n" for item in (
+            {
+                "event": "command",
+                "received_at": 1_700_000_103.0,
+                "command": {
+                    "id": "timer-evidence",
+                    "kind": "timer",
+                    "seconds": 300,
+                    "expires_at": "2026-10-04T20:00:00Z",
+                },
+            },
+            {"event": "result", "result": {
+                "id": "timer-evidence", "status": "ok", "detail": "Fake timer set",
+            }},
+        ))
 
-    def test_alice_live_father_answers_receive_answer_timestamps(self):
-        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
-        live_answers = (
-            "and donated it anonymously. Alice Keck Park was a Santa Barbara philanthropist and an heir to the superior oil fortune through her father, William Keck. Her aunt Carolyn had been married to the son of Albert Herter. Herter was the artist who built the El Mirasol estate on that site. That's likely why the property mattered to her. When she died, she left roughly $20 million to local agencies and causes. I don't have much on her personal life beyond that.",
-            "She was a Santa Barbara philanthropist from the Keck Oil family. Her dad, William Keck. founded Superior Oil, and her brother Howard later ran it. She was pretty private and lived quietly in town, but she gave generously to local causes, especially conservation, gardens, and animal welfare. The park's the big thing she's remembered for. Past that, the details of her personal life are thin, so I wouldn't.",
-        )
-        for answer in live_answers:
-            trace = {
-                "capture_started": 60.0,
-                "speech_end": 60.0,
-                "segments": [{"start": 0.4, "end": 12.0, "text": answer}],
-            }
-            with self.subTest(answer=answer):
-                self.assertEqual(
-                    runner._answer_time(
-                        trace,
-                        scenario.turns[1],
-                        scenario_name=scenario.name,
-                        turn_index=2,
-                    ),
-                    60.4,
-                )
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
 
-        for answer in (
-            "William Keck founded Superior Oil.",
-            "Alice Keck's dad was John Smith. William Keck founded Superior Oil.",
-            "William Keck was Alice Keck's brother, not her father.",
-            "I'm not sure whether William Keck was her father.",
-        ):
-            trace = {
-                "capture_started": 60.0,
-                "speech_end": 60.0,
-                "segments": [{"start": 0.4, "end": 12.0, "text": answer}],
-            }
-            with self.subTest(answer=answer):
-                self.assertIsNone(
-                    runner._answer_time(
-                        trace,
-                        scenario.turns[1],
-                        scenario_name=scenario.name,
-                        turn_index=2,
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, **_kwargs):
+                return CompletedProcess(command, 0, json.dumps({"turns": traces}), "")
+
+            def run_remote(self, command):
+                path = command[-1]
+                if path == "voice/evals/phone.jsonl":
+                    return CompletedProcess(command, 0, phone_log, "")
+                if path == "voice/evals/delegations.jsonl":
+                    return CompletedProcess(command, 0, "", "")
+                if path == f"records/voice-{room}.jsonl":
+                    raise subprocess.CalledProcessError(
+                        1, command, output="", stderr=f"cat: {path}: No such file or directory\n"
                     )
-                )
+                raise AssertionError(f"unexpected remote artifact {path!r}")
 
-    def test_run17_live_alice_answer_timestamps_match_sentence_break_and_full_name(self):
-        scenario = next(s for s in SCENARIOS if s.name == "alice-keck-context-chain")
-        first = {
-            "capture_started": 40.0,
-            "speech_end": 40.0,
-            "segments": [
-                {"start": 0.1, "end": 0.84, "text": " Looking it up."},
-                {"start": 0.3, "end": 2.0, "text": " Alice Keck Park."},
-                {"start": 0.8, "end": 5.2, "text": " anonymously bought the land and gave it to Santa Barbara for a public garden in 1975."},
-            ],
-        }
-        second = {
-            "capture_started": 50.0,
-            "speech_end": 50.0,
-            "segments": [
-                {"start": 0.1, "end": 0.5, "text": " Checking."},
-                {"start": 0.5, "end": 5.86, "text": " Alice Keck Park was a Santa Barbara philanthropist and daughter of William Myron Keck, who founded"},
-                {"start": 0.7, "end": 6.86, "text": " Superior Oil."},
-            ],
-        }
-        self.assertEqual(
-            runner._answer_time(first, scenario.turns[0], scenario_name=scenario.name, turn_index=1),
-            40.8,
-        )
-        self.assertEqual(
-            runner._answer_time(second, scenario.turns[1], scenario_name=scenario.name, turn_index=2),
-            50.5,
-        )
+        class PrefixFailureJudge(ScriptedJudge):
+            def __init__(self):
+                super().__init__({"required_1": 1.0})
+                self.calls = 0
 
-    def test_confirmation_timestamp_recognizes_all_approved_prompt_literals(self):
-        prompts = (
-            "Should I send it?",
-            "Shall I send it?",
-            "Want me to send it?",
-            "Would you like me to send it?",
-            "Say yes to send it.",
-            "Say send to confirm.",
-            "Say the word and I'll send it.",
-            "Confirm, and I'll send it.",
+            def evaluate(self, reply, questions, *, context=""):
+                self.calls += 1
+                if self.calls == 5:
+                    raise JudgeUnavailable("prefix timeout")
+                return super().evaluate(reply, questions, context=context)
+
+        matched_command = {
+            "id": "timer-evidence",
+            "kind": "timer",
+            "seconds": 300,
+            "expires_at": "2026-10-04T20:00:00Z",
+            "received_at": 1_700_000_103.0,
+            "turn": 1,
+        }
+        with (
+            patch.object(runner, "_voice_token", return_value={
+                "token": "a.b.c", "room": room, "url": "wss://livekit.invalid",
+            }),
+            patch.object(runner, "_attribute_model_calls", side_effect=lambda current, *_args, **_kwargs: current),
+            patch.object(runner, "_match_phone_tools", return_value=[matched_command]),
+        ):
+            observation = runner.observe_scenario(scenario, Stack(), judge=PrefixFailureJudge())
+
+        self.assertEqual(len(observation["turns"]), 3)
+        self.assertTrue(observation["turns"][0]["judge"]["questions"][0]["verdict"])
+        unavailable = observation["turns"][1]["judge"]
+        self.assertEqual(unavailable["unavailable"], "prefix timeout")
+        self.assertIsNone(unavailable["questions"][0]["verdict"])
+        self.assertIsNone(unavailable["questions"][0]["probability"])
+        self.assertTrue(observation["turns"][2]["judge"]["questions"][0]["verdict"])
+        self.assertIsNotNone(observation["turns"][0]["answer_at"])
+        self.assertIsNone(observation["turns"][1]["answer_at"])
+        self.assertIsNotNone(observation["turns"][2]["answer_at"])
+        self.assertEqual(observation["phone_commands"], [matched_command])
+        self.assertTrue(any(
+            item["turn"] == 2 and "judge unavailable" in item["message"]
+            for item in observation["product_failures"]
+        ))
+
+        report = score_observations(
+            {"cases": [{"name": scenario.name, "runs": [observation]}]},
+            required_runs=1,
         )
-        for prompt in prompts:
-            with self.subTest(prompt=prompt):
-                self.assertEqual(
-                    runner._confirmation_time({
-                        "capture_started": 10.0,
-                        "segments": [
-                            {"start": 0.0, "end": 0.3, "text": "Please confirm."},
-                            {"start": 0.4, "end": 0.8, "text": prompt},
-                        ],
-                    }),
-                    10.8,
-                )
+        self.assertFalse(report["passed"])
+        turns = report["cases"][0]["turns"]
+        self.assertEqual(len(turns), 3)
+        self.assertTrue(turns[0]["judge"]["questions"][0]["verdict"])
+        self.assertEqual(turns[1]["judge"]["unavailable"], "prefix timeout")
+        self.assertTrue(turns[2]["judge"]["questions"][0]["verdict"])
+        self.assertEqual(turns[0]["latency_seconds"]["command_receipt"], 3.0)
+        self.assertTrue(any("turn 2: product failure" in failure
+                            and "judge unavailable" in failure
+                            for failure in report["failures"]))
 
     def test_later_preflight_tts_failure_accepts_nonzero_capture_without_sdk_record(self):
         import json
@@ -4400,105 +4296,34 @@ class ScenarioObservationTests(unittest.TestCase):
             with self.subTest(received_at=invalid), self.assertRaisesRegex(RuntimeError, "receipt timestamp"):
                 runner._phone_commands(malformed)
 
-    def test_answer_timestamp_is_first_segment_completing_all_expected_patterns(self):
-        expectation = SCENARIOS[3].turns[0]
+    def test_judge_unavailable_never_produces_an_answer_timestamp(self):
+        from evals.judge import JudgeUnavailable, ScriptedJudge
+
         trace = {
-            "capture_started": 100.0,
-            "speech_end": 100.4,
-            "segments": [
-                {"start": 0.1, "end": 0.4, "text": "Text +1-202-555-0142: I will be there at six."},
-                {"start": 0.5, "end": 0.9, "text": "Should I send it?"},
-                {"start": 1.0, "end": 1.4, "text": "Anything else?"},
-            ],
+            "capture_started": 10.0,
+            "speech_end": 10.0,
+            "segments": [{"start": 0.1, "end": 0.4, "text": "Timer set for five minutes."}],
         }
-        self.assertEqual(
-            runner._answer_time(
-                trace, expectation, scenario_name=SCENARIOS[3].name, turn_index=1
-            ),
-            100.5,
-        )
-        self.assertIsNone(runner._answer_time({
-            "capture_started": 100.0,
-            "speech_end": 100.0,
-            "segments": [{"start": 0.1, "end": 0.4, "text": "I will text that."}],
-        }, expectation, scenario_name=SCENARIOS[3].name, turn_index=1))
+        judge = ScriptedJudge({
+            "action_completed": JudgeUnavailable("timed out"),
+            "timer_duration": 1.0,
+        })
+        with self.assertRaisesRegex(RuntimeError, "timed out") as raised:
+            runner._answer_time(trace, SCENARIOS[0].turns[0], judge=judge)
+        self.assertIsNone(raised.exception.evidence["questions"][0]["verdict"])
+        self.assertEqual(raised.exception.evidence["unavailable"], "timed out")
+
+    def test_answer_timing_rejects_malformed_segment_timestamps(self):
+        from evals.judge import ScriptedJudge
+
+        trace = {
+            "capture_started": 10.0,
+            "speech_end": 10.0,
+            "segments": [{"start": 0.1, "end": float("nan"), "text": "Timer set."}],
+        }
+        judge = ScriptedJudge({"action_completed": 1.0, "timer_duration": 1.0})
         with self.assertRaisesRegex(RuntimeError, "answer segment timestamp"):
-            runner._answer_time({
-                "capture_started": 100.0,
-                "speech_end": 100.0,
-                "segments": [{"start": 0.1, "end": float("nan"), "text": "Text +1-202-555-0142"}],
-            }, expectation, scenario_name=SCENARIOS[3].name, turn_index=1)
-
-    def test_answer_timestamp_uses_first_post_speech_end_utterance_with_prior_overlap(self):
-        trace = {
-            "capture_started": 100.0,
-            "speech_end": 101.0,
-            "segments": [
-                {"start": 0.8, "end": 1.0, "text": "Timer set for"},
-                {"start": 1.2, "end": 1.4, "text": "5 minutes."},
-            ],
-        }
-        self.assertEqual(
-            runner._answer_time(
-                trace,
-                SimpleNamespace(
-                    answer_patterns=(r"Timer set for", r"5 minutes"),
-                    reject_patterns=(),
-                ),
-            ),
-            101.2,
-        )
-
-    def test_answer_timestamp_skips_unverified_preamble_and_sms_confirmation_filler(self):
-        alice_scenario = SCENARIOS[5]
-        alice_trace = {
-            "capture_started": 100.0,
-            "speech_end": 100.0,
-            "segments": [
-                {
-                    "start": 1.0,
-                    "end": 5.0,
-                    "text": "I am not sure whether Alice Keck gave the land to the city.",
-                },
-                {
-                    "start": 12.0,
-                    "end": 17.0,
-                    "text": "I checked. Alice Keck Park purchased the land and gave it to the city.",
-                },
-            ],
-        }
-        self.assertEqual(
-            runner._answer_time(
-                alice_trace,
-                alice_scenario.turns[0],
-                scenario_name=alice_scenario.name,
-                turn_index=1,
-            ),
-            112.0,
-        )
-
-        sms_scenario = SCENARIOS[3]
-        sms_trace = {
-            "capture_started": 100.0,
-            "speech_end": 100.0,
-            "segments": [
-                {"start": 1.0, "end": 2.0, "text": "Should I send it?"},
-                {
-                    "start": 12.0,
-                    "end": 15.0,
-                    "text": "Text +1-202-555-0142: I will be there at six. Should I send it?",
-                },
-            ],
-        }
-        self.assertEqual(
-            runner._answer_time(
-                sms_trace,
-                sms_scenario.turns[0],
-                scenario_name=sms_scenario.name,
-                turn_index=1,
-            ),
-            112.0,
-        )
+            runner._answer_time(trace, SCENARIOS[0].turns[0], judge=judge)
 
     def test_delegation_jsonl_is_room_scoped_and_rejects_malformed_or_local_duplicates(self):
         records = (
@@ -4838,8 +4663,18 @@ class ScenarioObservationTests(unittest.TestCase):
                 raise AssertionError(f"unexpected remote command {command!r}")
 
         stack = Stack()
+        judge = ScriptedSequenceJudge(
+            lambda question_id, reply: 1.0
+            if (
+                question_id == "sms_recipient" and "202-555-0142" in reply
+                or question_id == "sms_body" and "I will be there at six" in reply
+                or question_id == "sms_confirmation" and "Should I send it" in reply
+                or question_id == "sms_sent" and "Message sent" in reply
+            )
+            else 0.0
+        )
         try:
-            observation = runner.observe_scenario(SCENARIOS[3], stack)
+            observation = runner.observe_scenario(SCENARIOS[3], stack, judge=judge)
         finally:
             server.shutdown()
             server.server_close()
@@ -4857,6 +4692,12 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertEqual(observation["turns"][0]["kind"], "search")
         self.assertIsNone(observation["turns"][0]["command_received_at"])
         self.assertEqual(observation["turns"][0]["answer_at"], 100.6)
+        self.assertEqual(observation["turns"][0]["judge"]["context"], "")
+        self.assertIsNone(observation["turns"][0]["judge"]["unavailable"])
+        self.assertEqual(
+            {question["id"] for question in observation["turns"][0]["judge"]["questions"]},
+            {"sms_recipient", "sms_body", "sms_confirmation"},
+        )
         self.assertEqual(observation["turns"][1]["kind"], "action")
         self.assertEqual(observation["turns"][1]["command_received_at"], 1_700_000_002.0)
         self.assertEqual(observation["turns"][1]["answer_at"], 201.2)
@@ -5717,8 +5558,8 @@ class LocalEvalCliTests(unittest.TestCase):
                     "command_received_at": 11.0 if runner._turn_kind(scenario, index) == "action" else None,
                     "answer_at": 11.0,
                     "overlap": False,
-                    "expect_confirmation": expectation.sms_recipient is not None,
-                    "confirmation": 12.0 if expectation.sms_recipient is not None else None,
+                    "expect_confirmation": "sms_confirmation" in runner.build_turn_questions(expectation),
+                    "confirmation": 12.0 if "sms_confirmation" in runner.build_turn_questions(expectation) else None,
                     "expect_hangup": scenario.room_close_after == index,
                     "room_deleted": 13.0 if scenario.room_close_after == index else None,
                     "model_calls": [{
@@ -5779,7 +5620,7 @@ class LocalEvalCliTests(unittest.TestCase):
 
         scenario = SimpleNamespace(
             name="isolated-phone",
-            turns=(SimpleNamespace(answer_patterns=("timer set",), sms_recipient=None),),
+            turns=(TurnExpectation((QuestionSpec("action_ack", {"action": "timer", "expected": "five minutes"}),)),),
             commands=({"turn": 1, "kind": "timer", "seconds": 300},),
             place_query=None,
             room_close_after=None,
@@ -5892,8 +5733,8 @@ class LocalEvalCliTests(unittest.TestCase):
         scenario = SimpleNamespace(
             name="spanish-interpreter",
             turns=tuple(
-                SimpleNamespace(sms_recipient=None, sms_body=None)
-                for _ in range(6)
+                TurnExpectation((QuestionSpec("interpreter_turn", {"turn": index}),))
+                for index in range(1, 7)
             ),
             room_close_after=6,
             commands=(),
@@ -6003,8 +5844,8 @@ class LocalEvalCliTests(unittest.TestCase):
                     "command_received_at": 11.0 if runner._turn_kind(scenario, index) == "action" else None,
                     "answer_at": 11.0,
                     "overlap": False,
-                    "expect_confirmation": expectation.sms_recipient is not None,
-                    "confirmation": 12.0 if expectation.sms_recipient is not None else None,
+                    "expect_confirmation": "sms_confirmation" in runner.build_turn_questions(expectation),
+                    "confirmation": 12.0 if "sms_confirmation" in runner.build_turn_questions(expectation) else None,
                     "expect_hangup": scenario.room_close_after == index,
                     "room_deleted": 13.0 if scenario.room_close_after == index else None,
                     "model_calls": [],
@@ -6120,8 +5961,8 @@ class LocalEvalCliTests(unittest.TestCase):
                     "command_received_at": 11.0 if runner._turn_kind(scenario, index) == "action" else None,
                     "answer_at": 11.0,
                     "overlap": False,
-                    "expect_confirmation": expectation.sms_recipient is not None,
-                    "confirmation": 12.0 if expectation.sms_recipient is not None else None,
+                    "expect_confirmation": "sms_confirmation" in runner.build_turn_questions(expectation),
+                    "confirmation": 12.0 if "sms_confirmation" in runner.build_turn_questions(expectation) else None,
                     "expect_hangup": scenario.room_close_after == index,
                     "room_deleted": 13.0 if scenario.room_close_after == index else None,
                     "model_calls": [{"model": "claude-opus-5"}],
@@ -6167,13 +6008,10 @@ class LocalEvalCliTests(unittest.TestCase):
             name="three-turn-call",
             caller_lines=("Set a timer.", "What time is it?", "Thanks."),
             turns=tuple(
-                SimpleNamespace(
-                    answer_patterns=(r"Timer set",) if index == 1 else (r"answer",),
-                    reject_patterns=(),
-                    sms_recipient=None,
-                    sms_body=None,
-                )
-                for index in range(3)
+                TurnExpectation((QuestionSpec("action_ack", {
+                    "action": "timer", "expected": "five minutes"
+                }),))
+                for _index in range(3)
             ),
             commands=({"turn": 1, "kind": "timer", "seconds": 300},),
             room_close_after=3,
@@ -6235,7 +6073,9 @@ class LocalEvalCliTests(unittest.TestCase):
                 return CompletedProcess(command, 0, outputs[command[-1]], "")
 
         with patch.object(runner, "_voice_token", return_value=grant):
-            observation = runner.observe_scenario(scenario, Stack())
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
 
         self.assertEqual(len(observation["turns"]), 1)
         self.assertEqual(observation["turns"][0]["model_calls"], [{
