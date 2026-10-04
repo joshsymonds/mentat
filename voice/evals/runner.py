@@ -54,6 +54,7 @@ FAKE_PHONE_LOG = "evals/phone.jsonl"
 SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
 DEFAULT_VOICE_MODEL = "chatgpt/sol-fast"
 DEFAULT_CONCURRENCY = 16
+_SCHEDULER_DRAIN_TIMEOUT_SECONDS = 1.0
 
 
 def _retain_sms_audio(
@@ -3139,10 +3140,14 @@ def _run_local_eval(argv: list[str]) -> int:
                             },
                         }
     finally:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            concurrent.futures.wait(
+                futures,
+                timeout=_SCHEDULER_DRAIN_TIMEOUT_SECONDS,
+            )
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
 
     for future, (scenario_index, run_index) in futures.items():
         runs = observations["cases"][scenario_index]["runs"]
@@ -3150,6 +3155,8 @@ def _run_local_eval(argv: list[str]) -> int:
             continue
         if future.cancelled():
             failure = f"aborted before launch: {abort_reason[0] or 'evaluation interrupted'}"
+        elif not future.done():
+            failure = f"aborted while worker remained active: {abort_reason[0] or 'evaluation interrupted'}"
         else:
             try:
                 result_scenario, result_run, observation, failure = future.result()

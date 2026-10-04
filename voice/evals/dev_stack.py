@@ -24,6 +24,8 @@ _READINESS_POLL_SECONDS = 0.2
 _READINESS_REQUEST_TIMEOUT_SECONDS = 2.0
 _RESTORE_GUARD_REFRESH_INTERVAL_SECONDS = 15 * 60.0
 _RESTORE_GUARD_REFRESH_TIMEOUT_SECONDS = 30.0
+_CLEANUP_TIMEOUT_SECONDS = 30.0
+_REMOTE_CALL_TIMEOUT_SECONDS = 300.0
 _SSH_HANDSHAKE_LIMIT = 9
 _SSH_HANDSHAKE_SLOTS = threading.BoundedSemaphore(_SSH_HANDSHAKE_LIMIT)
 _SSH_MUX_CLIENT_OPTIONS = ("-o", "ControlMaster=no", "-o", "ProxyCommand=false")
@@ -74,6 +76,7 @@ class _SSHTransport:
                     check=True,
                     capture_output=True,
                     text=True,
+                    timeout=_CLEANUP_TIMEOUT_SECONDS,
                 )
         except BaseException:
             shutil.rmtree(directory, ignore_errors=True)
@@ -93,14 +96,22 @@ class _SSHTransport:
             *_SSH_MUX_CLIENT_OPTIONS, *arguments,
         ]
 
-    def _control(self, *options: str) -> subprocess.CompletedProcess[str]:
+    def _control(
+        self, *options: str, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
         if not self._connected or self._control_path is None:
             raise RuntimeError("SSH control master is not connected")
+        run_options: dict[str, object] = {
+            "check": False,
+            "capture_output": True,
+            "text": True,
+        }
+        run_options["timeout"] = (
+            _CLEANUP_TIMEOUT_SECONDS if timeout is None else timeout
+        )
         result = self._run(
             ["ssh", "-S", self._control_path, *options, self.remote],
-            check=False,
-            capture_output=True,
-            text=True,
+            **run_options,
         )
         if result.returncode != 0:
             raise subprocess.CalledProcessError(
@@ -120,23 +131,28 @@ class _SSHTransport:
         )
         self._forwardings.add(forwarding)
 
-    def cancel_forward(self, forwarding: str) -> None:
+    def cancel_forward(self, forwarding: str, *, timeout: float | None = None) -> None:
         if forwarding not in self._forwardings:
             return
-        self._control("-O", "cancel", "-L", forwarding)
+        self._control("-O", "cancel", "-L", forwarding, timeout=timeout)
         self._forwardings.remove(forwarding)
 
-    def close(self) -> None:
+    def close(self, *, timeout: float | None = None) -> None:
         if self._directory is None:
             return
         directory = self._directory
         control_path = self._control_path
         if control_path is not None:
+            run_options: dict[str, object] = {
+                "check": False,
+                "capture_output": True,
+                "text": True,
+            }
+            if timeout is not None:
+                run_options["timeout"] = timeout
             result = self._run(
                 ["ssh", "-S", control_path, "-O", "exit", self.remote],
-                check=False,
-                capture_output=True,
-                text=True,
+                **run_options,
             )
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(
@@ -924,6 +940,9 @@ class _RunStack:
         self._entered = False
         self._restore_guard_armed = False
         self._producers_stopped = False
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_complete = False
+        self._cleanup_error: BaseException | None = None
         self.retained_evidence_dir: Path | None = None
 
     @property
@@ -974,6 +993,7 @@ class _RunStack:
             check=True,
             capture_output=True,
             text=True,
+            timeout=_REMOTE_CALL_TIMEOUT_SECONDS,
         )
 
     def run_voice(
@@ -1004,7 +1024,11 @@ class _RunStack:
             "MENTAT_VOICE_GRANT\n"
         )
         try:
-            result = self._remote(script, redact=(token,))
+            result = self._remote(
+                script,
+                redact=(token,),
+                timeout=_REMOTE_CALL_TIMEOUT_SECONDS,
+            )
         except BaseException as error:
             try:
                 self._stop_producers()
@@ -1022,7 +1046,11 @@ class _RunStack:
     def _stop_producers(self) -> None:
         if self._producers_stopped or self._remote_dir is None:
             return
-        self._remote(_STOP_RUN_SCRIPT, self._remote_dir)
+        self._remote(
+            _STOP_RUN_SCRIPT,
+            self._remote_dir,
+            timeout=_CLEANUP_TIMEOUT_SECONDS,
+        )
         self._producers_stopped = True
 
     def start_worker(self, room: str) -> None:
@@ -1092,14 +1120,21 @@ class _RunStack:
         script: str,
         *args: str,
         redact: Sequence[str] = (),
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
+            options: dict[str, object] = {
+                "input": script,
+                "check": True,
+                "capture_output": True,
+                "text": True,
+            }
+            options["timeout"] = (
+                _CLEANUP_TIMEOUT_SECONDS if timeout is None else timeout
+            )
             return self._run(
                 self._transport.ssh_command("sudo", "bash", "-s", "--", *args),
-                input=script,
-                check=True,
-                capture_output=True,
-                text=True,
+                **options,
             )
         except subprocess.CalledProcessError as error:
             raise RemoteCommandError(
@@ -1115,7 +1150,11 @@ class _RunStack:
         evidence_dir = Path(tempfile.mkdtemp(prefix="mentat-voice-eval-"))
         os.chmod(evidence_dir, 0o700)
         self.retained_evidence_dir = evidence_dir
-        self._remote(_RETAIN_EVIDENCE_SCRIPT, self._remote_dir)
+        self._remote(
+            _RETAIN_EVIDENCE_SCRIPT,
+            self._remote_dir,
+            timeout=_CLEANUP_TIMEOUT_SECONDS,
+        )
         archive = evidence_dir / "retained-evidence.tar.gz"
         self._run(
             self._transport.scp_command(
@@ -1126,6 +1165,7 @@ class _RunStack:
             check=True,
             capture_output=True,
             text=True,
+            timeout=_CLEANUP_TIMEOUT_SECONDS,
         )
         if not archive.is_file():
             evidence_dir.rmdir()
@@ -1214,6 +1254,20 @@ class _RunStack:
                 os.chmod(directory, 0o700)
 
     def _cleanup(self) -> None:
+        with self._cleanup_lock:
+            if self._cleanup_complete:
+                if self._cleanup_error is not None:
+                    raise self._cleanup_error
+                return
+            try:
+                self._cleanup_once()
+            except BaseException as error:
+                self._cleanup_error = error
+                raise
+            finally:
+                self._cleanup_complete = True
+
+    def _cleanup_once(self) -> None:
         cleanup_error: BaseException | None = None
 
         def remember(error: BaseException, context: str) -> None:
@@ -1225,7 +1279,10 @@ class _RunStack:
 
         if self._forward_spec is not None:
             try:
-                self._transport.cancel_forward(self._forward_spec)
+                self._transport.cancel_forward(
+                    self._forward_spec,
+                    timeout=_CLEANUP_TIMEOUT_SECONDS,
+                )
             except BaseException as error:
                 remember(error, "SSH forward cancellation also failed: ")
             else:
@@ -1242,7 +1299,7 @@ class _RunStack:
         self._local_port = None
         self._restore_guard_armed = False
         try:
-            self._transport.close()
+            self._transport.close(timeout=_CLEANUP_TIMEOUT_SECONDS)
         except BaseException as error:
             remember(error, "SSH transport shutdown also failed: ")
         else:
@@ -1341,7 +1398,7 @@ class DevStack:
         if stop is not None:
             stop.set()
         if thread is not None:
-            thread.join()
+            thread.join(timeout=_CLEANUP_TIMEOUT_SECONDS)
 
     def run(self, run_id: str) -> _RunStack:
         if not isinstance(run_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", run_id) is None:
@@ -1530,8 +1587,9 @@ class DevStack:
                 "capture_output": True,
                 "text": True,
             }
-            if timeout is not None:
-                options["timeout"] = timeout
+            options["timeout"] = (
+                _CLEANUP_TIMEOUT_SECONDS if timeout is None else timeout
+            )
             return self._run(
                 self._transport.ssh_command("sudo", "bash", "-s", "--", *args),
                 **options,
@@ -1579,14 +1637,18 @@ elif [ -n "$BATCH_DIR" ]; then
   rm -rf -- "$BATCH_DIR"
 fi
 '''
-                self._remote(script, remote_dir)
+                self._remote(
+                    script,
+                    remote_dir,
+                    timeout=_CLEANUP_TIMEOUT_SECONDS,
+                )
             except BaseException as error:
                 if first_error is None:
                     first_error = error
             finally:
                 self._remote_dir = None
         try:
-            self._transport.close()
+            self._transport.close(timeout=_CLEANUP_TIMEOUT_SECONDS)
         except BaseException as error:
             if first_error is None:
                 first_error = error

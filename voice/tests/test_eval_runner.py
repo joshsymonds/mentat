@@ -4944,6 +4944,68 @@ class LocalEvalCliTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(SystemExit):
                 runner._parse_local_eval_arguments(["--live", "--concurrency", invalid])
 
+    def test_scheduler_restores_without_waiting_indefinitely_for_hung_worker(self):
+        import io
+        import threading
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(name="hung-worker", turns=(), commands=(), place_query=None)
+        both_started = threading.Barrier(2)
+        release_hung = threading.Event()
+        restored = threading.Event()
+        finished = threading.Event()
+        lifecycle = []
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                lifecycle.append(("run-start", run_id))
+                try:
+                    yield SimpleNamespace(run_id=run_id)
+                finally:
+                    lifecycle.append(("run-cleanup", run_id))
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            try:
+                yield Batch()
+            finally:
+                lifecycle.append(("stop-candidates",))
+                lifecycle.append(("restore",))
+                restored.set()
+
+        def observe(_scenario, stack):
+            both_started.wait(timeout=2)
+            if stack.run_id.endswith("run-1"):
+                raise RuntimeError("first worker failed")
+            release_hung.wait(timeout=5)
+            return {"run_id": stack.run_id, "turns": []}
+
+        output = io.StringIO()
+
+        def run_eval():
+            try:
+                with redirect_stdout(output):
+                    runner._run_local_eval(["--live", "--runs", "2", "--concurrency", "2"])
+            finally:
+                finished.set()
+
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+        ):
+            coordinator = threading.Thread(target=run_eval)
+            coordinator.start()
+            self.assertTrue(restored.wait(timeout=2))
+            exited_before_worker_release = finished.wait(timeout=2)
+            release_hung.set()
+            coordinator.join(timeout=2)
+
+        self.assertFalse(coordinator.is_alive())
+        self.assertTrue(exited_before_worker_release)
+        self.assertLess(lifecycle.index(("stop-candidates",)), lifecycle.index(("restore",)))
+
     def test_scheduler_submit_failure_preserves_active_and_unsubmitted_run_positions(self):
         import concurrent.futures
         import io

@@ -355,7 +355,11 @@ class DevStackTest(unittest.TestCase):
         batch._remote_dir = "/tmp/mentat-eval-batch.synthetic"
         batch._begin_launch()
         restored = []
-        with patch.object(batch, "_remote", side_effect=lambda *args: restored.append(args)):
+        with patch.object(
+            batch,
+            "_remote",
+            side_effect=lambda *args, **_kwargs: restored.append(args),
+        ):
             cleanup = Thread(target=batch._cleanup)
             cleanup.start()
             deadline = time.monotonic() + 2
@@ -373,6 +377,50 @@ class DevStackTest(unittest.TestCase):
             cleanup.join(timeout=2)
         self.assertFalse(cleanup.is_alive())
         self.assertEqual(len(restored), 1)
+
+    def test_run_cleanup_is_serialized_and_executes_once(self):
+        from threading import Event, Thread
+
+        cleanup_started = Event()
+        release_cleanup = Event()
+        transport_closes = []
+        stop_calls = []
+        stack = _RunStack(
+            checkout=CHECKOUT,
+            run=lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+        )
+        stack._remote_dir = "/tmp/mentat-eval-batch.synthetic/runs/run-1"
+        stack._restore_guard_armed = True
+
+        def stop_producers():
+            stop_calls.append("stop")
+            cleanup_started.set()
+            self.assertTrue(release_cleanup.wait(timeout=2))
+
+        with (
+            patch.object(stack, "_stop_producers", side_effect=stop_producers),
+            patch.object(stack, "_retain_evidence"),
+            patch.object(
+                stack._transport,
+                "close",
+                side_effect=lambda **_kwargs: transport_closes.append("close"),
+            ),
+        ):
+            first = Thread(target=stack._cleanup)
+            second = Thread(target=stack._cleanup)
+            first.start()
+            self.assertTrue(cleanup_started.wait(timeout=1))
+            second.start()
+            time.sleep(0.02)
+            self.assertEqual(transport_closes, [])
+            release_cleanup.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(stop_calls, ["stop"])
+        self.assertEqual(transport_closes, ["close"])
 
     def test_signal_during_shutdown_does_not_abort_cleanup(self):
         import signal
@@ -406,7 +454,7 @@ class DevStackTest(unittest.TestCase):
                 batch._remote_dir = "/tmp/mentat-eval-batch.synthetic"
                 restored = []
 
-                def remote(_script, path):
+                def remote(_script, path, **_kwargs):
                     os.kill(os.getpid(), signum)
                     restored.append(path)
                     return subprocess.CompletedProcess(["ssh"], 0, "", "")
@@ -1220,9 +1268,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
 
         original_control = _SSHTransport._control
 
-        def record_control(transport, *options):
+        def record_control(transport, *options, **kwargs):
             control_calls.append(options)
-            return original_control(transport, *options)
+            return original_control(transport, *options, **kwargs)
 
         with patch.object(_SSHTransport, "_control", autospec=True, side_effect=record_control):
             with isolated_run(checkout=CHECKOUT, opt_in=True, run=run) as stack:
