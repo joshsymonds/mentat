@@ -2450,6 +2450,7 @@ class LocalEvalTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertFalse(report["passed"])
         self.assertIn(diagnostic, " ".join(report["failures"]))
+        self.assertIn("DevStack setup failed", " ".join(report["failures"]))
         self.assertNotIn("invalid partial capture failure metadata", " ".join(report["failures"]))
         for case, report_case in zip(captured["observations"]["cases"], report["cases"], strict=True):
             self.assertEqual(len(case["runs"]), 2)
@@ -2497,6 +2498,7 @@ class LocalEvalTests(unittest.TestCase):
         report = json.loads(output.getvalue())
         runs = captured["observations"]["cases"][0]["runs"]
         self.assertEqual(result, 1)
+        self.assertIn("run launch failed", runs[0]["failure"])
         self.assertIn("distinctive launch exception", runs[0]["failure"])
         self.assertEqual(runs[1]["failure"], "aborted before launch: case-1-run-1 failed")
         self.assertNotIn("invalid partial capture failure metadata", " ".join(report["failures"]))
@@ -4851,6 +4853,138 @@ class ScenarioObservationTests(unittest.TestCase):
 
 
 class LocalEvalCliTests(unittest.TestCase):
+    def test_batch_cleanup_failure_is_not_attributed_to_setup(self):
+        import io
+        import json
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(name="cleanup", turns=(), commands=(), place_query=None)
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                yield SimpleNamespace(run_id=run_id)
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield Batch()
+            raise RuntimeError("distinctive batch cleanup exception")
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=lambda _scenario, stack: {
+                "run_id": stack.run_id, "turns": [],
+            }),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        run = captured["observations"]["cases"][0]["runs"][0]
+        failures = " ".join(report["failures"])
+        self.assertEqual(result, 1)
+        self.assertEqual(run["run_id"], "case-1-run-1")
+        self.assertIn("distinctive batch cleanup exception", failures)
+        self.assertIn("DevStack cleanup failed", failures)
+        self.assertNotIn("DevStack setup failed", failures)
+        self.assertEqual([item["run"] for item in report["cases"][0]["run_timings"]], [1])
+
+    def test_scenario_execution_failure_is_attributed_and_indexed(self):
+        import io
+        import json
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(name="scenario", turns=(), commands=(), place_query=None)
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                yield SimpleNamespace(run_id=run_id)
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield Batch()
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=RuntimeError("distinctive scenario exception")),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        run = captured["observations"]["cases"][0]["runs"][0]
+        failures = " ".join(report["failures"])
+        self.assertEqual(result, 1)
+        self.assertIn("scenario execution failed", run["failure"])
+        self.assertIn("distinctive scenario exception", run["failure"])
+        self.assertIn("scenario run 1", failures)
+        self.assertEqual([item["run"] for item in report["cases"][0]["run_timings"]], [1])
+
+    def test_run_cleanup_failure_is_attributed_and_indexed(self):
+        import io
+        import json
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(name="cleanup", turns=(), commands=(), place_query=None)
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                try:
+                    yield SimpleNamespace(run_id=run_id)
+                finally:
+                    raise RuntimeError("distinctive run cleanup exception")
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield Batch()
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=lambda _scenario, stack: {
+                "run_id": stack.run_id, "turns": [],
+            }),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "1"])
+
+        report = json.loads(output.getvalue())
+        run = captured["observations"]["cases"][0]["runs"][0]
+        failures = " ".join(report["failures"])
+        self.assertEqual(result, 1)
+        self.assertIn("run cleanup failed", run["failure"])
+        self.assertIn("distinctive run cleanup exception", run["failure"])
+        self.assertIn("cleanup run 1", failures)
+        self.assertEqual([item["run"] for item in report["cases"][0]["run_timings"]], [1])
+
     def test_concurrent_batch_schedules_full_cartesian_product_with_indexed_timing(self):
         import io
         import json
@@ -5075,7 +5209,9 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual([run.get("run_id") for run in runs], ["case-1-run-1", None, None])
         self.assertNotIn("failure", runs[0])
+        self.assertIn("scheduler failed", " ".join(report["failures"]))
         self.assertIn("distinctive scheduler submit failure", " ".join(report["failures"]))
+        self.assertNotIn("DevStack setup failed", " ".join(report["failures"]))
         self.assertNotIn("invalid partial capture failure metadata", " ".join(report["failures"]))
         timings = report["cases"][0]["run_timings"]
         self.assertEqual([timing["run"] for timing in timings], [1, 2, 3])

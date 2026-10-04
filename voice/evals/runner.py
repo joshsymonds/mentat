@@ -3026,7 +3026,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 stack = manager.__enter__()
             except BaseException as error:
                 active = active_runs.pop(key)
-                failure = _redact_diagnostics(str(error))
+                failure = _redact_diagnostics(f"run launch failed: {error}")
                 request_abort(f"{run_id} failed")
                 return scenario_index, run_index, {
                     "failure": failure,
@@ -3040,7 +3040,7 @@ def _run_local_eval(argv: list[str]) -> int:
         try:
             observation = observe_scenario(scenario, stack)
         except BaseException as error:
-            failure = _redact_diagnostics(str(error))
+            failure = _redact_diagnostics(f"scenario execution failed: {error}")
             request_abort(f"{run_id} failed")
             try:
                 manager.__exit__(type(error), error, error.__traceback__)
@@ -3050,7 +3050,7 @@ def _run_local_eval(argv: list[str]) -> int:
             try:
                 manager.__exit__(None, None, None)
             except BaseException as error:
-                failure = _redact_diagnostics(str(error))
+                failure = _redact_diagnostics(f"run cleanup failed: {error}")
                 request_abort(f"{run_id} failed")
         finally:
             ended_at = time.time()
@@ -3063,6 +3063,8 @@ def _run_local_eval(argv: list[str]) -> int:
             }
             if isinstance(observation, dict):
                 observation["timing"] = timing
+                if failure is not None and "failure" not in observation:
+                    observation["failure"] = failure
             elif failure is not None:
                 observation = {"failure": failure, "turns": [], "timing": timing}
         return scenario_index, run_index, observation, failure
@@ -3079,12 +3081,15 @@ def _run_local_eval(argv: list[str]) -> int:
         request_abort(f"received {signal_name}")
         raise _EvaluationInterrupted(abort_reason[0])
 
+    batch_phase = "setup"
+    scheduler_failure = None
     try:
         if threading.current_thread() is threading.main_thread():
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous_handlers[signum] = signal.signal(signum, handle_signal)
         try:
             with DevStack(checkout=checkout, opt_in=True) as batch:
+                batch_phase = "scheduling"
                 try:
                     executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_cap)
                     for scenario_index in range(len(SCENARIOS)):
@@ -3107,21 +3112,30 @@ def _run_local_eval(argv: list[str]) -> int:
                     request_abort(str(error) or "received interrupt")
                     raise
                 except Exception as error:
-                    request_abort(
-                        f"scheduler failed: {_redact_diagnostics(str(error))}"
-                    )
-                    raise
+                    scheduler_failure = _redact_diagnostics(str(error))
+                    request_abort(f"scheduler failed: {scheduler_failure}")
                 finally:
                     for future in futures:
                         future.cancel()
                     if executor is not None:
                         executor.shutdown(wait=False, cancel_futures=True)
+                    batch_phase = "cleanup"
+            if scheduler_failure is not None:
+                capture_failures.append((
+                    0,
+                    0,
+                    _redact_diagnostics(f"scheduler failed: {scheduler_failure}"),
+                ))
         except _EvaluationInterrupted as error:
             request_abort(str(error))
         except KeyboardInterrupt:
             request_abort("received SIGINT")
         except Exception as error:
-            message = _redact_diagnostics(f"DevStack setup failed: {error}")
+            phase_label = (
+                "DevStack setup failed" if batch_phase == "setup"
+                else "DevStack cleanup failed"
+            )
+            message = _redact_diagnostics(f"{phase_label}: {error}")
             capture_failures.append((0, 0, message))
             request_abort(message)
             if not futures:
