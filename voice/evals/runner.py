@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import ipaddress
 import json
 import math
 import os
 import re
+import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import wave
@@ -50,6 +53,7 @@ TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
 DEFAULT_VOICE_MODEL = "chatgpt/sol-fast"
+DEFAULT_CONCURRENCY = 16
 
 
 def _retain_sms_audio(
@@ -2917,7 +2921,19 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
     return arguments.room, arguments.steps, room_close_after
 
 
-def _run_local_eval(argv: list[str]) -> int:
+def _positive_int(value: str) -> int:
+    import argparse
+
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return result
+
+
+def _parse_local_eval_arguments(argv: list[str]) -> dict[str, Any]:
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -2926,19 +2942,31 @@ def _run_local_eval(argv: list[str]) -> int:
     )
     parser.add_argument("--live", action="store_true", help="explicitly opt in to the live isolated stack")
     parser.add_argument("--runs", type=int, default=10, help="observations per scenario (default: 10)")
+    parser.add_argument(
+        "--concurrency", type=_positive_int, default=DEFAULT_CONCURRENCY,
+        help=f"maximum concurrent runs (default: {DEFAULT_CONCURRENCY})",
+    )
     parser.add_argument("--list", action="store_true", help="list the contracted scenarios without running them")
-    arguments = parser.parse_args(argv)
-    if arguments.list:
-        if arguments.live or arguments.runs != 10:
-            print("eval --list cannot be combined with --live or --runs", file=sys.stderr)
+    return vars(parser.parse_args(argv))
+
+
+class _EvaluationInterrupted(BaseException):
+    pass
+
+
+def _run_local_eval(argv: list[str]) -> int:
+    arguments = _parse_local_eval_arguments(argv)
+    if arguments["list"]:
+        if arguments["live"] or arguments["runs"] != 10 or arguments["concurrency"] != DEFAULT_CONCURRENCY:
+            print("eval --list cannot be combined with --live, --runs, or --concurrency", file=sys.stderr)
             return 2
         for scenario in SCENARIOS:
             print(scenario.name)
         return 0
-    if not arguments.live:
+    if not arguments["live"]:
         print("eval requires --live; no DevStack was started", file=sys.stderr)
         return 2
-    if arguments.runs <= 0:
+    if arguments["runs"] <= 0:
         print("eval --runs must be a positive integer", file=sys.stderr)
         return 2
     try:
@@ -2947,36 +2975,184 @@ def _run_local_eval(argv: list[str]) -> int:
         print(str(error), file=sys.stderr)
         return 2
 
-    observations: dict[str, Any] = {"cases": []}
-    capture_failures: list[tuple[int, int, str]] = []
-    checkout = Path(__file__).resolve().parents[2]
-    try:
-        with DevStack(checkout=checkout, opt_in=True) as batch:
-            for scenario_index, scenario in enumerate(SCENARIOS):
-                runs = []
-                for run_index in range(arguments.runs):
-                    try:
-                        with batch.run(f"case-{scenario_index + 1}-run-{run_index + 1}") as stack:
-                            runs.append(observe_scenario(scenario, stack))
-                    except Exception as error:
-                        message = _redact_diagnostics(
-                            f"{scenario.name} run {run_index + 1}: {error}"
-                        )
-                        capture_failures.append((scenario_index, run_index, message))
-                        runs.append({"failure": _redact_diagnostics(str(error))})
-                observations["cases"].append({
-                    "name": scenario.name,
-                    "runs": runs,
-                })
-    except Exception as error:
-        message = _redact_diagnostics(f"DevStack setup failed: {error}")
-        observations["cases"] = [
-            {"name": scenario.name, "runs": []}
+    run_count = arguments["runs"]
+    concurrency_cap = arguments["concurrency"]
+    observations: dict[str, Any] = {
+        "cases": [
+            {"name": scenario.name, "runs": [None] * run_count}
             for scenario in SCENARIOS
         ]
-        capture_failures.append((0, 0, message))
+    }
+    capture_failures: list[tuple[int, int, str]] = []
+    abort_event = threading.Event()
+    launch_lock = threading.Lock()
+    abort_reason_lock = threading.Lock()
+    active_runs: dict[tuple[int, int], dict[str, Any]] = {}
+    abort_reason = [""]
 
-    report = score_observations(observations, required_runs=arguments.runs)
+    def request_abort(reason: str) -> None:
+        with abort_reason_lock:
+            if not abort_event.is_set():
+                abort_reason[0] = reason
+                abort_event.set()
+
+    def execute_run(batch: Any, scenario_index: int, run_index: int) -> tuple[int, int, dict[str, Any] | None, str | None]:
+        scenario = SCENARIOS[scenario_index]
+        run_id = f"case-{scenario_index + 1}-run-{run_index + 1}"
+        key = (scenario_index, run_index)
+        manager = None
+        started_at = None
+        observation = None
+        failure = None
+        with launch_lock:
+            if abort_event.is_set():
+                return scenario_index, run_index, None, f"aborted before launch: {abort_reason[0]}"
+            started_at = time.time()
+            active_runs[key] = {"concurrency": 1}
+            for record in active_runs.values():
+                record["concurrency"] = max(record["concurrency"], len(active_runs))
+            try:
+                manager = batch.run(run_id)
+                stack = manager.__enter__()
+            except BaseException as error:
+                active = active_runs.pop(key)
+                failure = _redact_diagnostics(str(error))
+                request_abort(f"{run_id} failed")
+                return scenario_index, run_index, {
+                    "failure": failure,
+                    "turns": [],
+                    "timing": {
+                        "started_at": started_at,
+                        "ended_at": time.time(),
+                        "concurrency": active["concurrency"],
+                    },
+                }, failure
+        try:
+            observation = observe_scenario(scenario, stack)
+        except BaseException as error:
+            failure = _redact_diagnostics(str(error))
+            request_abort(f"{run_id} failed")
+            try:
+                manager.__exit__(type(error), error, error.__traceback__)
+            except BaseException as exit_error:
+                failure = _redact_diagnostics(f"{failure}; run cleanup failed: {exit_error}")
+        else:
+            try:
+                manager.__exit__(None, None, None)
+            except BaseException as error:
+                failure = _redact_diagnostics(str(error))
+                request_abort(f"{run_id} failed")
+        finally:
+            ended_at = time.time()
+            with launch_lock:
+                active = active_runs.pop(key, {"concurrency": 1})
+            timing = {
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "concurrency": active["concurrency"],
+            }
+            if isinstance(observation, dict):
+                observation["timing"] = timing
+            elif failure is not None:
+                observation = {"failure": failure, "turns": [], "timing": timing}
+        return scenario_index, run_index, observation, failure
+
+    checkout = Path(__file__).resolve().parents[2]
+    batch_started_at = time.time()
+    batch_started_monotonic = time.monotonic()
+    executor = None
+    futures: dict[concurrent.futures.Future[Any], tuple[int, int]] = {}
+    previous_handlers = {}
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        signal_name = signal.Signals(signum).name
+        request_abort(f"received {signal_name}")
+        raise _EvaluationInterrupted(abort_reason[0])
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous_handlers[signum] = signal.signal(signum, handle_signal)
+        try:
+            with DevStack(checkout=checkout, opt_in=True) as batch:
+                try:
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_cap)
+                    for scenario_index in range(len(SCENARIOS)):
+                        for run_index in range(run_count):
+                            future = executor.submit(execute_run, batch, scenario_index, run_index)
+                            futures[future] = (scenario_index, run_index)
+                    for future in concurrent.futures.as_completed(futures):
+                        scenario_index, run_index, observation, failure = future.result()
+                        if observation is not None:
+                            observations["cases"][scenario_index]["runs"][run_index] = observation
+                        if failure is not None:
+                            message = _redact_diagnostics(
+                                f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
+                            )
+                            capture_failures.append((scenario_index, run_index, message))
+                            break
+                        if abort_event.is_set():
+                            break
+                except KeyboardInterrupt as error:
+                    request_abort(str(error) or "received interrupt")
+                    raise
+                except Exception:
+                    request_abort("scheduler failed")
+                    raise
+                finally:
+                    for future in futures:
+                        future.cancel()
+                    if executor is not None:
+                        executor.shutdown(wait=False, cancel_futures=True)
+        except _EvaluationInterrupted as error:
+            request_abort(str(error))
+        except KeyboardInterrupt:
+            request_abort("received SIGINT")
+        except Exception as error:
+            message = _redact_diagnostics(f"DevStack setup failed: {error}")
+            capture_failures.append((0, 0, message))
+            request_abort("DevStack setup failed")
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    for future, (scenario_index, run_index) in futures.items():
+        runs = observations["cases"][scenario_index]["runs"]
+        if runs[run_index] is not None:
+            continue
+        if future.cancelled():
+            failure = f"aborted before launch: {abort_reason[0] or 'evaluation interrupted'}"
+        else:
+            try:
+                result_scenario, result_run, observation, failure = future.result()
+                if observation is not None:
+                    runs[result_run] = observation
+                    if failure is not None:
+                        capture_failures.append((
+                            result_scenario,
+                            result_run,
+                            _redact_diagnostics(
+                                f"{SCENARIOS[result_scenario].name} run {result_run + 1}: {failure}"
+                            ),
+                        ))
+                    continue
+            except BaseException as error:
+                failure = _redact_diagnostics(str(error))
+            failure = failure or f"aborted before launch: {abort_reason[0] or 'evaluation interrupted'}"
+        runs[run_index] = {"failure": failure, "turns": []}
+        capture_failures.append((scenario_index, run_index, _redact_diagnostics(
+            f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
+        )))
+
+    observations["batch_timing"] = {
+        "started_at": batch_started_at,
+        "ended_at": time.time(),
+        "wall_seconds": max(0.0, time.monotonic() - batch_started_monotonic),
+        "concurrency_cap": concurrency_cap,
+    }
+    report = score_observations(observations, required_runs=run_count)
     for observation_case, report_case in zip(
         observations["cases"], report["cases"], strict=False
     ):
@@ -3015,8 +3191,8 @@ def _run_local_eval(argv: list[str]) -> int:
                 report["failures"].append(message)
     for scenario_index, _run_index, message in capture_failures:
         report["failures"].append(message)
-        case = report["cases"][scenario_index]
-        case["failures"].append(message)
+        if scenario_index < len(report["cases"]):
+            report["cases"][scenario_index]["failures"].append(message)
     report["requested_model"] = requested_model
     _add_model_provenance(report, observations, requested_model)
     report["passed"] = not report["failures"]

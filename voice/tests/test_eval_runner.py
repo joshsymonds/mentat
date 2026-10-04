@@ -4779,6 +4779,241 @@ class ScenarioObservationTests(unittest.TestCase):
 
 
 class LocalEvalCliTests(unittest.TestCase):
+    def test_concurrent_batch_schedules_full_cartesian_product_with_indexed_timing(self):
+        import io
+        import json
+        import threading
+        from contextlib import contextmanager, redirect_stdout
+
+        scenarios = (SimpleNamespace(name="first", turns=(), commands=(), place_query=None),
+                     SimpleNamespace(name="second", turns=(), commands=(), place_query=None))
+        lifecycle = []
+        entered = []
+        active = 0
+        maximum_active = 0
+        lock = threading.Lock()
+        first_pair = threading.Barrier(2)
+        completed = []
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                entered.append(run_id)
+                yield SimpleNamespace(base_url="http://127.0.0.1:8485", run_id=run_id)
+
+        @contextmanager
+        def dev_stack(**kwargs):
+            lifecycle.append(("enter", kwargs["opt_in"]))
+            try:
+                yield Batch()
+            finally:
+                lifecycle.append(("exit",))
+
+        def observe(_scenario, stack):
+            nonlocal active, maximum_active
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            if stack.run_id in ("case-1-run-1", "case-1-run-2"):
+                first_pair.wait(timeout=2)
+            time.sleep(0.06 if stack.run_id == "case-1-run-1" else 0.005)
+            with lock:
+                active -= 1
+                completed.append(stack.run_id)
+            return {"run_id": stack.run_id, "turns": []}
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", scenarios),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(output),
+        ):
+            result = runner._run_local_eval(["--live", "--runs", "2", "--concurrency", "2"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertEqual(lifecycle, [("enter", True), ("exit",)])
+        self.assertEqual(set(entered), {
+            "case-1-run-1", "case-1-run-2", "case-2-run-1", "case-2-run-2",
+        })
+        self.assertEqual(maximum_active, 2)
+        self.assertLess(completed.index("case-1-run-2"), completed.index("case-1-run-1"))
+        observations = captured["observations"]
+        self.assertEqual(
+            [[run["run_id"] for run in case["runs"]] for case in observations["cases"]],
+            [["case-1-run-1", "case-1-run-2"], ["case-2-run-1", "case-2-run-2"]],
+        )
+        self.assertEqual(report["batch_timing"]["concurrency_cap"], 2)
+        self.assertLessEqual(report["batch_timing"]["started_at"], report["batch_timing"]["ended_at"])
+        self.assertGreaterEqual(report["batch_timing"]["wall_seconds"], 0)
+        for case in report["cases"]:
+            timings = case["run_timings"]
+            self.assertEqual([item["run"] for item in timings], [1, 2])
+            for timing in timings:
+                self.assertLessEqual(timing["started_at"], timing["ended_at"])
+                self.assertGreaterEqual(timing["concurrency"], 1)
+                self.assertLessEqual(timing["concurrency"], 2)
+
+    def test_concurrency_default_and_positive_override_validation(self):
+        self.assertEqual(runner.DEFAULT_CONCURRENCY, 16)
+        self.assertEqual(runner._parse_local_eval_arguments(["--live", "--runs", "1"])["concurrency"], 16)
+        self.assertEqual(runner._parse_local_eval_arguments(
+            ["--live", "--runs", "1", "--concurrency", "3"]
+        )["concurrency"], 3)
+        for invalid in ("0", "-1", "not-a-number"):
+            with self.subTest(invalid=invalid), self.assertRaises(SystemExit):
+                runner._parse_local_eval_arguments(["--live", "--concurrency", invalid])
+
+    def test_harness_error_stops_queued_launches_and_keeps_original_positions(self):
+        import io
+        import json
+        import threading
+        from contextlib import contextmanager, redirect_stdout
+
+        scenario = SimpleNamespace(name="abort", turns=(), commands=(), place_query=None)
+        entered = []
+        second_started = threading.Event()
+        stack_exited = threading.Event()
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                entered.append(run_id)
+                yield SimpleNamespace(base_url="http://127.0.0.1:8485", run_id=run_id)
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            try:
+                yield Batch()
+            finally:
+                stack_exited.set()
+
+        def observe(_scenario, stack):
+            if stack.run_id.endswith("run-1"):
+                self.assertTrue(second_started.wait(timeout=2))
+                raise RuntimeError("harness exploded")
+            second_started.set()
+            self.assertTrue(stack_exited.wait(timeout=2))
+            return {"run_id": stack.run_id, "turns": []}
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(output),
+        ):
+            runner._run_local_eval(["--live", "--runs", "4", "--concurrency", "2"])
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(set(entered), {"case-1-run-1", "case-1-run-2"})
+        runs = captured["observations"]["cases"][0]["runs"]
+        self.assertEqual([run.get("run_id") for run in runs], [None, "case-1-run-2", None, None])
+        self.assertIn("harness exploded", runs[0]["failure"])
+        self.assertEqual([run["failure"] for run in runs[2:]], [
+            "aborted before launch: case-1-run-1 failed",
+            "aborted before launch: case-1-run-1 failed",
+        ])
+
+    def test_sigterm_stops_queued_launches_when_dev_stack_overrides_signal_handler(self):
+        import concurrent.futures
+        import io
+        import json
+        import signal
+        import threading
+        from contextlib import redirect_stdout
+
+        scenario = SimpleNamespace(name="signal", turns=(), commands=(), place_query=None)
+        launch_calls = []
+        launch_entered = threading.Event()
+        release_enter = threading.Event()
+        batch_exited = threading.Event()
+        handlers = {}
+        real_as_completed = concurrent.futures.as_completed
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        def fake_signal(signum, handler):
+            if callable(handler):
+                handlers[signum] = handler
+            return signal.SIG_DFL
+
+        test_case = self
+
+        class Batch:
+            def run(self, run_id):
+                launch_calls.append(run_id)
+
+                class Run:
+                    def __enter__(self):
+                        launch_entered.set()
+                        if run_id.endswith("run-1"):
+                            test_case.assertTrue(release_enter.wait(timeout=2))
+                        return SimpleNamespace(run_id=run_id)
+
+                    def __exit__(self, *_args):
+                        return False
+
+                return Run()
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            # DevStack installs its own signal handler after the runner's handler.
+            def dev_stack_handler(_signum, _frame):
+                raise KeyboardInterrupt("received signal 15")
+
+            handlers[signal.SIGTERM] = dev_stack_handler
+            try:
+                yield Batch()
+            finally:
+                batch_exited.set()
+                release_enter.set()
+
+        def observe(_scenario, stack):
+            self.assertTrue(batch_exited.is_set())
+            return {"run_id": stack.run_id, "turns": []}
+
+        def interrupted_as_completed(futures):
+            self.assertTrue(launch_entered.wait(timeout=2))
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            yield from real_as_completed(futures)
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            patch.object(runner.signal, "signal", side_effect=fake_signal),
+            patch.object(runner.concurrent.futures, "as_completed", side_effect=interrupted_as_completed),
+            redirect_stdout(output),
+        ):
+            runner._run_local_eval(["--live", "--runs", "4", "--concurrency", "2"])
+
+        self.assertEqual(launch_calls, ["case-1-run-1"])
+        runs = captured["observations"]["cases"][0]["runs"]
+        self.assertEqual(runs[0]["run_id"], "case-1-run-1")
+        self.assertTrue(all("aborted before launch" in run["failure"] for run in runs[1:]))
+
     def test_list_prints_all_scenarios_without_starting_dev_stack(self):
         output = []
         with patch.object(runner, "DevStack", create=True) as dev_stack, patch(
@@ -4848,7 +5083,10 @@ class LocalEvalCliTests(unittest.TestCase):
             result = runner.main(["eval", "--live", "--runs", "2"])
 
         self.assertEqual(result, 0)
-        self.assertEqual(calls, [scenario.name for scenario in SCENARIOS for _ in range(2)])
+        self.assertEqual(
+            sorted(calls),
+            sorted(scenario.name for scenario in SCENARIOS for _ in range(2)),
+        )
         self.assertEqual(lifecycle, [("enter", True), ("exit",)])
         report = json.loads(output[0])
         self.assertTrue(report["passed"])
@@ -4870,70 +5108,119 @@ class LocalEvalCliTests(unittest.TestCase):
         )
         self.assertEqual(report["cases"][7]["phone_commands"], [[], []])
 
-    def test_failed_run_with_pending_phone_receipt_does_not_pollute_its_sibling(self):
+    def test_concurrent_identical_phone_receipts_keep_times_after_reverse_completion(self):
         import io
         import json
+        import threading
         from contextlib import contextmanager, redirect_stdout
 
-        scenario = SimpleNamespace(name="isolated-phone", turns=(), commands=(), place_query=None)
+        scenario = SimpleNamespace(
+            name="isolated-phone",
+            turns=(SimpleNamespace(answer_patterns=("timer set",), sms_recipient=None),),
+            commands=({"turn": 1, "kind": "timer", "seconds": 300},),
+            place_query=None,
+            room_close_after=None,
+        )
         run_ids = []
-        observed = []
+        completed = []
+        first_run_receipts = []
+        first_receipt_pending = threading.Event()
+        second_run_exited = threading.Event()
+        second_finished_with_first_pending = []
+        captured = {}
+        original_score = runner.score_observations
 
         class Batch:
+            @contextmanager
             def run(self, run_id):
                 run_ids.append(run_id)
-
-                @contextmanager
-                def context():
-                    yield SimpleNamespace(base_url=f"http://127.0.0.1:{49150 + len(run_ids)}")
-
-                return context()
+                try:
+                    yield SimpleNamespace(run_id=run_id)
+                finally:
+                    completed.append(run_id)
+                    if run_id.endswith("run-2"):
+                        second_finished_with_first_pending.append(
+                            first_receipt_pending.is_set() and not first_run_receipts
+                        )
+                        second_run_exited.set()
 
         @contextmanager
         def batch_context(**_kwargs):
             yield Batch()
 
         def observe(_scenario, stack):
-            observed.append(stack.base_url)
-            if len(observed) == 1:
-                raise RuntimeError("fake phone command result is still pending")
+            run_one = stack.run_id.endswith("run-1")
+            if run_one:
+                first_receipt_pending.set()
+                self.assertTrue(second_run_exited.wait(timeout=2))
+                base = 10.0
+                receipt_at = 10.5
+            else:
+                base = 20.0
+                receipt_at = 20.5
+            if run_one:
+                first_run_receipts.append(receipt_at)
             return {
-                "turns": [],
-                "phone_commands": [{"id": "same-command-id", "turn": 1, "received_at": 2.0}],
+                "turns": [{
+                    "kind": "action",
+                    "speech_end": base,
+                    "speech_end_wall": base,
+                    "first_audio": base + 0.5,
+                    "capture_started": base + 0.1,
+                    "segments": [{"start": 0.2, "end": 0.4, "text": "Timer set for five minutes."}],
+                    "command_received_at": receipt_at,
+                    "answer_at": base + 1.0,
+                    "overlap": False,
+                    "expect_confirmation": False,
+                    "confirmation": None,
+                    "expect_hangup": False,
+                    "room_deleted": None,
+                    "model_calls": [{
+                        "id": stack.run_id,
+                        "model": "gpt-6-sol",
+                        "service_tier": None,
+                        "result_service_tier": "standard",
+                        "speed": "standard",
+                        "fast_mode_state": "off",
+                    }],
+                }],
+                "phone_commands": [{
+                    "id": "same-command-id",
+                    "kind": "timer",
+                    "turn": 1,
+                    "received_at": receipt_at,
+                }],
             }
 
-        scored = {}
-
-        def score_observations(observations, *, required_runs):
-            scored["observations"] = observations
-            scored["required_runs"] = required_runs
-            return {
-                "passed": False,
-                "failures": [],
-                "cases": [{"name": scenario.name, "failures": [], "turns": []}],
-            }
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            captured["required_runs"] = required_runs
+            return original_score(observations, required_runs=required_runs)
 
         output = io.StringIO()
         with (
             patch.object(runner, "SCENARIOS", (scenario,)),
             patch.object(runner, "DevStack", side_effect=batch_context),
             patch.object(runner, "observe_scenario", side_effect=observe),
-            patch.object(runner, "score_observations", side_effect=score_observations),
+            patch.object(runner, "score_observations", side_effect=capture_score),
             patch.object(runner, "_requested_voice_model", return_value="chatgpt/sol-fast"),
             redirect_stdout(output),
         ):
-            result = runner._run_local_eval(["--live", "--runs", "2"])
+            result = runner._run_local_eval(["--live", "--runs", "2", "--concurrency", "2"])
 
         report = json.loads(output.getvalue())
-        self.assertEqual(result, 1)
-        self.assertEqual(run_ids, ["case-1-run-1", "case-1-run-2"])
-        self.assertNotEqual(observed[0], observed[1])
-        runs = scored["observations"]["cases"][0]["runs"]
-        self.assertEqual(runs[0], {"failure": "fake phone command result is still pending"})
-        self.assertEqual(runs[1]["phone_commands"], [{
-            "id": "same-command-id", "turn": 1, "received_at": 2.0,
-        }])
-        self.assertIn("fake phone command result is still pending", " ".join(report["failures"]))
+        self.assertEqual(result, 0)
+        self.assertEqual(set(run_ids), {"case-1-run-1", "case-1-run-2"})
+        self.assertEqual(completed, ["case-1-run-2", "case-1-run-1"])
+        self.assertEqual(second_finished_with_first_pending, [True])
+        runs = captured["observations"]["cases"][0]["runs"]
+        self.assertEqual(
+            [[receipt["id"], receipt["received_at"]] for run in runs
+             for receipt in run["phone_commands"]],
+            [["same-command-id", 10.5], ["same-command-id", 20.5]],
+        )
+        self.assertEqual(captured["required_runs"], 2)
+        self.assertTrue(report["passed"])
 
     def test_live_eval_retains_interpreter_phone_commands_and_fails_on_timer(self):
         from contextlib import contextmanager
@@ -5003,7 +5290,7 @@ class LocalEvalCliTests(unittest.TestCase):
         ), patch(
             "builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])
         ):
-            result = runner.main(["eval", "--live", "--runs", "2"])
+            result = runner.main(["eval", "--live", "--runs", "2", "--concurrency", "1"])
 
         report = json.loads(output[0])
         self.assertEqual(result, 1)
@@ -5015,7 +5302,7 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertTrue(any("fake phone command log is not empty" in failure for failure in report["failures"]))
         self.assertEqual(lifecycle, [("enter", True), ("exit",)])
 
-    def test_live_eval_requires_opt_in_and_continues_after_case_failure(self):
+    def test_live_eval_requires_opt_in_and_aborts_after_harness_failure(self):
         from contextlib import contextmanager
         import json
 
@@ -5066,9 +5353,9 @@ class LocalEvalCliTests(unittest.TestCase):
         with patch.object(runner, "DevStack", side_effect=dev_stack, create=True), patch.object(
             runner, "observe_scenario", side_effect=observe
         ), patch("builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])):
-            result = runner.main(["eval", "--live", "--runs", "1"])
+            result = runner.main(["eval", "--live", "--runs", "1", "--concurrency", "1"])
         self.assertEqual(result, 1)
-        self.assertEqual(calls, [scenario.name for scenario in SCENARIOS])
+        self.assertEqual(calls, [SCENARIOS[0].name])
         self.assertEqual(lifecycle, [("enter", True), ("exit",)])
         report = json.loads(output[0])
         self.assertFalse(report["passed"])
