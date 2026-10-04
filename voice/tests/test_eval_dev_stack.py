@@ -126,6 +126,23 @@ def isolated_run(**kwargs):
 
 class DevStackTest(unittest.TestCase):
     def setUp(self):
+        control_root = tempfile.TemporaryDirectory(prefix="mentat-dev-stack-test-")
+        self._control_temp_root = Path(control_root.name)
+        self.addCleanup(control_root.cleanup)
+
+        original_mkdtemp = tempfile.mkdtemp
+
+        def isolated_mkdtemp(*args, **kwargs):
+            kwargs["dir"] = control_root.name
+            return original_mkdtemp(*args, **kwargs)
+
+        tempdir_patcher = patch(
+            "voice.evals.dev_stack.tempfile",
+            SimpleNamespace(mkdtemp=isolated_mkdtemp),
+        )
+        tempdir_patcher.start()
+        self.addCleanup(tempdir_patcher.stop)
+
         original_popen = subprocess.Popen
 
         def offline_popen(command, *args, **kwargs):
@@ -134,9 +151,16 @@ class DevStackTest(unittest.TestCase):
                 raise AssertionError("offline fixture attempted a real SSH/SCP process")
             return original_popen(command, *args, **kwargs)
 
-        patcher = patch("voice.evals.dev_stack.subprocess.Popen", side_effect=offline_popen)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        popen_patcher = patch("voice.evals.dev_stack.subprocess.Popen", side_effect=offline_popen)
+        popen_patcher.start()
+        self.addCleanup(popen_patcher.stop)
+
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = b'{"status":"ok"}\n'
+        health_patcher = patch("urllib.request.urlopen", return_value=response)
+        health_patcher.start()
+        self.addCleanup(health_patcher.stop)
 
     def test_ssh_transports_admit_handshakes_and_overlap_sixteen_voice_captures(self):
         from threading import Barrier, Lock, Thread
@@ -1227,13 +1251,38 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         self.assertEqual(remote.call_args.args[0], _STOP_RUN_SCRIPT)
         self.assertFalse(stack._producers_stopped)
 
-    def setUp(self):
-        response = unittest.mock.MagicMock()
-        response.__enter__.return_value.status = 200
-        response.__enter__.return_value.read.return_value = b'{"status":"ok"}\n'
-        self._health_patch = patch("urllib.request.urlopen", return_value=response)
-        self._health_patch.start()
-        self.addCleanup(self._health_patch.stop)
+    def test_offline_set_up_rejects_ssh_and_scp_before_popen_and_fakes_health(self):
+        sentinel = unittest.mock.Mock(side_effect=AssertionError("Popen sentinel reached"))
+        probe = DevStackTest("runTest")
+        with patch("voice.evals.dev_stack.subprocess.Popen", sentinel):
+            probe.setUp()
+            try:
+                for command in (["ssh", "host", "true"], ["scp", "source", "host:/destination"]):
+                    with self.subTest(command=command):
+                        with self.assertRaisesRegex(AssertionError, "offline fixture attempted a real SSH/SCP process"):
+                            subprocess.Popen(command)
+                sentinel.assert_not_called()
+                with urllib.request.urlopen("https://health.invalid") as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), b'{"status":"ok"}\n')
+            finally:
+                control_root = probe._control_temp_root
+                probe.doCleanups()
+                self.assertFalse(control_root.exists())
+
+    def test_ssh_control_directory_is_removed_on_close(self):
+        transport = _SSHTransport(
+            "ultraviolet",
+            run=lambda args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+        )
+        transport.connect()
+        control_directory = Path(transport._directory)
+        self.assertTrue(control_directory.is_dir())
+
+        transport.close()
+
+        self.assertFalse(control_directory.exists())
+        self.assertEqual(list(self._control_temp_root.iterdir()), [])
 
     def test_requires_explicit_opt_in_before_any_remote_action(self):
         run = unittest.mock.Mock()
