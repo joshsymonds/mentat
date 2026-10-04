@@ -1,0 +1,351 @@
+[
+  {
+    "id": "action-timer-yes",
+    "family": "action_ack",
+    "inputs": {"action": "timer", "expected": "a five-minute timer"},
+    "reply": " on it. Your five minute timer is set.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "timer-300-seconds", "run": 1, "turn": 1, "segments": [0, 1]}
+  },
+  {
+    "id": "action-wrong-type",
+    "family": "action_ack",
+    "inputs": {"action": "timer", "expected": "a five-minute timer"},
+    "reply": "Your alarm is set for five minutes.",
+    "expected": false,
+    "tags": ["wrong-action"],
+    "source": {"kind": "scenario_corruption", "based_on": "action-timer-yes", "change": "changed the requested timer action to an alarm"}
+  },
+  {
+    "id": "timer-duration-five-minutes",
+    "family": "timer_duration",
+    "inputs": {"seconds": 300},
+    "reply": " on it. Your five minute timer is set.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "timer-300-seconds", "run": 1, "turn": 1, "segments": [0, 1]}
+  },
+  {
+    "id": "timer-duration-wrong-amount",
+    "family": "timer_duration",
+    "inputs": {"seconds": 300},
+    "reply": "Your ten-minute timer is set.",
+    "expected": false,
+    "tags": ["wrong-amount", "wrong-time"],
+    "source": {"kind": "scenario_corruption", "based_on": "timer-duration-five-minutes", "change": "changed five minutes to ten minutes"}
+  },
+  {
+    "id": "alarm-seven-am",
+    "family": "alarm_time",
+    "inputs": {"hour": 7, "minute": 0},
+    "reply": " You got it. Setting that now. Your alarm's set for 7 a.m.",
+    "expected": true,
+    "tags": ["six-oclock-equivalence", "retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "equivalent-alarm", "run": 1, "turn": 1, "segments": [0, 1, 2]}
+  },
+  {
+    "id": "alarm-wrong-meridiem",
+    "family": "alarm_time",
+    "inputs": {"hour": 7, "minute": 0},
+    "reply": "Your alarm's set for 7 p.m.",
+    "expected": false,
+    "tags": ["wrong-time"],
+    "source": {"kind": "scenario_corruption", "based_on": "alarm-seven-am", "change": "changed 7 a.m. to 7 p.m."}
+  },
+  {
+    "id": "place-alice-keck-park",
+    "family": "place_lookup",
+    "inputs": {"place_name": "Alice Keck Park Memorial Garden", "locality": "Santa Barbara"},
+    "reply": " On it. Looking that up. I found it. Alice Keck Park Memorial Garden is at 1500 Santa Barbara Street in Santa Barbara, California.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "place-search-navigation", "run": 2, "turn": 1, "segments": [0, 1, 2, 3]}
+  },
+  {
+    "id": "place-wrong-locality",
+    "family": "place_lookup",
+    "inputs": {"place_name": "Alice Keck Park Memorial Garden", "locality": "Santa Barbara"},
+    "reply": "Alice Keck Park Memorial Garden is in Los Angeles.",
+    "expected": false,
+    "tags": ["wrong-attribution"],
+    "source": {"kind": "scenario_corruption", "based_on": "place-alice-keck-park", "change": "changed the requested locality to Los Angeles"}
+  },
+  {
+    "id": "sms-initial-six-oclock",
+    "family": "sms_say_back",
+    "inputs": {"recipient": "+1-202-555-0142", "body": "I will be there at 6:00."},
+    "reply": "Got it. I'll text plus 1202555. 0142 saying exactly. I will be there at 6. Should I send it? Yes or no?",
+    "expected": true,
+    "tags": ["initial-sms", "six-minute-equivalence"],
+    "source": {"kind": "transcript", "artifact": "mentat-voice-eval-fozvq9km/sms-audio/transcripts.jsonl", "line": 1}
+  },
+  {
+    "id": "sms-corrected-inherited-recipient",
+    "family": "sms_say_back",
+    "inputs": {"recipient": "+1-202-555-0142", "verified_recipient": "+1-202-555-0142", "body": "I will be there at 7:00."},
+    "context": "The prior turn confirmed +1-202-555-0142 for the message saying I will be there at six. The caller corrected only the message time to seven; the recipient remains the previously confirmed number.",
+    "reply": "Got it. I've switched it to 7. I'll text. plus one, two, zero, two. 5 5 5 0142 And the message is... I will be there at 7. Should I send it? Yes or no?",
+    "expected": true,
+    "tags": ["corrected-sms", "inherited-recipient", "retained-2026-10-03"],
+    "source": {"kind": "transcript", "artifact": "mentat-voice-eval-fozvq9km/sms-audio/transcripts.jsonl", "line": 8}
+  },
+  {
+    "id": "sms-wrong-digits",
+    "family": "sms_say_back",
+    "inputs": {"recipient": "+1-202-555-0142", "body": "I will be there at 6:00."},
+    "reply": "I'll text +1-800-555-0142 saying I will be there at six. Should I send it?",
+    "expected": false,
+    "tags": ["wrong-digits"],
+    "source": {"kind": "scenario_corruption", "based_on": "sms-initial-six-oclock", "change": "changed the recipient digits"}
+  },
+  {
+    "id": "sms-wrong-body-time",
+    "family": "sms_say_back",
+    "inputs": {"recipient": "+1-202-555-0142", "body": "I will be there at 6:00."},
+    "reply": "I'll text +1-202-555-0142 saying I will be there at seven. Should I send it?",
+    "expected": false,
+    "tags": ["wrong-body", "wrong-time"],
+    "source": {"kind": "scenario_corruption", "based_on": "sms-initial-six-oclock", "change": "changed the message time from six to seven"}
+  },
+  {
+    "id": "sms-unanchored-recipient",
+    "family": "sms_say_back",
+    "inputs": {"recipient": "+1-202-555-0142", "body": "I will be there at 6:00."},
+    "reply": "Same number, and the message says I will be there at six. Should I send it?",
+    "expected": false,
+    "tags": ["unanchored-sms"],
+    "source": {"kind": "scenario_corruption", "based_on": "sms-initial-six-oclock", "change": "claimed the same number without providing a previously verified recipient context"}
+  },
+  {
+    "id": "sms-sent-acknowledgment",
+    "family": "sms_send_ack",
+    "inputs": {"recipient": "+1-202-555-0142"},
+    "context": "The caller asked to text +1-202-555-0142 with the message and explicitly authorized sending.",
+    "reply": "on it. Scent Your text saying you'll be there at 6 went through.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "transcript", "artifact": "mentat-voice-eval-7k86ggkv/sms-audio/transcripts.jsonl", "line": 2}
+  },
+  {
+    "id": "sms-draft-not-sent",
+    "family": "sms_send_ack",
+    "inputs": {"recipient": "+1-202-555-0142"},
+    "reply": "The text is drafted, but I have not sent it.",
+    "expected": false,
+    "tags": ["not-sent"],
+    "source": {"kind": "scenario_corruption", "based_on": "sms-sent-acknowledgment", "change": "changed sent confirmation into an unsent draft"}
+  },
+  {
+    "id": "sms-confirmation-present",
+    "family": "sms_confirmation",
+    "inputs": {"recipient": "+1-202-555-0142", "body": "I will be there at 6:00."},
+    "reply": "Got it. Just to confirm, I'll text plus one two zero two. 5 5 5 0142. with the message. I will be there at six o'clock. Should I send it? Yes or no?",
+    "expected": true,
+    "tags": ["initial-sms", "six-minute-equivalence", "retained-2026-10-03"],
+    "source": {"kind": "transcript", "artifact": "mentat-voice-eval-7k86ggkv/sms-audio/transcripts.jsonl", "line": 1}
+  },
+  {
+    "id": "sms-confirmation-missing",
+    "family": "sms_confirmation",
+    "inputs": {"recipient": "+1-202-555-0142", "body": "I will be there at 6:00."},
+    "reply": "I'll text +1-202-555-0142 with the message I will be there at six o'clock.",
+    "expected": false,
+    "tags": ["missing-confirmation"],
+    "source": {"kind": "scenario_corruption", "based_on": "sms-confirmation-present", "change": "removed the explicit send authorization question"}
+  },
+  {
+    "id": "claims-alice-wealth-source",
+    "family": "claims",
+    "inputs": {"required": ["Alice Keck's fortune came from her family wealth connected to Superior Oil"], "rejected": ["Alice Keck built the fortune herself"]},
+    "context": "The caller asked about Alice Keck's wealth.",
+    "reply": " It was oil money. Her father, William Keck. founded the Superior Oil Company back in the early 20th century. and turned it into one of the biggest independent oil producers in the country. Her fortune came from that family wealth. As far as I know, she didn't build it herself. She inherited it and then gave a lot of it away.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "alice-keck-context-chain", "run": 1, "turn": 3, "segments": [0, 1, 2, 3, 4, 5, 6]}
+  },
+  {
+    "id": "claims-wrong-amount-and-attribution",
+    "family": "claims",
+    "inputs": {"required": ["Alice Keck's family wealth was connected to Superior Oil"], "rejected": ["Alice Keck's fortune came from a $200 million personal lottery win"]},
+    "reply": "Alice Keck's fortune came from a $200 million personal lottery win.",
+    "expected": false,
+    "tags": ["wrong-amount", "wrong-attribution"],
+    "source": {"kind": "scenario_corruption", "based_on": "claims-alice-wealth-source", "change": "replaced family oil wealth with a fabricated $200 million lottery source"}
+  },
+  {
+    "id": "alice-donor-park-purchase",
+    "family": "alice_donor",
+    "inputs": {"donor": "Alice Keck", "action": "put up the money so the city could buy the land"},
+    "context": "The question is why the garden is named for Alice Keck.",
+    "reply": " It's named after Alice Keck Park. the oil heiress and philanthropist who saved the land. Back in the 70s, that block in downtown Santa Barbara was headed for development. And she put up the money to buy it and gave it to the city so it'd stay open space. It became a public garden in her memory after she died. The gardens planted mostly with drought-tolerant and native plants, which fits Santa Barbara pretty well.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "alice-keck-context-chain", "run": 1, "turn": 1, "segments": [0, 1, 2, 3, 4, 5, 6]}
+  },
+  {
+    "id": "alice-donor-wrong-attribution",
+    "family": "alice_donor",
+    "inputs": {"donor": "Alice Keck", "action": "put up the money so the city could buy the land"},
+    "reply": "John Smith put up the money so the city could buy the land.",
+    "expected": false,
+    "tags": ["wrong-attribution"],
+    "source": {"kind": "scenario_corruption", "based_on": "alice-donor-park-purchase", "change": "changed the donor attribution"}
+  },
+  {
+    "id": "alice-father-william-keck",
+    "family": "alice_father",
+    "inputs": {"person": "Alice Keck", "father": "William Keck"},
+    "context": "The caller asked who Alice Keck was.",
+    "reply": " She was a Santa Barbara philanthropist and an heir to the Keck oil fortune. Her father, William Keck. founded Superior Oil. She lived in Santa Barbara. They have a lot to local causes. and was known as a big animal and nature lover. She died in the late 70s. not long after she bought the land. and the garden was finished and named in her memory a few years later.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "alice-keck-context-chain", "run": 1, "turn": 2, "segments": [0, 1, 2, 3, 4, 5, 6, 7, 8]}
+  },
+  {
+    "id": "alice-father-wrong-person",
+    "family": "alice_father",
+    "inputs": {"person": "Alice Keck", "father": "William Keck"},
+    "reply": "William Keck was Alice Keck's brother, not her father.",
+    "expected": false,
+    "tags": ["wrong-attribution"],
+    "source": {"kind": "scenario_corruption", "based_on": "alice-father-william-keck", "change": "changed the father relationship to brother"}
+  },
+  {
+    "id": "alice-wealth-oil-family",
+    "family": "alice_wealth",
+    "inputs": {"person": "Alice Keck", "source": "family wealth from Superior Oil"},
+    "context": "The caller asked what the source of Alice Keck's wealth was.",
+    "reply": " It was oil money. Her father, William Keck. founded the Superior Oil Company back in the early 20th century. and turned it into one of the biggest independent oil producers in the country. Her fortune came from that family wealth. As far as I know, she didn't build it herself. She inherited it and then gave a lot of it away.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "alice-keck-context-chain", "run": 1, "turn": 3, "segments": [0, 1, 2, 3, 4, 5, 6]}
+  },
+  {
+    "id": "alice-wealth-wrong-source",
+    "family": "alice_wealth",
+    "inputs": {"person": "Alice Keck", "source": "family wealth from Superior Oil"},
+    "reply": "Alice Keck's wealth came from a personal lottery win, not her family or Superior Oil.",
+    "expected": false,
+    "tags": ["wrong-amount", "wrong-attribution"],
+    "source": {"kind": "scenario_corruption", "based_on": "alice-wealth-oil-family", "change": "replaced the family-oil source with a false personal source and amount claim"}
+  },
+  {
+    "id": "spanish-switch-turn-1",
+    "family": "spanish_switch",
+    "inputs": {"turn": 1},
+    "reply": " Sure. Switching to Spanish Listo. Ya estoy en español.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-language-switch", "run": 1, "turn": 1, "segments": [0, 1, 2, 3]}
+  },
+  {
+    "id": "spanish-switch-turn-2",
+    "family": "spanish_switch",
+    "inputs": {"turn": 2},
+    "reply": " La capital de Francia es París.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-language-switch", "run": 1, "turn": 2, "segments": [0]}
+  },
+  {
+    "id": "spanish-switch-turn-3",
+    "family": "spanish_switch",
+    "inputs": {"turn": 3},
+    "reply": " Claro. Switching back. Okay, I'm back to English.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-language-switch", "run": 1, "turn": 3, "segments": [0, 1, 2]}
+  },
+  {
+    "id": "spanish-switch-turn-4",
+    "family": "spanish_switch",
+    "inputs": {"turn": 4},
+    "reply": " Sure. Back to Spanish. Listo, ya estamos otra vez en español.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-language-switch", "run": 1, "turn": 4, "segments": [0, 1, 2]}
+  },
+  {
+    "id": "spanish-switch-turn-5",
+    "family": "spanish_switch",
+    "inputs": {"turn": 5},
+    "reply": " En un día despejado, el cielo es azul. es por cómo el aire dispersa la luz del sol. La luz azul se dispersa mucho más que la roja.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-language-switch", "run": 2, "turn": 5, "segments": [0, 1, 2]}
+  },
+  {
+    "id": "spanish-switch-wrong-language",
+    "family": "spanish_switch",
+    "inputs": {"turn": 5},
+    "reply": "The sky is blue on a clear day.",
+    "expected": false,
+    "tags": ["wrong-language"],
+    "source": {"kind": "scenario_corruption", "based_on": "spanish-switch-turn-5", "change": "translated the answer into English instead of Spanish"}
+  },
+  {
+    "id": "interpreter-turn-1",
+    "family": "interpreter_turn",
+    "inputs": {"turn": 1},
+    "context": "The caller asked to interpret for the Spanish-speaking gardener and said the caller is ready.",
+    "reply": "[[es]] Estoy listo.",
+    "expected": true,
+    "tags": ["retained-scripted-reply"],
+    "source": {"kind": "record_segment", "artifact": "/tmp/mentat-voice-eval-869o6jy0/records/voice-android-986b96b0-8407-429c-9cd6-00887716702a.jsonl", "line": 31, "block": 0}
+  },
+  {
+    "id": "interpreter-turn-2",
+    "family": "interpreter_turn",
+    "inputs": {"turn": 2},
+    "reply": " The gardener says the soil is too dry to plant tomatoes.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-interpreter", "run": 2, "turn": 2, "segments": [0]}
+  },
+  {
+    "id": "interpreter-turn-3",
+    "family": "interpreter_turn",
+    "inputs": {"turn": 3},
+    "reply": " Riegue las plántulas todas las mañanas, antes de que el sol esté fuerte.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-interpreter", "run": 2, "turn": 3, "segments": [0]}
+  },
+  {
+    "id": "interpreter-turn-4",
+    "family": "interpreter_turn",
+    "inputs": {"turn": 4},
+    "reply": " The gardener says. Now set a five-minute timer to water the plants.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-interpreter", "run": 2, "turn": 4, "segments": [0, 1]}
+  },
+  {
+    "id": "interpreter-turn-5",
+    "family": "interpreter_turn",
+    "inputs": {"turn": 5},
+    "reply": " The gardener says. While we were talking about the work, the gardener said, stop translating.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-interpreter", "run": 2, "turn": 5, "segments": [0, 1, 2]}
+  },
+  {
+    "id": "interpreter-turn-6",
+    "family": "interpreter_turn",
+    "inputs": {"turn": 6},
+    "reply": " Sure. Switching back to English. I've stopped interpreting. So, it's just you and me in English now.",
+    "expected": true,
+    "tags": ["retained-2026-10-03"],
+    "source": {"kind": "trace_segment_join", "artifact": "voice-eval-parallel/evidence/final-review-live.json", "case": "spanish-interpreter", "run": 2, "turn": 6, "segments": [0, 1, 2, 3]}
+  },
+  {
+    "id": "interpreter-turn-5-misread-as-command",
+    "family": "interpreter_turn",
+    "inputs": {"turn": 5},
+    "reply": "I will stop interpreting now.",
+    "expected": false,
+    "tags": ["quoted-speech-vs-command"],
+    "source": {"kind": "scenario_corruption", "based_on": "interpreter-turn-5", "change": "treated the gardener's quoted words as an instruction and stopped translating"}
+  }
+]

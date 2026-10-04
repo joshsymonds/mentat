@@ -290,3 +290,21 @@ phrase; neither is acted on as a phone command or mode change.
 The eval prints a JSON report to stdout and exits nonzero if any scenario,
 observation-count, or latency gate fails. Keep the report when diagnosing a
 failure; a successful process exit means every strict gate passed.
+
+### Semantic reply-judge qualification
+
+`just eval-judge` is a separate, opt-in live call to the semantic judge. It
+requires `TYPESAFE_API_KEY` and sends all retained-reply and deliberate
+scenario-corruption fixtures to the judge in three concurrent sweeps. Each
+fixture/run gets a new judge instance so cached verdicts cannot cross fixtures
+or runs. The corpus covers all thirteen question families, including each
+Spanish-switch and interpreter turn, corrected and inherited SMS recipients,
+read-back/confirmation distinctions, and wrong digits, message content, times,
+amounts, and attributions.
+
+The command prints one JSON report with per-run and per-family correct/wrong
+counts, each fixture's built question and probability/verdict evidence, and
+unavailable outcomes. Every sweep must pass at least 95% of correct fixtures,
+judge every known-wrong fixture no, and have zero unavailable results; any
+failed bar returns a nonzero exit. Offline coverage is `just test-voice`; it
+uses `ScriptedJudge` and does not call the live service.

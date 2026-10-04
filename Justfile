@@ -25,6 +25,10 @@ eval-voice RUNS='10' MODEL='chatgpt/sol-fast' CONCURRENCY='':
 eval-stt RUNS='1':
     "$(nix build .#voice-env --no-link --print-out-paths)/bin/python3" -m voice.evals.stt_phrases --runs {{quote(RUNS)}}
 
+# Opt-in live semantic judge qualification; sends every corpus fixture in three uncached concurrent runs.
+eval-judge:
+    PYTHONDONTWRITEBYTECODE=1 python3 -m voice.evals.judge_qualify
+
 # Public OAuth front (public/): FastMCP and Uvicorn from the flake environment
 test-public:
     "$(nix build .#public-env --no-link --print-out-paths)/bin/python" -m unittest discover -s public/tests
