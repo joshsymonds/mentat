@@ -37,10 +37,40 @@ from voice.evals.dev_stack import (
     _START_WORKER_SCRIPT,
     _STOP_RUN_SCRIPT,
     _REFRESH_RESTORE_GUARD_SCRIPT,
+    _SSHTransport,
 )
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
+
+
+def _legacy_transport_args(args):
+    """Keep lifecycle fakes focused on remote commands, not SSH option plumbing."""
+    if args[0] == "ssh":
+        if "-M" in args or "-O" in args:
+            return None
+        if "-S" in args:
+            index = args.index("-S") + 2
+            while index < len(args):
+                if args[index] == "-o":
+                    index += 2
+                    continue
+                return ["ssh", *args[index:]]
+    if args[0] == "scp":
+        normalized = [args[0]]
+        index = 1
+        while index < len(args):
+            if args[index] == "-o" and index + 1 < len(args):
+                option = args[index + 1]
+                if option.startswith("ControlPath=") or option in (
+                    "ControlMaster=no", "ProxyCommand=false",
+                ):
+                    index += 2
+                    continue
+            normalized.append(args[index])
+            index += 1
+        return normalized
+    return args
 
 
 def run_setup_environment(run_dir, model):
@@ -69,6 +99,9 @@ def isolated_run(**kwargs):
     ))
 
     def run(args, **options):
+        args = _legacy_transport_args(args)
+        if args is None:
+            return subprocess.CompletedProcess(["ssh"], 0, "", "")
         result = command_runner(args, **options)
         if args[:2] == ["ssh", "ultraviolet"] and len(args) > 2 and args[2] == "mktemp":
             if re.fullmatch(r"/tmp/mentat-eval-batch\.[A-Za-z0-9]+", str(getattr(result, "stdout", "")).strip()):
@@ -92,6 +125,218 @@ def isolated_run(**kwargs):
 
 
 class DevStackTest(unittest.TestCase):
+    def setUp(self):
+        original_popen = subprocess.Popen
+
+        def offline_popen(command, *args, **kwargs):
+            executable = command[0] if isinstance(command, (list, tuple)) else command
+            if Path(os.fsdecode(executable)).name in ("ssh", "scp"):
+                raise AssertionError("offline fixture attempted a real SSH/SCP process")
+            return original_popen(command, *args, **kwargs)
+
+        patcher = patch("voice.evals.dev_stack.subprocess.Popen", side_effect=offline_popen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_ssh_transports_admit_handshakes_and_overlap_sixteen_voice_captures(self):
+        from threading import Barrier, Lock, Thread
+
+        state_lock = Lock()
+        capture_barrier = Barrier(16)
+        active_handshakes = 0
+        max_handshakes = 0
+        active_captures = 0
+        max_captures = 0
+        master_paths = []
+        master_calls = []
+        capture_calls = []
+        errors = []
+
+        def run(args, **kwargs):
+            nonlocal active_handshakes, max_handshakes, active_captures, max_captures
+            if args[0] == "ssh" and "-M" in args:
+                path = args[args.index("-S") + 1] if "-S" in args else ""
+                with state_lock:
+                    active_handshakes += 1
+                    max_handshakes = max(max_handshakes, active_handshakes)
+                    master_paths.append(path)
+                    master_calls.append(args)
+                time.sleep(0.02)
+                with state_lock:
+                    active_handshakes -= 1
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[0] == "ssh" and "MENTAT_VOICE_GRANT" in kwargs.get("input", ""):
+                with state_lock:
+                    capture_calls.append(args)
+                    active_captures += 1
+                    max_captures = max(max_captures, active_captures)
+                try:
+                    capture_barrier.wait(timeout=5)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    with state_lock:
+                        active_captures -= 1
+                return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def capture(index):
+            stack = _RunStack(checkout=CHECKOUT, remote="ultraviolet", run=run)
+            stack._entered = True
+            stack._remote_dir = f"/tmp/run-{index}"
+            try:
+                stack.run_voice(
+                    ["caller.py"], token=f"token-{index}", livekit_url="wss://example.invalid"
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                try:
+                    stack._transport.close()
+                except BaseException as error:
+                    errors.append(error)
+
+        threads = [Thread(target=capture, args=(index,)) for index in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(capture_calls), 16)
+        self.assertLess(max_handshakes, 10)
+        self.assertEqual(max_captures, 16)
+        self.assertEqual(len(master_paths), 16)
+        self.assertTrue(all(master_paths))
+        self.assertEqual(len(set(master_paths)), 16)
+        for args in capture_calls:
+            self.assertEqual(args[0], "ssh")
+            self.assertIn("-S", args)
+            self.assertIn(args[args.index("-S") + 1], master_paths)
+            option_pairs = [args[index:index + 2] for index in range(len(args) - 1)]
+            self.assertIn(["-o", "ControlMaster=no"], option_pairs)
+            self.assertIn(["-o", "ProxyCommand=false"], option_pairs)
+        for args in master_calls:
+            self.assertIn("-M", args)
+            self.assertIn("-N", args)
+            self.assertIn("-f", args)
+            self.assertIn(["-o", "ControlPersist=no"], [
+                args[index:index + 2] for index in range(len(args) - 1)
+            ])
+            self.assertIn("-S", args)
+            self.assertNotEqual(args[args.index("-S") + 1], "")
+        self.assertEqual(
+            {args[args.index("-S") + 1] for args in capture_calls},
+            set(master_paths),
+        )
+
+    def test_all_eval_ssh_and_scp_sites_use_the_owned_transport(self):
+        calls = []
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = b'{"status":"ok"}'
+
+        def run(args, **kwargs):
+            calls.append(args)
+            normalized = _legacy_transport_args(args)
+            if normalized is None:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if normalized[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if normalized[:2] == ["ssh", "ultraviolet"] and normalized[2] == "mktemp":
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.transport\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"dev_port": 49151, "health_port": 49152}), ""
+                )
+            if "MENTAT_VOICE_GRANT" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch("urllib.request.urlopen", return_value=response):
+            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+                with batch.run("transport-run") as stack:
+                    stack.start_worker("transport-room")
+                    stack.run_voice(["caller.py"], token="token", livekit_url="wss://example.invalid")
+                    stack.run_remote(["true"])
+
+        all_commands = calls
+        ssh_commands = [args for args in all_commands if args and args[0] == "ssh"]
+        scp_commands = [args for args in all_commands if args and args[0] == "scp"]
+        self.assertTrue(ssh_commands)
+        self.assertTrue(scp_commands)
+        for args in ssh_commands:
+            self.assertIn("-S", args)
+            self.assertNotIn("ControlPath=none", args)
+            if "-M" not in args and "-O" not in args:
+                option_pairs = [args[index:index + 2] for index in range(len(args) - 1)]
+                self.assertIn(["-o", "ControlMaster=no"], option_pairs)
+                self.assertIn(["-o", "ProxyCommand=false"], option_pairs)
+        for args in scp_commands:
+            options = [args[index + 1] for index, value in enumerate(args[:-1]) if value == "-o"]
+            self.assertTrue(any(option.startswith("ControlPath=") for option in options), args)
+            self.assertIn("ControlMaster=no", options)
+            self.assertIn("ProxyCommand=false", options)
+            self.assertFalse(any(option == "ControlPath=none" for option in options), args)
+        control_operations = [args[args.index("-O") + 1] for args in ssh_commands if "-O" in args]
+        self.assertIn("forward", control_operations)
+        self.assertIn("cancel", control_operations)
+
+    def test_mux_clients_fail_closed_instead_of_starting_network_fallback(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        transport = _SSHTransport("ultraviolet", run=run)
+        ssh = transport.ssh_command("true")
+        scp = transport.scp_command("-r", "source", "ultraviolet:/destination")
+        control_path = transport._control_path
+        self.assertTrue(control_path)
+
+        for args in (ssh, scp):
+            option_pairs = [args[index:index + 2] for index in range(len(args) - 1)]
+            self.assertIn(["-o", "ControlMaster=no"], option_pairs)
+            self.assertIn(["-o", "ProxyCommand=false"], option_pairs)
+            path_values = [
+                args[index + 1] for index, value in enumerate(args[:-1])
+                if value == "-S" or (value == "-o" and args[index + 1].startswith("ControlPath="))
+            ]
+            self.assertTrue(any(control_path in value for value in path_values))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("-M", calls[0])
+        transport.close()
+
+    def test_ssh_transport_close_surfaces_failed_master_exit_and_retains_owner(self):
+        close_attempts = 0
+
+        def run(args, **kwargs):
+            nonlocal close_attempts
+            if "-O" in args:
+                close_attempts += 1
+                if close_attempts == 1:
+                    return subprocess.CompletedProcess(args, 255, "", "master still running")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        transport = _SSHTransport("ultraviolet", run=run)
+        transport.connect()
+        directory = Path(transport._directory)
+        control_path = transport._control_path
+
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            transport.close()
+
+        self.assertEqual(raised.exception.returncode, 255)
+        self.assertEqual(raised.exception.stderr, "master still running")
+        self.assertEqual(transport._control_path, control_path)
+        self.assertTrue(directory.is_dir())
+        transport.close()
+        self.assertEqual(transport._control_path, None)
+        self.assertFalse(directory.exists())
+        self.assertEqual(close_attempts, 2)
+
     def test_batch_shutdown_closes_launch_gate_before_restoring(self):
         batch = DevStack(checkout=CHECKOUT, opt_in=True, run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
         batch._entered = True
@@ -583,10 +828,15 @@ class DevStackTest(unittest.TestCase):
 
     def test_batch_runs_share_staging_but_keep_independent_run_lifecycles(self):
         calls = []
+        raw_calls = []
         events = []
         probe_count = 0
 
         def run(args, **kwargs):
+            raw_calls.append(args)
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             nonlocal probe_count
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
@@ -623,34 +873,32 @@ class DevStackTest(unittest.TestCase):
                 )
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
-            popen.return_value = unittest.mock.Mock(poll=lambda: None)
-            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
-                with batch.run("same-scenario-1") as first:
-                    with batch.run("same-scenario-2") as second:
-                        self.assertNotEqual(first.base_url, second.base_url)
-                        self.assertNotEqual(first.dev_port, second.dev_port)
-                        self.assertNotEqual(first.health_port, second.health_port)
-                        second.start_worker("second-room")
-                        second_receipt = second.run_voice(
-                            ["caller.py"], token="second-token", livekit_url="wss://second.invalid"
-                        )
-                        second_phone = second.run_remote(["cat", "voice/evals/phone.jsonl"])
-                    self.assertTrue(first._entered)
-                    self.assertEqual(json.loads(second_receipt.stdout)["turns"][0]["receipt"], "same-scenario-2-receipt")
-                    self.assertEqual(json.loads(second_phone.stdout)["run_id"], "same-scenario-2")
-                    self.assertFalse(any(
-                        'bash "$BATCH_DIR/cleanup.sh"' in kwargs.get("input", "")
-                        for args, kwargs in calls
-                        if args[:2] == ["ssh", "ultraviolet"]
-                    ))
-                    first.start_worker("first-room")
-                    first_receipt = first.run_voice(
-                        ["caller.py"], token="first-token", livekit_url="wss://first.invalid"
+        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+            with batch.run("same-scenario-1") as first:
+                with batch.run("same-scenario-2") as second:
+                    self.assertNotEqual(first.base_url, second.base_url)
+                    self.assertNotEqual(first.dev_port, second.dev_port)
+                    self.assertNotEqual(first.health_port, second.health_port)
+                    second.start_worker("second-room")
+                    second_receipt = second.run_voice(
+                        ["caller.py"], token="second-token", livekit_url="wss://second.invalid"
                     )
-                    first_phone = first.run_remote(["cat", "voice/evals/phone.jsonl"])
-                    self.assertEqual(json.loads(first_receipt.stdout)["turns"][0]["receipt"], "same-scenario-1-receipt")
-                    self.assertEqual(json.loads(first_phone.stdout)["run_id"], "same-scenario-1")
+                    second_phone = second.run_remote(["cat", "voice/evals/phone.jsonl"])
+                self.assertTrue(first._entered)
+                self.assertEqual(json.loads(second_receipt.stdout)["turns"][0]["receipt"], "same-scenario-2-receipt")
+                self.assertEqual(json.loads(second_phone.stdout)["run_id"], "same-scenario-2")
+                self.assertFalse(any(
+                    'bash "$BATCH_DIR/cleanup.sh"' in kwargs.get("input", "")
+                    for args, kwargs in calls
+                    if args[:2] == ["ssh", "ultraviolet"]
+                ))
+                first.start_worker("first-room")
+                first_receipt = first.run_voice(
+                    ["caller.py"], token="first-token", livekit_url="wss://first.invalid"
+                )
+                first_phone = first.run_remote(["cat", "voice/evals/phone.jsonl"])
+                self.assertEqual(json.loads(first_receipt.stdout)["turns"][0]["receipt"], "same-scenario-1-receipt")
+                self.assertEqual(json.loads(first_phone.stdout)["run_id"], "same-scenario-1")
 
         builds = [args for args, _ in calls if args[:2] == ["nix", "build"]]
         transfers = [args for args, _ in calls if args and args[0] == "scp" and args[1:2] != ["-p"]]
@@ -694,22 +942,31 @@ class DevStackTest(unittest.TestCase):
             stop_index = events.index(("stop", run_id))
             evidence_index = events.index(("evidence", run_id))
             self.assertLess(stop_index, evidence_index)
+        forward_commands = [
+            args for args in raw_calls
+            if args[0] == "ssh" and "-O" in args and args[args.index("-O") + 1] == "forward"
+        ]
         tunnel_ports = {
-            int(call.args[0][-2].rsplit(":", 1)[1])
-            for call in popen.call_args_list
+            int(args[args.index("-L") + 1].rsplit(":", 1)[1])
+            for args in forward_commands
         }
+        self.assertEqual(len(forward_commands), 2)
         self.assertEqual(tunnel_ports, {int(ports[0]) for ports in setup_ports.values()})
-        self.assertEqual(popen.call_count, 2)
 
     def test_concurrent_run_stacks_keep_ports_and_remote_roots_independent(self):
         from concurrent.futures import ThreadPoolExecutor
         from threading import Lock
 
         calls = []
+        raw_calls = []
         guard = Lock()
         probe_count = 0
 
         def run(args, **kwargs):
+            raw_calls.append(args)
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             nonlocal probe_count
             with guard:
                 calls.append((args, kwargs))
@@ -730,33 +987,26 @@ class DevStackTest(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with patch("voice.evals.dev_stack.subprocess.Popen") as popen:
-            popen.side_effect = lambda *_args, **_kwargs: unittest.mock.Mock(poll=lambda: None)
-            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
-                def launch(run_id):
-                    with batch.run(run_id) as stack:
-                        stack.start_worker(f"{run_id}-room")
-                        stack.run_voice(["caller.py"], token=f"{run_id}-token", livekit_url="wss://lk.invalid")
-                        return stack.dev_port, stack.health_port, stack._remote_dir, stack.base_url
+        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+            def launch(run_id):
+                with batch.run(run_id) as stack:
+                    stack.start_worker(f"{run_id}-room")
+                    stack.run_voice(["caller.py"], token=f"{run_id}-token", livekit_url="wss://lk.invalid")
+                    return stack.dev_port, stack.health_port, stack._remote_dir, stack.base_url
 
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    results = list(executor.map(launch, ("parallel-one", "parallel-two")))
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(launch, ("parallel-one", "parallel-two")))
 
         self.assertEqual(len({(dev_port, health_port) for dev_port, health_port, _root, _url in results}), 2)
         self.assertEqual(len({root for _dev_port, _health_port, root, _url in results}), 2)
         self.assertEqual(len({url for _dev_port, _health_port, _root, url in results}), 2)
-        self.assertEqual(popen.call_count, 2)
+        self.assertEqual(sum(
+            args[0] == "ssh" and "-O" in args and args[args.index("-O") + 1] == "forward"
+            for args in raw_calls
+        ), 2)
 
     def test_run_voice_stops_its_daemon_and_worker_before_evidence_reads(self):
         events = []
-        stack = _RunStack(
-            checkout=CHECKOUT, run=subprocess.run, batch=SimpleNamespace(), run_id="producer-order"
-        )
-        stack._entered = True
-        stack._remote_dir = "/tmp/mentat-eval-batch.synthetic/runs/producer-order"
-        stack.dev_port = 49151
-        stack.health_port = 49152
-
         def remote(script, *_args, **_kwargs):
             if "MENTAT_VOICE_GRANT" in script:
                 events.append("capture")
@@ -767,10 +1017,25 @@ class DevStackTest(unittest.TestCase):
             raise AssertionError(f"unexpected remote command: {script[:80]}")
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             events.append("evidence-read")
             return subprocess.CompletedProcess(args, 0, "{}\n", "")
 
-        with patch.object(stack, "_remote", side_effect=remote), patch.object(stack, "_run", side_effect=run):
+        stack = _RunStack(
+            checkout=CHECKOUT, run=run, batch=SimpleNamespace(), run_id="producer-order"
+        )
+        stack._entered = True
+        stack._remote_dir = "/tmp/mentat-eval-batch.synthetic/runs/producer-order"
+        stack.dev_port = 49151
+        stack.health_port = 49152
+
+        self.addCleanup(stack._transport.close)
+
+        with patch.object(stack, "_remote", side_effect=remote), patch(
+            "voice.evals.dev_stack.subprocess.Popen", side_effect=AssertionError("offline fixture invoked a subprocess")
+        ):
             stack.run_voice(["caller.py"], token="private-token", livekit_url="wss://lk.invalid")
             self.assertEqual([event if isinstance(event, str) else event[0] for event in events], ["capture", "stop"])
             stop_script = events[-1][1]
@@ -784,6 +1049,9 @@ class DevStackTest(unittest.TestCase):
         from concurrent.futures import ThreadPoolExecutor
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
@@ -792,7 +1060,7 @@ class DevStackTest(unittest.TestCase):
 
         def slow_stack(**kwargs):
             time.sleep(0.05)
-            return SimpleNamespace(run_id=kwargs["run_id"], _remote_dir=None, _tunnel=None)
+            return SimpleNamespace(run_id=kwargs["run_id"], _remote_dir=None, _forward_spec=None)
 
         with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
             with patch("voice.evals.dev_stack._RunStack", side_effect=slow_stack):
@@ -926,13 +1194,15 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
 
         run.assert_not_called()
 
-    @patch("voice.evals.dev_stack.subprocess.Popen")
-    def test_default_live_stack_selects_and_propagates_free_remote_ports(self, popen):
-        popen.return_value = unittest.mock.Mock(poll=lambda: None)
+    def test_default_live_stack_selects_and_propagates_free_remote_ports(self):
         calls = []
+        control_calls = []
         selected_ports = {"dev_port": 49151, "health_port": 49152}
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -948,12 +1218,19 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
                 return subprocess.CompletedProcess(args, 0, '{"turns":[]}\n', "")
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with isolated_run(checkout=CHECKOUT, opt_in=True, run=run) as stack:
-            self.assertEqual(stack.dev_port, selected_ports["dev_port"])
-            self.assertEqual(stack.health_port, selected_ports["health_port"])
-            local_port = int(urlsplit(stack.url).port)
-            stack.start_worker("ports-test-room")
-            stack.run_voice(["python3", "caller.py"], token="issued-token", livekit_url="wss://lk.invalid")
+        original_control = _SSHTransport._control
+
+        def record_control(transport, *options):
+            control_calls.append(options)
+            return original_control(transport, *options)
+
+        with patch.object(_SSHTransport, "_control", autospec=True, side_effect=record_control):
+            with isolated_run(checkout=CHECKOUT, opt_in=True, run=run) as stack:
+                self.assertEqual(stack.dev_port, selected_ports["dev_port"])
+                self.assertEqual(stack.health_port, selected_ports["health_port"])
+                local_port = int(urlsplit(stack.url).port)
+                stack.start_worker("ports-test-room")
+                stack.run_voice(["python3", "caller.py"], token="issued-token", livekit_url="wss://lk.invalid")
 
         self.assertNotIn(stack.dev_port, (8485, 8486))
         self.assertNotIn(stack.health_port, (8485, 8486))
@@ -981,9 +1258,13 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         )
         self.assertIn(str(selected_ports["dev_port"]), caller_script)
         self.assertIn(str(selected_ports["health_port"]), caller_script)
+        forward_options = next(
+            options for options in control_calls
+            if "-O" in options and options[options.index("-O") + 1] == "forward"
+        )
         self.assertIn(
             f"127.0.0.1:{local_port}:127.0.0.1:{selected_ports['dev_port']}",
-            popen.call_args.args[0],
+            forward_options,
         )
         self.assertNotIn("systemctl stop mentatd", "\n".join(kwargs.get("input", "") for _, kwargs in remote_calls))
         self.assertIn("systemctl start mentat-voice", "\n".join(kwargs.get("input", "") for _, kwargs in remote_calls))
@@ -992,6 +1273,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -1026,6 +1310,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         dev_port = 8485
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -1086,6 +1373,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -1225,11 +1515,10 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
             with self.assertRaisesRegex(RuntimeError, "candidate system prompt"):
                 run_setup_environment(run_dir, "synthetic-model")
 
-    @patch("voice.evals.dev_stack.subprocess.Popen")
-    def test_controlmaster_handoff_does_not_abort_a_live_forward(self, popen):
+    def test_owned_controlmaster_forward_survives_readiness_retries(self):
         calls = []
-        tunnel_processes = []
-        forward = {"available": False}
+        events = []
+        forward = {"active": False}
         refusals = [
             urllib.error.URLError("connection refused"),
             urllib.error.URLError("connection refused"),
@@ -1239,57 +1528,66 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         response.__enter__.return_value.read.return_value = b'{"status":"ok"}\n'
         health_calls = []
 
-        def start_ssh(args, **kwargs):
-            calls.append(args)
-            dedicated = ["-o", "ControlMaster=no"] in [args[i:i + 2] for i in range(len(args) - 1)]
-            dedicated = dedicated and ["-o", "ControlPath=none"] in [
-                args[i:i + 2] for i in range(len(args) - 1)
-            ]
-            dedicated = dedicated and ["-o", "ExitOnForwardFailure=yes"] in [
-                args[i:i + 2] for i in range(len(args) - 1)
-            ]
-            forward["available"] = True
-            tunnel = unittest.mock.Mock(poll=lambda: None if dedicated else 0)
-            tunnel_processes.append(tunnel)
-            return tunnel
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["nix", "build"]:
+                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
+            if args[0] == "ssh" and "-M" in args:
+                events.append("master-start")
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[0] == "ssh" and "-O" in args:
+                operation = args[args.index("-O") + 1]
+                if operation == "forward":
+                    forward["active"] = True
+                    events.append("forward-request")
+                elif operation == "cancel":
+                    forward["active"] = False
+                    events.append("forward-cancel")
+                return subprocess.CompletedProcess(args, 0, "", "")
+            normalized = _legacy_transport_args(args)
+            if normalized is None:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if normalized[:3] == ["ssh", "ultraviolet", "mktemp"]:
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.controlmaster\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"dev_port": 49151, "health_port": 49152}), ""
+                )
+            if kwargs.get("input") == _STOP_RUN_SCRIPT:
+                events.append("producer-stop")
+            return subprocess.CompletedProcess(args, 0, "", "")
 
         def urlopen(url, *, timeout):
             health_calls.append((url, timeout))
-            self.assertTrue(forward["available"], "the persistent ControlMaster keeps the forward open")
+            self.assertTrue(forward["active"], "the owned master accepted and retains the forward")
             if refusals:
                 raise refusals.pop(0)
             return response
 
-        def run(args, **kwargs):
-            if args[:2] == ["nix", "build"]:
-                return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
-            if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
-                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.controlmaster\n", "")
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        popen.side_effect = start_ssh
         with patch("urllib.request.urlopen", side_effect=urlopen), patch("time.sleep") as sleep:
-            with isolated_run(checkout=CHECKOUT, opt_in=True, dev_port=8485, health_port=8486, run=run) as stack:
-                self.assertEqual(len(health_calls), 3)
-                self.assertEqual(health_calls[-1][0], f"{stack.url}/healthz")
-                sleep.assert_called()
+            with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+                with batch.run("controlmaster-run") as stack:
+                    self.assertEqual(len(health_calls), 3)
+                    self.assertEqual(health_calls[-1][0], f"{stack.url}/healthz")
+                    sleep.assert_called()
 
-        self.assertEqual(len(calls), 1)
-        self.assertIn(["-o", "ControlMaster=no"], [
-            calls[0][i:i + 2] for i in range(len(calls[0]) - 1)
-        ])
-        self.assertIn(["-o", "ControlPath=none"], [
-            calls[0][i:i + 2] for i in range(len(calls[0]) - 1)
-        ])
+        operations = [
+            args[args.index("-O") + 1]
+            for args, _kwargs in calls
+            if args[0] == "ssh" and "-O" in args
+        ]
+        self.assertEqual(operations[:1], ["forward"])
+        self.assertIn("check", operations)
+        self.assertIn("cancel", operations)
+        self.assertLess(events.index("forward-request"), events.index("forward-cancel"))
+        self.assertLess(events.index("forward-cancel"), events.index("producer-stop"))
+        forward_call = next(args for args, _kwargs in calls if "-O" in args and "forward" in args)
+        self.assertIn("-S", forward_call)
         self.assertIn(["-o", "ExitOnForwardFailure=yes"], [
-            calls[0][i:i + 2] for i in range(len(calls[0]) - 1)
+            forward_call[index:index + 2] for index in range(len(forward_call) - 1)
         ])
-        tunnel_processes[0].terminate.assert_called_once()
 
-    @patch("voice.evals.dev_stack.subprocess.Popen")
-    def test_enter_waits_for_tunneled_health_endpoint_before_returning(self, popen):
-        tunnel = unittest.mock.Mock(poll=lambda: None)
-        popen.return_value = tunnel
+    def test_enter_waits_for_tunneled_health_endpoint_before_returning(self):
         responses = [
             urllib.error.URLError("connection refused"),
             urllib.error.URLError("connection refused"),
@@ -1307,6 +1605,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
             return response
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
@@ -1320,21 +1621,25 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
                 self.assertTrue(all(timeout > 0 for _, timeout in calls))
                 sleep.assert_called()
 
-        tunnel.terminate.assert_called_once()
-
-    @patch("voice.evals.dev_stack.subprocess.Popen")
-    def test_never_ready_endpoint_times_out_and_cleans_up(self, popen):
-        tunnel = unittest.mock.Mock(poll=lambda: None)
-        popen.return_value = tunnel
+    def test_never_ready_endpoint_times_out_and_cleans_up(self):
         calls = []
+        raw_calls = []
         now = [0.0]
 
         def run(args, **kwargs):
+            raw_calls.append((args, kwargs))
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
-                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.timeout\n", "")
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.timeout\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"dev_port": 49151, "health_port": 49152}), ""
+                )
             return subprocess.CompletedProcess(args, 0, "", "")
 
         def sleep(seconds):
@@ -1344,50 +1649,106 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
             with patch("time.monotonic", side_effect=lambda: now[0]), patch("time.sleep", side_effect=sleep):
                 with patch("voice.evals.dev_stack._READINESS_TIMEOUT_SECONDS", 0.5, create=True):
                     with self.assertRaisesRegex(TimeoutError, "health endpoint"):
-                        with isolated_run(
-                            checkout=CHECKOUT, opt_in=True, dev_port=8485,
-                            health_port=8486, run=run,
-                        ):
-                            pass
+                        with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+                            with batch.run("timeout-run"):
+                                pass
 
         self.assertGreater(urlopen.call_count, 1)
         self.assertLessEqual(now[0], 0.7)
-        tunnel.terminate.assert_called_once()
         self.assertTrue(any(
             "systemctl start mentat-voice" in kwargs.get("input", "")
             for args, kwargs in calls
             if args[:2] == ["ssh", "ultraviolet"]
         ))
+        control_operations = [
+            (index, args[args.index("-O") + 1], args)
+            for index, (args, _kwargs) in enumerate(raw_calls)
+            if args[0] == "ssh" and "-O" in args
+        ]
+        self.assertEqual(
+            [operation for _index, operation, _args in control_operations if operation in ("forward", "cancel")],
+            ["forward", "cancel"],
+        )
+        forward_index, _operation, forward_args = next(
+            call for call in control_operations if call[1] == "forward"
+        )
+        control_path = forward_args[forward_args.index("-S") + 1]
+        cancel_index, _operation, cancel_args = next(
+            call for call in control_operations if call[1] == "cancel"
+        )
+        self.assertEqual(cancel_args[cancel_args.index("-S") + 1], control_path)
+        exit_index = next(
+            index for index, operation, args in control_operations
+            if operation == "exit" and args[args.index("-S") + 1] == control_path
+        )
+        restore_index = next(
+            index for index, (_args, kwargs) in enumerate(raw_calls)
+            if 'bash "$BATCH_DIR/cleanup.sh"' in kwargs.get("input", "")
+        )
+        self.assertLess(forward_index, cancel_index)
+        self.assertLess(cancel_index, exit_index)
+        self.assertLess(exit_index, restore_index)
 
-    @patch("voice.evals.dev_stack.subprocess.Popen")
-    def test_interruption_during_health_wait_cleans_up(self, popen):
-        tunnel = unittest.mock.Mock(poll=lambda: None)
-        popen.return_value = tunnel
+    def test_interruption_during_health_wait_cleans_up(self):
         calls = []
+        raw_calls = []
 
         def run(args, **kwargs):
+            raw_calls.append((args, kwargs))
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
-                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.interrupt\n", "")
+                return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval-batch.interrupt\n", "")
+            if "MENTAT_EVAL_PORT_PROBE" in kwargs.get("input", ""):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"dev_port": 49151, "health_port": 49152}), ""
+                )
             return subprocess.CompletedProcess(args, 0, "", "")
 
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")):
             with patch("time.sleep", side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
-                    with isolated_run(
-                        checkout=CHECKOUT, opt_in=True, dev_port=8485,
-                        health_port=8486, run=run,
-                    ):
-                        pass
+                    with DevStack(checkout=CHECKOUT, opt_in=True, run=run) as batch:
+                        with batch.run("interrupted-run"):
+                            pass
 
-        tunnel.terminate.assert_called_once()
         self.assertTrue(any(
             "systemctl start mentat-voice" in kwargs.get("input", "")
             for args, kwargs in calls
             if args[:2] == ["ssh", "ultraviolet"]
         ))
+        control_operations = [
+            (index, args[args.index("-O") + 1], args)
+            for index, (args, _kwargs) in enumerate(raw_calls)
+            if args[0] == "ssh" and "-O" in args
+        ]
+        self.assertEqual(
+            [operation for _index, operation, _args in control_operations if operation in ("forward", "cancel")],
+            ["forward", "cancel"],
+        )
+        forward_index, _operation, forward_args = next(
+            call for call in control_operations if call[1] == "forward"
+        )
+        control_path = forward_args[forward_args.index("-S") + 1]
+        cancel_index, _operation, cancel_args = next(
+            call for call in control_operations if call[1] == "cancel"
+        )
+        self.assertEqual(cancel_args[cancel_args.index("-S") + 1], control_path)
+        exit_index = next(
+            index for index, operation, args in control_operations
+            if operation == "exit" and args[args.index("-S") + 1] == control_path
+        )
+        restore_index = next(
+            index for index, (_args, kwargs) in enumerate(raw_calls)
+            if 'bash "$BATCH_DIR/cleanup.sh"' in kwargs.get("input", "")
+        )
+        self.assertLess(forward_index, cancel_index)
+        self.assertLess(cancel_index, exit_index)
+        self.assertLess(exit_index, restore_index)
 
     def test_successive_worker_starts_preserve_room_scoped_voice_mode_entries(self):
         scenario = next(item for item in SCENARIOS if item.name == "spanish-interpreter")
@@ -1542,6 +1903,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -1576,6 +1940,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         room = "android-token-issued-room"
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -1613,6 +1980,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -1646,6 +2016,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         livekit_url = "wss://issued-livekit.invalid"
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             return subprocess.CompletedProcess(
                 args,
@@ -1840,6 +2213,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -2117,6 +2493,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -2308,6 +2687,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -2347,6 +2729,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls_lock = Lock()
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             with calls_lock:
                 calls.append((args, kwargs))
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -2379,24 +2764,30 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
             self.assertIn('systemctl restart "$RESTORE_UNIT.timer"', script)
             self.assertNotIn("systemctl start mentat-voice", script)
 
-    def test_restore_guard_refreshes_periodically_without_run_work_and_stops_on_teardown(self):
+    def test_restore_guard_refreshes_over_batch_transport_and_stops_on_teardown(self):
         from threading import Event, Lock
 
-        batch = DevStack(checkout=CHECKOUT, remote="ultraviolet")
         remote_dir = "/tmp/mentat-eval-batch.heartbeat"
-        batch._remote_dir = remote_dir
-        batch._entered = True
         calls = []
         calls_lock = Lock()
         first_refresh = Event()
 
-        def remote(script, remote_dir, **_kwargs):
+        def run(args, **kwargs):
+            if args[0] == "ssh" and "-M" in args:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[0] == "ssh" and "-O" in args:
+                return subprocess.CompletedProcess(args, 0, "", "")
             with calls_lock:
-                calls.append((script, remote_dir, time.monotonic()))
-            first_refresh.set()
-            return subprocess.CompletedProcess(["ssh"], 0, "", "")
+                calls.append((args, kwargs.get("input", ""), time.monotonic()))
+            if kwargs.get("input") == _REFRESH_RESTORE_GUARD_SCRIPT:
+                first_refresh.set()
+            return subprocess.CompletedProcess(args, 0, "", "")
 
-        with patch.object(batch, "_remote", side_effect=remote), patch(
+        batch = DevStack(checkout=CHECKOUT, remote="ultraviolet", run=run)
+        batch._remote_dir = remote_dir
+        batch._entered = True
+
+        with patch(
             "voice.evals.dev_stack._RESTORE_GUARD_REFRESH_INTERVAL_SECONDS", 0.05
         ):
             started = time.monotonic()
@@ -2405,10 +2796,19 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
             batch._cleanup()
             time.sleep(0.12)
 
-        refreshes = [call for call in calls if call[0] == _REFRESH_RESTORE_GUARD_SCRIPT]
+        refreshes = [call for call in calls if call[1] == _REFRESH_RESTORE_GUARD_SCRIPT]
         self.assertGreaterEqual(refreshes[0][2] - started, 0.04)
         self.assertEqual(len(refreshes), 1)
-        self.assertEqual(refreshes[0][1], remote_dir)
+        args = refreshes[0][0]
+        self.assertEqual(args[0], "ssh")
+        self.assertIn("-S", args)
+        control_path = args[args.index("-S") + 1]
+        self.assertTrue(control_path)
+        option_pairs = [args[index:index + 2] for index in range(len(args) - 1)]
+        self.assertIn(["-o", "ControlMaster=no"], option_pairs)
+        self.assertIn(["-o", "ProxyCommand=false"], option_pairs)
+        self.assertTrue(all("-S" in call[0] for call in calls))
+        self.assertTrue(all(call[0][call[0].index("-S") + 1] == control_path for call in calls))
 
     def test_batch_cleanup_stops_candidates_before_waiting_for_guard_refresh(self):
         from threading import Event, Thread
@@ -2419,11 +2819,10 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         cleanup_finished = Event()
         events = []
         refresh_timeouts = []
-        batch = DevStack(checkout=CHECKOUT, remote="ultraviolet")
-        batch._remote_dir = "/tmp/mentat-eval-batch.blocked-refresh"
-        batch._entered = True
-
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             script = kwargs.get("input", "")
             if script == _REFRESH_RESTORE_GUARD_SCRIPT:
                 refresh_timeouts.append(kwargs.get("timeout"))
@@ -2439,13 +2838,19 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
             events.append("candidate-stopped")
             run_stopped.set()
 
+        batch = DevStack(checkout=CHECKOUT, remote="ultraviolet", run=run)
+        batch._remote_dir = "/tmp/mentat-eval-batch.blocked-refresh"
+        batch._entered = True
+
         batch._run_stacks["run-1"] = SimpleNamespace(
             _remote_dir="/tmp/mentat-eval-batch.blocked-refresh/runs/run-1",
-            _tunnel=None,
+            _forward_spec=None,
             _cleanup=stop_run,
         )
 
-        with patch.object(batch, "_run", side_effect=run), patch(
+        with patch(
+            "voice.evals.dev_stack.subprocess.Popen", side_effect=AssertionError("offline fixture invoked a subprocess")
+        ), patch(
             "voice.evals.dev_stack._RESTORE_GUARD_REFRESH_INTERVAL_SECONDS", 0.01
         ):
             batch._start_restore_guard_refresh()
@@ -2636,6 +3041,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -2753,6 +3161,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["ssh", "ultraviolet"] and args[2] == "mktemp":
                 return subprocess.CompletedProcess(args, 0, "/tmp/mentat-eval.failure\n", "")
@@ -2775,6 +3186,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         secrets = ("credential-value-double-quoted", "credential-value-single-quoted")
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             error = subprocess.CalledProcessError(
                 1,
                 args,
@@ -2798,6 +3212,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -2814,6 +3231,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")
@@ -2841,6 +3261,9 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         calls = []
 
         def run(args, **kwargs):
+            args = _legacy_transport_args(args)
+            if args is None:
+                return subprocess.CompletedProcess(["ssh"], 0, "", "")
             calls.append((args, kwargs))
             if args[:2] == ["nix", "build"]:
                 return subprocess.CompletedProcess(args, 0, "/nix/store/candidate\n", "")

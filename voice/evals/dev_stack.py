@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -23,6 +24,9 @@ _READINESS_POLL_SECONDS = 0.2
 _READINESS_REQUEST_TIMEOUT_SECONDS = 2.0
 _RESTORE_GUARD_REFRESH_INTERVAL_SECONDS = 15 * 60.0
 _RESTORE_GUARD_REFRESH_TIMEOUT_SECONDS = 30.0
+_SSH_HANDSHAKE_LIMIT = 9
+_SSH_HANDSHAKE_SLOTS = threading.BoundedSemaphore(_SSH_HANDSHAKE_LIMIT)
+_SSH_MUX_CLIENT_OPTIONS = ("-o", "ControlMaster=no", "-o", "ProxyCommand=false")
 _REMOTE_PORT_PROBE_SCRIPT = r'''# MENTAT_EVAL_PORT_PROBE
 set -euo pipefail
 python3 - <<'PY'
@@ -42,6 +46,110 @@ finally:
         sock.close()
 PY
 '''
+
+
+class _SSHTransport:
+    """Own one authenticated SSH connection, isolated from user control sockets."""
+
+    def __init__(self, remote: str, *, run: CommandRunner) -> None:
+        self.remote = remote
+        self._run = run
+        self._directory: str | None = None
+        self._control_path: str | None = None
+        self._connected = False
+        self._forwardings: set[str] = set()
+
+    def connect(self) -> None:
+        if self._connected:
+            return
+        directory = tempfile.mkdtemp(prefix="mentat-ssh-")
+        control_path = os.fspath(Path(directory) / "c")
+        try:
+            with _SSH_HANDSHAKE_SLOTS:
+                self._run(
+                    [
+                        "ssh", "-M", "-N", "-f", "-o", "ControlPersist=no",
+                        "-S", control_path, self.remote,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+        except BaseException:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+        self._directory = directory
+        self._control_path = control_path
+        self._connected = True
+
+    def ssh_command(self, *command: str) -> list[str]:
+        self.connect()
+        return ["ssh", "-S", self._control_path or "", *_SSH_MUX_CLIENT_OPTIONS, self.remote, *command]
+
+    def scp_command(self, *arguments: str) -> list[str]:
+        self.connect()
+        return [
+            "scp", "-o", f"ControlPath={self._control_path}",
+            *_SSH_MUX_CLIENT_OPTIONS, *arguments,
+        ]
+
+    def _control(self, *options: str) -> subprocess.CompletedProcess[str]:
+        if not self._connected or self._control_path is None:
+            raise RuntimeError("SSH control master is not connected")
+        result = self._run(
+            ["ssh", "-S", self._control_path, *options, self.remote],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                result.args,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+        return result
+
+    def check(self) -> None:
+        self._control("-O", "check")
+
+    def forward(self, forwarding: str) -> None:
+        self._control(
+            "-o", "ExitOnForwardFailure=yes", "-O", "forward", "-L", forwarding
+        )
+        self._forwardings.add(forwarding)
+
+    def cancel_forward(self, forwarding: str) -> None:
+        if forwarding not in self._forwardings:
+            return
+        self._control("-O", "cancel", "-L", forwarding)
+        self._forwardings.remove(forwarding)
+
+    def close(self) -> None:
+        if self._directory is None:
+            return
+        directory = self._directory
+        control_path = self._control_path
+        if control_path is not None:
+            result = self._run(
+                ["ssh", "-S", control_path, "-O", "exit", self.remote],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    result.returncode,
+                    result.args,
+                    output=result.stdout,
+                    stderr=result.stderr,
+                )
+        self._directory = None
+        self._control_path = None
+        self._connected = False
+        self._forwardings.clear()
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 class RemoteCommandError(subprocess.CalledProcessError):
@@ -811,7 +919,8 @@ class _RunStack:
         self._run = run
         self._local_port: int | None = None
         self._remote_dir: str | None = None
-        self._tunnel: subprocess.Popen[bytes] | None = None
+        self._transport = _SSHTransport(remote, run=run)
+        self._forward_spec: str | None = None
         self._entered = False
         self._restore_guard_armed = False
         self._producers_stopped = False
@@ -860,7 +969,7 @@ class _RunStack:
             raise ValueError("remote command must contain non-empty safe arguments")
         script = f"cd {shlex.quote(self._remote_dir or '')}\nexec {shlex.join(command)}\n"
         return self._run(
-            ["ssh", self.remote, "bash", "-s"],
+            self._transport.ssh_command("bash", "-s"),
             input=script,
             check=True,
             capture_output=True,
@@ -949,20 +1058,8 @@ class _RunStack:
             os.environ.get("MENTAT_VOICE_MODEL", "chatgpt/sol-fast"),
         )
         self._restore_guard_armed = True
-        self._tunnel = subprocess.Popen(
-            [
-                "ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none",
-                "-o", "ExitOnForwardFailure=yes", "-N", "-L",
-                f"127.0.0.1:{self._local_port}:127.0.0.1:{self.dev_port}",
-                self.remote,
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        if self._tunnel.poll() is not None:
-            raise RuntimeError("SSH port-forward exited before the dev stack became available")
+        self._forward_spec = f"127.0.0.1:{self._local_port}:127.0.0.1:{self.dev_port}"
+        self._transport.forward(self._forward_spec)
         self._wait_until_ready()
 
     def _wait_until_ready(self) -> None:
@@ -972,8 +1069,9 @@ class _RunStack:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("timed out waiting for dev stack health endpoint")
-            if self._tunnel is None or self._tunnel.poll() is not None:
-                raise RuntimeError("SSH port-forward exited before the dev stack became ready")
+            if self._forward_spec is None:
+                raise RuntimeError("SSH port-forward was not requested")
+            self._transport.check()
             try:
                 with urllib.request.urlopen(
                     health_url,
@@ -997,7 +1095,7 @@ class _RunStack:
     ) -> subprocess.CompletedProcess[str]:
         try:
             return self._run(
-                ["ssh", self.remote, "sudo", "bash", "-s", "--", *args],
+                self._transport.ssh_command("sudo", "bash", "-s", "--", *args),
                 input=script,
                 check=True,
                 capture_output=True,
@@ -1020,11 +1118,11 @@ class _RunStack:
         self._remote(_RETAIN_EVIDENCE_SCRIPT, self._remote_dir)
         archive = evidence_dir / "retained-evidence.tar.gz"
         self._run(
-            [
-                "scp", "-p",
+            self._transport.scp_command(
+                "-p",
                 f"{self.remote}:{self._remote_dir}/retained-evidence.tar.gz",
                 str(archive),
-            ],
+            ),
             check=True,
             capture_output=True,
             text=True,
@@ -1116,29 +1214,41 @@ class _RunStack:
                 os.chmod(directory, 0o700)
 
     def _cleanup(self) -> None:
-        try:
-            if self._tunnel is not None:
-                self._tunnel.terminate()
-                try:
-                    self._tunnel.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._tunnel.kill()
-                    self._tunnel.wait()
-                self._tunnel = None
-        finally:
+        cleanup_error: BaseException | None = None
+
+        def remember(error: BaseException, context: str) -> None:
+            nonlocal cleanup_error
+            if cleanup_error is None:
+                cleanup_error = error
+            else:
+                cleanup_error.add_note(context + str(error))
+
+        if self._forward_spec is not None:
             try:
-                self._stop_producers()
-            finally:
-                retention_error: BaseException | None = None
-                try:
-                    self._retain_evidence()
-                except BaseException as error:
-                    retention_error = error
-                self._remote_dir = None
-                self._local_port = None
-                self._restore_guard_armed = False
-                if retention_error is not None:
-                    raise retention_error
+                self._transport.cancel_forward(self._forward_spec)
+            except BaseException as error:
+                remember(error, "SSH forward cancellation also failed: ")
+            else:
+                self._forward_spec = None
+        try:
+            self._stop_producers()
+        except BaseException as error:
+            remember(error, "Candidate producer shutdown also failed: ")
+        try:
+            self._retain_evidence()
+        except BaseException as error:
+            remember(error, "Evidence retention also failed: ")
+        self._remote_dir = None
+        self._local_port = None
+        self._restore_guard_armed = False
+        try:
+            self._transport.close()
+        except BaseException as error:
+            remember(error, "SSH transport shutdown also failed: ")
+        else:
+            self._forward_spec = None
+        if cleanup_error is not None:
+            raise cleanup_error
 
 class DevStack:
     """Build and stage shared voice-eval dependencies for isolated runs."""
@@ -1155,6 +1265,7 @@ class DevStack:
         self.opt_in = opt_in
         self.remote = remote
         self._run = run
+        self._transport = _SSHTransport(remote, run=run)
         self._remote_dir: str | None = None
         self._entered = False
         self._signal_handlers: dict[int, signal.Handlers] = {}
@@ -1267,7 +1378,7 @@ class DevStack:
 
     def _reap_dead_batches(self) -> None:
         listed = self._run(
-            ["ssh", self.remote, "sudo", "bash", "-s"], input=_REAP_BATCHES_SCRIPT,
+            self._transport.ssh_command("sudo", "bash", "-s"), input=_REAP_BATCHES_SCRIPT,
             check=True, capture_output=True, text=True,
         )
         try:
@@ -1319,7 +1430,7 @@ class DevStack:
             raise RuntimeError("candidate package build did not return exactly one store path")
         package = Path(store_paths[0]) / "lib/mentat"
         staged = self._run(
-            ["ssh", self.remote, "mktemp", "-d", "/tmp/mentat-eval-batch.XXXXXX"],
+            self._transport.ssh_command("mktemp", "-d", "/tmp/mentat-eval-batch.XXXXXX"),
             check=True,
             capture_output=True,
             text=True,
@@ -1330,46 +1441,48 @@ class DevStack:
             raise RuntimeError("remote staging returned an unsafe directory")
         shared = f"{self._remote_dir}/shared"
         self._run(
-            [
-                "ssh", self.remote, "mkdir", "-m", "700", "-p", "--",
+            self._transport.ssh_command(
+                "mkdir", "-m", "700", "-p", "--",
                 f"{shared}/mentat", f"{shared}/voice/assets", f"{shared}/voice/evals",
-            ],
+            ),
             check=True,
             capture_output=True,
             text=True,
         )
         self._run(
-            [
-                "scp", "-r", str(package / "src"), str(package / "node_modules"),
+            self._transport.scp_command(
+                "-r", str(package / "src"), str(package / "node_modules"),
                 str(package / "package.json"), str(self.checkout / "prompt.md"),
                 f"{self.remote}:{shared}/mentat/",
-            ],
+            ),
             check=True, capture_output=True, text=True,
         )
         voice_files = [
             "agent.py", "persona.md", "request.py", "stream.py", "voices.py", "caller.py",
         ]
         self._run(
-            [
-                "scp", "-r", *(str(self.checkout / "voice" / name) for name in voice_files),
+            self._transport.scp_command(
+                "-r", *(str(self.checkout / "voice" / name) for name in voice_files),
                 str(self.checkout / "voice" / "evals" / "phone.py"),
                 str(self.checkout / "nix" / "voice-env.nix"),
                 f"{self.remote}:{shared}/voice/",
-            ],
+            ),
             check=True, capture_output=True, text=True,
         )
         self._run(
-            [
-                "scp", "-r",
+            self._transport.scp_command(
+                "-r",
                 *(str(self.checkout / "voice" / "evals" / name) for name in (
                     "runner.py", "dev_stack.py", "report.py", "scenarios.py",
                 )),
                 f"{self.remote}:{shared}/voice/evals/",
-            ],
+            ),
             check=True, capture_output=True, text=True,
         )
         self._run(
-            ["scp", "-r", str(self.checkout / "voice" / "assets"), f"{self.remote}:{shared}/voice/"],
+            self._transport.scp_command(
+                "-r", str(self.checkout / "voice" / "assets"), f"{self.remote}:{shared}/voice/"
+            ),
             check=True, capture_output=True, text=True,
         )
         self._reap_dead_batches()
@@ -1420,7 +1533,7 @@ class DevStack:
             if timeout is not None:
                 options["timeout"] = timeout
             return self._run(
-                ["ssh", self.remote, "sudo", "bash", "-s", "--", *args],
+                self._transport.ssh_command("sudo", "bash", "-s", "--", *args),
                 **options,
             )
         except subprocess.CalledProcessError as error:
@@ -1448,7 +1561,7 @@ class DevStack:
         with self._condition:
             run_stacks = tuple(self._run_stacks.values())
         for stack in run_stacks:
-            if stack._remote_dir is not None or stack._tunnel is not None:
+            if stack._remote_dir is not None or stack._forward_spec is not None:
                 try:
                     stack._cleanup()
                 except BaseException as error:
@@ -1472,6 +1585,11 @@ fi
                     first_error = error
             finally:
                 self._remote_dir = None
+        try:
+            self._transport.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         if first_error is not None:
             raise first_error
 
