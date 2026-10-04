@@ -57,12 +57,22 @@ def _build_action_ack(inputs: Mapping[str, object]) -> dict[str, str]:
     contrast = _ACTION_CONTRASTS.get(action)
     if contrast is None:
         raise ValueError(f"action must be one of {sorted(_ACTION_CONTRASTS)}")
-    return {
-        "action_completed": (
+    if action == "alarm":
+        question = (
+            f"Does the reply say that an alarm, not {contrast}, was successfully set "
+            f"with this expected result: {expected}?"
+        )
+    elif action == "navigate":
+        question = (
+            f"Does the reply say that directions to {expected} were started, rather than only "
+            "describing the place?"
+        )
+    else:
+        question = (
             f"Does the reply say that a {action}, not {contrast}, was successfully set or "
             f"started with this expected result: {expected}?"
         )
-    }
+    return {"action_completed": question}
 
 
 def _build_timer_duration(inputs: Mapping[str, object]) -> dict[str, str]:

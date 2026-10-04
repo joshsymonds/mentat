@@ -48,12 +48,26 @@ class QuestionBuilderTests(unittest.TestCase):
         self.assertIn("seven o'clock in the morning", alarm)
 
     def test_action_acknowledgement_and_place_lookup_name_expected_facts(self):
-        action = build_questions("action_ack", {"action": "navigate", "expected": "Alice Keck Park Memorial Garden"})
-        self.assertIn("navigate", action["action_completed"].lower())
-        self.assertIn("Alice Keck Park Memorial Garden", action["action_completed"])
-        self.assertIn("not only a description of the place", action["action_completed"])
+        alarm = build_questions("action_ack", {"action": "alarm", "expected": "7:00 a.m."})
+        self.assertEqual(
+            alarm["action_completed"],
+            "Does the reply say that an alarm, not a timer or a reminder, was successfully set "
+            "with this expected result: 7:00 a.m.?",
+        )
+        navigation = build_questions(
+            "action_ack", {"action": "navigate", "expected": "Alice Keck Park Memorial Garden"},
+        )
+        self.assertEqual(
+            navigation["action_completed"],
+            "Does the reply say that directions to Alice Keck Park Memorial Garden were started, "
+            "rather than only describing the place?",
+        )
         timer = build_questions("action_ack", {"action": "timer", "expected": "a five-minute timer"})
-        self.assertIn("a timer, not an alarm or a reminder", timer["action_completed"])
+        self.assertEqual(
+            timer["action_completed"],
+            "Does the reply say that a timer, not an alarm or a reminder, was successfully set or "
+            "started with this expected result: a five-minute timer?",
+        )
         with self.assertRaises(ValueError):
             build_questions("action_ack", {"action": "dance", "expected": "a dance"})
 
