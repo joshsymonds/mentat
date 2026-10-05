@@ -3271,6 +3271,71 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
             )
             self.assertEqual(caller_output_spoof.capacity_failures, ())
 
+    def test_audio_transcription_capacity_events_cross_remote_envelopes(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        import io
+        from evals.dev_stack import RemoteCommandError
+
+        capacity = {
+            "source": "audio transcription",
+            "cause": "ElevenLabs concurrent_limit_exceeded",
+        }
+        envelopes = (
+            {"turns": [], "capacity_failure": capacity},
+            {
+                "turns": [{"turn": 1, "transcript": "completed"}],
+                "failure": {
+                    "turn": 2,
+                    "message": "ElevenLabs transcription rejected utterance 1 "
+                    "(HTTP 429; concurrent_limit_exceeded)",
+                    "speech_started_at": 20.0,
+                    "capacity_failure": capacity,
+                },
+            },
+        )
+        for envelope in envelopes:
+            with self.subTest(completed_turns=len(envelope["turns"])), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "voice/evals").mkdir(parents=True)
+                (root / "launch.lock").touch()
+                (root / "voice-python.path").write_text("/nix/store/python/bin/python")
+                (root / "setpriv.path").write_text("/usr/bin/setpriv")
+                (root / "voice.env.json").write_text("{}")
+                payload = json.dumps({
+                    "command": ["evals/runner.py", "private-room", "Question@0::Answer"],
+                    "token": "header.payload.signature",
+                    "livekit_url": "wss://livekit.invalid",
+                })
+                output = io.StringIO()
+                diagnostic = io.StringIO()
+                with (
+                    patch.object(sys, "argv", ["wrapper", "--", str(root), "8485", "8486"]),
+                    patch.object(sys, "stdin", io.StringIO(payload)),
+                    patch.object(sys, "path", list(sys.path)),
+                    patch.object(
+                        subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess(
+                            ["caller"], 127, json.dumps(envelope), ""
+                        ),
+                    ),
+                    redirect_stdout(output),
+                    redirect_stderr(diagnostic),
+                    self.assertRaises(SystemExit) as exited,
+                ):
+                    exec(compile(_RUN_VOICE_SCRIPT, "<caller-wrapper>", "exec"), {})
+
+                failure = RemoteCommandError(
+                    exited.exception.code,
+                    ["ssh", "sudo", "bash"],
+                    output=output.getvalue(),
+                    stderr=diagnostic.getvalue(),
+                    operation="run_voice",
+                )
+                self.assertEqual(exited.exception.code, 127)
+                self.assertEqual(failure.capacity_failures, (capacity,))
+                self.assertEqual(json.loads(failure.output), envelope)
+
     def test_fake_phone_start_failure_survives_caller_boundary_into_local_report(self):
         from contextlib import redirect_stderr, redirect_stdout
         import traceback

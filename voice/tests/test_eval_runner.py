@@ -1228,7 +1228,45 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(traces[0]["transcript"], "part-0 part-1 part-2")
 
-    async def test_whisper_4xx_preserves_completed_turns_and_allows_later_run(self):
+    async def test_scribe_prompt_capacity_failure_uses_typed_empty_turn_envelope(self):
+        import json
+
+        dependencies = self.dependencies_for_failure("other")
+
+        async def transcribe(*_args):
+            raise runner.caller.TranscriptionCapacityError()
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "transcribe": transcribe,
+        })
+        with patch.dict(os.environ, TEST_VOICE_ENV):
+            with self.assertRaises(runner.NamedCapacityFailure) as caught:
+                await capture_script(
+                    "android-selected-room",
+                    ["Question@0::answer"],
+                    dependencies=dependencies,
+                    room_close_after=None,
+                )
+
+        capacity = {
+            "source": "audio transcription",
+            "cause": "ElevenLabs concurrent_limit_exceeded",
+        }
+        self.assertEqual(caught.exception.capacity_failure, capacity)
+        self.assertEqual(
+            runner._capture_envelope(
+                json.dumps({"turns": [], "capacity_failure": capacity}), 1
+            ),
+            ([], {
+                "turn": 1,
+                "message": "scripted speech transcription rejected for line 1 "
+                "(HTTP 429; concurrent_limit_exceeded)",
+                "capacity_failure": capacity,
+            }),
+        )
+
+    async def test_scribe_capacity_failure_preserves_completed_turns_and_allows_later_run(self):
         import json
 
         dependencies = self.dependencies_for_failure("other")
@@ -1256,8 +1294,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         async def transcribe(_http, utterance_pcm, _rate, _channels):
             nonlocal attempts
             attempts += 1
+            if fail and attempts == 4 and utterance_indexes[utterance_pcm] == 0:
+                raise runner.caller.TranscriptionError(400, "invalid_audio")
             if fail and attempts == 5 and utterance_indexes[utterance_pcm] == 1:
-                raise runner.caller.WhisperTranscriptionError(429)
+                await asyncio.sleep(0.05)
+            if fail and attempts == 6 and utterance_indexes[utterance_pcm] == 2:
+                raise runner.caller.TranscriptionCapacityError()
             return [{"start": 0.0, "end": 0.2, "text": "completed"}]
 
         dependencies = CaptureDependencies(**{
@@ -1266,8 +1308,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             "transcribe": rendered_aware_transcriber(transcribe),
         })
         speech_end = lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1)
-        with patch.dict(os.environ, TEST_VOICE_ENV), patch.object(
-            runner.caller, "_speech_end_after_playout", speech_end
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+            patch.object(runner, "ANSWER_TRANSCRIPTION_DEADLINE_SECONDS", 0.01),
         ):
             with self.assertRaises(runner.PartialCaptureFailure) as caught:
                 await capture_script(
@@ -1285,7 +1329,15 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(caught.exception.failure["turn"], 2)
             self.assertEqual(
                 caught.exception.failure["message"],
-                "Whisper transcription rejected utterance 2 (HTTP 429)",
+                "Transcription rejected utterance 1 "
+                "(HTTP 400; invalid_audio)",
+            )
+            self.assertEqual(
+                caught.exception.failure["capacity_failure"],
+                {
+                    "source": "audio transcription",
+                    "cause": "ElevenLabs concurrent_limit_exceeded",
+                },
             )
             envelope = json.dumps({
                 "turns": caught.exception.turns,
@@ -4799,6 +4851,340 @@ class LocalEvalCliTests(unittest.TestCase):
         )
         self.assertEqual(report["capacity_failure_count"], 1)
         self.assertEqual(report["cases"][0]["run_capacity_failures"][0]["count"], 1)
+
+    def test_transcription_capacity_count_keeps_completed_turns_in_report(self):
+        import io
+        import json
+        import subprocess
+        from contextlib import contextmanager, redirect_stderr, redirect_stdout
+        from evals.dev_stack import RemoteCommandError, _RUN_VOICE_SCRIPT
+        from evals import judge as judge_module
+
+        scenario = SCENARIOS[5]
+        grant = {
+            "token": "header.payload.signature",
+            "room": "android-selected-room",
+            "url": "wss://livekit.invalid",
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        capacity = {
+            "source": "audio transcription",
+            "cause": "ElevenLabs concurrent_limit_exceeded",
+        }
+        calls = []
+        reports = []
+
+        class FormData:
+            def add_field(self, name, value, **kwargs):
+                return None
+
+        class Response:
+            def __init__(self, status, payload):
+                self.status = status
+                self.payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def json(self):
+                return self.payload
+
+            def raise_for_status(self):
+                if self.status >= 500:
+                    raise RuntimeError(f"HTTP {self.status}")
+
+        class FakeHttp:
+            def __init__(self, responses):
+                self.responses = list(responses)
+
+            def post(self, url, **kwargs):
+                calls.append((url, kwargs))
+                if not self.responses:
+                    raise AssertionError("unexpected Scribe request")
+                status, payload = self.responses.pop(0)
+                return Response(status, payload)
+
+        class HttpSession:
+            def __init__(self, http):
+                self.http = http
+
+            async def __aenter__(self):
+                return self.http
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class PhoneProcess:
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def transcript(text):
+            return 200, {
+                "text": text,
+                "words": [{"text": text, "start": 0.0, "end": 0.8, "type": "word"}],
+            }
+
+        def rate_limit():
+            return 429, {"detail": {"code": "rate_limit_exceeded", "status": "too_many_requests"}}
+
+        def concurrency_limit():
+            return 429, {
+                "detail": {
+                    "type": "rate_limit_error",
+                    "code": "concurrent_limit_exceeded",
+                    "message": (
+                        "Too many concurrent requests. Your current subscription is associated with a maximum of "
+                        "12 concurrent requests (running in parallel). This is done such that a single user does "
+                        "not overwhelm our systems and affect other users negatively. Please upgrade your "
+                        "subscription or contact sales if you want to increase this limit."
+                    ),
+                    "status": "too_many_concurrent_requests",
+                    "request_id": "6987ad41e236a010fe8eaa67d8756296",
+                    "docs_url": "https://elevenlabs.io/docs/eleven-api/resources/errors#rate-limiting-and-concurrency",
+                }
+            }
+
+        async def no_wait(_delay):
+            return None
+
+        base_dependencies = RunnerTests.dependencies_for_failure("other")
+        original_score = runner.score_observations
+
+        def run_case(responses):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                voice_dir = root / "voice"
+                (voice_dir / "evals/retained-evidence").mkdir(parents=True, mode=0o700)
+                (root / "launch.lock").touch()
+                (root / "voice-python.path").write_text("/nix/store/python/bin/python")
+                (root / "setpriv.path").write_text("/usr/bin/setpriv")
+                (root / "voice.env.json").write_text(json.dumps({
+                    **TEST_VOICE_ENV,
+                    "ELEVENLABS_API_KEY": "test-scribe-key",
+                }))
+
+                http = FakeHttp(responses)
+                reply_pcm = pcm_windows(*([0] * 5), *([600] * 10), *([0] * 18))
+
+                class CapturedReply:
+                    async def start(self):
+                        pass
+
+                    async def result(self):
+                        return reply_pcm, 24000, 1, time.monotonic() + 0.1
+
+                dependencies = CaptureDependencies(**{
+                    **base_dependencies.__dict__,
+                    "capture_factory": lambda *_args: CapturedReply(),
+                    "transcribe": runner.caller._transcribe,
+                })
+
+                def run_caller(command, **kwargs):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    voice_env = kwargs["env"]
+                    with (
+                        patch.object(runner, "__file__", str(voice_dir / "evals/runner.py")),
+                        patch.object(
+                            runner,
+                            "_dependencies",
+                            side_effect=lambda actual_http: CaptureDependencies(**{
+                                **dependencies.__dict__, "http": actual_http,
+                            }),
+                        ),
+                        patch.dict(os.environ, voice_env, clear=True),
+                        patch.dict(sys.modules, {
+                            "aiohttp": SimpleNamespace(
+                                ClientSession=lambda: HttpSession(http),
+                                FormData=FormData,
+                            ),
+                        }),
+                        patch.object(subprocess, "Popen", side_effect=lambda *_a, **_k: PhoneProcess()),
+                        patch.object(runner.caller, "_transcription_retry_sleep", no_wait),
+                        redirect_stdout(stdout),
+                        redirect_stderr(stderr),
+                    ):
+                        result_code = runner.main(
+                            command[command.index("evals/runner.py") + 1:]
+                        )
+                    return subprocess.CompletedProcess(
+                        command, result_code, stdout.getvalue(), stderr.getvalue()
+                    )
+
+                class Stack:
+                    base_url = "http://voice.invalid"
+
+                    def __init__(self):
+                        self.envelope = None
+                        self.delegation_log = ""
+                        self.record_log = ""
+
+                    def start_worker(self, _room):
+                        return None
+
+                    def run_voice(self, command, *, token, livekit_url):
+                        wrapper_input = json.dumps({
+                            "command": list(command),
+                            "token": token,
+                            "livekit_url": livekit_url,
+                        })
+                        stdout = io.StringIO()
+                        stderr = io.StringIO()
+                        try:
+                            with (
+                                patch.object(sys, "argv", ["wrapper", "--", str(root), "8485", "8486"]),
+                                patch.object(sys, "stdin", io.StringIO(wrapper_input)),
+                                patch.object(sys, "path", list(sys.path)),
+                                patch.object(subprocess, "run", side_effect=run_caller),
+                                redirect_stdout(stdout),
+                                redirect_stderr(stderr),
+                            ):
+                                exec(compile(_RUN_VOICE_SCRIPT, "<remote-caller>", "exec"), {})
+                        except SystemExit as exited:
+                            code = exited.code
+                        else:
+                            raise AssertionError("remote caller did not exit")
+                        if code != 0:
+                            error = RemoteCommandError(
+                                code,
+                                ["ssh", "sudo", "bash"],
+                                output=stdout.getvalue(),
+                                stderr=stderr.getvalue(),
+                                operation="run_voice",
+                            )
+                            self.envelope = json.loads(error.output)
+                            turns = self.envelope.get("turns", [])
+                            if turns:
+                                first_start = turns[0]["speech_started_at"]
+                                self.delegation_log = json.dumps({
+                                    "room": grant["room"],
+                                    "id": "delegate-1",
+                                    "created_at": first_start + 0.05,
+                                }) + "\n"
+                                self.record_log = "".join(
+                                    json.dumps(record) + "\n"
+                                    for record in (
+                                        {
+                                            "type": "stream_event",
+                                            "event": {
+                                                "type": "message_start",
+                                                "message": {
+                                                    "id": "model-call-1",
+                                                    "model": runner.DEFAULT_VOICE_MODEL,
+                                                },
+                                            },
+                                        },
+                                        {"type": "result", "session_id": "voice-android-selected-room"},
+                                    )
+                                )
+                            raise error
+                        return subprocess.CompletedProcess(
+                            command, 0, stdout.getvalue(), stderr.getvalue()
+                        )
+
+                    def run_remote(self, command):
+                        if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
+                            content = ""
+                        elif command == ["sudo", "cat", "voice/evals/delegations.jsonl"]:
+                            content = self.delegation_log
+                        elif command == ["sudo", "cat", "records/voice-android-selected-room.jsonl"]:
+                            content = self.record_log
+                        else:
+                            raise AssertionError(f"unexpected remote artifact read {command!r}")
+                        return subprocess.CompletedProcess(command, 0, content, "")
+
+                stack = Stack()
+
+                class Batch:
+                    @contextmanager
+                    def run(self, _run_id):
+                        yield stack
+
+                @contextmanager
+                def dev_stack(**_kwargs):
+                    yield Batch()
+
+                captured = {}
+
+                def capture_score(observations, *, required_runs):
+                    captured["observations"] = observations
+                    return original_score(observations, required_runs=required_runs)
+
+                output = io.StringIO()
+                with (
+                    patch.object(runner, "SCENARIOS", (scenario,)),
+                    patch.object(runner, "DevStack", side_effect=dev_stack),
+                    patch.object(runner, "_voice_token", return_value=grant),
+                    patch.object(
+                        judge_module,
+                        "JevJudge",
+                        return_value=ScriptedSequenceJudge(lambda _id, _reply: 1.0),
+                    ),
+                    patch.object(runner, "score_observations", side_effect=capture_score),
+                    redirect_stdout(output),
+                ):
+                    runner._run_local_eval(["--live", "--runs", "1", "--concurrency", "1"])
+
+                report = json.loads(output.getvalue())
+                run = captured["observations"]["cases"][0]["runs"][0]
+                reports.append((stack.envelope, run, report))
+                self.assertEqual(
+                    http.responses,
+                    [],
+                    f"remote envelope={stack.envelope!r}; observed run={run!r}; report={report!r}",
+                )
+
+        prompt_responses = [
+            concurrency_limit()
+            for _ in range(runner.caller.TRANSCRIPTION_MAX_ATTEMPTS)
+        ]
+        run_case(prompt_responses)
+        self.assertEqual(reports[-1][0], {
+            "turns": [],
+            "capacity_failure": capacity,
+        })
+        self.assertEqual(reports[-1][1]["turns"], [])
+        self.assertEqual(reports[-1][2]["capacity_failure_count"], 1)
+
+        reply_responses = [
+            rate_limit(),
+            transcript(scenario.caller_lines[0]),
+            transcript(scenario.caller_lines[1]),
+            transcript(scenario.caller_lines[2]),
+            rate_limit(),
+            transcript("Alice bought and donated Alice Keck Park Memorial Garden."),
+            *[
+                concurrency_limit()
+                for _ in range(runner.caller.TRANSCRIPTION_MAX_ATTEMPTS)
+            ],
+        ]
+        run_case(reply_responses)
+        envelope, run, report = reports[-1]
+        self.assertEqual(len(envelope["turns"]), 1)
+        self.assertEqual(envelope["failure"]["capacity_failure"], capacity)
+        self.assertEqual(len(run["turns"]), 1)
+        self.assertEqual(
+            run["turns"][0]["transcript"],
+            "Alice bought and donated Alice Keck Park Memorial Garden.",
+        )
+        self.assertEqual(run["capacity_failures"], [capacity])
+        self.assertEqual(report["capacity_failure_count"], 1)
+        self.assertEqual(len(calls), 4 + 10)
 
     def test_scenario_failure_capacity_wording_is_not_capacity_evidence(self):
         import io
