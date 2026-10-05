@@ -244,7 +244,7 @@ _CAPACITY_EVENT_PREFIX = "MENTAT_EVAL_CAPACITY_EVENT_V1"
 _CAPACITY_EVENT_SOURCE_BY_OPERATION = {
     "candidate_setup": {"candidate daemon start"},
     "start_worker": {"room dispatch"},
-    "run_voice": {"caller start", "fake phone start"},
+    "run_voice": {"caller start", "fake phone start", "audio transcription"},
 }
 
 
@@ -1041,19 +1041,44 @@ except (ValueError, TypeError):
     sys.exit(result.returncode or 1)
 if result.returncode == 127:
     envelope = json.loads(machine_output)
-    capacity = envelope.get("capacity_failure") if isinstance(envelope, dict) else None
+    capacity = None
+    if isinstance(envelope, dict) and set(envelope) == {"turns", "capacity_failure"}:
+        candidate = envelope["capacity_failure"]
+        if (
+            isinstance(candidate, dict)
+            and set(candidate) == {"source", "cause"}
+            and candidate["source"] == "fake phone start"
+            and envelope["turns"] == []
+        ):
+            capacity = candidate
+        elif (
+            isinstance(candidate, dict)
+            and set(candidate) == {"source", "cause"}
+            and candidate["source"] == "audio transcription"
+            and candidate["cause"] == "ElevenLabs concurrent_limit_exceeded"
+            and isinstance(envelope["turns"], list)
+            and not envelope["turns"]
+        ):
+            capacity = candidate
+    elif isinstance(envelope, dict) and set(envelope) == {"turns", "failure"}:
+        failure = envelope["failure"]
+        candidate = failure.get("capacity_failure") if isinstance(failure, dict) else None
+        if (
+            isinstance(candidate, dict)
+            and set(candidate) == {"source", "cause"}
+            and candidate["source"] == "audio transcription"
+            and candidate["cause"] == "ElevenLabs concurrent_limit_exceeded"
+            and isinstance(envelope["turns"], list)
+        ):
+            capacity = candidate
     if (
-        isinstance(envelope, dict)
-        and set(envelope) == {"turns", "capacity_failure"}
-        and envelope["turns"] == []
-        and isinstance(capacity, dict)
-        and set(capacity) == {"source", "cause"}
-        and capacity["source"] == "fake phone start"
+        isinstance(capacity, dict)
         and isinstance(capacity["cause"], str)
         and capacity["cause"].strip()
     ):
+        source = capacity["source"].replace("\t", " ").replace("\r", " ").replace("\n", " ")
         cause = capacity["cause"].replace("\t", " ").replace("\r", " ").replace("\n", " ")
-        print(f"MENTAT_EVAL_CAPACITY_EVENT_V1\tfake phone start\t{cause}", file=sys.stderr)
+        print(f"MENTAT_EVAL_CAPACITY_EVENT_V1\t{source}\t{cause}", file=sys.stderr)
 sys.stdout.write(machine_output)
 sys.exit(result.returncode)
 '''

@@ -156,8 +156,9 @@ events.
 ### 4. Run calls A-D
 
 Use `LINE@DELAY_SECONDS::ANSWER_REGEX` for each scripted prompt. Regexes are
-matched against timestamped Whisper segments; output reports the first match's
-start relative to the caller's speech end. These four calls exercise current
+matched against timestamped ElevenLabs Scribe batch segments with language
+auto-detected; output reports the first match's start relative to the caller's
+speech end. These four calls exercise current
 lookup, price/source freshness, a stable fact from mentatd, and stale-summary
 caution:
 

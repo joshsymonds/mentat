@@ -243,10 +243,15 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
         form_data.assert_not_called()
         http.post.assert_not_called()
 
-    async def test_uploads_valid_duration_pcm_for_transcription(self):
+    async def test_uploads_scribe_batch_request_and_maps_phrase_timestamps(self):
         class FormData:
-            def add_field(self, *_args, **_kwargs):
-                return None
+            def __init__(self):
+                self.fields = []
+
+            def add_field(self, name, value, **kwargs):
+                self.fields.append((name, value, kwargs))
+
+        form = FormData()
 
         class Response:
             status = 200
@@ -261,44 +266,42 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             async def json(self):
-                return {"segments": [{"text": "answer"}]}
+                return {
+                    "text": "+1 800 555 0142",
+                    "words": [
+                        {"text": "+1", "start": 0.2, "end": 0.4, "type": "word"},
+                        {"text": "800", "start": 0.5, "end": 0.8, "type": "word"},
+                        {"text": "555", "start": 0.9, "end": 1.1, "type": "word"},
+                        {"text": "0142", "start": 1.2, "end": 1.6, "type": "word"},
+                    ],
+                }
 
         http = Mock()
         http.post.return_value = Response()
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
-            with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=FormData)}):
-                segments = await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
-        self.assertEqual(segments, [{"text": "answer"}])
-        http.post.assert_called_once()
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": "test-key"}):
+            with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=lambda: form)}):
+                segments = await caller._transcribe(http, b"\0\0" * 24000, 24000, 1)
 
-    async def test_whisper_4xx_is_a_named_clip_failure_but_server_errors_surface(self):
+        self.assertEqual(
+            segments,
+            [{"start": 0.2, "end": 1.6, "text": "+1 800 555 0142"}],
+        )
+        self.assertEqual(http.post.call_args.args[0], "https://api.elevenlabs.io/v1/speech-to-text")
+        self.assertEqual(http.post.call_args.kwargs["headers"], {"xi-api-key": "test-key"})
+        self.assertEqual([field[0] for field in form.fields], ["file", "model_id", "tag_audio_events"])
+        self.assertEqual(form.fields[0][2], {"filename": "answer.wav", "content_type": "audio/wav"})
+        self.assertEqual(form.fields[1][1], "scribe_v2")
+        self.assertEqual(form.fields[2][1], "false")
+
+    async def test_recovers_after_bounded_429_retry(self):
         class FormData:
             def add_field(self, *_args, **_kwargs):
                 return None
 
-        for status in (400, 429):
-            class Response:
-                def __init__(self):
-                    self.status = status
-
-                async def __aenter__(self):
-                    return self
-
-                async def __aexit__(self, *_args):
-                    return None
-
-                def raise_for_status(self):
-                    raise RuntimeError(f"HTTP {status}")
-
-            http = Mock()
-            http.post.return_value = Response()
-            with self.subTest(status=status), patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
-                with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=FormData)}):
-                    with self.assertRaisesRegex(RuntimeError, rf"Whisper transcription rejected clip \(HTTP {status}\)"):
-                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
-
-        class ServerErrorResponse:
-            status = 500
+        class Response:
+            def __init__(self, status, payload):
+                self.status = status
+                self.payload = payload
 
             async def __aenter__(self):
                 return self
@@ -306,15 +309,178 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_args):
                 return None
 
+            async def json(self):
+                return self.payload
+
             def raise_for_status(self):
-                raise RuntimeError("HTTP 500")
+                return None
 
         http = Mock()
-        http.post.return_value = ServerErrorResponse()
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+        http.post.side_effect = [
+            Response(429, {
+                "detail": {
+                    "code": "rate_limit_exceeded",
+                    "status": "too_many_requests",
+                }
+            }),
+            Response(200, {
+                "text": "The answer is six.",
+                "words": [{"text": "The", "start": 0.0, "end": 0.1, "type": "word"}],
+            }),
+        ]
+        delays = []
+
+        async def sleep(delay):
+            delays.append(delay)
+
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": "test-key"}):
             with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=FormData)}):
-                with self.assertRaisesRegex(RuntimeError, "HTTP 500"):
-                    await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+                with patch.object(caller, "_transcription_retry_sleep", sleep):
+                    segments = await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+
+        self.assertEqual(http.post.call_count, 2)
+        self.assertEqual(delays, [0.5])
+        self.assertEqual(
+            segments,
+            [{"start": 0.0, "end": 0.1, "text": "The answer is six."}],
+        )
+
+    async def test_retries_429_and_uses_typed_concurrency_error_after_exhaustion(self):
+        class FormData:
+            def add_field(self, *_args, **_kwargs):
+                return None
+
+        class Response:
+            status = 429
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def json(self):
+                return {
+                    "detail": {
+                        "type": "rate_limit_error",
+                        "code": "concurrent_limit_exceeded",
+                        "message": (
+                            "Too many concurrent requests. Your current subscription is associated with a maximum of "
+                            "12 concurrent requests (running in parallel). This is done such that a single user does "
+                            "not overwhelm our systems and affect other users negatively. Please upgrade your "
+                            "subscription or contact sales if you want to increase this limit."
+                        ),
+                        "status": "too_many_concurrent_requests",
+                        "request_id": "6987ad41e236a010fe8eaa67d8756296",
+                        "docs_url": "https://elevenlabs.io/docs/eleven-api/resources/errors#rate-limiting-and-concurrency",
+                    }
+                }
+
+            def raise_for_status(self):
+                raise RuntimeError("unexpected status handling")
+
+        http = Mock()
+        http.post.return_value = Response()
+        delays = []
+
+        async def sleep(delay):
+            delays.append(delay)
+
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": "test-key"}):
+            with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=FormData)}):
+                with patch.object(caller, "_transcription_retry_sleep", sleep, create=True):
+                    with self.assertRaises(caller.TranscriptionCapacityError) as raised:
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+
+        self.assertEqual(http.post.call_count, caller.TRANSCRIPTION_MAX_ATTEMPTS)
+        self.assertEqual(len(delays), caller.TRANSCRIPTION_MAX_ATTEMPTS - 1)
+        self.assertLessEqual(sum(delays), 30)
+        self.assertEqual(raised.exception.status, 429)
+        self.assertEqual(
+            raised.exception.capacity_failure,
+            {"source": "audio transcription", "cause": "ElevenLabs concurrent_limit_exceeded"},
+        )
+
+    async def test_other_429_and_4xx_are_named_and_server_transport_failures_surface(self):
+        class FormData:
+            def add_field(self, *_args, **_kwargs):
+                return None
+
+        class ContentTypeError(Exception):
+            pass
+
+        class Response:
+            def __init__(self, status, detail=None):
+                self.status = status
+                self.detail = detail
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def json(self):
+                return {
+                    "detail": {
+                        "code": self.detail,
+                        "status": "too_many_requests" if self.status == 429 else "invalid_request",
+                    }
+                } if self.detail else {}
+
+            def raise_for_status(self):
+                raise RuntimeError(f"HTTP {self.status}")
+
+        class NonJsonResponse(Response):
+            async def json(self):
+                raise ContentTypeError("error body is not JSON")
+
+        async def no_wait(_delay):
+            return None
+
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": "test-key"}):
+            with patch.dict(sys.modules, {
+                "aiohttp": SimpleNamespace(FormData=FormData, ContentTypeError=ContentTypeError)
+            }):
+                with patch.object(caller, "_transcription_retry_sleep", no_wait, create=True):
+                    http = Mock()
+                    http.post.return_value = Response(429, "rate_limit_exceeded")
+                    with self.assertRaises(caller.TranscriptionError) as raised:
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+                    self.assertNotIsInstance(raised.exception, caller.TranscriptionCapacityError)
+                    self.assertEqual(raised.exception.code, "rate_limit_exceeded")
+                    self.assertEqual(http.post.call_count, caller.TRANSCRIPTION_MAX_ATTEMPTS)
+
+                    http = Mock()
+                    http.post.return_value = Response(400, "invalid_api_key")
+                    with self.assertRaises(caller.TranscriptionError) as bad_request:
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+                    self.assertEqual(bad_request.exception.code, "invalid_api_key")
+                    self.assertEqual(http.post.call_count, 1)
+
+                    http = Mock()
+                    http.post.return_value = NonJsonResponse(429)
+                    with self.assertRaises(caller.TranscriptionError) as non_json_rate_limit:
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+                    self.assertEqual(non_json_rate_limit.exception.code, None)
+                    self.assertEqual(http.post.call_count, caller.TRANSCRIPTION_MAX_ATTEMPTS)
+
+                    http = Mock()
+                    http.post.return_value = NonJsonResponse(400)
+                    with self.assertRaises(caller.TranscriptionError) as non_json_bad_request:
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+                    self.assertEqual(non_json_bad_request.exception.status, 400)
+                    self.assertEqual(http.post.call_count, 1)
+
+                    http = Mock()
+                    http.post.return_value = Response(500)
+                    with self.assertRaisesRegex(RuntimeError, "HTTP 500"):
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+
+                    http = Mock()
+                    http.post.side_effect = OSError("transport failed")
+                    with self.assertRaisesRegex(OSError, "transport failed"):
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
 
 
 class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
@@ -771,7 +937,7 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
             nonlocal calls
             calls += 1
             if calls == 1:
-                raise caller.WhisperTranscriptionError(400)
+                raise caller.TranscriptionError(400)
             return [{"start": 0.0, "end": 0.2, "text": "answer"}]
 
         task, subscribed, _speech_started, output, _room, _participant, cleanup = await self.run_caller(
@@ -783,7 +949,7 @@ class CallerSubscriptionReadinessTests(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.wait_for(task, timeout=4)
             self.assertEqual(calls, 2)
-            self.assertIn("transcription failure: Whisper transcription rejected clip (HTTP 400)", output)
+            self.assertIn("transcription failure: Transcription rejected clip (HTTP 400)", output)
             self.assertIn("say: Later question", output)
         finally:
             cleanup()

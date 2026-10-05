@@ -113,7 +113,7 @@ def sonnet_report(latencies, **kwargs):
 class CompareTests(unittest.TestCase):
     def test_latency_gate_failures_do_not_disqualify_and_correctness_is_summarized(self):
         sol = report([1.0] * 10, passed=False, failures=[
-            "timer-300-seconds turn 1: first-speech p50 3s exceeds 2s",
+            "timer-300-seconds turn 1: first-speech p50 6s exceeds 5s",
             "timer-300-seconds turn 1: command-receipt p50 3s exceeds 2s",
         ])
         sol["cases"][0]["failures"] = [

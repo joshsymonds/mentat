@@ -30,14 +30,35 @@ class TTSResponse:
     response_bytes: int
 
 
-class WhisperTranscriptionError(RuntimeError):
-    """Whisper rejected one captured clip with an HTTP 4xx response."""
+TRANSCRIPTION_MAX_ATTEMPTS = 4
+_TRANSCRIPTION_RETRY_DELAYS = (0.5, 1.0, 2.0)
 
-    def __init__(self, status: int):
+
+class TranscriptionError(RuntimeError):
+    """A batch transcription provider rejected one captured clip with HTTP 4xx."""
+
+    def __init__(self, status: int, code: str | None = None):
         if not 400 <= status < 500:
-            raise ValueError("Whisper transcription failures must be HTTP 4xx responses")
+            raise ValueError("Transcription failures must be HTTP 4xx responses")
         self.status = status
-        super().__init__(f"Whisper transcription rejected clip (HTTP {status})")
+        self.code = code
+        label = f"; {code}" if code else ""
+        super().__init__(f"Transcription rejected clip (HTTP {status}{label})")
+
+
+class TranscriptionCapacityError(TranscriptionError):
+    """Scribe rejected a request because provider concurrency was exhausted."""
+
+    def __init__(self, status: int = 429):
+        super().__init__(status, "concurrent_limit_exceeded")
+        self.capacity_failure = {
+            "source": "audio transcription",
+            "cause": "ElevenLabs concurrent_limit_exceeded",
+        }
+
+
+async def _transcription_retry_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
 
 
 async def wait_for_microphone_ready(
@@ -346,6 +367,7 @@ async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) ->
     if len(pcm) * 10 < sample_rate * channels * 2:
         return []
 
+    import aiohttp
     from aiohttp import FormData
 
     import io
@@ -356,22 +378,92 @@ async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) ->
         output.setsampwidth(2)
         output.setframerate(sample_rate)
         output.writeframes(pcm)
-    form = FormData()
-    form.add_field("file", wav_bytes.getvalue(), filename="answer.wav", content_type="audio/wav")
-    form.add_field("model", "whisper-1")
-    form.add_field("response_format", "verbose_json")
-    form.add_field("timestamp_granularities[]", "segment")
-    async with http.post(
-        "https://api.openai.com/v1/audio/transcriptions",
-        headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-        data=form,
-    ) as response:
-        status = getattr(response, "status", None)
-        if isinstance(status, int) and 400 <= status < 500:
-            raise WhisperTranscriptionError(status)
-        response.raise_for_status()
-        result = await response.json()
-    return result.get("segments", [])
+    wav_data = wav_bytes.getvalue()
+    duration = len(pcm) / (sample_rate * channels * 2)
+
+    for attempt in range(TRANSCRIPTION_MAX_ATTEMPTS):
+        form = FormData()
+        form.add_field("file", wav_data, filename="answer.wav", content_type="audio/wav")
+        form.add_field("model_id", "scribe_v2")
+        form.add_field("tag_audio_events", "false")
+        async with http.post(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
+            data=form,
+        ) as response:
+            status = getattr(response, "status", None)
+            if status == 429:
+                try:
+                    error_payload = await response.json()
+                except (aiohttp.ContentTypeError, ValueError, TypeError):
+                    error_payload = None
+                detail = error_payload.get("detail") if isinstance(error_payload, dict) else None
+                code = detail.get("code") if isinstance(detail, dict) else None
+                if attempt + 1 < TRANSCRIPTION_MAX_ATTEMPTS:
+                    await _transcription_retry_sleep(_TRANSCRIPTION_RETRY_DELAYS[attempt])
+                    continue
+                if code == "concurrent_limit_exceeded":
+                    raise TranscriptionCapacityError(status)
+                raise TranscriptionError(status, code if isinstance(code, str) else None)
+            if isinstance(status, int) and 400 <= status < 500:
+                try:
+                    error_payload = await response.json()
+                except (aiohttp.ContentTypeError, ValueError, TypeError):
+                    error_payload = None
+                detail = error_payload.get("detail") if isinstance(error_payload, dict) else None
+                code = detail.get("code") if isinstance(detail, dict) else None
+                raise TranscriptionError(status, code if isinstance(code, str) else None)
+            response.raise_for_status()
+            result = await response.json()
+
+        if not isinstance(result, dict):
+            raise RuntimeError("Scribe returned an invalid transcription response")
+        text = result.get("text")
+        words = result.get("words")
+        if not isinstance(text, str):
+            if isinstance(words, list):
+                text = " ".join(
+                    word["text"].strip()
+                    for word in words
+                    if isinstance(word, dict)
+                    and isinstance(word.get("text"), str)
+                    and word["text"].strip()
+                    and word.get("type", "word") == "word"
+                )
+            else:
+                text = ""
+        text = text.strip()
+        if not text:
+            return []
+
+        timestamps = []
+        if isinstance(words, list):
+            for word in words:
+                if (
+                    not isinstance(word, dict)
+                    or not isinstance(word.get("text"), str)
+                    or not word["text"].strip()
+                    or word.get("type", "word") != "word"
+                ):
+                    continue
+                start = word.get("start")
+                end = word.get("end")
+                if (
+                    isinstance(start, (int, float))
+                    and not isinstance(start, bool)
+                    and math.isfinite(start)
+                    and isinstance(end, (int, float))
+                    and not isinstance(end, bool)
+                    and math.isfinite(end)
+                    and 0 <= start <= end
+                ):
+                    timestamps.append((float(start), float(end)))
+        if timestamps:
+            start, end = timestamps[0][0], timestamps[-1][1]
+        else:
+            start, end = 0.0, duration
+        return [{"start": start, "end": end, "text": text}]
+    raise RuntimeError("Scribe transcription retry loop ended unexpectedly")
 
 
 async def run(room_name: str, raw_steps: list[str]) -> None:
@@ -466,7 +558,7 @@ async def run(room_name: str, raw_steps: list[str]) -> None:
                 answer_pcm, sample_rate, channels, capture_started = await capture.result()
                 try:
                     segments = await _transcribe(http, answer_pcm, sample_rate, channels)
-                except WhisperTranscriptionError as error:
+                except TranscriptionError as error:
                     print(f"transcription failure: {error}", flush=True)
                     continue
                 transcript = _segments_text(segments)

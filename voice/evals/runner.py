@@ -247,8 +247,13 @@ SPOKEN_NUMBER_WORDS = frozenset({
     "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
     "sixty", "seventy", "eighty", "ninety",
 })
-WHISPER_HTTP_FAILURE_PATTERN = re.compile(
-    r"Whisper transcription rejected utterance [1-9][0-9]* \(HTTP 4[0-9]{2}\)"
+TRANSCRIPTION_HTTP_FAILURE_PATTERN = re.compile(
+    r"Transcription rejected utterance [1-9][0-9]* "
+    r"\(HTTP 4[0-9]{2}(?:; [a-z0-9_]+)?\)"
+)
+SCRIPTED_TRANSCRIPTION_FAILURE_PATTERN = re.compile(
+    r"scripted speech transcription rejected for line ([1-9][0-9]*) "
+    r"\(HTTP 4[0-9]{2}(?:; [a-z0-9_]+)?\)"
 )
 PHONE_TOOL_KINDS = {
     "send_sms": "sms",
@@ -286,6 +291,9 @@ def _scripted_tts_failure_line(message: Any) -> int | None:
     content_match = SCRIPTED_CONTENT_FAILURE_PATTERN.fullmatch(message)
     if content_match is not None:
         return int(content_match.group(1))
+    transcription_match = SCRIPTED_TRANSCRIPTION_FAILURE_PATTERN.fullmatch(message)
+    if transcription_match is not None:
+        return int(transcription_match.group(1))
     match = SCRIPTED_TTS_RENDER_FAILURE_PATTERN.fullmatch(message)
     if match is None:
         return None
@@ -296,8 +304,8 @@ def _is_scripted_tts_timeout(message: Any) -> bool:
     return _scripted_tts_timeout_line(message) is not None
 
 
-def _is_whisper_http_failure(message: Any) -> bool:
-    return isinstance(message, str) and WHISPER_HTTP_FAILURE_PATTERN.fullmatch(message) is not None
+def _is_transcription_http_failure(message: Any) -> bool:
+    return isinstance(message, str) and TRANSCRIPTION_HTTP_FAILURE_PATTERN.fullmatch(message) is not None
 
 
 class PartialCaptureFailure(RuntimeError):
@@ -313,6 +321,7 @@ class PartialCaptureFailure(RuntimeError):
         *,
         line: int | None = None,
         retry_count: int | None = None,
+        capacity_failure: dict[str, str] | None = None,
     ):
         super().__init__(message)
         self.turns = turns
@@ -325,6 +334,8 @@ class PartialCaptureFailure(RuntimeError):
             self.failure["line"] = line
         if retry_count is not None:
             self.failure["retry_count"] = retry_count
+        if capacity_failure is not None:
+            self.failure["capacity_failure"] = capacity_failure
 
 
 @dataclass(frozen=True)
@@ -890,6 +901,31 @@ async def capture_script(
                     REMOTE_OPERATION_DEADLINE_SECONDS,
                     "scripted speech content transcription",
                 )
+            except caller.TranscriptionCapacityError as error:
+                raise NamedCapacityFailure(
+                    error.capacity_failure["source"], error.capacity_failure["cause"]
+                ) from error
+            except caller.TranscriptionError as error:
+                if retain_caller_audio_dir is not None:
+                    _retain_caller_audio(
+                        retain_caller_audio_dir,
+                        room_name,
+                        index + 1,
+                        step.line,
+                        speech,
+                        b"",
+                        0,
+                        0,
+                        attempt=attempts,
+                        content_check_passed=False,
+                    )
+                suffix = f"; {error.code}" if error.code else ""
+                raise PartialCaptureFailure(
+                    [], 1,
+                    f"scripted speech transcription rejected for line {index + 1} "
+                    f"(HTTP {error.status}{suffix})",
+                    line=index + 1, retry_count=attempts - 1,
+                ) from error
             except Exception as error:
                 if retain_caller_audio_dir is not None:
                     _retain_caller_audio(
@@ -1141,7 +1177,8 @@ async def capture_script(
             utterances = _pcm_utterances(answer_pcm, sample_rate, channels)
             raw_segments = []
             segments = []
-            transcription_failure: tuple[caller.WhisperTranscriptionError, int] | None = None
+            transcription_failure: tuple[caller.TranscriptionError, int] | None = None
+            transcription_capacity_failure: tuple[caller.TranscriptionCapacityError, int] | None = None
             if (
                 not math.isfinite(ANSWER_TRANSCRIPTION_DEADLINE_SECONDS)
                 or ANSWER_TRANSCRIPTION_DEADLINE_SECONDS <= 0
@@ -1173,6 +1210,14 @@ async def capture_script(
                         task.cancel()
                     await asyncio.gather(*pending, return_exceptions=True)
 
+                for utterance_ordinal, task in enumerate(transcription_tasks, start=1):
+                    if task not in done:
+                        continue
+                    task_error = task.exception()
+                    if isinstance(task_error, caller.TranscriptionCapacityError):
+                        if transcription_capacity_failure is None:
+                            transcription_capacity_failure = (task_error, utterance_ordinal)
+
                 for utterance_ordinal, (utterance, task) in enumerate(
                     zip(utterances, transcription_tasks, strict=True), start=1
                 ):
@@ -1181,7 +1226,7 @@ async def capture_script(
                     utterance_start, utterance_end, _utterance_pcm = utterance
                     try:
                         utterance_segments = task.result()
-                    except caller.WhisperTranscriptionError as error:
+                    except caller.TranscriptionError as error:
                         if transcription_failure is None:
                             transcription_failure = (error, utterance_ordinal)
                         continue
@@ -1214,15 +1259,24 @@ async def capture_script(
                         sample_rate,
                         channels,
                     )
+            if transcription_failure is None and transcription_capacity_failure is not None:
+                transcription_failure = transcription_capacity_failure
             if transcription_failure is not None:
                 error, utterance_ordinal = transcription_failure
-                raise PartialCaptureFailure(
+                suffix = f"; {error.code}" if error.code else ""
+                failure = PartialCaptureFailure(
                     traces,
                     index + 1,
-                    f"Whisper transcription rejected utterance {utterance_ordinal} "
-                    f"(HTTP {error.status})",
+                    f"Transcription rejected utterance {utterance_ordinal} "
+                    f"(HTTP {error.status}{suffix})",
                     speech_started_at=speech_started_at,
-                ) from error
+                    capacity_failure=(
+                        transcription_capacity_failure[0].capacity_failure
+                        if transcription_capacity_failure is not None
+                        else None
+                    ),
+                )
+                raise failure from error
             if pending:
                 raise PartialCaptureFailure(
                     traces,
@@ -2386,8 +2440,28 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         payload = json.loads(text)
     except json.JSONDecodeError as error:
         raise RuntimeError("remote scripted capture returned malformed JSON") from error
-    if not isinstance(payload, dict) or set(payload) not in ({"turns"}, {"turns", "failure"}):
+    if not isinstance(payload, dict) or set(payload) not in (
+        {"turns"}, {"turns", "failure"}, {"turns", "capacity_failure"}
+    ):
         raise RuntimeError("remote scripted capture returned an invalid envelope")
+    if "capacity_failure" in payload:
+        capacity = payload["capacity_failure"]
+        if (
+            not isinstance(capacity, dict)
+            or set(capacity) != {"source", "cause"}
+            or capacity.get("source") != "audio transcription"
+            or capacity.get("cause") != "ElevenLabs concurrent_limit_exceeded"
+        ):
+            raise RuntimeError("remote scripted capture returned invalid capacity failure metadata")
+        payload = {
+            "turns": payload["turns"],
+            "failure": {
+                "turn": 1,
+                "message": "scripted speech transcription rejected for line 1 "
+                "(HTTP 429; concurrent_limit_exceeded)",
+                "capacity_failure": capacity,
+            },
+        }
     traces = payload.get("turns")
     if not isinstance(traces, list) or len(traces) > expected_turns:
         raise RuntimeError("remote scripted capture returned missing or invalid turns")
@@ -2401,6 +2475,8 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         {"turn", "message", "speech_started_at"},
         {"turn", "message", "speech_started_at", "segments"},
         {"turn", "message", "line", "retry_count"},
+        {"turn", "message", "capacity_failure"},
+        {"turn", "message", "speech_started_at", "capacity_failure"},
     )
     preflight_tts_line = _scripted_tts_failure_line(
         failure.get("message") if isinstance(failure, dict) else None
@@ -2446,14 +2522,14 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
                 "room was deleted before all scripted lines were captured",
                 "room deletion was not observed before deadline",
             }
-            or _is_whisper_http_failure(failure.get("message"))
+            or _is_transcription_http_failure(failure.get("message"))
         )
         or (
             failure.get("message") in {
                 NO_ANSWER_FAILURE,
                 "answer transcription exceeded its deadline",
             }
-            or _is_whisper_http_failure(failure.get("message"))
+            or _is_transcription_http_failure(failure.get("message"))
         ) != ("speech_started_at" in failure)
         or (
             failure.get("message") == "room was deleted before all scripted lines were captured"
@@ -2461,6 +2537,23 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         )
     ):
         raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
+    if "capacity_failure" in failure:
+        capacity = failure.get("capacity_failure")
+        if (
+            not isinstance(capacity, dict)
+            or set(capacity) != {"source", "cause"}
+            or capacity.get("source") != "audio transcription"
+            or capacity.get("cause") != "ElevenLabs concurrent_limit_exceeded"
+            or not (
+                _is_transcription_http_failure(failure.get("message"))
+                or SCRIPTED_TRANSCRIPTION_FAILURE_PATTERN.fullmatch(
+                    failure.get("message")
+                    if isinstance(failure.get("message"), str)
+                    else ""
+                ) is not None
+            )
+        ):
+            raise RuntimeError("remote scripted capture returned invalid capacity failure metadata")
     if "line" in failure or "retry_count" in failure:
         line = failure.get("line")
         retry_count = failure.get("retry_count")
@@ -2625,6 +2718,7 @@ def observe_scenario(
     room = grant["room"]
     stack.start_worker(room)
     command = _capture_command(scenario, room, raw_steps)
+    remote_capacity_failures: list[dict[str, str]] = []
     try:
         capture = stack.run_voice(
             command,
@@ -2632,22 +2726,41 @@ def observe_scenario(
             livekit_url=grant["url"],
         )
     except RemoteCommandError as error:
-        if error.returncode != 1 or not isinstance(error.output, str):
+        if error.returncode not in {1, 127} or not isinstance(error.output, str):
             raise
         try:
             traces, capture_failure = _capture_envelope(error.output, len(scenario.turns))
         except RuntimeError:
             raise error
-        if not _is_preflight_tts_capture_failure(traces, capture_failure):
-            raise
-        capture_returncode = error.returncode
+        if error.returncode == 127 and capture_failure is not None:
+            capacity = capture_failure.get("capacity_failure")
+            if not isinstance(capacity, dict):
+                raise error
+            remote_capacity_failures = [capacity]
+            capture_returncode = 0
+        elif error.returncode == 1 and _is_preflight_tts_capture_failure(
+            traces, capture_failure
+        ):
+            capture_returncode = error.returncode
+        else:
+            raise error
     else:
         capture_text = getattr(capture, "stdout", None)
         if not isinstance(capture_text, str):
             raise RuntimeError("remote scripted capture returned no output")
         traces, capture_failure = _capture_envelope(capture_text, len(scenario.turns))
         capture_returncode = getattr(capture, "returncode", None)
+        if capture_failure is not None and isinstance(
+            capture_failure.get("capacity_failure"), dict
+        ):
+            remote_capacity_failures = [capture_failure["capacity_failure"]]
 
+    if not traces and remote_capacity_failures:
+        return {
+            "turns": [],
+            "failure": "scripted speech transcription exhausted provider concurrency",
+            "capacity_failures": remote_capacity_failures,
+        }
     if capture_returncode != 0 and not _is_preflight_tts_capture_failure(
         traces, capture_failure
     ):
@@ -2881,6 +2994,8 @@ def observe_scenario(
         "phone_commands": phone_commands,
         "room_closed_after": room_closed_after,
     }
+    if remote_capacity_failures:
+        observation["capacity_failures"] = remote_capacity_failures
     if getattr(scenario, "reply_languages", ()):
         observation["first_spanish_lookup_ms"] = first_spanish_lookup_ms
     if unattributed_model_calls:
@@ -3146,6 +3261,11 @@ def _run_local_eval(argv: list[str]) -> int:
             }
             capacity_failures = _named_capacity_failures(capacity_error, stack)
             if isinstance(observation, dict):
+                reported_capacity = observation.get("capacity_failures", [])
+                if isinstance(reported_capacity, list):
+                    capacity_failures.extend(
+                        item for item in reported_capacity if item not in capacity_failures
+                    )
                 observation["timing"] = timing
                 observation["capacity_failures"] = capacity_failures
                 if failure is not None and "failure" not in observation:
@@ -3419,6 +3539,8 @@ def main(argv: list[str] | None = None) -> int:
     except PartialCaptureFailure as error:
         envelope = {"turns": error.turns, "failure": error.failure}
         print(json.dumps(envelope, separators=(",", ":")), flush=True)
+        if "capacity_failure" in error.failure:
+            return 127
         return int(_is_preflight_tts_capture_failure(error.turns, error.failure))
     print(json.dumps({"turns": traces}, separators=(",", ":")), flush=True)
     return 0
