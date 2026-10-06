@@ -302,6 +302,118 @@ def write_voice_trace(room_name: str, event: str, **fields: Any) -> None:
         logger.exception("failed to write eval voice trace")
 
 
+class ScribeCommitController:
+    """Commit the live Scribe stream every few quiet seconds, never mid-line."""
+
+    def __init__(
+        self, interval: float = 5.0, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._interval = interval
+        self._clock = clock
+        self._stream: Any | None = None
+        self._agent_speaking = False
+        self._user_speaking = False
+        # A line is open from the start of Josh's speech until its final
+        # transcript, the turn's completion, or a stall recovery: local VAD ends
+        # before Scribe's partial arrives, so listening alone never closes it.
+        self._line_open = False
+        self._quiet_due = clock() + interval
+        self._last_commit_at: float | None = None
+        self._closed = False
+        self._wake = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run())
+
+    def set_stream(self, stream: Any) -> None:
+        self._stream = stream
+        self._wake.set()
+
+    def agent_state(self, old_state: str | None, new_state: str) -> None:
+        if new_state == "speaking":
+            self._agent_speaking = True
+        elif old_state == "speaking":
+            self._agent_speaking = False
+            self._quiet_due = self._clock()
+        self._wake.set()
+
+    def user_state(self, new_state: str) -> None:
+        if new_state == "speaking":
+            self._user_speaking = True
+            self._line_open = True
+        else:
+            # Quiet is counted from when Josh stops speaking, even if his line's
+            # final transcript already arrived while VAD still heard him.
+            self._user_speaking = False
+            self._quiet_due = self._clock() + self._interval
+        self._wake.set()
+
+    def close_line(self) -> None:
+        self._line_open = False
+        self._quiet_due = self._clock() + self._interval
+        self._wake.set()
+
+    def _due_at(self) -> float | None:
+        if (
+            self._stream is None
+            or self._agent_speaking
+            or self._user_speaking
+            or self._line_open
+        ):
+            return None
+        if self._last_commit_at is None:
+            return self._quiet_due
+        return max(self._quiet_due, self._last_commit_at + self._interval)
+
+    def _commit_if_due(self) -> None:
+        due = self._due_at()
+        if due is None or self._clock() < due:
+            return
+        try:
+            self._stream.flush()
+        except RuntimeError:
+            # The stream closed under us; the next stt_node hands over a new one.
+            logger.warning("Scribe stream closed before a commit; waiting for the next")
+            self._stream = None
+            return
+        self._last_commit_at = self._clock()
+        self._quiet_due = self._last_commit_at + self._interval
+
+    async def _run(self) -> None:
+        while not self._closed:
+            self._wake.clear()
+            self._commit_if_due()
+            due = self._due_at()
+            timeout = None if due is None else max(0.0, due - self._clock())
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout)
+            except TimeoutError:
+                continue
+
+    async def aclose(self) -> None:
+        self._closed = True
+        self._stream = None
+        self._wake.set()
+        if self._task is not None:
+            await self._task
+            self._task = None
+
+
+class CommitSTT(elevenlabs.STT):
+    """Scribe that hands every stream it opens to the worker's commit cadence."""
+
+    def __init__(self, *, commits: ScribeCommitController | None, **options: Any) -> None:
+        super().__init__(**options)
+        self._commits = commits
+
+    def stream(self, **kwargs: Any) -> Any:
+        stream = super().stream(**kwargs)
+        if self._commits is not None:
+            self._commits.set_stream(stream)
+        return stream
+
+
 class FrontAgent(Agent):
     """A text-only front that streams every user turn through mentatd."""
 
@@ -316,6 +428,7 @@ class FrontAgent(Agent):
         ending_policy: EndingPolicy,
         ending_changed: Callable[[], None],
         stt: Any,
+        scribe_commits: ScribeCommitController,
         tts_provider: Any,
         default_voice: str,
         voice_resolver: VoiceResolver,
@@ -342,6 +455,7 @@ class FrontAgent(Agent):
         self._input_audio = (
             InputAudioRecorder(room_name, input_audio_dir) if input_audio_dir else None
         )
+        self._scribe_commits = scribe_commits
         self._sms_consent = False
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_text = ""
@@ -368,6 +482,7 @@ class FrontAgent(Agent):
         """Reconnect a transcriber that heard speech but never committed it, and ask again."""
         if self._closed:
             return
+        self._scribe_commits.close_line()
         logger.warning(
             "no transcript for %.1f s of speech; reconnecting STT", speech_duration
         )
@@ -384,6 +499,7 @@ class FrontAgent(Agent):
 
     async def on_user_turn_completed(self, chat_ctx: Any, new_message: Any) -> None:
         """Start backend work immediately, merging only a short continuation."""
+        self._scribe_commits.close_line()
         question = str(getattr(new_message, "text_content", "")).strip()
         if not question or self._closed:
             return
@@ -411,6 +527,7 @@ class FrontAgent(Agent):
     async def aclose(self) -> None:
         """Cancel and drain active backend and speech work before session close."""
         self._closed = True
+        await self._scribe_commits.aclose()
         task = self._turn_task
         self._turn_task = None
         if task is not None and not task.done():
@@ -927,9 +1044,12 @@ class FrontAgent(Agent):
         )
         self._ending_changed()
 
-def build_stt(api_key: str, keyterms: tuple[str, ...]) -> Any:
+def build_stt(
+    api_key: str, keyterms: tuple[str, ...], commits: ScribeCommitController | None = None
+) -> Any:
     """ElevenLabs Scribe v2 realtime, English-primary, biased toward private names."""
-    return elevenlabs.STT(
+    return CommitSTT(
+        commits=commits,
         model=STT_MODEL,
         api_key=api_key,
         language_code="en",
@@ -971,7 +1091,11 @@ def prewarm(proc: agents.JobProcess) -> None:
 
 async def entrypoint(ctx: JobContext) -> None:
     """Serve one room until mentatd or the close policy ends it."""
-    stt = build_stt(os.environ["ELEVENLABS_API_KEY"], ctx.proc.userdata["private"].keyterms)
+    scribe_commits = ScribeCommitController()
+    scribe_commits.start()
+    stt = build_stt(
+        os.environ["ELEVENLABS_API_KEY"], ctx.proc.userdata["private"].keyterms, scribe_commits
+    )
     default_voice = os.environ.get("MENTAT_VOICE_TTS_VOICE", TTS_VOICE)
     tts_provider = elevenlabs.TTS(
         model="eleven_v4_turbo",
@@ -1095,6 +1219,8 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_agent_state(event: Any) -> None:
         old_state = getattr(event, "old_state", None)
         new_state = getattr(event, "new_state", None)
+        if new_state is not None:
+            scribe_commits.agent_state(old_state, new_state)
         if new_state == "listening":
             ending_policy.agent_listening(time.monotonic())
         elif new_state in {"thinking", "speaking"}:
@@ -1115,10 +1241,16 @@ async def entrypoint(ctx: JobContext) -> None:
         ending_policy=ending_policy,
         ending_changed=_rearm_timer,
         stt=stt,
+        scribe_commits=scribe_commits,
         tts_provider=tts_provider,
         default_voice=default_voice,
         voice_resolver=voice_resolver,
     )
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(event: Any) -> None:
+        if event.is_final:
+            scribe_commits.close_line()
 
     @session.on("user_transcription_timeout")
     def _on_transcription_timeout(event: Any) -> None:
@@ -1127,6 +1259,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @session.on("user_state_changed")
     def _on_user_state(event: Any) -> None:
+        scribe_commits.user_state(event.new_state)
         if event.new_state == "speaking":
             ending_policy.user_spoke()
         elif event.new_state in {"listening", "away"}:
