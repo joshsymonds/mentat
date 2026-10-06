@@ -38,7 +38,13 @@ from evals.dev_stack import (
 if TYPE_CHECKING:
     from evals.judge import Judge
 
-from evals.report import NO_ANSWER_FAILURE, score_observations
+from evals.report import (
+    MISSING_WORD_TIMESTAMPS_FAILURE,
+    NO_ANSWER_FAILURE,
+    TRANSCRIPTION_FAILURE_DETAIL,
+    is_transcription_failure,
+    score_observations,
+)
 from evals.scenarios import (
     SCENARIOS,
     _expectation_sms,
@@ -247,13 +253,9 @@ SPOKEN_NUMBER_WORDS = frozenset({
     "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
     "sixty", "seventy", "eighty", "ninety",
 })
-TRANSCRIPTION_HTTP_FAILURE_PATTERN = re.compile(
-    r"Transcription rejected utterance [1-9][0-9]* "
-    r"\(HTTP 4[0-9]{2}(?:; [a-z0-9_]+)?\)"
-)
 SCRIPTED_TRANSCRIPTION_FAILURE_PATTERN = re.compile(
     r"scripted speech transcription rejected for line ([1-9][0-9]*) "
-    r"\(HTTP 4[0-9]{2}(?:; [a-z0-9_]+)?\)"
+    rf"\({TRANSCRIPTION_FAILURE_DETAIL}\)"
 )
 PHONE_TOOL_KINDS = {
     "send_sms": "sms",
@@ -304,8 +306,11 @@ def _is_scripted_tts_timeout(message: Any) -> bool:
     return _scripted_tts_timeout_line(message) is not None
 
 
-def _is_transcription_http_failure(message: Any) -> bool:
-    return isinstance(message, str) and TRANSCRIPTION_HTTP_FAILURE_PATTERN.fullmatch(message) is not None
+def _transcription_failure_detail(error: caller.TranscriptionError) -> str:
+    if isinstance(error, caller.TranscriptionTimestampError):
+        return str(error.code)
+    suffix = f"; {error.code}" if error.code else ""
+    return f"HTTP {error.status}{suffix}"
 
 
 class PartialCaptureFailure(RuntimeError):
@@ -549,6 +554,45 @@ def _pcm_utterances(
             answer_pcm[start * window_bytes : end * window_bytes],
         )
         for start, end in ranges
+    ]
+
+
+def _validated_words(words: Any) -> list[dict[str, Any]]:
+    if not isinstance(words, list):
+        raise RuntimeError("transcription returned invalid segments")
+    for word in words:
+        if not isinstance(word, dict) or not isinstance(word.get("text"), str):
+            raise RuntimeError("transcription segment has no text")
+        for field in ("start", "end"):
+            value = word.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise RuntimeError("transcription word has no timestamp")
+    return words
+
+
+def _window_segments(
+    windows: list[tuple[float, float, bytes]], words: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Place each word in the pause window holding its midpoint, else the nearest.
+
+    Window start and end stay the timing authority; a word only chooses a window.
+    """
+    window_texts: list[list[str]] = [[] for _window in windows]
+    for word in words:
+        midpoint = (word["start"] + word["end"]) / 2
+        nearest = min(
+            range(len(windows)),
+            key=lambda position: max(
+                windows[position][0] - midpoint, midpoint - windows[position][1], 0.0
+            ),
+        )
+        text = word["text"].strip()
+        if text:
+            window_texts[nearest].append(text)
+    return [
+        {"start": start, "end": end, "text": " ".join(texts)}
+        for (start, end, _pcm), texts in zip(windows, window_texts, strict=True)
+        if texts
     ]
 
 
@@ -919,11 +963,10 @@ async def capture_script(
                         attempt=attempts,
                         content_check_passed=False,
                     )
-                suffix = f"; {error.code}" if error.code else ""
                 raise PartialCaptureFailure(
                     [], 1,
                     f"scripted speech transcription rejected for line {index + 1} "
-                    f"(HTTP {error.status}{suffix})",
+                    f"({_transcription_failure_detail(error)})",
                     line=index + 1, retry_count=attempts - 1,
                 ) from error
             except Exception as error:
@@ -1177,8 +1220,7 @@ async def capture_script(
             utterances = _pcm_utterances(answer_pcm, sample_rate, channels)
             raw_segments = []
             segments = []
-            transcription_failure: tuple[caller.TranscriptionError, int] | None = None
-            transcription_capacity_failure: tuple[caller.TranscriptionCapacityError, int] | None = None
+            transcription_failure: caller.TranscriptionError | None = None
             if (
                 not math.isfinite(ANSWER_TRANSCRIPTION_DEADLINE_SECONDS)
                 or ANSWER_TRANSCRIPTION_DEADLINE_SECONDS <= 0
@@ -1187,66 +1229,34 @@ async def capture_script(
             transcription_deadline = (
                 dependencies.monotonic() + ANSWER_TRANSCRIPTION_DEADLINE_SECONDS
             )
+            pending: set[asyncio.Task[Any]] = set()
             try:
-                transcription_tasks = [
-                    asyncio.create_task(
+                if utterances:
+                    transcription_task = asyncio.create_task(
                         dependencies.transcribe(
-                            dependencies.http, utterance_pcm, sample_rate, channels
+                            dependencies.http, answer_pcm, sample_rate, channels
                         )
                     )
-                    for _utterance_start, _utterance_end, utterance_pcm in utterances
-                ]
-                remaining = transcription_deadline - dependencies.monotonic()
-                if remaining > 0:
-                    done, pending = await asyncio.wait(
-                        transcription_tasks,
-                        timeout=remaining,
-                        return_when=asyncio.ALL_COMPLETED,
-                    )
-                else:
-                    done, pending = set(), set(transcription_tasks)
-                if pending:
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-
-                for utterance_ordinal, task in enumerate(transcription_tasks, start=1):
-                    if task not in done:
-                        continue
-                    task_error = task.exception()
-                    if isinstance(task_error, caller.TranscriptionCapacityError):
-                        if transcription_capacity_failure is None:
-                            transcription_capacity_failure = (task_error, utterance_ordinal)
-
-                for utterance_ordinal, (utterance, task) in enumerate(
-                    zip(utterances, transcription_tasks, strict=True), start=1
-                ):
-                    if task not in done:
-                        break
-                    utterance_start, utterance_end, _utterance_pcm = utterance
-                    try:
-                        utterance_segments = task.result()
-                    except caller.TranscriptionError as error:
-                        if transcription_failure is None:
-                            transcription_failure = (error, utterance_ordinal)
-                        continue
-                    if not isinstance(utterance_segments, list):
-                        raise RuntimeError("transcription returned invalid segments")
-                    raw_segments.extend(utterance_segments)
-                    texts = []
-                    for segment in utterance_segments:
-                        if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
-                            raise RuntimeError("transcription segment has no text")
-                        text = segment["text"].strip()
-                        if text:
-                            texts.append(text)
-                    text = " ".join(texts)
-                    if text:
-                        segments.append({
-                            "start": utterance_start,
-                            "end": utterance_end,
-                            "text": text,
-                        })
+                    remaining = transcription_deadline - dependencies.monotonic()
+                    if remaining > 0:
+                        _done, pending = await asyncio.wait(
+                            {transcription_task},
+                            timeout=remaining,
+                            return_when=asyncio.ALL_COMPLETED,
+                        )
+                    else:
+                        pending = {transcription_task}
+                    if pending:
+                        transcription_task.cancel()
+                        await asyncio.gather(transcription_task, return_exceptions=True)
+                    else:
+                        try:
+                            words = transcription_task.result()
+                        except caller.TranscriptionError as error:
+                            transcription_failure = error
+                        else:
+                            raw_segments = _validated_words(words)
+                            segments = _window_segments(utterances, raw_segments)
             finally:
                 if retain_sms_audio_dir is not None and retain_sms_audio_scenario is not None:
                     _retain_sms_audio(
@@ -1259,20 +1269,25 @@ async def capture_script(
                         sample_rate,
                         channels,
                     )
-            if transcription_failure is None and transcription_capacity_failure is not None:
-                transcription_failure = transcription_capacity_failure
             if transcription_failure is not None:
-                error, utterance_ordinal = transcription_failure
-                suffix = f"; {error.code}" if error.code else ""
+                error = transcription_failure
                 failure = PartialCaptureFailure(
                     traces,
                     index + 1,
-                    f"Transcription rejected utterance {utterance_ordinal} "
-                    f"(HTTP {error.status}{suffix})",
+                    f"Transcription rejected reply clip ({_transcription_failure_detail(error)})",
                     speech_started_at=speech_started_at,
+                    segments=(
+                        [{
+                            "start": 0.0,
+                            "end": len(answer_pcm) / (sample_rate * channels * 2),
+                            "text": error.text,
+                        }]
+                        if isinstance(error, caller.TranscriptionTimestampError)
+                        else None
+                    ),
                     capacity_failure=(
-                        transcription_capacity_failure[0].capacity_failure
-                        if transcription_capacity_failure is not None
+                        error.capacity_failure
+                        if isinstance(error, caller.TranscriptionCapacityError)
                         else None
                     ),
                 )
@@ -1283,7 +1298,6 @@ async def capture_script(
                     index + 1,
                     "answer transcription exceeded its deadline",
                     speech_started_at=speech_started_at,
-                    segments=raw_segments or None,
                 )
             if not segments:
                 raise PartialCaptureFailure(
@@ -2522,14 +2536,14 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
                 "room was deleted before all scripted lines were captured",
                 "room deletion was not observed before deadline",
             }
-            or _is_transcription_http_failure(failure.get("message"))
+            or is_transcription_failure(failure.get("message"))
         )
         or (
             failure.get("message") in {
                 NO_ANSWER_FAILURE,
                 "answer transcription exceeded its deadline",
             }
-            or _is_transcription_http_failure(failure.get("message"))
+            or is_transcription_failure(failure.get("message"))
         ) != ("speech_started_at" in failure)
         or (
             failure.get("message") == "room was deleted before all scripted lines were captured"
@@ -2545,7 +2559,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
             or capacity.get("source") != "audio transcription"
             or capacity.get("cause") != "ElevenLabs concurrent_limit_exceeded"
             or not (
-                _is_transcription_http_failure(failure.get("message"))
+                is_transcription_failure(failure.get("message"))
                 or SCRIPTED_TRANSCRIPTION_FAILURE_PATTERN.fullmatch(
                     failure.get("message")
                     if isinstance(failure.get("message"), str)
@@ -2568,10 +2582,13 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         ):
             raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
     if "segments" in failure and (
-        failure.get("message") not in {
-            NO_ANSWER_FAILURE,
-            "answer transcription exceeded its deadline",
-        }
+        not (
+            failure.get("message") in {
+                NO_ANSWER_FAILURE,
+                "answer transcription exceeded its deadline",
+            }
+            or failure.get("message") == MISSING_WORD_TIMESTAMPS_FAILURE
+        )
         or not isinstance(failure["segments"], list)
     ):
         raise RuntimeError("remote scripted capture returned invalid partial failure metadata")
@@ -3136,6 +3153,10 @@ def _parse_local_eval_arguments(argv: list[str]) -> dict[str, Any]:
         help=f"maximum concurrent runs (default: {DEFAULT_CONCURRENCY})",
     )
     parser.add_argument("--list", action="store_true", help="list the contracted scenarios without running them")
+    parser.add_argument(
+        "--scenario", action="append", metavar="NAME",
+        help="run only this scenario; repeat to run several (default: every scenario)",
+    )
     return vars(parser.parse_args(argv))
 
 
@@ -3145,6 +3166,13 @@ class _EvaluationInterrupted(BaseException):
 
 def _run_local_eval(argv: list[str]) -> int:
     arguments = _parse_local_eval_arguments(argv)
+    requested_names = arguments["scenario"]
+    if requested_names is not None:
+        unknown = sorted(set(requested_names) - {scenario.name for scenario in SCENARIOS})
+        if unknown:
+            known = ", ".join(scenario.name for scenario in SCENARIOS)
+            print(f"eval --scenario: unknown scenario: {', '.join(unknown)} (known: {known})", file=sys.stderr)
+            return 2
     if arguments["list"]:
         if arguments["live"] or arguments["runs"] != 10 or arguments["concurrency"] != DEFAULT_CONCURRENCY:
             print("eval --list cannot be combined with --live, --runs, or --concurrency", file=sys.stderr)
@@ -3164,12 +3192,16 @@ def _run_local_eval(argv: list[str]) -> int:
         print(str(error), file=sys.stderr)
         return 2
 
+    scenarios = [
+        scenario for scenario in SCENARIOS
+        if requested_names is None or scenario.name in requested_names
+    ]
     run_count = arguments["runs"]
     concurrency_cap = arguments["concurrency"]
     observations: dict[str, Any] = {
         "cases": [
             {"name": scenario.name, "runs": [None] * run_count}
-            for scenario in SCENARIOS
+            for scenario in scenarios
         ]
     }
     capture_failures: list[tuple[int, int, str]] = []
@@ -3188,7 +3220,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 abort_event.set()
 
     def execute_run(batch: Any, scenario_index: int, run_index: int) -> tuple[int, int, dict[str, Any] | None, str | None]:
-        scenario = SCENARIOS[scenario_index]
+        scenario = scenarios[scenario_index]
         run_id = f"case-{scenario_index + 1}-run-{run_index + 1}"
         key = (scenario_index, run_index)
         manager = None
@@ -3302,7 +3334,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 batch_phase = "scheduling"
                 try:
                     executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_cap)
-                    for scenario_index in range(len(SCENARIOS)):
+                    for scenario_index in range(len(scenarios)):
                         for run_index in range(run_count):
                             future = executor.submit(execute_run, batch, scenario_index, run_index)
                             futures[future] = (scenario_index, run_index)
@@ -3312,7 +3344,7 @@ def _run_local_eval(argv: list[str]) -> int:
                             observations["cases"][scenario_index]["runs"][run_index] = observation
                         if failure is not None:
                             message = _redact_diagnostics(
-                                f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
+                                f"{scenarios[scenario_index].name} run {run_index + 1}: {failure}"
                             )
                             capture_failures.append((scenario_index, run_index, message))
                             break
@@ -3392,7 +3424,7 @@ def _run_local_eval(argv: list[str]) -> int:
                             result_scenario,
                             result_run,
                             _redact_diagnostics(
-                                f"{SCENARIOS[result_scenario].name} run {result_run + 1}: {failure}"
+                                f"{scenarios[result_scenario].name} run {result_run + 1}: {failure}"
                             ),
                         ))
                     continue
@@ -3414,7 +3446,7 @@ def _run_local_eval(argv: list[str]) -> int:
             },
         }
         capture_failures.append((scenario_index, run_index, _redact_diagnostics(
-            f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
+            f"{scenarios[scenario_index].name} run {run_index + 1}: {failure}"
         )))
 
     for scenario_index, case in enumerate(observations["cases"]):
@@ -3433,7 +3465,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 },
             }
             capture_failures.append((scenario_index, run_index, _redact_diagnostics(
-                f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
+                f"{scenarios[scenario_index].name} run {run_index + 1}: {failure}"
             )))
 
     observations["batch_timing"] = {

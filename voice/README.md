@@ -156,9 +156,9 @@ events.
 ### 4. Run calls A-D
 
 Use `LINE@DELAY_SECONDS::ANSWER_REGEX` for each scripted prompt. Regexes are
-matched against timestamped ElevenLabs Scribe batch segments with language
-auto-detected; output reports the first match's start relative to the caller's
-speech end. These four calls exercise current
+matched against the words of one ElevenLabs Scribe batch transcription of the
+whole reply clip, with language auto-detected; output reports the start of the
+word where the first match begins, relative to the caller's speech end. These four calls exercise current
 lookup, price/source freshness, a stable fact from mentatd, and stale-summary
 caution:
 
@@ -266,6 +266,15 @@ provider concurrency refusal found in that run's retained `voice.log`; repeated
 copies of one provider refusal count once per run. Generic setup, cleanup, or
 scenario-check failures do not count as capacity evidence.
 
+The eval transcribes each reply clip with one Scribe batch request, so a 0.3 s
+acknowledgment such as "Got it." keeps its words. Each returned word goes to
+the pause window holding its start/end midpoint, or to the nearest window; the
+windows alone set segment timing. A clip whose transcription returns text
+without word timestamps fails as "Transcription rejected reply clip
+(missing_word_timestamps)" with the text kept in the failure evidence. Scribe
+HTTP 4xx rejections and concurrency 429 refusals are likewise named for the
+reply clip.
+
 On normal exit, errors, or SIGINT/SIGTERM, the runner stops launching work,
 finishes stopping all candidate processes, then restores production
 `mentat-voice`. A later setup reaps leftovers only when their recorded batch
@@ -275,6 +284,18 @@ To inspect the contracted scenarios without starting services, run:
 
 ```sh
 python3 -m voice.evals.runner eval --list
+```
+
+To run only some scenarios, repeat `--scenario NAME`. Names are checked against
+the scenario list below (an unknown name is an error), repeated names select a
+scenario once, and selected scenarios run in registry order. `--runs` still sets
+the repetitions of each selected scenario. Without the flag every scenario
+runs; with `--list`, known names still print the full listing. For example, the
+Spanish subset, eight runs each:
+
+```sh
+python3 -m voice.evals.runner eval --live --runs 8 \
+  --scenario spanish-language-switch --scenario spanish-interpreter
 ```
 
 The current scenarios are `timer-300-seconds`, `equivalent-alarm`,

@@ -295,8 +295,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return rendered_pcm(text)
 
         async def transcribe(_http, pcm, _rate, _channels):
-            self.assertEqual(pcm, pcm_windows(600, 600))
-            return [{"start": 0.0, "end": 23.0, "text": "answer"}]
+            self.assertTrue(pcm == pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18)))
+            return [{"start": 0.1, "end": 0.14, "text": "answer"}]
 
         dependencies = CaptureDependencies(
             api=api,
@@ -612,14 +612,13 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             (10.06, True),
         )
 
-    async def test_capture_transcribes_pcm_utterances_when_asr_timestamps_collapse(self):
+    async def test_capture_transcribes_each_reply_clip_once_and_maps_words_to_windows(self):
         dependencies = self.dependencies_for_failure("other")
         windows = [0] * (23 * 50)
         for onset, level in ((50, 400), (500, 500), (1000, 600)):
-            windows[onset : onset + 5] = [level] * 5
+            windows[onset : onset + 15] = [level] * 15
         pcm = pcm_windows(*windows)
         calls = []
-        responses = {400: "OK.", 500: "Timer set for 5 minutes.", 600: "OK."}
 
         class LongCapture:
             async def start(self):
@@ -630,8 +629,13 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         async def transcribe(_http, audio, _rate, _channels):
             calls.append(audio)
-            level = struct.unpack_from("<h", audio)[0]
-            return [{"start": 0.0, "end": 23.0, "text": responses[level]}]
+            return [
+                {"start": 1.0, "end": 1.25, "text": "Got"},
+                {"start": 1.25, "end": 1.3, "text": "it."},
+                {"start": 9.8, "end": 9.9, "text": "Timer"},
+                {"start": 10.0, "end": 10.1, "text": "set"},
+                {"start": 20.0, "end": 20.1, "text": "OK."},
+            ]
 
         dependencies = CaptureDependencies(
             **{
@@ -656,13 +660,20 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         trace = traces[0]
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(trace["transcript"], "OK. Timer set for 5 minutes. OK.")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0] == pcm)
+        self.assertEqual(trace["transcript"], "Got it. Timer set OK.")
         self.assertEqual(
-            [(segment["start"], segment["end"]) for segment in trace["segments"]],
-            [(1.0, 1.1), (10.0, 10.1), (20.0, 20.1)],
+            [(segment["start"], segment["end"], segment["text"]) for segment in trace["segments"]],
+            [(1.0, 1.3, "Got it."), (10.0, 10.3, "Timer set"), (20.0, 20.3, "OK.")],
         )
-        self.assertEqual([segment["start"] for segment in trace["raw_segments"]], [0.0] * 3)
+        self.assertEqual(trace["raw_segments"], [
+            {"start": 1.0, "end": 1.25, "text": "Got"},
+            {"start": 1.25, "end": 1.3, "text": "it."},
+            {"start": 9.8, "end": 9.9, "text": "Timer"},
+            {"start": 10.0, "end": 10.1, "text": "set"},
+            {"start": 20.0, "end": 20.1, "text": "OK."},
+        ])
         self.assertEqual(
             runner._answer_time(
                 trace,
@@ -1185,12 +1196,14 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(connects, [])
 
-    async def test_concurrent_utterance_transcriptions_preserve_capture_order(self):
+    async def test_words_map_to_the_window_holding_their_midpoint_or_the_nearest_window(self):
         dependencies = self.dependencies_for_failure("other")
         levels = [0] * 55
         for onset, level in zip((0, 20, 40), (600, 700, 800), strict=True):
             levels[onset : onset + 5] = [level] * 5
         pcm = pcm_windows(*levels)
+        windows = [(start, end) for start, end, _pcm in runner._pcm_utterances(pcm, 24000, 1)]
+        self.assertEqual(len(windows), 3)
 
         class LongCapture:
             async def start(self):
@@ -1199,17 +1212,15 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             async def result(self):
                 return pcm, 24000, 1, time.monotonic() + 0.1
 
-        utterance_indexes = {
-            utterance_pcm: index
-            for index, (_start, _end, utterance_pcm) in enumerate(
-                runner._pcm_utterances(pcm, 24000, 1)
-            )
-        }
-        delays = {0: 0.04, 1: 0.001, 2: 0.02}
-        async def transcribe(_http, utterance_pcm, _rate, _channels):
-            index = utterance_indexes[utterance_pcm]
-            await asyncio.sleep(delays[index])
-            return [{"start": 0.0, "end": 0.2, "text": f"part-{index}"}]
+        async def transcribe(_http, _utterance_pcm, _rate, _channels):
+            return [
+                {"start": 0.0, "end": 0.1, "text": "inside-first"},
+                {"start": 0.12, "end": 0.18, "text": "gap-near-first"},
+                {"start": 0.3, "end": 0.36, "text": "gap-near-second"},
+                {"start": 0.45, "end": 0.5, "text": "inside-second"},
+                {"start": 0.7, "end": 1.2, "text": "straddles-third"},
+                {"start": 4.0, "end": 4.2, "text": "after-last"},
+            ]
 
         dependencies = CaptureDependencies(
             **{**dependencies.__dict__, "capture_factory": lambda *_args: LongCapture(), "transcribe": rendered_aware_transcriber(transcribe)}
@@ -1226,7 +1237,14 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 dependencies=dependencies, room_close_after=None,
             )
 
-        self.assertEqual(traces[0]["transcript"], "part-0 part-1 part-2")
+        self.assertEqual(
+            [(segment["start"], segment["end"], segment["text"]) for segment in traces[0]["segments"]],
+            [
+                (windows[0][0], windows[0][1], "inside-first gap-near-first"),
+                (windows[1][0], windows[1][1], "gap-near-second inside-second"),
+                (windows[2][0], windows[2][1], "straddles-third after-last"),
+            ],
+        )
 
     async def test_scribe_prompt_capacity_failure_uses_typed_empty_turn_envelope(self):
         import json
@@ -1274,13 +1292,6 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         for onset, level in zip((0, 20, 40), (600, 700, 800), strict=True):
             levels[onset : onset + 5] = [level] * 5
         pcm = pcm_windows(*levels)
-        utterance_indexes = {
-            utterance_pcm: index
-            for index, (_start, _end, utterance_pcm) in enumerate(
-                runner._pcm_utterances(pcm, 24000, 1)
-            )
-        }
-        self.assertEqual(len(utterance_indexes), 3)
         fail = True
         attempts = 0
 
@@ -1291,14 +1302,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             async def result(self):
                 return pcm, 24000, 1, time.monotonic() + 0.1
 
-        async def transcribe(_http, utterance_pcm, _rate, _channels):
+        async def transcribe(_http, _clip_pcm, _rate, _channels):
             nonlocal attempts
             attempts += 1
-            if fail and attempts == 4 and utterance_indexes[utterance_pcm] == 0:
-                raise runner.caller.TranscriptionError(400, "invalid_audio")
-            if fail and attempts == 5 and utterance_indexes[utterance_pcm] == 1:
-                await asyncio.sleep(0.05)
-            if fail and attempts == 6 and utterance_indexes[utterance_pcm] == 2:
+            if fail and attempts == 2:
                 raise runner.caller.TranscriptionCapacityError()
             return [{"start": 0.0, "end": 0.2, "text": "completed"}]
 
@@ -1311,7 +1318,6 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.dict(os.environ, TEST_VOICE_ENV),
             patch.object(runner.caller, "_speech_end_after_playout", speech_end),
-            patch.object(runner, "ANSWER_TRANSCRIPTION_DEADLINE_SECONDS", 0.01),
         ):
             with self.assertRaises(runner.PartialCaptureFailure) as caught:
                 await capture_script(
@@ -1321,16 +1327,14 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     room_close_after=None,
                 )
 
+            self.assertEqual(attempts, 2)
             self.assertEqual(len(caught.exception.turns), 1)
-            self.assertEqual(
-                caught.exception.turns[0]["transcript"],
-                "completed completed completed",
-            )
+            self.assertEqual(caught.exception.turns[0]["transcript"], "completed")
             self.assertEqual(caught.exception.failure["turn"], 2)
             self.assertEqual(
                 caught.exception.failure["message"],
-                "Transcription rejected utterance 1 "
-                "(HTTP 400; invalid_audio)",
+                "Transcription rejected reply clip "
+                "(HTTP 429; concurrent_limit_exceeded)",
             )
             self.assertEqual(
                 caught.exception.failure["capacity_failure"],
@@ -1356,6 +1360,181 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 room_close_after=None,
             )
             self.assertEqual(len(traces), 2)
+
+    async def test_reply_clip_429_retries_inside_one_clip_and_exhaustion_is_typed(self):
+        from unittest.mock import Mock
+
+        class FormData:
+            def add_field(self, *_args, **_kwargs):
+                return None
+
+        class Response:
+            def __init__(self, status, payload):
+                self.status = status
+                self.payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def json(self):
+                return self.payload
+
+            def raise_for_status(self):
+                return None
+
+        busy = {"detail": {"code": "concurrent_limit_exceeded", "status": "too_many_requests"}}
+        ok = {
+            "text": "Got it.",
+            "words": [
+                {"text": "Got", "start": 0.1, "end": 0.2, "type": "word"},
+                {"text": "it.", "start": 0.2, "end": 0.3, "type": "word"},
+            ],
+        }
+        pcm = pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18))
+
+        class Capture:
+            async def start(self):
+                pass
+
+            async def result(self):
+                return pcm, 24000, 1, time.monotonic() + 0.1
+
+        async def no_sleep(_delay):
+            return None
+
+        async def run_capture(responses):
+            http = Mock()
+            http.post.side_effect = responses
+            dependencies = self.dependencies_for_failure("other")
+            dependencies = CaptureDependencies(**{
+                **dependencies.__dict__,
+                "http": http,
+                "capture_factory": lambda *_args: Capture(),
+                "transcribe": rendered_aware_transcriber(runner.caller._transcribe),
+            })
+            with (
+                patch.dict(os.environ, {**TEST_VOICE_ENV, "ELEVENLABS_API_KEY": "test-key"}),
+                patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=FormData)}),
+                patch.object(runner.caller, "_transcription_retry_sleep", no_sleep),
+                patch.object(
+                    runner.caller,
+                    "_speech_end_after_playout",
+                    lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1),
+                ),
+            ):
+                try:
+                    return http, await capture_script(
+                        "android-selected-room", ["Question@0::answer"],
+                        dependencies=dependencies, room_close_after=None,
+                    )
+                except runner.PartialCaptureFailure as failure:
+                    return http, failure
+
+        http, traces = await run_capture([Response(429, busy), Response(200, ok)])
+        self.assertEqual(http.post.call_count, 2)
+        self.assertEqual(traces[0]["transcript"], "Got it.")
+
+        http, failure = await run_capture([Response(429, busy)] * runner.caller.TRANSCRIPTION_MAX_ATTEMPTS)
+        self.assertEqual(http.post.call_count, runner.caller.TRANSCRIPTION_MAX_ATTEMPTS)
+        self.assertEqual(
+            failure.failure["message"],
+            "Transcription rejected reply clip (HTTP 429; concurrent_limit_exceeded)",
+        )
+        self.assertEqual(
+            failure.failure["capacity_failure"],
+            {"source": "audio transcription", "cause": "ElevenLabs concurrent_limit_exceeded"},
+        )
+
+    async def test_rejected_reply_clip_failure_names_the_clip(self):
+        import json
+
+        dependencies = self.dependencies_for_failure("other")
+        pcm = pcm_windows(0, 0, 600, 600, *([0] * 18))
+
+        class Capture:
+            async def start(self):
+                pass
+
+            async def result(self):
+                return pcm, 24000, 1, time.monotonic() + 0.1
+
+        async def transcribe(*_args):
+            raise runner.caller.TranscriptionError(400, "invalid_audio")
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "capture_factory": lambda *_args: Capture(),
+            "transcribe": rendered_aware_transcriber(transcribe),
+        })
+        with patch.dict(os.environ, TEST_VOICE_ENV), patch.object(
+            runner.caller,
+            "_speech_end_after_playout",
+            lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1),
+        ):
+            with self.assertRaises(runner.PartialCaptureFailure) as caught:
+                await capture_script(
+                    "android-selected-room",
+                    ["Question@0::answer"],
+                    dependencies=dependencies,
+                    room_close_after=None,
+                )
+
+        failure = caught.exception.failure
+        self.assertEqual(
+            failure["message"], "Transcription rejected reply clip (HTTP 400; invalid_audio)"
+        )
+        self.assertNotIn("capacity_failure", failure)
+        self.assertNotIn("segments", failure)
+        envelope = json.dumps({"turns": [], "failure": failure})
+        self.assertEqual(runner._capture_envelope(envelope, 1), ([], failure))
+
+    async def test_reply_without_word_timestamps_fails_by_name_and_keeps_text(self):
+        import json
+
+        dependencies = self.dependencies_for_failure("other")
+        pcm = pcm_windows(0, 0, 600, 600, *([0] * 18))
+
+        class Capture:
+            async def start(self):
+                pass
+
+            async def result(self):
+                return pcm, 24000, 1, time.monotonic() + 0.1
+
+        async def transcribe(*_args):
+            raise runner.caller.TranscriptionTimestampError("Got it. Timer set.")
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "capture_factory": lambda *_args: Capture(),
+            "transcribe": rendered_aware_transcriber(transcribe),
+        })
+        with patch.dict(os.environ, TEST_VOICE_ENV), patch.object(
+            runner.caller,
+            "_speech_end_after_playout",
+            lambda *_args: asyncio.sleep(0, result=time.monotonic() - 1),
+        ):
+            with self.assertRaises(runner.PartialCaptureFailure) as caught:
+                await capture_script(
+                    "android-selected-room",
+                    ["Question@0::answer"],
+                    dependencies=dependencies,
+                    room_close_after=None,
+                )
+
+        failure = caught.exception.failure
+        self.assertEqual(
+            failure["message"], "Transcription rejected reply clip (missing_word_timestamps)"
+        )
+        self.assertEqual(
+            failure["segments"],
+            [{"start": 0.0, "end": len(pcm) / (24000 * 2), "text": "Got it. Timer set."}],
+        )
+        envelope = json.dumps({"turns": [], "failure": failure})
+        self.assertEqual(runner._capture_envelope(envelope, 1), ([], failure))
 
     async def test_non_4xx_transcription_errors_still_surface(self):
         dependencies = self.dependencies_for_failure("other")
@@ -1389,7 +1568,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     room_close_after=None,
                 )
 
-    async def test_asr_deadline_is_named_partial_failure_with_turn_start_and_prefix(self):
+    async def test_asr_deadline_is_named_partial_failure_with_turn_start_and_retained_audio(self):
         import json
         import tempfile
         import wave
@@ -1407,17 +1586,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             async def result(self):
                 return pcm, 24000, 1, time.monotonic() + 0.1
 
-        utterance_indexes = {
-            utterance_pcm: index
-            for index, (_start, _end, utterance_pcm) in enumerate(
-                runner._pcm_utterances(pcm, 24000, 1)
-            )
-        }
-        async def transcribe(_http, utterance_pcm, _rate, _channels):
-            if utterance_indexes[utterance_pcm] == 1:
-                await asyncio.sleep(1)
-            else:
-                await asyncio.sleep(0)
+        async def transcribe(_http, _clip_pcm, _rate, _channels):
+            await asyncio.sleep(1)
             return [{"start": 0.0, "end": 0.2, "text": "completed"}]
 
         dependencies = CaptureDependencies(
@@ -1451,12 +1621,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(retained.readframes(retained.getnframes()), pcm)
             metadata = json.loads((audio_dir / "transcripts.jsonl").read_text())
             self.assertEqual(metadata["filename"], audio_path.name)
-            self.assertEqual(metadata["transcript"], "completed")
+            self.assertEqual(metadata["transcript"], "")
 
         self.assertEqual(caught.exception.failure["turn"], 1)
         self.assertEqual(caught.exception.failure["message"], "answer transcription exceeded its deadline")
         self.assertIsInstance(caught.exception.failure["speech_started_at"], float)
-        self.assertEqual(caught.exception.failure["segments"], [{"start": 0.0, "end": 0.2, "text": "completed"}])
+        self.assertNotIn("segments", caught.exception.failure)
         self.assertEqual(
             runner._capture_envelope(json.dumps({
                 "turns": caught.exception.turns,
@@ -1464,52 +1634,6 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             }), 1),
             ([], caught.exception.failure),
         )
-
-    async def test_utterance_transcriptions_share_one_per_turn_deadline(self):
-        dependencies = self.dependencies_for_failure("other")
-        windows = [0] * 55
-        for onset in (0, 20, 40):
-            windows[onset : onset + 5] = [600] * 5
-        pcm = pcm_windows(*windows)
-        calls = []
-
-        class LongCapture:
-            async def start(self):
-                pass
-
-            async def result(self):
-                return pcm, 24000, 1, time.monotonic() + 0.1
-
-        async def transcribe(*_args):
-            calls.append(1)
-            await asyncio.sleep(0.1)
-            return [{"start": 0.0, "end": 0.2, "text": "answer"}]
-
-        dependencies = CaptureDependencies(
-            **{
-                **dependencies.__dict__,
-                "capture_factory": lambda *_args: LongCapture(),
-                "transcribe": rendered_aware_transcriber(transcribe),
-            }
-        )
-
-        async def speech_end(_source):
-            return time.monotonic()
-
-        with (
-            patch.dict(os.environ, TEST_VOICE_ENV),
-            patch.object(runner, "ANSWER_TRANSCRIPTION_DEADLINE_SECONDS", 0.2),
-            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
-        ):
-            traces = await capture_script(
-                "android-selected-room",
-                ["Question@0::answer"],
-                dependencies=dependencies,
-                room_close_after=None,
-            )
-
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(traces[0]["transcript"], "answer answer answer")
 
     def test_pcm_utterances_require_two_onset_windows_and_300ms_quiet(self):
         levels = [200, 200, *([0] * 14), 600, 600, *([0] * 15)]
@@ -1559,10 +1683,13 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             async def result(self):
                 return pcm_windows(600, 600, *([0] * 58), 600, 600), 24000, 1, 99.0
 
-        transcriptions = iter(("Okay, I heard you.", "The timer is set for five minutes."))
-
         async def transcribe(*_args):
-            return [{"start": 0.0, "end": 23.0, "text": next(transcriptions)}]
+            return [
+                {"start": 0.0, "end": 0.02, "text": "Okay,"},
+                {"start": 0.02, "end": 0.04, "text": "heard."},
+                {"start": 1.2, "end": 1.22, "text": "Timer"},
+                {"start": 1.22, "end": 23.0, "text": "set."},
+            ]
 
         dependencies = CaptureDependencies(
             **{
@@ -1588,16 +1715,13 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(traces), 1)
         trace = traces[0]
-        self.assertEqual(
-            trace["transcript"],
-            "Okay, I heard you. The timer is set for five minutes.",
-        )
+        self.assertEqual(trace["transcript"], "Okay, heard. Timer set.")
         self.assertEqual([segment["start"] for segment in trace["segments"]], [0.0, 1.2])
         self.assertEqual(trace["segments"][1]["start"], 1.2)
         self.assertEqual(trace["raw_segments"][0]["start"], 0.0)
         self.assertEqual(trace["first_audio"], 100.2)
         self.assertEqual(trace["speech_end"], 100.0)
-        self.assertEqual(trace["raw_segments"][1]["end"], 23.0)
+        self.assertEqual(trace["raw_segments"][3]["end"], 23.0)
         self.assertTrue(trace["overlap"])
         from evals.report import score_observations
 
@@ -1621,7 +1745,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             }]}],
         }]}, required_runs=1)
         self.assertEqual(len(scored["cases"][0]["turns"]), 1)
-        self.assertEqual(scored["cases"][0]["turns"][0]["segments"][1]["end"], 23.0)
+        self.assertEqual(scored["cases"][0]["turns"][0]["segments"][3]["end"], 23.0)
 
     async def test_raw_asr_timestamps_do_not_define_pcm_transcript_timing(self):
         dependencies = self.dependencies_for_failure("other")
@@ -5949,6 +6073,110 @@ class LocalEvalCliTests(unittest.TestCase):
             "builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])
         ):
             result = runner.main(["eval", "--list"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output, [scenario.name for scenario in SCENARIOS])
+        dev_stack.assert_not_called()
+
+    def test_scenario_flag_is_repeatable_and_defaults_to_none(self):
+        self.assertIsNone(runner._parse_local_eval_arguments(["--live"])["scenario"])
+        self.assertEqual(
+            runner._parse_local_eval_arguments(
+                ["--live", "--scenario", "b", "--scenario", "a"]
+            )["scenario"],
+            ["b", "a"],
+        )
+
+    def _run_named_scenarios(self, flags):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        scenarios = tuple(
+            SimpleNamespace(name=name, turns=(), commands=(), place_query=None)
+            for name in ("alpha", "bravo", "charlie")
+        )
+        observed = []
+        run_ids = []
+
+        def observe(scenario, stack):
+            observed.append(scenario.name)
+            run_ids.append(stack.run_id)
+            return {"run_id": stack.run_id, "turns": []}
+
+        class Batch:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def run(self, run_id):
+                return _run_context(SimpleNamespace(base_url="http://127.0.0.1:8485", run_id=run_id))
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", scenarios),
+            patch.object(runner, "DevStack", return_value=Batch()),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            redirect_stdout(output),
+        ):
+            runner._run_local_eval(["--live", "--runs", "2", "--concurrency", "1", *flags])
+        report = json.loads(output.getvalue())
+        return observed, run_ids, report
+
+    def test_repeated_scenario_filters_run_only_named_scenarios_in_registry_order(self):
+        observed, run_ids, report = self._run_named_scenarios(
+            ["--scenario", "charlie", "--scenario", "alpha", "--scenario", "charlie"]
+        )
+
+        self.assertEqual(sorted(observed), ["alpha", "alpha", "charlie", "charlie"])
+        self.assertEqual(
+            sorted(run_ids),
+            ["case-1-run-1", "case-1-run-2", "case-2-run-1", "case-2-run-2"],
+        )
+        self.assertEqual([case["name"] for case in report["cases"]], ["alpha", "charlie"])
+        self.assertEqual(
+            [[item["run"] for item in case["run_timings"]] for case in report["cases"]],
+            [[1, 2], [1, 2]],
+        )
+
+    def test_omitted_scenario_filter_runs_every_scenario(self):
+        observed, _run_ids, report = self._run_named_scenarios([])
+
+        self.assertEqual(
+            sorted(observed),
+            ["alpha", "alpha", "bravo", "bravo", "charlie", "charlie"],
+        )
+        self.assertEqual([case["name"] for case in report["cases"]], ["alpha", "bravo", "charlie"])
+
+    def test_unknown_scenario_name_is_an_error_before_any_stack_starts(self):
+        import io
+        from contextlib import redirect_stderr
+
+        for flags in (["--live"], ["--list"]):
+            with self.subTest(flags=flags):
+                stderr = io.StringIO()
+                with (
+                    patch.object(runner, "DevStack", create=True) as dev_stack,
+                    patch.object(runner, "observe_scenario") as observe,
+                    redirect_stderr(stderr),
+                ):
+                    result = runner._run_local_eval(
+                        [*flags, "--scenario", "spanish-interpreter", "--scenario", "no-such-scenario"]
+                    )
+
+                self.assertEqual(result, 2)
+                self.assertIn("unknown scenario: no-such-scenario (known: ", stderr.getvalue())
+                dev_stack.assert_not_called()
+                observe.assert_not_called()
+
+    def test_list_with_known_scenario_names_still_prints_every_scenario(self):
+        output = []
+        with patch.object(runner, "DevStack", create=True) as dev_stack, patch(
+            "builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])
+        ):
+            result = runner.main(["eval", "--list", "--scenario", "spanish-interpreter"])
 
         self.assertEqual(result, 0)
         self.assertEqual(output, [scenario.name for scenario in SCENARIOS])

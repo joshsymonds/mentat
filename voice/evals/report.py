@@ -24,11 +24,22 @@ PARTIAL_CAPTURE_MESSAGES = {
     NO_ANSWER_FAILURE,
     "room deletion was not observed before deadline",
 }
+TRANSCRIPTION_FAILURE_DETAIL = (
+    r"(?:HTTP 4[0-9]{2}(?:; [a-z0-9_]+)?|missing_word_timestamps)"
+)
+TRANSCRIPTION_FAILURE_PATTERN = re.compile(
+    rf"Transcription rejected reply clip \({TRANSCRIPTION_FAILURE_DETAIL}\)"
+)
+MISSING_WORD_TIMESTAMPS_FAILURE = "Transcription rejected reply clip (missing_word_timestamps)"
 SCRIPTED_TTS_PREFLIGHT_FAILURE_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
     r"|scripted speech sample count mismatch for line ([1-9][0-9]*)"
     r"|scripted speech content verification failed for line ([1-9][0-9]*)"
 )
+
+
+def is_transcription_failure(message: Any) -> bool:
+    return isinstance(message, str) and TRANSCRIPTION_FAILURE_PATTERN.fullmatch(message) is not None
 
 
 def _is_scripted_tts_preflight_failure(message: Any) -> bool:
@@ -392,18 +403,21 @@ def score_observations(
                         and (
                             preflight_tts_failure
                             or failure.get("message") in PARTIAL_CAPTURE_MESSAGES
+                            or is_transcription_failure(failure.get("message"))
                         )
                         and (
                             failure.get("message") in {
                                 NO_ANSWER_FAILURE,
                                 "answer transcription exceeded its deadline",
                             }
+                            or is_transcription_failure(failure.get("message"))
                         ) == ("speech_started_at" in failure)
                         and (
                             "segments" not in failure
                             or failure.get("message") in {
                                 NO_ANSWER_FAILURE,
                                 "answer transcription exceeded its deadline",
+                                MISSING_WORD_TIMESTAMPS_FAILURE,
                             }
                         )
                     )
