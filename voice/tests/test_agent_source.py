@@ -10,7 +10,11 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
+
+
+def scribe_commits_double():
+    return SimpleNamespace(close_line=Mock(), aclose=AsyncMock())
 
 
 def _stt_language_helper(tree):
@@ -103,7 +107,8 @@ class AgentSourceContractTest(unittest.TestCase):
             and any(isinstance(target, ast.Name) and target.id == "stt" for target in node.targets)
         )
         expected_stt_provider = ast.parse(
-            'build_stt(os.environ["ELEVENLABS_API_KEY"], ctx.proc.userdata["private"].keyterms)',
+            'build_stt(os.environ["ELEVENLABS_API_KEY"], ctx.proc.userdata["private"].keyterms, '
+            'scribe_commits)',
             mode="eval",
         ).body
         self.assertEqual(
@@ -118,7 +123,7 @@ class AgentSourceContractTest(unittest.TestCase):
             node.value for node in build_stt.body if isinstance(node, ast.Return)
         )
         expected_scribe = ast.parse(
-            'elevenlabs.STT(model=STT_MODEL, api_key=api_key, language_code="en", '
+            'CommitSTT(commits=commits, model=STT_MODEL, api_key=api_key, language_code="en", '
             'server_vad=STT_SERVER_VAD, tag_audio_events=False, keyterms=list(keyterms))',
             mode="eval",
         ).body
@@ -297,7 +302,11 @@ class AgentSourceContractTest(unittest.TestCase):
 
     def test_old_front_and_tools_are_absent(self):
         source = (Path(__file__).resolve().parents[1] / "agent.py").read_text()
-        self.assertNotIn("user_input_transcribed", source)
+        front_agent = next(
+            node for node in ast.parse(source).body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        self.assertNotIn("user_input_transcribed", ast.get_source_segment(source, front_agent))
         for forbidden in (
             "GPTLive",
             "openai.realtime",
@@ -815,6 +824,7 @@ class AgentSourceContractTest(unittest.TestCase):
         namespace = {"asyncio": asyncio, "time": time, "uuid4": lambda: SimpleNamespace(hex="turn-id")}
         exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
         agent = SimpleNamespace(
+            _scribe_commits=scribe_commits_double(),
             _closed=False,
             _turn_task=None,
             _turn_text="",
@@ -851,6 +861,7 @@ class AgentSourceContractTest(unittest.TestCase):
         namespace = {"asyncio": asyncio, "time": SimpleNamespace(monotonic=lambda: now[0]), "uuid4": lambda: SimpleNamespace(hex="turn-id"), "TURN_CONTINUATION_WINDOW": 3.0}
         exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
         agent = SimpleNamespace(
+            _scribe_commits=scribe_commits_double(),
             _closed=False,
             _turn_task=None,
             _turn_text="",
@@ -964,6 +975,7 @@ class AgentSourceContractTest(unittest.TestCase):
                     return handle
 
             agent = SimpleNamespace(
+                _scribe_commits=scribe_commits_double(),
                 _closed=False,
                 _turn_task=None,
                 _turn_text="",
@@ -1014,6 +1026,7 @@ class AgentSourceContractTest(unittest.TestCase):
         namespace = {"asyncio": asyncio, "time": time, "uuid4": lambda: SimpleNamespace(hex="turn-id"), "TURN_CONTINUATION_WINDOW": 3.0}
         exec(compile(ast.Module(body=[method], type_ignores=[]), str(agent_path), "exec"), namespace)
         agent = SimpleNamespace(
+            _scribe_commits=scribe_commits_double(),
             _closed=False,
             _turn_task=None,
             _turn_text="",
@@ -1058,6 +1071,7 @@ class AgentSourceContractTest(unittest.TestCase):
         namespace = {"asyncio": asyncio, "time": time, "uuid4": lambda: SimpleNamespace(hex="turn-id")}
         exec(compile(ast.Module(body=methods, type_ignores=[]), str(agent_path), "exec"), namespace)
         agent = SimpleNamespace(
+            _scribe_commits=scribe_commits_double(),
             _closed=False,
             _turn_task=None,
             _turn_text="",
@@ -1747,6 +1761,7 @@ class AgentSourceContractTest(unittest.TestCase):
             if stt_fails:
                 stt.update_options.side_effect = RuntimeError("reconnect failed")
             return SimpleNamespace(
+                _scribe_commits=scribe_commits_double(),
                 _closed=closed,
                 _voice_mode=mode,
                 _voice_language=language,
@@ -1895,7 +1910,11 @@ class AgentSourceContractTest(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "__init__"
         )
         self.assertIn("if input_audio_dir else None", ast.unparse(init))
-        self.assertNotIn("user_input_transcribed", source)
+        front_agent = next(
+            node for node in ast.parse(source).body
+            if isinstance(node, ast.ClassDef) and node.name == "FrontAgent"
+        )
+        self.assertNotIn("user_input_transcribed", ast.get_source_segment(source, front_agent))
 
     def test_voice_mode_result_updates_call_local_stt_and_tts_or_rolls_back(self):
         agent_path = Path(__file__).resolve().parents[1] / "agent.py"
