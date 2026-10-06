@@ -61,6 +61,15 @@ class MatchingLatencyTests(unittest.TestCase):
         ]
         self.assertAlmostEqual(first_matching_latency(segments, r"Jane\s+Austen", 10.0, 10.05), 1.45)
 
+    def test_latency_matches_phrases_across_word_segments(self):
+        segments = [
+            {"start": 0.2, "text": "Jane"},
+            {"start": 0.6, "text": "Austen"},
+            {"start": 1.0, "text": "wrote"},
+        ]
+        self.assertAlmostEqual(first_matching_latency(segments, r"Jane\s+Austen", 10.0, 10.05), 0.25)
+        self.assertAlmostEqual(first_matching_latency(segments, r"wrote", 10.0, 10.05), 1.05)
+
     def test_returns_none_when_no_segment_matches(self):
         self.assertIsNone(first_matching_latency([{"start": 0.2, "text": "I am unsure."}], r"Jane", 10.0, 10.05))
 
@@ -284,7 +293,12 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             segments,
-            [{"start": 0.2, "end": 1.6, "text": "+1 800 555 0142"}],
+            [
+                {"start": 0.2, "end": 0.4, "text": "+1"},
+                {"start": 0.5, "end": 0.8, "text": "800"},
+                {"start": 0.9, "end": 1.1, "text": "555"},
+                {"start": 1.2, "end": 1.6, "text": "0142"},
+            ],
         )
         self.assertEqual(http.post.call_args.args[0], "https://api.elevenlabs.io/v1/speech-to-text")
         self.assertEqual(http.post.call_args.kwargs["headers"], {"xi-api-key": "test-key"})
@@ -292,6 +306,34 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(form.fields[0][2], {"filename": "answer.wav", "content_type": "audio/wav"})
         self.assertEqual(form.fields[1][1], "scribe_v2")
         self.assertEqual(form.fields[2][1], "false")
+
+    async def test_text_without_word_timestamps_fails_by_name_and_keeps_text(self):
+        class FormData:
+            def add_field(self, *_args, **_kwargs):
+                return None
+
+        class Response:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def json(self):
+                return {"text": "Got it.", "words": [{"text": "Got"}, {"text": "it."}]}
+
+        http = Mock()
+        http.post.return_value = Response()
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": "test-key"}):
+            with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=FormData)}):
+                with self.assertRaises(caller.TranscriptionTimestampError) as caught:
+                    await caller._transcribe(http, b"\0\0" * 7200, 24000, 1)
+
+        self.assertEqual(caught.exception.text, "Got it.")
+        self.assertIn("word timestamps", str(caught.exception))
 
     async def test_recovers_after_bounded_429_retry(self):
         class FormData:
@@ -342,7 +384,7 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delays, [0.5])
         self.assertEqual(
             segments,
-            [{"start": 0.0, "end": 0.1, "text": "The answer is six."}],
+            [{"start": 0.0, "end": 0.1, "text": "The"}],
         )
 
     async def test_retries_429_and_uses_typed_concurrency_error_after_exhaustion(self):

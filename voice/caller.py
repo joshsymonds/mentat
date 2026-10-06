@@ -57,6 +57,16 @@ class TranscriptionCapacityError(TranscriptionError):
         }
 
 
+class TranscriptionTimestampError(TranscriptionError):
+    """Scribe returned text without usable per-word timestamps."""
+
+    def __init__(self, text: str):
+        RuntimeError.__init__(self, "Transcription rejected reply clip (missing word timestamps)")
+        self.text = text
+        self.status = None
+        self.code = "missing_word_timestamps"
+
+
 async def _transcription_retry_sleep(delay: float) -> None:
     await asyncio.sleep(delay)
 
@@ -154,14 +164,20 @@ def is_agent_audio_track(
 def first_matching_latency(
     segments: list[dict[str, Any]], pattern: str, speech_end: float, capture_started: float
 ) -> float | None:
-    """Return seconds from caller speech end to the first matching segment start."""
+    """Return seconds from caller speech end to the start of the segment holding the first match."""
     try:
         matcher = re.compile(pattern)
     except re.error as exc:
         raise ValueError(f"invalid answer regex: {exc}") from exc
-    for segment in segments:
-        if matcher.search(str(segment.get("text", ""))):
+    texts = [str(segment.get("text", "")) for segment in segments]
+    match = matcher.search(" ".join(texts))
+    if match is None or not segments:
+        return None
+    offset = 0
+    for segment, text in zip(segments, texts, strict=True):
+        if match.start() <= offset + len(text):
             return capture_started + float(segment["start"]) - speech_end
+        offset += len(text) + 1
     return None
 
 
@@ -379,7 +395,6 @@ async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) ->
         output.setframerate(sample_rate)
         output.writeframes(pcm)
     wav_data = wav_bytes.getvalue()
-    duration = len(pcm) / (sample_rate * channels * 2)
 
     for attempt in range(TRANSCRIPTION_MAX_ATTEMPTS):
         form = FormData()
@@ -436,7 +451,7 @@ async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) ->
         if not text:
             return []
 
-        timestamps = []
+        timestamped_words = []
         if isinstance(words, list):
             for word in words:
                 if (
@@ -457,12 +472,14 @@ async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) ->
                     and math.isfinite(end)
                     and 0 <= start <= end
                 ):
-                    timestamps.append((float(start), float(end)))
-        if timestamps:
-            start, end = timestamps[0][0], timestamps[-1][1]
-        else:
-            start, end = 0.0, duration
-        return [{"start": start, "end": end, "text": text}]
+                    timestamped_words.append({
+                        "start": float(start),
+                        "end": float(end),
+                        "text": word["text"].strip(),
+                    })
+        if not timestamped_words:
+            raise TranscriptionTimestampError(text)
+        return timestamped_words
     raise RuntimeError("Scribe transcription retry loop ended unexpectedly")
 
 

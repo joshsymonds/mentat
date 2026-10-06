@@ -580,6 +580,86 @@ class ScoringTests(unittest.TestCase):
         self.assertNotIn("product failure", failures)
         self.assertEqual(result["cases"][0]["turns"][0]["latency_seconds"]["first_audio"], 2.0)
 
+    def test_reply_clip_transcription_failures_are_named_and_keep_their_text(self):
+        for message, segments in (
+            (
+                "Transcription rejected reply clip (missing_word_timestamps)",
+                [{"start": 0.0, "end": 1.5, "text": "Got it."}],
+            ),
+            ("Transcription rejected reply clip (HTTP 400; invalid_audio)", None),
+        ):
+            with self.subTest(message=message):
+                trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
+                trace["speech_started_at"] = 1_700_000_000.0
+                trace["expect_confirmation"] = False
+                trace["expect_hangup"] = False
+                failure = {
+                    "turn": 2,
+                    "message": message,
+                    "speech_started_at": 1_700_000_001.0,
+                }
+                if segments is not None:
+                    failure["segments"] = segments
+                observation = {
+                    "cases": [{
+                        "name": "place-search-navigation",
+                        "runs": [{
+                            "turns": [trace],
+                            "failure": failure,
+                            "product_failures": [],
+                            "phone_commands": [{
+                                "id": "phone-command-1",
+                                "turn": 1,
+                                "kind": "location",
+                            }],
+                        }],
+                    }]
+                }
+
+                result = score_observations(observation, required_runs=1)
+
+                self.assertFalse(result["passed"])
+                failures = " ".join(result["failures"])
+                self.assertIn(
+                    f"place-search-navigation run 1 turn 2: capture failed: {message}", failures
+                )
+                self.assertNotIn("invalid partial capture failure metadata", failures)
+                capture_failure = result["cases"][0]["capture_failures"][0]
+                self.assertEqual(capture_failure["message"], message)
+                if segments is None:
+                    self.assertNotIn("segments", capture_failure)
+                else:
+                    self.assertEqual(capture_failure["segments"][0]["text"], "Got it.")
+
+    def test_reply_clip_http_failure_cannot_carry_transcript_segments(self):
+        trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
+        trace["speech_started_at"] = 1_700_000_000.0
+        trace["expect_confirmation"] = False
+        trace["expect_hangup"] = False
+        observation = {
+            "cases": [{
+                "name": "place-search-navigation",
+                "runs": [{
+                    "turns": [trace],
+                    "failure": {
+                        "turn": 2,
+                        "message": "Transcription rejected reply clip (HTTP 400; invalid_audio)",
+                        "speech_started_at": 1_700_000_001.0,
+                        "segments": [{"start": 0.0, "end": 0.2, "text": "forged"}],
+                    },
+                    "product_failures": [],
+                    "phone_commands": [],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertIn(
+            "place-search-navigation run 1: invalid partial capture failure metadata",
+            result["failures"],
+        )
+
     def test_partial_failure_turn_product_error_requires_observed_phone_command(self):
         trace = turn(first_audio=2.0, confirmation=None, room_deleted=None, kind="search")
         trace["speech_started_at"] = 1_700_000_000.0
