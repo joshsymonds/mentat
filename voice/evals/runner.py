@@ -3153,6 +3153,10 @@ def _parse_local_eval_arguments(argv: list[str]) -> dict[str, Any]:
         help=f"maximum concurrent runs (default: {DEFAULT_CONCURRENCY})",
     )
     parser.add_argument("--list", action="store_true", help="list the contracted scenarios without running them")
+    parser.add_argument(
+        "--scenario", action="append", metavar="NAME",
+        help="run only this scenario; repeat to run several (default: every scenario)",
+    )
     return vars(parser.parse_args(argv))
 
 
@@ -3162,6 +3166,13 @@ class _EvaluationInterrupted(BaseException):
 
 def _run_local_eval(argv: list[str]) -> int:
     arguments = _parse_local_eval_arguments(argv)
+    requested_names = arguments["scenario"]
+    if requested_names is not None:
+        unknown = sorted(set(requested_names) - {scenario.name for scenario in SCENARIOS})
+        if unknown:
+            known = ", ".join(scenario.name for scenario in SCENARIOS)
+            print(f"eval --scenario: unknown scenario: {', '.join(unknown)} (known: {known})", file=sys.stderr)
+            return 2
     if arguments["list"]:
         if arguments["live"] or arguments["runs"] != 10 or arguments["concurrency"] != DEFAULT_CONCURRENCY:
             print("eval --list cannot be combined with --live, --runs, or --concurrency", file=sys.stderr)
@@ -3181,12 +3192,16 @@ def _run_local_eval(argv: list[str]) -> int:
         print(str(error), file=sys.stderr)
         return 2
 
+    scenarios = [
+        scenario for scenario in SCENARIOS
+        if requested_names is None or scenario.name in requested_names
+    ]
     run_count = arguments["runs"]
     concurrency_cap = arguments["concurrency"]
     observations: dict[str, Any] = {
         "cases": [
             {"name": scenario.name, "runs": [None] * run_count}
-            for scenario in SCENARIOS
+            for scenario in scenarios
         ]
     }
     capture_failures: list[tuple[int, int, str]] = []
@@ -3205,7 +3220,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 abort_event.set()
 
     def execute_run(batch: Any, scenario_index: int, run_index: int) -> tuple[int, int, dict[str, Any] | None, str | None]:
-        scenario = SCENARIOS[scenario_index]
+        scenario = scenarios[scenario_index]
         run_id = f"case-{scenario_index + 1}-run-{run_index + 1}"
         key = (scenario_index, run_index)
         manager = None
@@ -3319,7 +3334,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 batch_phase = "scheduling"
                 try:
                     executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_cap)
-                    for scenario_index in range(len(SCENARIOS)):
+                    for scenario_index in range(len(scenarios)):
                         for run_index in range(run_count):
                             future = executor.submit(execute_run, batch, scenario_index, run_index)
                             futures[future] = (scenario_index, run_index)
@@ -3329,7 +3344,7 @@ def _run_local_eval(argv: list[str]) -> int:
                             observations["cases"][scenario_index]["runs"][run_index] = observation
                         if failure is not None:
                             message = _redact_diagnostics(
-                                f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
+                                f"{scenarios[scenario_index].name} run {run_index + 1}: {failure}"
                             )
                             capture_failures.append((scenario_index, run_index, message))
                             break
@@ -3409,7 +3424,7 @@ def _run_local_eval(argv: list[str]) -> int:
                             result_scenario,
                             result_run,
                             _redact_diagnostics(
-                                f"{SCENARIOS[result_scenario].name} run {result_run + 1}: {failure}"
+                                f"{scenarios[result_scenario].name} run {result_run + 1}: {failure}"
                             ),
                         ))
                     continue
@@ -3431,7 +3446,7 @@ def _run_local_eval(argv: list[str]) -> int:
             },
         }
         capture_failures.append((scenario_index, run_index, _redact_diagnostics(
-            f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
+            f"{scenarios[scenario_index].name} run {run_index + 1}: {failure}"
         )))
 
     for scenario_index, case in enumerate(observations["cases"]):
@@ -3450,7 +3465,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 },
             }
             capture_failures.append((scenario_index, run_index, _redact_diagnostics(
-                f"{SCENARIOS[scenario_index].name} run {run_index + 1}: {failure}"
+                f"{scenarios[scenario_index].name} run {run_index + 1}: {failure}"
             )))
 
     observations["batch_timing"] = {

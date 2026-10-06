@@ -286,6 +286,18 @@ To inspect the contracted scenarios without starting services, run:
 python3 -m voice.evals.runner eval --list
 ```
 
+To run only some scenarios, repeat `--scenario NAME`. Names are checked against
+the scenario list below (an unknown name is an error), repeated names select a
+scenario once, and selected scenarios run in registry order. `--runs` still sets
+the repetitions of each selected scenario. Without the flag every scenario
+runs; with `--list`, known names still print the full listing. For example, the
+Spanish subset, eight runs each:
+
+```sh
+python3 -m voice.evals.runner eval --live --runs 8 \
+  --scenario spanish-language-switch --scenario spanish-interpreter
+```
+
 The current scenarios are `timer-300-seconds`, `equivalent-alarm`,
 `place-search-navigation`, `sms-say-back-yes`, `sms-correction-new-yes`,
 `alice-keck-context-chain`, `spanish-language-switch`, and

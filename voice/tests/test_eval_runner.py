@@ -6078,6 +6078,110 @@ class LocalEvalCliTests(unittest.TestCase):
         self.assertEqual(output, [scenario.name for scenario in SCENARIOS])
         dev_stack.assert_not_called()
 
+    def test_scenario_flag_is_repeatable_and_defaults_to_none(self):
+        self.assertIsNone(runner._parse_local_eval_arguments(["--live"])["scenario"])
+        self.assertEqual(
+            runner._parse_local_eval_arguments(
+                ["--live", "--scenario", "b", "--scenario", "a"]
+            )["scenario"],
+            ["b", "a"],
+        )
+
+    def _run_named_scenarios(self, flags):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        scenarios = tuple(
+            SimpleNamespace(name=name, turns=(), commands=(), place_query=None)
+            for name in ("alpha", "bravo", "charlie")
+        )
+        observed = []
+        run_ids = []
+
+        def observe(scenario, stack):
+            observed.append(scenario.name)
+            run_ids.append(stack.run_id)
+            return {"run_id": stack.run_id, "turns": []}
+
+        class Batch:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def run(self, run_id):
+                return _run_context(SimpleNamespace(base_url="http://127.0.0.1:8485", run_id=run_id))
+
+        output = io.StringIO()
+        with (
+            patch.object(runner, "SCENARIOS", scenarios),
+            patch.object(runner, "DevStack", return_value=Batch()),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            redirect_stdout(output),
+        ):
+            runner._run_local_eval(["--live", "--runs", "2", "--concurrency", "1", *flags])
+        report = json.loads(output.getvalue())
+        return observed, run_ids, report
+
+    def test_repeated_scenario_filters_run_only_named_scenarios_in_registry_order(self):
+        observed, run_ids, report = self._run_named_scenarios(
+            ["--scenario", "charlie", "--scenario", "alpha", "--scenario", "charlie"]
+        )
+
+        self.assertEqual(sorted(observed), ["alpha", "alpha", "charlie", "charlie"])
+        self.assertEqual(
+            sorted(run_ids),
+            ["case-1-run-1", "case-1-run-2", "case-2-run-1", "case-2-run-2"],
+        )
+        self.assertEqual([case["name"] for case in report["cases"]], ["alpha", "charlie"])
+        self.assertEqual(
+            [[item["run"] for item in case["run_timings"]] for case in report["cases"]],
+            [[1, 2], [1, 2]],
+        )
+
+    def test_omitted_scenario_filter_runs_every_scenario(self):
+        observed, _run_ids, report = self._run_named_scenarios([])
+
+        self.assertEqual(
+            sorted(observed),
+            ["alpha", "alpha", "bravo", "bravo", "charlie", "charlie"],
+        )
+        self.assertEqual([case["name"] for case in report["cases"]], ["alpha", "bravo", "charlie"])
+
+    def test_unknown_scenario_name_is_an_error_before_any_stack_starts(self):
+        import io
+        from contextlib import redirect_stderr
+
+        for flags in (["--live"], ["--list"]):
+            with self.subTest(flags=flags):
+                stderr = io.StringIO()
+                with (
+                    patch.object(runner, "DevStack", create=True) as dev_stack,
+                    patch.object(runner, "observe_scenario") as observe,
+                    redirect_stderr(stderr),
+                ):
+                    result = runner._run_local_eval(
+                        [*flags, "--scenario", "spanish-interpreter", "--scenario", "no-such-scenario"]
+                    )
+
+                self.assertEqual(result, 2)
+                self.assertIn("unknown scenario: no-such-scenario (known: ", stderr.getvalue())
+                dev_stack.assert_not_called()
+                observe.assert_not_called()
+
+    def test_list_with_known_scenario_names_still_prints_every_scenario(self):
+        output = []
+        with patch.object(runner, "DevStack", create=True) as dev_stack, patch(
+            "builtins.print", side_effect=lambda *args, **_kwargs: output.append(args[0])
+        ):
+            result = runner.main(["eval", "--list", "--scenario", "spanish-interpreter"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output, [scenario.name for scenario in SCENARIOS])
+        dev_stack.assert_not_called()
+
     def test_live_eval_repeats_every_scenario_and_prints_strict_report(self):
         from contextlib import contextmanager
         import json
