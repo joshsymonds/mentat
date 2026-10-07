@@ -21,7 +21,7 @@ import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -55,6 +55,9 @@ from evals.scenarios import (
 
 RATE = caller.RATE
 FRAME_SAMPLES = caller.FRAME_SAMPLES
+# Echo mode keeps line audio queued at this much, under the residual's echo delay, so each
+# frame is mixed with agent audio the residual has already heard; half the delay is margin.
+ECHO_QUEUE_TARGET_SECONDS = caller.ECHO_DELAY_SECONDS / 2
 PARTICIPANT_DEADLINE_SECONDS = 30.0
 ANSWER_CAPTURE_DEADLINE_SECONDS = caller.MAX_CAPTURE_SECONDS + 30.0
 ANSWER_TRANSCRIPTION_DEADLINE_SECONDS = 30.0
@@ -62,6 +65,8 @@ ROOM_DELETE_DEADLINE_SECONDS = 60.0
 REMOTE_OPERATION_DEADLINE_SECONDS = 30.0
 ROOM_POLL_INTERVAL_SECONDS = 0.25
 BARGE_IN_POLL_SECONDS = 0.02
+# voice/caller.py's message when the agent's reply never starts before its deadline.
+REPLY_NOT_STARTED_FAILURE = "agent audio response did not start before its deadline"
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
@@ -914,6 +919,7 @@ async def capture_script(
     retain_caller_audio_dir: Path | None = None,
     preconnect_first_line: bool = False,
     barge_in: dict[int, float] | None = None,
+    echo_residual: bool = False,
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy.
 
@@ -924,6 +930,10 @@ async def capture_script(
     With barge_in={turn: seconds} line TURN starts that many seconds after the agent
     begins speaking its reply to line TURN-1, over the reply instead of after it; the
     line's own delay is ignored and the interrupted reply is captured up to that point.
+
+    With echo_residual every capture hears the agent through one caller.EchoResidual,
+    and every mic frame pushed is mixed with the agent audio that plays at its playout
+    time, so the caller hears itself the way a phone with an open speaker does.
     """
     if not raw_steps:
         raise ValueError("at least one scripted line is required")
@@ -1111,6 +1121,7 @@ async def capture_script(
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
     capture_end: asyncio.Event | None = None
+    echo = caller.EchoResidual() if echo_residual else None
 
     @room.on("track_subscribed")
     def track_subscribed(track: Any, publication: Any, participant: Any) -> None:
@@ -1152,6 +1163,13 @@ async def capture_script(
             "LiveKit room connection",
         )
         source = dependencies.rtc.AudioSource(RATE, 1)
+
+        def mic_frame(pcm: bytes) -> bytes:
+            """Return a mic frame as it plays: mixed with the agent audio playing at its time."""
+            if echo is None:
+                return pcm
+            return echo.mix(pcm, dependencies.monotonic() + source.queued_duration)
+
         local_track = dependencies.rtc.LocalAudioTrack.create_audio_track("mic", source)
         publish_options: dict[str, Any] = {
             "source": dependencies.rtc.TrackSource.SOURCE_MICROPHONE
@@ -1181,7 +1199,9 @@ async def capture_script(
                 raise RuntimeError("voice worker did not join the selected room before deadline")
             await _with_deadline(
                 source.capture_frame(
-                    dependencies.rtc.AudioFrame(bytes(FRAME_SAMPLES * 2), RATE, 1, FRAME_SAMPLES)
+                    dependencies.rtc.AudioFrame(
+                        mic_frame(bytes(FRAME_SAMPLES * 2)), RATE, 1, FRAME_SAMPLES,
+                    )
                 ),
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "LiveKit participant wait audio",
@@ -1255,7 +1275,15 @@ async def capture_script(
             pushed_samples = 0
             try:
                 for offset in range(0, len(pcm), FRAME_SAMPLES * 2):
-                    chunk = pcm[offset : offset + FRAME_SAMPLES * 2]
+                    if echo is not None:
+                        await _with_deadline(
+                            dependencies.sleep(
+                                max(0.0, source.queued_duration - ECHO_QUEUE_TARGET_SECONDS)
+                            ),
+                            REMOTE_OPERATION_DEADLINE_SECONDS,
+                            "LiveKit speech audio pacing",
+                        )
+                    chunk = mic_frame(pcm[offset : offset + FRAME_SAMPLES * 2])
                     frame_samples = len(chunk) // 2
                     await _with_deadline(
                         source.capture_frame(
@@ -1288,6 +1316,28 @@ async def capture_script(
                     f"scripted speech sample count mismatch for line {line_number}",
                 )
 
+        async def push_with_preconnect_buffer(
+            speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
+            attempt: int,
+        ) -> None:
+            """Start line 1's live overlap while its pre-connect buffer is still sent.
+
+            Like the phone, the live track is already flowing when the buffer lands, so
+            the worker hears the buffer and the live head in the order it expects. A
+            failure on either side cancels the other before the capture fails.
+            """
+            live = asyncio.ensure_future(
+                push(speech, step, line_number, attempt, live_start_sample)
+            )
+            buffer = asyncio.ensure_future(send_preconnect_buffer(speech))
+            try:
+                await asyncio.gather(live, buffer)
+            except BaseException:
+                live.cancel()
+                buffer.cancel()
+                await asyncio.gather(live, buffer, return_exceptions=True)
+                raise
+
         silence = bytes(FRAME_SAMPLES * 2)
 
         async def quiet(seconds: float) -> None:
@@ -1295,7 +1345,7 @@ async def capture_script(
             while dependencies.monotonic() < deadline:
                 await _with_deadline(
                     source.capture_frame(
-                        dependencies.rtc.AudioFrame(silence, RATE, 1, FRAME_SAMPLES)
+                        dependencies.rtc.AudioFrame(mic_frame(silence), RATE, 1, FRAME_SAMPLES)
                     ),
                     REMOTE_OPERATION_DEADLINE_SECONDS,
                     "LiveKit silence playout",
@@ -1502,26 +1552,41 @@ async def capture_script(
                     )
                 raise RuntimeError("room was deleted before all scripted lines were captured")
 
+        async def await_reply(index: int, speech_started_at: float, reply: Awaitable[Any]) -> Any:
+            """Await turn INDEX + 1's reply, failing that turn if the agent never starts it."""
+            try:
+                return await reply
+            except RuntimeError as error:
+                if str(error) != REPLY_NOT_STARTED_FAILURE:
+                    raise
+                if pending_finish is not None:
+                    await pending_finish
+                raise PartialCaptureFailure(
+                    traces,
+                    index + 1,
+                    str(error),
+                    speech_started_at=speech_started_at,
+                ) from error
+
         for index, (step, rendered) in enumerate(zip(steps, synthesized, strict=True)):
             speech, retry_count, attempt = rendered
             barge_after = barge_in.get(index + 1)
             if barge_after is None:
                 await quiet(step.delay)
             capture_end = asyncio.Event()
-            capture = dependencies.capture_factory(answer_tracks, capture_end)
+            capture_options = {"echo": echo} if echo is not None else {}
+            capture = dependencies.capture_factory(answer_tracks, capture_end, **capture_options)
             await _with_deadline(
                 capture.start(),
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "continuous answer capture start",
             )
             preconnect = preconnect_first_line and index == 0
-            if preconnect:
-                await send_preconnect_buffer(speech)
             speech_started_at = time.time()
-            await push(
-                speech, step, index + 1, attempt,
-                live_start_sample if preconnect else 0,
-            )
+            if preconnect:
+                await push_with_preconnect_buffer(speech, step, index + 1, attempt)
+            else:
+                await push(speech, step, index + 1, attempt)
             speech_end = _finite_timestamp(
                 await _with_deadline(
                     caller._speech_end_after_playout(source),
@@ -1554,10 +1619,14 @@ async def capture_script(
                 )
             next_barge_after = barge_in.get(index + 2)
             if next_barge_after is not None:
-                await hold_for_barge_in(capture, next_barge_after)
+                await await_reply(
+                    index, speech_started_at, hold_for_barge_in(capture, next_barge_after)
+                )
             try:
-                answer = await asyncio.wait_for(
-                    capture.result(), timeout=ANSWER_CAPTURE_DEADLINE_SECONDS
+                answer = await await_reply(
+                    index,
+                    speech_started_at,
+                    asyncio.wait_for(capture.result(), timeout=ANSWER_CAPTURE_DEADLINE_SECONDS),
                 )
             except TimeoutError as error:
                 raise RuntimeError("agent audio capture exceeded its deadline") from error
@@ -2755,6 +2824,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
             or failure.get("message") in {
                 "answer transcription exceeded its deadline",
                 NO_ANSWER_FAILURE,
+                REPLY_NOT_STARTED_FAILURE,
                 "room was deleted before all scripted lines were captured",
                 "room deletion was not observed before deadline",
             }
@@ -2763,6 +2833,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         or (
             failure.get("message") in {
                 NO_ANSWER_FAILURE,
+                REPLY_NOT_STARTED_FAILURE,
                 "answer transcription exceeded its deadline",
             }
             or is_transcription_failure(failure.get("message"))
@@ -2932,6 +3003,8 @@ def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str
     for turn, seconds in enumerate(getattr(scenario, "barge_in_after", ()), 1):
         if seconds is not None:
             command.extend(("--barge-in", f"{turn}:{seconds}"))
+    if getattr(scenario, "echo_residual", False):
+        command.append("--echo-residual")
     command.extend((room, *raw_steps))
     return command
 
@@ -3291,6 +3364,7 @@ async def _run_remote_capture_with_fake_phone(
     retain_caller_audio_dir: Path | None = None,
     preconnect_first_line: bool = False,
     barge_in: dict[int, float] | None = None,
+    echo_residual: bool = False,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
     log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
@@ -3325,6 +3399,7 @@ async def _run_remote_capture_with_fake_phone(
             retain_caller_audio_dir=retain_caller_audio_dir,
             preconnect_first_line=preconnect_first_line,
             barge_in=barge_in,
+            echo_residual=echo_residual,
         )
     finally:
         if process.poll() is None:
@@ -3346,6 +3421,7 @@ async def run_remote_capture(
     retain_caller_audio_dir: Path | None = None,
     preconnect_first_line: bool = False,
     barge_in: dict[int, float] | None = None,
+    echo_residual: bool = False,
 ) -> list[dict[str, Any]]:
     import aiohttp
 
@@ -3360,6 +3436,7 @@ async def run_remote_capture(
             retain_caller_audio_dir=retain_caller_audio_dir,
             preconnect_first_line=preconnect_first_line,
             barge_in=barge_in,
+            echo_residual=echo_residual,
         )
 
 
@@ -3386,6 +3463,11 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None, dict[
         "--preconnect-first-line",
         action="store_true",
         help="send the opening second of line 1 as a phone-style pre-connect buffer",
+    )
+    parser.add_argument(
+        "--echo-residual",
+        action="store_true",
+        help="mix the agent's voice into the caller's mic as a phone with an open speaker would",
     )
     parser.add_argument(
         "--barge-in",
@@ -3863,6 +3945,8 @@ def main(argv: list[str] | None = None) -> int:
         capture_options["retain_caller_audio_dir"] = retain_caller_audio_dir
     if "--preconnect-first-line" in arguments:
         capture_options["preconnect_first_line"] = True
+    if "--echo-residual" in arguments:
+        capture_options["echo_residual"] = True
     if barge_in:
         capture_options["barge_in"] = barge_in
     try:

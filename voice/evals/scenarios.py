@@ -43,6 +43,7 @@ class Scenario:
     preconnect_first_line: bool = False
     barge_in_after: tuple[float | None, ...] = ()
     exact_caller_stt: bool = False
+    echo_residual: bool = False
 
 
 @dataclass(frozen=True)
@@ -228,6 +229,7 @@ SCENARIOS = (
         room_close_after=None,
         barge_in_after=(None, 15.0),
         exact_caller_stt=True,
+        echo_residual=True,
     ),
 )
 

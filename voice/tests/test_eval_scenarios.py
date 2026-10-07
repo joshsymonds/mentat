@@ -292,6 +292,7 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertTrue(phone.preconnect_first_line)
         self.assertTrue(phone.exact_caller_stt)
         self.assertEqual(phone.barge_in_after, ())
+        self.assertFalse(phone.echo_residual)
 
         barge = self.scenario("barge-in-long-reply")
         self.assertEqual(barge.turns, (
@@ -306,6 +307,7 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertEqual(barge.barge_in_after, (None, 15.0))
         self.assertTrue(barge.exact_caller_stt)
         self.assertFalse(barge.preconnect_first_line)
+        self.assertTrue(barge.echo_residual)
 
     def test_existing_scenarios_keep_new_field_defaults(self):
         new = {"phone-first-line", "barge-in-long-reply"}
@@ -316,6 +318,7 @@ class ScenarioScoringTests(unittest.TestCase):
                 self.assertFalse(scenario.preconnect_first_line)
                 self.assertEqual(scenario.barge_in_after, ())
                 self.assertFalse(scenario.exact_caller_stt)
+                self.assertFalse(scenario.echo_residual)
 
     def test_barge_in_after_is_empty_or_one_entry_per_line_starting_with_none(self):
         for scenario in SCENARIOS:
@@ -614,6 +617,34 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertTrue(evaluate_scenario_failures(
             chain, turns, [], 3, judge=all_yes_judge()
         ))
+
+
+class EchoResidualDocumentationTests(unittest.TestCase):
+    def capture_modes_paragraph(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+        start = readme.index("`phone-first-line` runs with")
+        end = readme.index("The R4/R5 command", start)
+        return " ".join(readme[start:end].split())
+
+    def test_readme_documents_echo_residual_mode_and_barge_in_timing(self):
+        paragraph = self.capture_modes_paragraph()
+        barge_in_seconds = next(
+            scenario.barge_in_after[-1]
+            for scenario in SCENARIOS
+            if scenario.name == "barge-in-long-reply"
+        )
+
+        for required in (
+            "--echo-residual",
+            "-30 dB",
+            "150 ms",
+            "echo canceller",
+            "barge-in-long-reply",
+            f"{barge_in_seconds:g} seconds",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, paragraph)
+        self.assertNotIn("9 seconds", paragraph)
 
 
 if __name__ == "__main__":

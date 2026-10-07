@@ -120,6 +120,29 @@ class Clock:
         self.now += seconds
 
 
+ECHO_STAND_IN_SHIFT = 1000
+
+
+def shifted_pcm(pcm):
+    """Add ECHO_STAND_IN_SHIFT to every sample, silence included, so silence shows the mix."""
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+    return struct.pack(
+        f"<{len(samples)}h", *(min(32767, sample + ECHO_STAND_IN_SHIFT) for sample in samples),
+    )
+
+
+class RecordingEcho:
+    """Stand-in residual that shifts each mic frame and records every mix call."""
+
+    def __init__(self, instances):
+        self.calls = []
+        instances.append(self)
+
+    def mix(self, mic_pcm, started_at):
+        self.calls.append((mic_pcm, started_at))
+        return shifted_pcm(mic_pcm)
+
+
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_fake_phone_start_failure_is_named_capacity_evidence(self):
         with patch.object(runner.subprocess, "Popen", side_effect=OSError("process table full")):
@@ -432,8 +455,16 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         samples = len(pcm) // 2
         return (samples + runner.FRAME_SAMPLES - 1) // runner.FRAME_SAMPLES
 
-    def preconnect_dependencies(self, first_line_pcm, *, agent_after_sleeps=0):
-        """Fake rtc whose room records the publish options, byte stream and live frames."""
+    def preconnect_dependencies(
+        self, first_line_pcm, *, agent_after_sleeps=0, slow_io=False,
+        buffer_error=None, live_error=None,
+    ):
+        """Fake rtc whose room records the publish options, byte stream and live frames.
+
+        slow_io makes each buffer write and each live frame yield to the event loop, so
+        the two can interleave the way real I/O does. buffer_error fails the first buffer
+        write; live_error fails the first live frame sent after the buffer stream opens.
+        """
         dependencies = self.dependencies_for_failure("other")
         recorded = SimpleNamespace(
             events=[], options=[], streams=[], frames=[], sleeps=[],
@@ -445,6 +476,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.stream = stream
 
             async def write(self, data):
+                if buffer_error is not None:
+                    raise buffer_error
+                if slow_io:
+                    await asyncio.sleep(0)
                 self.stream["data"].extend(data)
 
             async def aclose(self):
@@ -475,9 +510,15 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         dependencies.rtc.AudioFrame = lambda data, *_rest: SimpleNamespace(data=data)
 
         class Source:
+            queued_duration = 0.0
+
             async def capture_frame(self, frame):
+                if live_error is not None and "stream-opened" in recorded.events:
+                    raise live_error
                 recorded.events.append("frame")
                 recorded.frames.append(frame.data)
+                if slow_io:
+                    await asyncio.sleep(0)
 
             async def wait_for_playout(self):
                 pass
@@ -498,7 +539,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         return dependencies, recorded
 
     @staticmethod
-    async def run_preconnect_capture(dependencies, *, preconnect_first_line):
+    async def run_preconnect_capture(dependencies, *, preconnect_first_line, echo_residual=False):
         async def speech_end(source):
             await source.wait_for_playout()
             return time.monotonic()
@@ -513,6 +554,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 dependencies=dependencies,
                 room_close_after=None,
                 **({"preconnect_first_line": True} if preconnect_first_line else {}),
+                **({"echo_residual": True} if echo_residual else {}),
             )
 
     async def test_preconnect_first_line_sends_phone_style_buffer_then_overlaps_live_stream(self):
@@ -542,12 +584,53 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             recorded.events.index("subscribed") < recorded.events.index("stream-opened"), True
         )
-        self.assertLess(recorded.events.index("stream-closed"), recorded.events.index("frame"))
+        self.assertLess(recorded.events.index("frame"), recorded.events.index("stream-closed"))
         self.assertNotIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
         self.assertEqual(traces[0]["preconnect"], {"buffer_seconds": 1.0, "overlap_seconds": 0.7})
         self.assertNotIn("preconnect", traces[1])
         second = b"".join(recorded.frames[len(first_frames) :])
         self.assertEqual(second, rendered_pcm("Second question"))
+
+    async def test_preconnect_live_head_streams_while_the_buffer_writes_are_in_flight(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first, slow_io=True)
+
+        await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertLess(recorded.events.index("subscribed"), recorded.events.index("frame"))
+        self.assertLess(recorded.events.index("frame"), recorded.events.index("stream-closed"))
+        first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
+        self.assertEqual(b"".join(first_frames), first[int(0.3 * runner.RATE) * 2 :])
+        opening = first[: runner.RATE * 2]
+        upsampled = b"".join(opening[index : index + 2] * 2 for index in range(0, len(opening), 2))
+        self.assertEqual(bytes(recorded.streams[0]["data"]), upsampled)
+
+    async def test_preconnect_buffer_failure_fails_the_capture_and_leaves_no_task_running(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, _recorded = self.preconnect_dependencies(
+            first, slow_io=True, buffer_error=RuntimeError("buffer write broke"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "buffer write broke"):
+            await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertEqual(self.other_tasks(), [])
+
+    async def test_preconnect_live_push_failure_fails_the_capture_and_leaves_no_task_running(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, _recorded = self.preconnect_dependencies(
+            first, slow_io=True, live_error=RuntimeError("live frame broke"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "live frame broke"):
+            await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertEqual(self.other_tasks(), [])
+
+    @staticmethod
+    def other_tasks():
+        current = asyncio.current_task()
+        return [task for task in asyncio.all_tasks() if task is not current and not task.done()]
 
     async def test_preconnect_first_line_waits_for_the_agent_participant(self):
         first = self.ramp_pcm("First question", 2.0)
@@ -677,23 +760,60 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     BARGE_ONSET = 25.0
     BARGE_REPLY_END = 45.0
 
-    def barge_in_harness(self, *, hold_first_transcription=False, second_answer=None):
+    def barge_in_harness(
+        self, *, hold_first_transcription=False, second_answer=None, livekit_queue=False,
+        capture_failures=None,
+    ):
         """Fake room on a fake clock whose first capture hears a reply from 25.0 to 45.0.
 
         SECOND_ANSWER, when given, is (pcm, words, lead): the second capture hears that audio
-        and starts LEAD seconds before the second line's speech end.
+        and starts LEAD seconds before the second line's speech end. LIVEKIT_QUEUE gives the
+        mic a QueueSource, which keeps livekit's queue on the clock and records each frame's
+        queued_duration in record.queued; it does not classify voice, so use it with echo.
+        CAPTURE_FAILURES maps a capture number to the error its wait_for_voice and result raise.
         """
+        failures = capture_failures or {}
         clock = Clock()
         dependencies = self.dependencies_for_failure("other")
         record = SimpleNamespace(
             events=[], pushes={}, silent_frames=0, stopped=[], transcribed=[], speech_ends=[],
             hold_first_transcription=hold_first_transcription,
-            line_two_pushing=asyncio.Event(),
+            line_two_pushing=asyncio.Event(), mic=[], queued=[],
         )
         pushed_samples = []
         voiced_replies = pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18))
         onset = self.BARGE_ONSET
         reply_end = self.BARGE_REPLY_END
+
+        class QueueSource:
+            """AudioSource with livekit's queue bookkeeping on the test clock.
+
+            Follows livekit/rtc/audio_source.py: queued_duration is the queue net of the time
+            since the last capture, and a capture that would queue more than one second waits
+            on the clock until the excess has played. Playout is the queue draining.
+            """
+
+            def __init__(self):
+                self.q_size = 0.0
+                self.last_capture = 0.0
+
+            @property
+            def queued_duration(self):
+                return max(self.q_size - (clock.now - self.last_capture), 0.0)
+
+            async def capture_frame(self, frame):
+                record.mic.append((clock.now, bytes(frame.data)))
+                record.queued.append(self.queued_duration)
+                seconds = len(frame.data) // 2 / runner.RATE
+                elapsed = 0.0 if self.last_capture == 0.0 else clock.now - self.last_capture
+                self.q_size += seconds - elapsed
+                self.last_capture = clock.now
+                if self.queued_duration > 1.0:
+                    clock.now += self.queued_duration - 1.0
+
+            async def wait_for_playout(self):
+                clock.now += self.queued_duration
+                record.speech_ends.append(clock.now)
 
         class Source:
             async def capture_frame(self, frame):
@@ -714,15 +834,18 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         captures = []
 
         class Capture:
-            def __init__(self, _queue, ended=None):
+            def __init__(self, _queue, ended=None, **options):
                 self.number = len(captures) + 1
                 self.is_stopped = False
+                self.options = options
                 captures.append(self)
 
             async def start(self):
                 record.events.append(f"start-{self.number}")
 
             async def wait_for_voice(self):
+                if self.number in failures:
+                    raise failures[self.number]
                 while clock.now < onset:
                     await asyncio.sleep(0)
                 return onset
@@ -734,6 +857,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
             async def result(self):
                 record.events.append(f"result-{self.number}")
+                if self.number in failures:
+                    raise failures[self.number]
                 if self.number == 1 and not self.is_stopped:
                     clock.now = max(clock.now, reply_end)
                 if self.number == 2 and second_answer is not None:
@@ -747,7 +872,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         dependencies.rtc.TrackPublishOptions = lambda **kwargs: SimpleNamespace(**kwargs)
         dependencies.rtc.AudioFrame = lambda data, *_rest: SimpleNamespace(data=data)
-        dependencies.rtc.AudioSource = lambda *_args: Source()
+        dependencies.rtc.AudioSource = lambda *_args: QueueSource() if livekit_queue else Source()
         base_transcribe = dependencies.transcribe
 
         async def transcribe(http, pcm, rate, channels):
@@ -874,6 +999,154 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn(runner.NO_ANSWER_FAILURE, str(raised.exception))
+
+    # voice/caller.py's message when the agent's reply never starts before its deadline.
+    CALLER_REPLY_NOT_STARTED = "agent audio response did not start before its deadline"
+
+    def assert_reply_not_started(self, failure, turn, started_before, started_after):
+        """The failed turn names its speech start, which capture_script read between the bounds."""
+        self.assertEqual(set(failure), {"turn", "message", "speech_started_at"})
+        self.assertEqual(failure["turn"], turn)
+        self.assertEqual(failure["message"], self.CALLER_REPLY_NOT_STARTED)
+        self.assertLessEqual(started_before, failure["speech_started_at"])
+        self.assertLessEqual(failure["speech_started_at"], started_after)
+
+    async def test_barge_in_hold_for_a_reply_that_never_starts_fails_that_turn(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness(
+            capture_failures={1: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
+        )
+
+        started_before = time.time()
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+        started_after = time.time()
+
+        self.assertEqual(raised.exception.turns, [])
+        self.assert_reply_not_started(
+            raised.exception.failure, 1, started_before, started_after
+        )
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertNotIn(2, record.pushes)
+
+    async def test_barge_in_turn_whose_reply_never_starts_keeps_the_turn_before_it(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            capture_failures={2: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
+        )
+
+        started_before = time.time()
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+        started_after = time.time()
+
+        self.assertEqual([trace["turn"] for trace in raised.exception.turns], [1])
+        self.assertEqual(raised.exception.turns[0]["transcript"], "answer")
+        self.assert_reply_not_started(
+            raised.exception.failure, 2, started_before, started_after
+        )
+
+    async def test_turn_whose_reply_never_starts_after_a_plain_turn_is_a_partial_failure(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            capture_failures={2: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
+        )
+
+        started_before = time.time()
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@4::answer"],
+            )
+        started_after = time.time()
+
+        self.assertEqual([trace["turn"] for trace in raised.exception.turns], [1])
+        self.assert_reply_not_started(
+            raised.exception.failure, 2, started_before, started_after
+        )
+
+    async def test_first_turn_reply_that_never_starts_is_observed_and_scored_without_aborting(self):
+        from subprocess import CompletedProcess
+
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            capture_failures={1: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
+        )
+        room = "android-selected-room"
+        scenario = SCENARIOS[0]
+
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+        # The delegation starts after the line's speech start, which capture_script recorded.
+        delegation_at = time.time()
+        envelope = json.dumps({
+            "turns": raised.exception.turns,
+            "failure": raised.exception.failure,
+        })
+        delegation_markers = json.dumps({"room": room, "id": "d1", "created_at": delegation_at}) + "\n"
+        record = "".join(json.dumps(message) + "\n" for message in (
+            {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1", "model": "claude-opus-5"}}},
+            {"type": "result", "session_id": "voice-" + room},
+        ))
+        grant = {"token": "header.payload.signature", "room": room, "url": "wss://livekit.invalid"}
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, envelope, "")
+
+            def run_remote(self, command):
+                if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
+                    output = ""
+                elif command == ["sudo", "cat", "voice/evals/delegations.jsonl"]:
+                    output = delegation_markers
+                elif command == ["sudo", "cat", f"records/voice-{room}.jsonl"]:
+                    output = record
+                else:
+                    raise AssertionError(f"unexpected remote command {command!r}")
+                return CompletedProcess(command, 0, output, "")
+
+        with patch.object(runner, "_voice_token", return_value=grant):
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
+
+        self.assertEqual(observation["turns"], [])
+        self.assertEqual(observation["failure"], raised.exception.failure)
+        from evals.report import score_observations
+
+        report = score_observations({"cases": [{"name": scenario.name, "runs": [observation]}]}, required_runs=1)
+        self.assertFalse(report["passed"])
+
+    async def test_other_capture_errors_still_raise_as_they_did(self):
+        for failing_capture in (1, 2):
+            with self.subTest(capture=failing_capture):
+                other = RuntimeError("agent audio capture exceeded its deadline")
+                dependencies, _record, _captures, _clock = self.barge_in_harness(
+                    capture_failures={failing_capture: other}
+                )
+
+                with self.assertRaises(RuntimeError) as raised:
+                    await self.run_barge_in_capture(
+                        dependencies,
+                        ["First question@0::answer", "Second question@30::answer"],
+                        barge_in={2: 9.0},
+                    )
+
+                self.assertNotIsInstance(raised.exception, runner.PartialCaptureFailure)
+                self.assertIs(raised.exception, other)
 
     async def test_barge_in_push_is_not_delayed_by_the_interrupted_turns_transcription(self):
         dependencies, record, _captures, _clock = self.barge_in_harness(
@@ -1005,6 +1278,187 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 room_close_after=None, barge_in={2: 9.0},
             )
         self.assertEqual(remote_calls[0]["barge_in"], {2: 9.0})
+
+    async def test_echo_residual_mixes_every_mic_frame_at_its_playout_time(self):
+        instances = []
+        dependencies, record, _captures, _clock = self.barge_in_harness(livekit_queue=True)
+
+        with patch.object(runner.caller, "EchoResidual", lambda: RecordingEcho(instances)):
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+                echo_residual=True,
+            )
+
+        [echo] = instances
+        self.assertEqual(len(echo.calls), len(record.mic))
+        for (captured_at, pushed), queued, (mic_pcm, started_at) in zip(
+            record.mic, record.queued, echo.calls,
+        ):
+            self.assertEqual(pushed, shifted_pcm(mic_pcm))
+            self.assertAlmostEqual(started_at, captured_at + queued, places=6)
+        self.assertTrue(any(
+            self.BARGE_ONSET <= captured_at < self.BARGE_ONSET + 9.0 and not any(mic_pcm)
+            for (captured_at, _pushed), (mic_pcm, _started_at) in zip(record.mic, echo.calls)
+        ))
+        self.assertTrue(any(any(mic_pcm) for mic_pcm, _started_at in echo.calls))
+
+    async def test_echo_residual_paces_line_audio_so_each_line_frame_is_heard_before_it_plays(self):
+        instances = []
+        dependencies, record, _captures, _clock = self.barge_in_harness(livekit_queue=True)
+
+        with patch.object(runner.caller, "EchoResidual", lambda: RecordingEcho(instances)):
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+                echo_residual=True,
+            )
+
+        [echo] = instances
+        line_frames = 0
+        previous_was_line = False
+        for (captured_at, _pushed), queued, (mic_pcm, started_at) in zip(
+            record.mic, record.queued, echo.calls,
+        ):
+            is_line = any(mic_pcm)
+            if is_line:
+                line_frames += 1
+                self.assertLessEqual(
+                    started_at - runner.caller.ECHO_DELAY_SECONDS, captured_at + 1e-9,
+                )
+                if previous_was_line:
+                    self.assertGreater(queued, 0.0)
+            previous_was_line = is_line
+        self.assertGreater(line_frames, 0)
+
+    async def test_echo_residual_mixes_participant_wait_silence_and_both_lines(self):
+        instances = []
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=2)
+
+        with patch.object(runner.caller, "EchoResidual", lambda: RecordingEcho(instances)):
+            await self.run_preconnect_capture(
+                dependencies, preconnect_first_line=True, echo_residual=True,
+            )
+
+        [echo] = instances
+        self.assertTrue(recorded.frames)
+        self.assertEqual(len(echo.calls), len(recorded.frames))
+        self.assertEqual(recorded.frames, [shifted_pcm(mic_pcm) for mic_pcm, _ in echo.calls])
+
+    async def test_every_capture_is_built_with_the_calls_one_echo_residual(self):
+        instances = []
+        dependencies, _record, captures, _clock = self.barge_in_harness(livekit_queue=True)
+
+        with patch.object(runner.caller, "EchoResidual", lambda: RecordingEcho(instances)):
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@4::answer"],
+                echo_residual=True,
+            )
+
+        [echo] = instances
+        self.assertEqual([capture.options for capture in captures], [{"echo": echo}, {"echo": echo}])
+
+    async def test_without_echo_residual_no_residual_is_built_and_frames_are_unmixed(self):
+        instances = []
+        dependencies, record, captures, _clock = self.barge_in_harness(livekit_queue=True)
+        first = rendered_pcm("First question")
+
+        with patch.object(runner.caller, "EchoResidual", lambda: RecordingEcho(instances)):
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+
+        self.assertEqual(instances, [])
+        self.assertEqual([capture.options for capture in captures], [{}, {}])
+        opening = [frame for _at, frame in record.mic[: self.frames_in(first)]]
+        self.assertEqual(b"".join(opening), first)
+        self.assertEqual({at for at, _frame in record.mic[:100]}, {record.mic[0][0]})
+
+    async def test_echo_residual_cli_flag_reaches_capture_script_through_every_capture_entry(self):
+        steps = ["First@0::a", "Second@0::a"]
+        self.assertEqual(
+            runner._parse_arguments(["--echo-residual", "android-selected-room", *steps]),
+            ("android-selected-room", steps, 2, {}),
+        )
+        calls = []
+
+        async def capture(room, steps, **options):
+            calls.append(options)
+            return []
+
+        for entry in ("run_remote_capture", "_run_remote_capture_with_fake_phone"):
+            for flags in (["--echo-residual"], []):
+                arguments = [*flags, "android-selected-room", *steps]
+                if entry != "run_remote_capture":
+                    arguments.insert(0, "--fake-phone")
+                with (
+                    self.subTest(entry=entry, flags=flags),
+                    patch.object(runner, entry, capture),
+                    patch("sys.stdout"),
+                ):
+                    self.assertEqual(await asyncio.to_thread(runner.main, arguments), 0)
+                    if flags:
+                        self.assertIs(calls[-1]["echo_residual"], True)
+                    else:
+                        self.assertNotIn("echo_residual", calls[-1])
+
+        script_calls = []
+
+        async def capture_script_spy(room, steps, **options):
+            script_calls.append(options)
+            return []
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with (
+            patch.dict(sys.modules, {"aiohttp": SimpleNamespace(ClientSession=Session)}),
+            patch.object(runner, "capture_script", capture_script_spy),
+            patch.object(runner, "_dependencies", lambda _http: object()),
+        ):
+            await runner.run_remote_capture("android-selected-room", steps, echo_residual=True)
+        self.assertIs(script_calls[0]["echo_residual"], True)
+
+        class PhoneProcess:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        remote_calls = []
+
+        async def remote_capture(*_args, **options):
+            remote_calls.append(options)
+            return []
+
+        async def no_sleep(_seconds):
+            pass
+
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=PhoneProcess()),
+            patch.object(runner, "run_remote_capture", remote_capture),
+            patch.object(runner.asyncio, "sleep", no_sleep),
+        ):
+            await runner._run_remote_capture_with_fake_phone(
+                "android-selected-room", steps, room_close_after=None, echo_residual=True,
+            )
+        self.assertIs(remote_calls[0]["echo_residual"], True)
 
     async def test_missing_worker_subscription_fails_within_participant_deadline(self):
         dependencies = self.dependencies_for_failure("other")
@@ -3001,7 +3455,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         class Capture:
-            def __init__(self, _queue, ended=None):
+            def __init__(self, _queue, ended=None, **_options):
                 self.ended = ended
 
             async def start(self):
@@ -4465,6 +4919,38 @@ class ScenarioObservationTests(unittest.TestCase):
             runner._capture_envelope(started_failure, 2)[1]["speech_started_at"],
             1_700_000_000.0,
         )
+        reply_not_started = json.dumps({
+            "turns": [trace],
+            "failure": {
+                "turn": 2,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        })
+        self.assertEqual(runner._capture_envelope(reply_not_started, 2), (
+            [trace],
+            {
+                "turn": 2,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        ))
+        first_reply_not_started = json.dumps({
+            "turns": [],
+            "failure": {
+                "turn": 1,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        })
+        self.assertEqual(runner._capture_envelope(first_reply_not_started, 2), (
+            [],
+            {
+                "turn": 1,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        ))
         same_turn_timeout = json.dumps({
             "turns": [{"turn": 1, "room_deleted": None}],
             "failure": {
@@ -4483,6 +4969,9 @@ class ScenarioObservationTests(unittest.TestCase):
             {"turns": [trace], "failure": {"turn": 3, "message": "room was deleted before all scripted lines were captured"}},
             {"turns": [trace], "failure": {"turn": 2, "message": "unrecognized failure"}},
             {"turns": [trace], "failure": {"turn": 2, "message": runner.NO_ANSWER_FAILURE}},
+            {"turns": [trace], "failure": {"turn": 2, "message": runner.REPLY_NOT_STARTED_FAILURE}},
+            {"turns": [], "failure": {"turn": 1, "message": runner.REPLY_NOT_STARTED_FAILURE}},
+            {"turns": [trace], "failure": {"turn": 3, "message": runner.REPLY_NOT_STARTED_FAILURE, "speech_started_at": 1_700_000_000.0}},
             {"turns": [trace], "failure": {"turn": 2, "message": "scripted speech synthesis exceeded its deadline", "speech_started_at": 1_700_000_000.0}},
             {"turns": [], "failure": {"turn": 1, "message": "room was deleted before all scripted lines were captured"}},
             {"turns": [{"turn": 1, "room_deleted": 4.0}], "failure": {"turn": 1, "message": "room deletion was not observed before deadline"}},
@@ -4519,6 +5008,40 @@ class ScenarioObservationTests(unittest.TestCase):
                 "message": "scripted speech synthesis for line 1 exceeded its deadline",
             },
         })
+
+    def test_remote_cli_reply_not_started_envelope_is_accepted_by_the_parent(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        trace = {"turn": 1, "speech_started_at": 1_699_999_999.0}
+
+        async def fail_before_second_reply(_room, _steps, *, room_close_after):
+            raise runner.PartialCaptureFailure(
+                [trace], 2, runner.REPLY_NOT_STARTED_FAILURE, speech_started_at=1_700_000_000.0
+            )
+
+        output = io.StringIO()
+        with patch.object(runner, "run_remote_capture", fail_before_second_reply), redirect_stdout(output):
+            result = runner.main(["android-selected-room", "First@0::answer", "Second@4::answer"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), {
+            "turns": [trace],
+            "failure": {
+                "turn": 2,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        })
+        self.assertEqual(runner._capture_envelope(output.getvalue(), 2), (
+            [trace],
+            {
+                "turn": 2,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        ))
 
     def test_missing_or_malformed_evidence_fails_closed(self):
         class Response:
@@ -5303,6 +5826,15 @@ class ScenarioObservationTests(unittest.TestCase):
                         ),
                         command.index("safe-room"),
                     )
+
+    def test_capture_command_carries_echo_residual_only_for_the_barge_in_long_reply_scenario(self):
+        emitting = []
+        for scenario in SCENARIOS:
+            command = runner._capture_command(scenario, "safe-room", ["Question@0::answer"])
+            if "--echo-residual" in command:
+                emitting.append(scenario.name)
+                self.assertLess(command.index("--echo-residual"), command.index("safe-room"))
+        self.assertEqual(emitting, ["barge-in-long-reply"])
 
     def observe_exact_caller_stt(self, scenario_name, sidecars):
         import json

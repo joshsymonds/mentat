@@ -316,15 +316,20 @@ interpreter scenario translates six English and Spanish turns for a generic
 gardener, including a timer imperative and a quoted stop-translation
 phrase; neither is acted on as a phone command or mode change.
 
-Two capture modes serve the first-line scenarios. `phone-first-line` runs with
-`--preconnect-first-line`: the opening second of line 1 goes to the worker as
-the phone's pre-connect buffer while line 1 also streams live from 0.3 s, so
-the two overlap by 0.7 s the way the Pixel's do, and the room must still hear
-the line once. In
-`barge-in-long-reply`, `--barge-in TURN:SECONDS` (one-based TURN, repeatable)
-starts that line SECONDS after the agent's reply begins; the scenario speaks
-its second line 9 seconds into a long story to check that the interruption
-commits during the agent's speech. Both scenarios set `exact_caller_stt`:
+Three capture modes serve the first-line and barge-in scenarios.
+`phone-first-line` runs with `--preconnect-first-line`: the opening second of
+line 1 goes to the worker as the phone's pre-connect buffer while line 1 also
+streams live from 0.3 s, so the two overlap by 0.7 s the way the Pixel's do, and
+the room must still hear the line once. In `barge-in-long-reply`,
+`--barge-in TURN:SECONDS` (one-based TURN, repeatable) starts that line SECONDS
+after the agent's reply begins; the scenario speaks its second line 15 seconds
+into a long story to check that the interruption commits during the agent's
+speech. That scenario also sets `echo_residual`, which runs the caller with
+`--echo-residual`: while the voice speaks, the caller's mic carries the agent's
+speech as the caller received it, at -30 dB and 150 ms late. This mirrors the
+residual echo a phone's echo canceller leaves after cancellation, so barge-in is
+judged over the echo a phone mic actually hears rather than a clean line. Both
+scenarios set `exact_caller_stt`:
 each turn's input STT sidecar must match its scripted line, so a misheard or
 duplicated first line, or a missing sidecar, fails that turn, and the
 observation records the sidecars as `caller_stt`. The R4/R5 command runs both
