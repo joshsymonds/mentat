@@ -21,7 +21,7 @@ import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -65,6 +65,8 @@ ROOM_DELETE_DEADLINE_SECONDS = 60.0
 REMOTE_OPERATION_DEADLINE_SECONDS = 30.0
 ROOM_POLL_INTERVAL_SECONDS = 0.25
 BARGE_IN_POLL_SECONDS = 0.02
+# voice/caller.py's message when the agent's reply never starts before its deadline.
+REPLY_NOT_STARTED_FAILURE = "agent audio response did not start before its deadline"
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
@@ -1550,6 +1552,22 @@ async def capture_script(
                     )
                 raise RuntimeError("room was deleted before all scripted lines were captured")
 
+        async def await_reply(index: int, speech_started_at: float, reply: Awaitable[Any]) -> Any:
+            """Await turn INDEX + 1's reply, failing that turn if the agent never starts it."""
+            try:
+                return await reply
+            except RuntimeError as error:
+                if str(error) != REPLY_NOT_STARTED_FAILURE:
+                    raise
+                if pending_finish is not None:
+                    await pending_finish
+                raise PartialCaptureFailure(
+                    traces,
+                    index + 1,
+                    str(error),
+                    speech_started_at=speech_started_at,
+                ) from error
+
         for index, (step, rendered) in enumerate(zip(steps, synthesized, strict=True)):
             speech, retry_count, attempt = rendered
             barge_after = barge_in.get(index + 1)
@@ -1601,10 +1619,14 @@ async def capture_script(
                 )
             next_barge_after = barge_in.get(index + 2)
             if next_barge_after is not None:
-                await hold_for_barge_in(capture, next_barge_after)
+                await await_reply(
+                    index, speech_started_at, hold_for_barge_in(capture, next_barge_after)
+                )
             try:
-                answer = await asyncio.wait_for(
-                    capture.result(), timeout=ANSWER_CAPTURE_DEADLINE_SECONDS
+                answer = await await_reply(
+                    index,
+                    speech_started_at,
+                    asyncio.wait_for(capture.result(), timeout=ANSWER_CAPTURE_DEADLINE_SECONDS),
                 )
             except TimeoutError as error:
                 raise RuntimeError("agent audio capture exceeded its deadline") from error
@@ -2802,6 +2824,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
             or failure.get("message") in {
                 "answer transcription exceeded its deadline",
                 NO_ANSWER_FAILURE,
+                REPLY_NOT_STARTED_FAILURE,
                 "room was deleted before all scripted lines were captured",
                 "room deletion was not observed before deadline",
             }
@@ -2810,6 +2833,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         or (
             failure.get("message") in {
                 NO_ANSWER_FAILURE,
+                REPLY_NOT_STARTED_FAILURE,
                 "answer transcription exceeded its deadline",
             }
             or is_transcription_failure(failure.get("message"))

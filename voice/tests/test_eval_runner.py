@@ -762,6 +762,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
     def barge_in_harness(
         self, *, hold_first_transcription=False, second_answer=None, livekit_queue=False,
+        capture_failures=None,
     ):
         """Fake room on a fake clock whose first capture hears a reply from 25.0 to 45.0.
 
@@ -769,7 +770,9 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         and starts LEAD seconds before the second line's speech end. LIVEKIT_QUEUE gives the
         mic a QueueSource, which keeps livekit's queue on the clock and records each frame's
         queued_duration in record.queued; it does not classify voice, so use it with echo.
+        CAPTURE_FAILURES maps a capture number to the error its wait_for_voice and result raise.
         """
+        failures = capture_failures or {}
         clock = Clock()
         dependencies = self.dependencies_for_failure("other")
         record = SimpleNamespace(
@@ -841,6 +844,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 record.events.append(f"start-{self.number}")
 
             async def wait_for_voice(self):
+                if self.number in failures:
+                    raise failures[self.number]
                 while clock.now < onset:
                     await asyncio.sleep(0)
                 return onset
@@ -852,6 +857,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
             async def result(self):
                 record.events.append(f"result-{self.number}")
+                if self.number in failures:
+                    raise failures[self.number]
                 if self.number == 1 and not self.is_stopped:
                     clock.now = max(clock.now, reply_end)
                 if self.number == 2 and second_answer is not None:
@@ -992,6 +999,154 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn(runner.NO_ANSWER_FAILURE, str(raised.exception))
+
+    # voice/caller.py's message when the agent's reply never starts before its deadline.
+    CALLER_REPLY_NOT_STARTED = "agent audio response did not start before its deadline"
+
+    def assert_reply_not_started(self, failure, turn, started_before, started_after):
+        """The failed turn names its speech start, which capture_script read between the bounds."""
+        self.assertEqual(set(failure), {"turn", "message", "speech_started_at"})
+        self.assertEqual(failure["turn"], turn)
+        self.assertEqual(failure["message"], self.CALLER_REPLY_NOT_STARTED)
+        self.assertLessEqual(started_before, failure["speech_started_at"])
+        self.assertLessEqual(failure["speech_started_at"], started_after)
+
+    async def test_barge_in_hold_for_a_reply_that_never_starts_fails_that_turn(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness(
+            capture_failures={1: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
+        )
+
+        started_before = time.time()
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+        started_after = time.time()
+
+        self.assertEqual(raised.exception.turns, [])
+        self.assert_reply_not_started(
+            raised.exception.failure, 1, started_before, started_after
+        )
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertNotIn(2, record.pushes)
+
+    async def test_barge_in_turn_whose_reply_never_starts_keeps_the_turn_before_it(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            capture_failures={2: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
+        )
+
+        started_before = time.time()
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+        started_after = time.time()
+
+        self.assertEqual([trace["turn"] for trace in raised.exception.turns], [1])
+        self.assertEqual(raised.exception.turns[0]["transcript"], "answer")
+        self.assert_reply_not_started(
+            raised.exception.failure, 2, started_before, started_after
+        )
+
+    async def test_turn_whose_reply_never_starts_after_a_plain_turn_is_a_partial_failure(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            capture_failures={2: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
+        )
+
+        started_before = time.time()
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@4::answer"],
+            )
+        started_after = time.time()
+
+        self.assertEqual([trace["turn"] for trace in raised.exception.turns], [1])
+        self.assert_reply_not_started(
+            raised.exception.failure, 2, started_before, started_after
+        )
+
+    async def test_first_turn_reply_that_never_starts_is_observed_and_scored_without_aborting(self):
+        from subprocess import CompletedProcess
+
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            capture_failures={1: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
+        )
+        room = "android-selected-room"
+        scenario = SCENARIOS[0]
+
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+        # The delegation starts after the line's speech start, which capture_script recorded.
+        delegation_at = time.time()
+        envelope = json.dumps({
+            "turns": raised.exception.turns,
+            "failure": raised.exception.failure,
+        })
+        delegation_markers = json.dumps({"room": room, "id": "d1", "created_at": delegation_at}) + "\n"
+        record = "".join(json.dumps(message) + "\n" for message in (
+            {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1", "model": "claude-opus-5"}}},
+            {"type": "result", "session_id": "voice-" + room},
+        ))
+        grant = {"token": "header.payload.signature", "room": room, "url": "wss://livekit.invalid"}
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, envelope, "")
+
+            def run_remote(self, command):
+                if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
+                    output = ""
+                elif command == ["sudo", "cat", "voice/evals/delegations.jsonl"]:
+                    output = delegation_markers
+                elif command == ["sudo", "cat", f"records/voice-{room}.jsonl"]:
+                    output = record
+                else:
+                    raise AssertionError(f"unexpected remote command {command!r}")
+                return CompletedProcess(command, 0, output, "")
+
+        with patch.object(runner, "_voice_token", return_value=grant):
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
+
+        self.assertEqual(observation["turns"], [])
+        self.assertEqual(observation["failure"], raised.exception.failure)
+        from evals.report import score_observations
+
+        report = score_observations({"cases": [{"name": scenario.name, "runs": [observation]}]}, required_runs=1)
+        self.assertFalse(report["passed"])
+
+    async def test_other_capture_errors_still_raise_as_they_did(self):
+        for failing_capture in (1, 2):
+            with self.subTest(capture=failing_capture):
+                other = RuntimeError("agent audio capture exceeded its deadline")
+                dependencies, _record, _captures, _clock = self.barge_in_harness(
+                    capture_failures={failing_capture: other}
+                )
+
+                with self.assertRaises(RuntimeError) as raised:
+                    await self.run_barge_in_capture(
+                        dependencies,
+                        ["First question@0::answer", "Second question@30::answer"],
+                        barge_in={2: 9.0},
+                    )
+
+                self.assertNotIsInstance(raised.exception, runner.PartialCaptureFailure)
+                self.assertIs(raised.exception, other)
 
     async def test_barge_in_push_is_not_delayed_by_the_interrupted_turns_transcription(self):
         dependencies, record, _captures, _clock = self.barge_in_harness(
@@ -4764,6 +4919,38 @@ class ScenarioObservationTests(unittest.TestCase):
             runner._capture_envelope(started_failure, 2)[1]["speech_started_at"],
             1_700_000_000.0,
         )
+        reply_not_started = json.dumps({
+            "turns": [trace],
+            "failure": {
+                "turn": 2,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        })
+        self.assertEqual(runner._capture_envelope(reply_not_started, 2), (
+            [trace],
+            {
+                "turn": 2,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        ))
+        first_reply_not_started = json.dumps({
+            "turns": [],
+            "failure": {
+                "turn": 1,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        })
+        self.assertEqual(runner._capture_envelope(first_reply_not_started, 2), (
+            [],
+            {
+                "turn": 1,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        ))
         same_turn_timeout = json.dumps({
             "turns": [{"turn": 1, "room_deleted": None}],
             "failure": {
@@ -4782,6 +4969,9 @@ class ScenarioObservationTests(unittest.TestCase):
             {"turns": [trace], "failure": {"turn": 3, "message": "room was deleted before all scripted lines were captured"}},
             {"turns": [trace], "failure": {"turn": 2, "message": "unrecognized failure"}},
             {"turns": [trace], "failure": {"turn": 2, "message": runner.NO_ANSWER_FAILURE}},
+            {"turns": [trace], "failure": {"turn": 2, "message": runner.REPLY_NOT_STARTED_FAILURE}},
+            {"turns": [], "failure": {"turn": 1, "message": runner.REPLY_NOT_STARTED_FAILURE}},
+            {"turns": [trace], "failure": {"turn": 3, "message": runner.REPLY_NOT_STARTED_FAILURE, "speech_started_at": 1_700_000_000.0}},
             {"turns": [trace], "failure": {"turn": 2, "message": "scripted speech synthesis exceeded its deadline", "speech_started_at": 1_700_000_000.0}},
             {"turns": [], "failure": {"turn": 1, "message": "room was deleted before all scripted lines were captured"}},
             {"turns": [{"turn": 1, "room_deleted": 4.0}], "failure": {"turn": 1, "message": "room deletion was not observed before deadline"}},
@@ -4818,6 +5008,40 @@ class ScenarioObservationTests(unittest.TestCase):
                 "message": "scripted speech synthesis for line 1 exceeded its deadline",
             },
         })
+
+    def test_remote_cli_reply_not_started_envelope_is_accepted_by_the_parent(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        trace = {"turn": 1, "speech_started_at": 1_699_999_999.0}
+
+        async def fail_before_second_reply(_room, _steps, *, room_close_after):
+            raise runner.PartialCaptureFailure(
+                [trace], 2, runner.REPLY_NOT_STARTED_FAILURE, speech_started_at=1_700_000_000.0
+            )
+
+        output = io.StringIO()
+        with patch.object(runner, "run_remote_capture", fail_before_second_reply), redirect_stdout(output):
+            result = runner.main(["android-selected-room", "First@0::answer", "Second@4::answer"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), {
+            "turns": [trace],
+            "failure": {
+                "turn": 2,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        })
+        self.assertEqual(runner._capture_envelope(output.getvalue(), 2), (
+            [trace],
+            {
+                "turn": 2,
+                "message": runner.REPLY_NOT_STARTED_FAILURE,
+                "speech_started_at": 1_700_000_000.0,
+            },
+        ))
 
     def test_missing_or_malformed_evidence_fails_closed(self):
         class Response:
