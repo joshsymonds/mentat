@@ -267,11 +267,78 @@ class CommitCadenceTest(ScribeCommitTestCase):
         await self.time.advance(0.1)
         self.assertEqual(self.flushes, [26.0])
 
+    async def test_recovery_reconnect_then_agent_speech_end_waits_five_seconds(self):
+        scribe = FakeScribe()
+        namespace = _exec(
+            [_front_agent_method("recover_stalled_stt"), _top_level("stt_secondary_languages")],
+            {"logger": self.logger, "STT_STALL_REPLY": "Say it again?"},
+        )
+        agent = SimpleNamespace(
+            _scribe_commits=self.controller, _closed=False, _stt_provider=scribe,
+            _tts_provider=Mock(), _voice_language="en", _voice_mode="normal",
+            _default_voice="voice", session=SimpleNamespace(say=Mock()),
+        )
+        await self.speech_starts_and_vad_ends()
+        await self.time.advance(20)
+        namespace["recover_stalled_stt"](agent, 4.0)
+        self.controller.agent_state("listening", "speaking")
+        await self.time.advance(0.3)
+        self.controller.agent_state("speaking", "listening")
+        await self.time.advance(4.6)
+        self.assertEqual(self.flushes, [])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [26.0])
+
     async def test_close_stops_the_background_loop(self):
         await self.controller.aclose()
         await self.time.advance(60)
         self.assertEqual(self.flushes, [])
         self.assertIsNone(self.controller._task)
+
+
+class SessionStartGapTest(ScribeCommitTestCase):
+    """A Scribe session start counts as the worker's last commit."""
+
+    async def hold_agent_speech(self, seconds):
+        self.controller.agent_state("listening", "speaking")
+        await self.time.advance(seconds)
+
+    async def test_new_stream_then_agent_speech_end_waits_five_seconds(self):
+        await self.hold_agent_speech(20)
+        fresh = FakeStream(self.time)
+        self.controller.set_stream(fresh)
+        self.controller.agent_state("speaking", "listening")
+        await self.time.advance(4.9)
+        self.assertEqual(fresh.flushes, [])
+        await self.time.advance(0.1)
+        self.assertEqual(fresh.flushes, [25.0])
+
+    async def test_reconnect_then_agent_speech_end_waits_five_seconds(self):
+        await self.hold_agent_speech(20)
+        self.controller.session_started()
+        self.controller.agent_state("speaking", "listening")
+        await self.time.advance(4.9)
+        self.assertEqual(self.flushes, [])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [25.0])
+
+    async def test_reconnect_pushes_the_quiet_cadence_five_seconds_out(self):
+        await self.time.advance(3)
+        self.controller.session_started()
+        await self.time.advance(4.9)
+        self.assertEqual(self.flushes, [])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [8.0])
+
+    async def test_session_start_after_a_commit_still_waits_five_seconds(self):
+        await self.time.advance(5)
+        self.assertEqual(self.flushes, [5.0])
+        await self.time.advance(2)
+        self.controller.session_started()
+        await self.time.advance(4.9)
+        self.assertEqual(self.flushes, [5.0])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [5.0, 12.0])
 
 
 class StreamHandoffTest(ScribeCommitTestCase):
@@ -300,6 +367,16 @@ class StreamHandoffTest(ScribeCommitTestCase):
         await self.time.advance(5)
         self.assertEqual(self.scribe.reconnects, 2)
         self.assertEqual(opened.flushes, [5.0, 10.0, 15.0])
+
+    async def test_a_stream_the_stt_opens_counts_as_a_session_start(self):
+        self.controller.agent_state("listening", "speaking")
+        await self.time.advance(20)
+        opened = self.scribe.stream()
+        self.controller.agent_state("speaking", "listening")
+        await self.time.advance(4.9)
+        self.assertEqual(opened.flushes, [])
+        await self.time.advance(0.1)
+        self.assertEqual(opened.flushes, [25.0])
 
     async def test_a_closed_stream_is_dropped_without_killing_the_cadence(self):
         first = self.scribe.stream()

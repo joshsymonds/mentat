@@ -328,6 +328,13 @@ class ScribeCommitController:
 
     def set_stream(self, stream: Any) -> None:
         self._stream = stream
+        self.session_started()
+
+    def session_started(self) -> None:
+        # A new Scribe session, whether a fresh stream or a same-stream reconnect,
+        # counts as the worker's last commit: flushing right after it hands Scribe
+        # a few hundred milliseconds of near-silence and it invents a final.
+        self._last_commit_at = self._clock()
         self._wake.set()
 
     def agent_state(self, old_state: str | None, new_state: str) -> None:
@@ -491,6 +498,7 @@ class FrontAgent(Agent):
             self._stt_provider.update_options(
                 secondary_languages=stt_secondary_languages(self._voice_language)
             )
+            self._scribe_commits.session_started()
         except Exception:
             logger.exception("STT reconnect after a stall failed")
         if self._voice_mode == "interpreter":
@@ -853,6 +861,7 @@ class FrontAgent(Agent):
             self._stt_provider.update_options(
                 secondary_languages=stt_secondary_languages(language)
             )
+            self._scribe_commits.session_started()
             self._tts_provider.update_options(voice_id=voice_id)
             self.session.update_options(endpointing_opts=endpointing_opts)
         except Exception as error:
@@ -872,6 +881,8 @@ class FrontAgent(Agent):
             ):
                 try:
                     provider.update_options(**options)
+                    if provider is self._stt_provider:
+                        self._scribe_commits.session_started()
                 except Exception as rollback_error:
                     rollback_failed = True
                     logger.error(
