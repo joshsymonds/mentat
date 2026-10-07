@@ -432,8 +432,16 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         samples = len(pcm) // 2
         return (samples + runner.FRAME_SAMPLES - 1) // runner.FRAME_SAMPLES
 
-    def preconnect_dependencies(self, first_line_pcm, *, agent_after_sleeps=0):
-        """Fake rtc whose room records the publish options, byte stream and live frames."""
+    def preconnect_dependencies(
+        self, first_line_pcm, *, agent_after_sleeps=0, slow_io=False,
+        buffer_error=None, live_error=None,
+    ):
+        """Fake rtc whose room records the publish options, byte stream and live frames.
+
+        slow_io makes each buffer write and each live frame yield to the event loop, so
+        the two can interleave the way real I/O does. buffer_error fails the first buffer
+        write; live_error fails the first live frame sent after the buffer stream opens.
+        """
         dependencies = self.dependencies_for_failure("other")
         recorded = SimpleNamespace(
             events=[], options=[], streams=[], frames=[], sleeps=[],
@@ -445,6 +453,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.stream = stream
 
             async def write(self, data):
+                if buffer_error is not None:
+                    raise buffer_error
+                if slow_io:
+                    await asyncio.sleep(0)
                 self.stream["data"].extend(data)
 
             async def aclose(self):
@@ -476,8 +488,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         class Source:
             async def capture_frame(self, frame):
+                if live_error is not None and "stream-opened" in recorded.events:
+                    raise live_error
                 recorded.events.append("frame")
                 recorded.frames.append(frame.data)
+                if slow_io:
+                    await asyncio.sleep(0)
 
             async def wait_for_playout(self):
                 pass
@@ -542,12 +558,53 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             recorded.events.index("subscribed") < recorded.events.index("stream-opened"), True
         )
-        self.assertLess(recorded.events.index("stream-closed"), recorded.events.index("frame"))
+        self.assertLess(recorded.events.index("frame"), recorded.events.index("stream-closed"))
         self.assertNotIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
         self.assertEqual(traces[0]["preconnect"], {"buffer_seconds": 1.0, "overlap_seconds": 0.7})
         self.assertNotIn("preconnect", traces[1])
         second = b"".join(recorded.frames[len(first_frames) :])
         self.assertEqual(second, rendered_pcm("Second question"))
+
+    async def test_preconnect_live_head_streams_while_the_buffer_writes_are_in_flight(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first, slow_io=True)
+
+        await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertLess(recorded.events.index("subscribed"), recorded.events.index("frame"))
+        self.assertLess(recorded.events.index("frame"), recorded.events.index("stream-closed"))
+        first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
+        self.assertEqual(b"".join(first_frames), first[int(0.3 * runner.RATE) * 2 :])
+        opening = first[: runner.RATE * 2]
+        upsampled = b"".join(opening[index : index + 2] * 2 for index in range(0, len(opening), 2))
+        self.assertEqual(bytes(recorded.streams[0]["data"]), upsampled)
+
+    async def test_preconnect_buffer_failure_fails_the_capture_and_leaves_no_task_running(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, _recorded = self.preconnect_dependencies(
+            first, slow_io=True, buffer_error=RuntimeError("buffer write broke"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "buffer write broke"):
+            await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertEqual(self.other_tasks(), [])
+
+    async def test_preconnect_live_push_failure_fails_the_capture_and_leaves_no_task_running(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, _recorded = self.preconnect_dependencies(
+            first, slow_io=True, live_error=RuntimeError("live frame broke"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "live frame broke"):
+            await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertEqual(self.other_tasks(), [])
+
+    @staticmethod
+    def other_tasks():
+        current = asyncio.current_task()
+        return [task for task in asyncio.all_tasks() if task is not current and not task.done()]
 
     async def test_preconnect_first_line_waits_for_the_agent_participant(self):
         first = self.ramp_pcm("First question", 2.0)

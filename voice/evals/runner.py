@@ -1288,6 +1288,28 @@ async def capture_script(
                     f"scripted speech sample count mismatch for line {line_number}",
                 )
 
+        async def push_with_preconnect_buffer(
+            speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
+            attempt: int,
+        ) -> None:
+            """Start line 1's live overlap while its pre-connect buffer is still sent.
+
+            Like the phone, the live track is already flowing when the buffer lands, so
+            the worker hears the buffer and the live head in the order it expects. A
+            failure on either side cancels the other before the capture fails.
+            """
+            live = asyncio.ensure_future(
+                push(speech, step, line_number, attempt, live_start_sample)
+            )
+            buffer = asyncio.ensure_future(send_preconnect_buffer(speech))
+            try:
+                await asyncio.gather(live, buffer)
+            except BaseException:
+                live.cancel()
+                buffer.cancel()
+                await asyncio.gather(live, buffer, return_exceptions=True)
+                raise
+
         silence = bytes(FRAME_SAMPLES * 2)
 
         async def quiet(seconds: float) -> None:
@@ -1515,13 +1537,11 @@ async def capture_script(
                 "continuous answer capture start",
             )
             preconnect = preconnect_first_line and index == 0
-            if preconnect:
-                await send_preconnect_buffer(speech)
             speech_started_at = time.time()
-            await push(
-                speech, step, index + 1, attempt,
-                live_start_sample if preconnect else 0,
-            )
+            if preconnect:
+                await push_with_preconnect_buffer(speech, step, index + 1, attempt)
+            else:
+                await push(speech, step, index + 1, attempt)
             speech_end = _finite_timestamp(
                 await _with_deadline(
                     caller._speech_end_after_playout(source),
