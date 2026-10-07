@@ -33,7 +33,7 @@ class QuestionBuilderTests(unittest.TestCase):
             "interpreter_turn": {"turn": 1},
             "story_start": {"subject": "a lighthouse keeper and her cat"},
             "barge_in_answer": {
-                "answer": "stating that Tokyo is the capital of Japan",
+                "answer": "state that Tokyo is the capital of Japan",
                 "abandoned": "the story about a lighthouse keeper and her cat",
             },
         }
@@ -185,15 +185,12 @@ class QuestionBuilderTests(unittest.TestCase):
             build_questions(
                 "barge_in_answer",
                 {
-                    "answer": "stating that Tokyo is the capital of Japan",
+                    "answer": "state that Tokyo is the capital of Japan",
                     "abandoned": "the story about a lighthouse keeper and her cat",
                 },
             ),
             {
-                "barge_in_answer": (
-                    "Does the reply respond to the caller's interruption by "
-                    "stating that Tokyo is the capital of Japan?"
-                ),
+                "barge_in_answer": "Does the reply state that Tokyo is the capital of Japan?",
                 "barge_in_dropped": (
                     "Does the reply leave the story about a lighthouse keeper and her cat "
                     "behind instead of resuming or continuing it?"
@@ -206,7 +203,7 @@ class QuestionBuilderTests(unittest.TestCase):
             build_questions("story_start", {})
         with self.assertRaises(ValueError):
             build_questions("story_start", {"subject": "  "})
-        answer = "stating that Tokyo is the capital of Japan"
+        answer = "state that Tokyo is the capital of Japan"
         abandoned = "the story about a lighthouse keeper and her cat"
         for inputs in ({}, {"answer": answer}, {"abandoned": abandoned}, {"answer": " ", "abandoned": abandoned}, {"answer": answer, "abandoned": ""}):
             with self.subTest(inputs=inputs), self.assertRaises(ValueError):

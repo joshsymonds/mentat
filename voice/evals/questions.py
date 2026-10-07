@@ -320,7 +320,7 @@ def _build_barge_in_answer(inputs: Mapping[str, object]) -> dict[str, str]:
     answer = _text(inputs, "answer")
     abandoned = _text(inputs, "abandoned")
     return {
-        "barge_in_answer": f"Does the reply respond to the caller's interruption by {answer}?",
+        "barge_in_answer": f"Does the reply {answer}?",
         "barge_in_dropped": (
             f"Does the reply leave {abandoned} behind instead of resuming or continuing it?"
         ),

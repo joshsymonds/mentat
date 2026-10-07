@@ -299,7 +299,7 @@ class ScenarioScoringTests(unittest.TestCase):
                 "subject": "a lighthouse keeper and her cat",
             }),)),
             TurnExpectation((QuestionSpec("barge_in_answer", {
-                "answer": "stating that Tokyo is the capital of Japan",
+                "answer": "state that Tokyo is the capital of Japan",
                 "abandoned": "the story about a lighthouse keeper and her cat",
             }),)),
         ))
