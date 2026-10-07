@@ -157,13 +157,76 @@ class CommitCadenceTest(ScribeCommitTestCase):
         await self.time.advance(15)
         self.assertEqual(self.flushes, [5.0, 10.0, 15.0, 20.0, 25.0])
 
-    async def test_commits_at_agent_speech_end_and_not_while_the_agent_speaks(self):
+    async def test_commits_continue_every_five_seconds_while_the_agent_speaks(self):
         self.controller.agent_state("listening", "speaking")
-        await self.time.advance(30)
+        await self.time.advance(4.9)
         self.assertEqual(self.flushes, [])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [5.0])
+        await self.time.advance(15)
+        self.assertEqual(self.flushes, [5.0, 10.0, 15.0, 20.0])
+
+    async def test_commits_at_agent_speech_end_once_five_seconds_have_passed(self):
+        await self.time.advance(5)
+        self.controller.agent_state("listening", "speaking")
+        await self.time.advance(3)
+        self.speech_ended_by_josh_final()
+        await self.time.advance(3)
+        self.assertEqual(self.flushes, [5.0])
         self.controller.agent_state("speaking", "listening")
         await self.time.settle()
-        self.assertEqual(self.flushes, [30.0])
+        self.assertEqual(self.flushes, [5.0, 11.0])
+
+    async def test_agent_speech_end_after_a_long_reply_waits_for_the_next_spacing(self):
+        self.controller.agent_state("listening", "speaking")
+        await self.time.advance(22)
+        self.assertEqual(self.flushes, [5.0, 10.0, 15.0, 20.0])
+        self.controller.agent_state("speaking", "listening")
+        await self.time.advance(2.9)
+        self.assertEqual(self.flushes, [5.0, 10.0, 15.0, 20.0])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [5.0, 10.0, 15.0, 20.0, 25.0])
+
+    async def test_a_barge_in_holds_commits_through_a_five_second_boundary(self):
+        self.controller.agent_state("listening", "speaking")
+        await self.time.advance(3)
+        self.controller.user_state("speaking")
+        await self.time.advance(5)
+        self.assertEqual(self.flushes, [])
+        self.controller.agent_state("speaking", "listening")
+        await self.time.advance(30)
+        self.assertEqual(self.flushes, [])
+
+    async def test_a_barge_in_that_ends_locally_waits_for_its_final_transcript(self):
+        self.controller.agent_state("listening", "speaking")
+        await self.time.advance(3)
+        self.controller.user_state("speaking")
+        await self.time.advance(4)
+        self.controller.user_state("listening")
+        await self.time.advance(30)
+        self.assertEqual(self.flushes, [])
+        self.controller.close_line()
+        await self.time.advance(4.9)
+        self.assertEqual(self.flushes, [])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [42.0])
+
+    async def test_commits_resume_while_the_agent_speaks_after_the_barge_in_final(self):
+        self.controller.agent_state("listening", "speaking")
+        await self.time.advance(3)
+        self.controller.user_state("speaking")
+        await self.time.advance(4)
+        self.controller.user_state("listening")
+        self.controller.close_line()
+        await self.time.advance(4.9)
+        self.assertEqual(self.flushes, [])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [12.0])
+
+    def speech_ended_by_josh_final(self):
+        self.controller.user_state("speaking")
+        self.controller.user_state("listening")
+        self.controller.close_line()
 
     async def test_agent_speech_end_does_not_commit_within_five_seconds_of_the_last_commit(self):
         await self.time.advance(5)
@@ -318,9 +381,9 @@ class SessionStartGapTest(ScribeCommitTestCase):
         self.controller.session_started()
         self.controller.agent_state("speaking", "listening")
         await self.time.advance(4.9)
-        self.assertEqual(self.flushes, [])
+        self.assertEqual(self.flushes, [5.0, 10.0, 15.0, 20.0])
         await self.time.advance(0.1)
-        self.assertEqual(self.flushes, [25.0])
+        self.assertEqual(self.flushes, [5.0, 10.0, 15.0, 20.0, 25.0])
 
     async def test_reconnect_pushes_the_quiet_cadence_five_seconds_out(self):
         await self.time.advance(3)
@@ -449,12 +512,17 @@ class SessionEventsTest(ScribeCommitTestCase):
         self.transcribed = namespace["_on_user_input_transcribed"]
 
     async def test_agent_speech_end_event_commits(self):
+        await self.time.advance(5)
         self.agent_state(SimpleNamespace(old_state="listening", new_state="speaking"))
-        await self.time.advance(30)
-        self.assertEqual(self.flushes, [])
+        await self.time.advance(3)
+        self.user_state(SimpleNamespace(old_state="listening", new_state="speaking"))
+        self.user_state(SimpleNamespace(old_state="speaking", new_state="listening"))
+        self.transcribed(SimpleNamespace(is_final=True, transcript="wait"))
+        await self.time.advance(3)
+        self.assertEqual(self.flushes, [5.0])
         self.agent_state(SimpleNamespace(old_state="speaking", new_state="listening"))
         await self.time.settle()
-        self.assertEqual(self.flushes, [30.0])
+        self.assertEqual(self.flushes, [5.0, 11.0])
 
     async def test_speech_start_event_holds_commits_until_a_final_transcript(self):
         self.user_state(SimpleNamespace(old_state="listening", new_state="speaking"))

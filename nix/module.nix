@@ -19,6 +19,7 @@
     fileset = lib.fileset.unions [
       ../voice/agent.py
       ../voice/persona.md
+      ../voice/preconnect.py
       ../voice/request.py
       ../voice/stream.py
       ../voice/voices.py

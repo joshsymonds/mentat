@@ -1809,7 +1809,8 @@ class DevStack:
             check=True, capture_output=True, text=True,
         )
         voice_files = [
-            "agent.py", "persona.md", "request.py", "stream.py", "voices.py", "caller.py",
+            "agent.py", "persona.md", "preconnect.py", "request.py", "stream.py", "voices.py",
+            "caller.py",
         ]
         self._run(
             self._transport.scp_command(
