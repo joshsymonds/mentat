@@ -228,6 +228,22 @@ def _retain_caller_audio(
     _atomic_private_write(audio_dir / f"{stem}.json", metadata)
 
 
+PRECONNECT_TOPIC = "lk.agent.pre-connect-audio-buffer"
+PRECONNECT_BUFFER_SECONDS = 1.0
+PRECONNECT_LIVE_START_SECONDS = 0.3
+PRECONNECT_SAMPLE_RATE = 48000
+PRECONNECT_WRITE_BYTES = 16000
+
+
+def _upsample_2x(pcm: bytes) -> bytes:
+    """Double a 16-bit mono PCM rate by repeating each sample."""
+    doubled = bytearray(len(pcm) * 2)
+    for lane in (0, 1):
+        doubled[lane::4] = pcm[lane::2]
+        doubled[lane + 2 :: 4] = pcm[lane::2]
+    return bytes(doubled)
+
+
 SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5", "claude-sonnet-5-5"})
 SCRIPTED_TTS_TIMEOUT_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
@@ -835,8 +851,14 @@ async def capture_script(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
+    preconnect_first_line: bool = False,
 ) -> list[dict[str, Any]]:
-    """Capture every script turn and enforce its expected room-close policy."""
+    """Capture every script turn and enforce its expected room-close policy.
+
+    With preconnect_first_line the opening second of line 1 goes to the worker as a
+    phone-style pre-connect buffer while line 1 streams live from 0.3 s, so the two
+    overlap by 0.7 s the way the Pixel's do.
+    """
     if not raw_steps:
         raise ValueError("at least one scripted line is required")
     if not math.isfinite(room_delete_deadline) or room_delete_deadline <= 0:
@@ -1012,6 +1034,13 @@ async def capture_script(
                     line=index + 1, retry_count=attempts - 1,
                 )
 
+    buffer_bytes = int(RATE * PRECONNECT_BUFFER_SECONDS) * 2
+    live_start_sample = int(RATE * PRECONNECT_LIVE_START_SECONDS)
+    if preconnect_first_line and len(synthesized[0][0].pcm) < buffer_bytes:
+        raise PartialCaptureFailure(
+            [], 1, "scripted speech sample count mismatch for line 1", line=1, retry_count=0,
+        )
+
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
     capture_end: asyncio.Event | None = None
@@ -1056,19 +1085,30 @@ async def capture_script(
         )
         source = dependencies.rtc.AudioSource(RATE, 1)
         local_track = dependencies.rtc.LocalAudioTrack.create_audio_track("mic", source)
+        publish_options: dict[str, Any] = {
+            "source": dependencies.rtc.TrackSource.SOURCE_MICROPHONE
+        }
+        if preconnect_first_line:
+            publish_options["preconnect_buffer"] = True
         publication = await _with_deadline(
             room.local_participant.publish_track(
                 local_track,
-                dependencies.rtc.TrackPublishOptions(
-                    source=dependencies.rtc.TrackSource.SOURCE_MICROPHONE
-                ),
+                dependencies.rtc.TrackPublishOptions(**publish_options),
             ),
             REMOTE_OPERATION_DEADLINE_SECONDS,
             "LiveKit microphone publication",
         )
 
+        def agent_identity() -> str | None:
+            for participant in room.remote_participants.values():
+                if participant.kind == dependencies.rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+                    return participant.identity
+            return None
+
         participant_deadline = dependencies.monotonic() + PARTICIPANT_DEADLINE_SECONDS
-        while not room.remote_participants:
+        while (
+            agent_identity() is None if preconnect_first_line else not room.remote_participants
+        ):
             if dependencies.monotonic() >= participant_deadline:
                 raise RuntimeError("voice worker did not join the selected room before deadline")
             await _with_deadline(
@@ -1084,20 +1124,63 @@ async def capture_script(
                 "voice worker join polling",
             )
         try:
-            await caller.wait_for_microphone_ready(
-                publication,
-                deadline=participant_deadline,
-                monotonic=dependencies.monotonic,
-                sleep=dependencies.sleep,
-            )
+            if preconnect_first_line:
+                try:
+                    await asyncio.wait_for(
+                        publication.wait_for_subscription(),
+                        timeout=participant_deadline - dependencies.monotonic(),
+                    )
+                except TimeoutError as error:
+                    raise TimeoutError(
+                        "caller microphone subscription exceeded its deadline"
+                    ) from error
+            else:
+                await caller.wait_for_microphone_ready(
+                    publication,
+                    deadline=participant_deadline,
+                    monotonic=dependencies.monotonic,
+                    sleep=dependencies.sleep,
+                )
         except TimeoutError as error:
             raise DeadlineExceeded(str(error)) from error
 
+        async def send_preconnect_buffer(speech: caller.TTSResponse) -> None:
+            identity = agent_identity()
+            if identity is None:
+                raise RuntimeError("voice worker left the room before the pre-connect buffer")
+            writer = await _with_deadline(
+                room.local_participant.stream_bytes(
+                    "preconnect",
+                    mime_type="audio/pcm",
+                    topic=PRECONNECT_TOPIC,
+                    destination_identities=[identity],
+                    attributes={
+                        "trackId": publication.sid,
+                        "sampleRate": str(PRECONNECT_SAMPLE_RATE),
+                        "channels": "1",
+                    },
+                ),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "pre-connect buffer stream open",
+            )
+            buffered = _upsample_2x(speech.pcm[:buffer_bytes])
+            for offset in range(0, len(buffered), PRECONNECT_WRITE_BYTES):
+                await _with_deadline(
+                    writer.write(buffered[offset : offset + PRECONNECT_WRITE_BYTES]),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "pre-connect buffer write",
+                )
+            await _with_deadline(
+                writer.aclose(),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "pre-connect buffer close",
+            )
+
         async def push(
             speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
-            attempt: int,
+            attempt: int, start_sample: int = 0,
         ) -> None:
-            pcm = speech.pcm
+            pcm = speech.pcm[start_sample * 2 :]
             rendered_samples = len(pcm) // 2
             pushed_pcm = bytearray()
             pushed_frames = 0
@@ -1165,8 +1248,14 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "continuous answer capture start",
             )
+            preconnect = preconnect_first_line and index == 0
+            if preconnect:
+                await send_preconnect_buffer(speech)
             speech_started_at = time.time()
-            await push(speech, step, index + 1, attempt)
+            await push(
+                speech, step, index + 1, attempt,
+                live_start_sample if preconnect else 0,
+            )
             speech_end = _finite_timestamp(
                 await _with_deadline(
                     caller._speech_end_after_playout(source),
@@ -1325,6 +1414,11 @@ async def capture_script(
                 "raw_segments": raw_segments,
                 "room_deleted": None,
             }
+            if preconnect:
+                trace["preconnect"] = {
+                    "buffer_seconds": PRECONNECT_BUFFER_SECONDS,
+                    "overlap_seconds": PRECONNECT_BUFFER_SECONDS - PRECONNECT_LIVE_START_SECONDS,
+                }
             traces.append(trace)
 
             if room_close_after == index + 1:
@@ -3033,6 +3127,7 @@ async def _run_remote_capture_with_fake_phone(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
+    preconnect_first_line: bool = False,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
     log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
@@ -3065,6 +3160,7 @@ async def _run_remote_capture_with_fake_phone(
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
             retain_caller_audio_dir=retain_caller_audio_dir,
+            preconnect_first_line=preconnect_first_line,
         )
     finally:
         if process.poll() is None:
@@ -3084,6 +3180,7 @@ async def run_remote_capture(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
+    preconnect_first_line: bool = False,
 ) -> list[dict[str, Any]]:
     import aiohttp
 
@@ -3096,6 +3193,7 @@ async def run_remote_capture(
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
             retain_caller_audio_dir=retain_caller_audio_dir,
+            preconnect_first_line=preconnect_first_line,
         )
 
 
@@ -3106,6 +3204,11 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
         description="Capture scripted caller turns from a remote voice room"
     )
     parser.add_argument("--fake-phone", action="store_true", help="run the loopback-only fake phone during capture")
+    parser.add_argument(
+        "--preconnect-first-line",
+        action="store_true",
+        help="send the opening second of line 1 as a phone-style pre-connect buffer",
+    )
     parser.add_argument("room")
     parser.add_argument(
         "--room-close-after",
@@ -3562,6 +3665,8 @@ def main(argv: list[str] | None = None) -> int:
         })
     if retain_caller_audio:
         capture_options["retain_caller_audio_dir"] = retain_caller_audio_dir
+    if "--preconnect-first-line" in arguments:
+        capture_options["preconnect_first_line"] = True
     try:
         traces = asyncio.run(capture(room, steps, **capture_options))
     except NamedCapacityFailure as error:

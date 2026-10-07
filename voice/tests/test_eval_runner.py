@@ -419,6 +419,261 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             (samples + runner.FRAME_SAMPLES - 1) // runner.FRAME_SAMPLES
         ))
 
+    @staticmethod
+    def ramp_pcm(text, seconds):
+        """Return mono PCM whose every sample differs, so offsets are observable."""
+        samples = int(seconds * runner.RATE)
+        pcm = struct.pack(f"<{samples}h", *(1 + index % 30000 for index in range(samples)))
+        RENDERED_PCM_TEXT[pcm] = text
+        return pcm
+
+    @staticmethod
+    def frames_in(pcm):
+        samples = len(pcm) // 2
+        return (samples + runner.FRAME_SAMPLES - 1) // runner.FRAME_SAMPLES
+
+    def preconnect_dependencies(self, first_line_pcm, *, agent_after_sleeps=0):
+        """Fake rtc whose room records the publish options, byte stream and live frames."""
+        dependencies = self.dependencies_for_failure("other")
+        recorded = SimpleNamespace(
+            events=[], options=[], streams=[], frames=[], sleeps=[],
+        )
+        agent = SimpleNamespace(kind=1, identity="agent-worker-1")
+
+        class Writer:
+            def __init__(self, stream):
+                self.stream = stream
+
+            async def write(self, data):
+                self.stream["data"].extend(data)
+
+            async def aclose(self):
+                self.stream["closed"] = True
+                recorded.events.append("stream-closed")
+
+        async def stream_bytes(name, **kwargs):
+            stream = {"name": name, "kwargs": kwargs, "data": bytearray(), "closed": False}
+            recorded.streams.append(stream)
+            recorded.events.append("stream-opened")
+            return Writer(stream)
+
+        async def wait_for_subscription():
+            recorded.events.append("subscribed")
+
+        publication = SimpleNamespace(sid="TR_caller_mic", wait_for_subscription=wait_for_subscription)
+
+        async def publish_track(_track, options):
+            recorded.options.append(options)
+            return publication
+
+        participants = {} if agent_after_sleeps else {agent.identity: agent}
+        dependencies.rtc.Room.remote_participants = participants
+        dependencies.rtc.Room.local_participant = SimpleNamespace(
+            publish_track=publish_track, stream_bytes=stream_bytes,
+        )
+        dependencies.rtc.TrackPublishOptions = lambda **kwargs: SimpleNamespace(**kwargs)
+        dependencies.rtc.AudioFrame = lambda data, *_rest: SimpleNamespace(data=data)
+
+        class Source:
+            async def capture_frame(self, frame):
+                recorded.events.append("frame")
+                recorded.frames.append(frame.data)
+
+            async def wait_for_playout(self):
+                pass
+
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+
+        async def sleep(seconds):
+            recorded.sleeps.append(seconds)
+            if len(recorded.sleeps) == agent_after_sleeps:
+                participants[agent.identity] = agent
+
+        async def tts(_http, text):
+            if text.startswith("First"):
+                return first_line_pcm
+            return rendered_pcm(text)
+
+        dependencies = CaptureDependencies(**{**dependencies.__dict__, "sleep": sleep, "tts": tts})
+        return dependencies, recorded
+
+    @staticmethod
+    async def run_preconnect_capture(dependencies, *, preconnect_first_line):
+        async def speech_end(source):
+            await source.wait_for_playout()
+            return time.monotonic()
+
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+        ):
+            return await capture_script(
+                "android-selected-room",
+                ["First question@0::answer", "Second question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+                **({"preconnect_first_line": True} if preconnect_first_line else {}),
+            )
+
+    async def test_preconnect_first_line_sends_phone_style_buffer_then_overlaps_live_stream(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first)
+
+        traces = await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertTrue(recorded.options[0].preconnect_buffer)
+        self.assertEqual(len(recorded.streams), 1)
+        stream = recorded.streams[0]
+        self.assertEqual(stream["kwargs"], {
+            "mime_type": "audio/pcm",
+            "topic": "lk.agent.pre-connect-audio-buffer",
+            "destination_identities": ["agent-worker-1"],
+            "attributes": {"trackId": "TR_caller_mic", "sampleRate": "48000", "channels": "1"},
+        })
+        opening = first[: runner.RATE * 2]
+        upsampled = b"".join(opening[index : index + 2] * 2 for index in range(0, len(opening), 2))
+        self.assertEqual(len(stream["data"]), 48000 * 1 * 2)
+        self.assertEqual(bytes(stream["data"]), upsampled)
+        self.assertTrue(stream["closed"])
+
+        first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
+        live = b"".join(first_frames)
+        self.assertEqual(live, first[int(0.3 * runner.RATE) * 2 :])
+        self.assertEqual(
+            recorded.events.index("subscribed") < recorded.events.index("stream-opened"), True
+        )
+        self.assertLess(recorded.events.index("stream-closed"), recorded.events.index("frame"))
+        self.assertNotIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
+        self.assertEqual(traces[0]["preconnect"], {"buffer_seconds": 1.0, "overlap_seconds": 0.7})
+        self.assertNotIn("preconnect", traces[1])
+        second = b"".join(recorded.frames[len(first_frames) :])
+        self.assertEqual(second, rendered_pcm("Second question"))
+
+    async def test_preconnect_first_line_waits_for_the_agent_participant(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=2)
+
+        await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertEqual(len(recorded.streams), 1)
+        self.assertEqual(
+            recorded.streams[0]["kwargs"]["destination_identities"], ["agent-worker-1"]
+        )
+        self.assertNotIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
+
+    async def test_preconnect_first_line_shorter_than_the_buffer_fails_before_connecting(self):
+        first = self.ramp_pcm("First question", 0.8)
+        dependencies, recorded = self.preconnect_dependencies(first)
+
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertEqual(raised.exception.turns, [])
+        self.assertEqual(
+            raised.exception.failure["message"],
+            "scripted speech sample count mismatch for line 1",
+        )
+        envelope = json.dumps({"turns": [], "failure": raised.exception.failure})
+        self.assertEqual(
+            runner._capture_envelope(envelope, 1), ([], raised.exception.failure)
+        )
+        self.assertEqual(recorded.options, [])
+        self.assertEqual(recorded.streams, [])
+
+    async def test_without_preconnect_first_line_the_whole_line_streams_live_after_the_settle(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first)
+
+        traces = await self.run_preconnect_capture(dependencies, preconnect_first_line=False)
+
+        self.assertFalse(getattr(recorded.options[0], "preconnect_buffer", False))
+        self.assertEqual(recorded.streams, [])
+        self.assertIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
+        first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
+        self.assertEqual(b"".join(first_frames), first)
+        self.assertTrue(all("preconnect" not in trace for trace in traces))
+
+    async def test_cli_flag_reaches_capture_script_through_every_capture_entry(self):
+        self.assertEqual(
+            runner._parse_arguments(
+                ["--preconnect-first-line", "android-selected-room", "First@0::answer"]
+            ),
+            ("android-selected-room", ["First@0::answer"], 1),
+        )
+        calls = []
+
+        async def capture(room, steps, **options):
+            calls.append((room, steps, options))
+            return []
+
+        for arguments, expected in (
+            (["--preconnect-first-line"], {"room_close_after": 1, "preconnect_first_line": True}),
+            ([], {"room_close_after": 1}),
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                patch.object(runner, "run_remote_capture", capture),
+                patch("sys.stdout"),
+            ):
+                result = await asyncio.to_thread(
+                    runner.main, [*arguments, "android-selected-room", "First@0::answer"]
+                )
+                self.assertEqual(result, 0)
+                self.assertEqual(calls[-1], ("android-selected-room", ["First@0::answer"], expected))
+
+        script_calls = []
+
+        async def capture_script_spy(room, steps, **options):
+            script_calls.append(options)
+            return []
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with (
+            patch.dict(sys.modules, {"aiohttp": SimpleNamespace(ClientSession=Session)}),
+            patch.object(runner, "capture_script", capture_script_spy),
+            patch.object(runner, "_dependencies", lambda _http: object()),
+        ):
+            await runner.run_remote_capture("android-selected-room", ["First@0::answer"], preconnect_first_line=True)
+        self.assertTrue(script_calls[0]["preconnect_first_line"])
+
+        class PhoneProcess:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        remote_calls = []
+
+        async def remote_capture(*_args, **options):
+            remote_calls.append(options)
+            return []
+
+        async def no_sleep(_seconds):
+            pass
+
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=PhoneProcess()),
+            patch.object(runner, "run_remote_capture", remote_capture),
+            patch.object(runner.asyncio, "sleep", no_sleep),
+        ):
+            await runner._run_remote_capture_with_fake_phone(
+                "android-selected-room", ["First@0::answer"],
+                room_close_after=None, preconnect_first_line=True,
+            )
+        self.assertTrue(remote_calls[0]["preconnect_first_line"])
+
     async def test_missing_worker_subscription_fails_within_participant_deadline(self):
         dependencies = self.dependencies_for_failure("other")
 
