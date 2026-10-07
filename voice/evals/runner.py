@@ -61,6 +61,7 @@ ANSWER_TRANSCRIPTION_DEADLINE_SECONDS = 30.0
 ROOM_DELETE_DEADLINE_SECONDS = 60.0
 REMOTE_OPERATION_DEADLINE_SECONDS = 30.0
 ROOM_POLL_INTERVAL_SECONDS = 0.25
+BARGE_IN_POLL_SECONDS = 0.02
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
@@ -883,6 +884,23 @@ async def _wait_for_room_deletion(
     return _finite_timestamp(monotonic(), "room deletion")
 
 
+def _validated_barge_in(barge_in: dict[int, float] | None, line_count: int) -> dict[int, float]:
+    """Return the barge-in turns, each a later line that starts over the previous reply."""
+    validated: dict[int, float] = {}
+    for turn, seconds in (barge_in or {}).items():
+        if isinstance(turn, bool) or not isinstance(turn, int) or not 2 <= turn <= line_count:
+            raise ValueError("barge_in must name scripted turns from 2 to the last line")
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds)
+            or seconds <= 0
+        ):
+            raise ValueError("barge_in seconds must be finite and positive")
+        validated[turn] = float(seconds)
+    return validated
+
+
 async def capture_script(
     room_name: str,
     raw_steps: list[str],
@@ -895,12 +913,17 @@ async def capture_script(
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
     preconnect_first_line: bool = False,
+    barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy.
 
     With preconnect_first_line the opening second of line 1 goes to the worker as a
     phone-style pre-connect buffer while line 1 streams live from 0.3 s, so the two
     overlap by 0.7 s the way the Pixel's do.
+
+    With barge_in={turn: seconds} line TURN starts that many seconds after the agent
+    begins speaking its reply to line TURN-1, over the reply instead of after it; the
+    line's own delay is ignored and the interrupted reply is captured up to that point.
     """
     if not raw_steps:
         raise ValueError("at least one scripted line is required")
@@ -914,6 +937,7 @@ async def capture_script(
         or not 1 <= room_close_after <= len(raw_steps)
     ):
         raise ValueError("room_close_after must name a scripted turn or be None")
+    barge_in = _validated_barge_in(barge_in, len(raw_steps))
     if (retain_sms_audio_dir is None) != (retain_sms_audio_scenario is None):
         raise ValueError("SMS audio retention directory and scenario must be provided together")
     if retain_sms_audio_scenario is not None and retain_sms_audio_scenario not in SMS_AUDIO_SCENARIOS:
@@ -1120,6 +1144,7 @@ async def capture_script(
     api_client = dependencies.api.LiveKitAPI(livekit_url, api_key, api_secret)
     traces: list[dict[str, Any]] = []
     deletion_task: asyncio.Task[float] | None = None
+    pending_finish: asyncio.Task[None] | None = None
     try:
         await _with_deadline(
             room.connect(livekit_url, token),
@@ -1281,60 +1306,36 @@ async def capture_script(
                     "silence timing",
                 )
 
-        for index, (step, rendered) in enumerate(zip(steps, synthesized, strict=True)):
-            speech, retry_count, attempt = rendered
-            await quiet(step.delay)
-            capture_end = asyncio.Event()
-            capture = dependencies.capture_factory(answer_tracks, capture_end)
-            await _with_deadline(
-                capture.start(),
-                REMOTE_OPERATION_DEADLINE_SECONDS,
-                "continuous answer capture start",
-            )
-            preconnect = preconnect_first_line and index == 0
-            if preconnect:
-                await send_preconnect_buffer(speech)
-            speech_started_at = time.time()
-            await push(
-                speech, step, index + 1, attempt,
-                live_start_sample if preconnect else 0,
-            )
-            speech_end = _finite_timestamp(
-                await _with_deadline(
-                    caller._speech_end_after_playout(source),
-                    REMOTE_OPERATION_DEADLINE_SECONDS,
-                    "speech playout completion",
-                ),
-                "speech_end",
-            )
-            paired_monotonic = _finite_timestamp(
-                dependencies.monotonic(), "paired monotonic speech end"
-            )
-            paired_wall_time = _finite_timestamp(
-                dependencies.wall_time(), "paired wall speech end"
-            )
-            speech_end_wall = _finite_timestamp(
-                paired_wall_time + speech_end - paired_monotonic,
-                "speech_end_wall",
-            )
-            if room_close_after == index + 1:
-                deletion_task = asyncio.create_task(
-                    _wait_for_room_deletion(
-                        api_client,
-                        dependencies.api,
-                        room_name,
-                        deadline=speech_end + room_delete_deadline,
-                        poll_interval=poll_interval,
-                        monotonic=dependencies.monotonic,
-                        sleep=dependencies.sleep,
-                    )
-                )
+        async def hold_for_barge_in(capture: Any, seconds: float) -> None:
+            """Keep the mic quiet until SECONDS after the reply starts, then end its capture."""
+            voice = asyncio.ensure_future(capture.wait_for_voice())
+            deadline = dependencies.monotonic() + ANSWER_CAPTURE_DEADLINE_SECONDS
             try:
-                answer_pcm, sample_rate, channels, capture_started = await asyncio.wait_for(
-                    capture.result(), timeout=ANSWER_CAPTURE_DEADLINE_SECONDS
-                )
-            except TimeoutError as error:
-                raise RuntimeError("agent audio capture exceeded its deadline") from error
+                while not voice.done():
+                    if dependencies.monotonic() >= deadline:
+                        raise RuntimeError("agent audio capture exceeded its deadline")
+                    await quiet(BARGE_IN_POLL_SECONDS)
+                onset = _finite_timestamp(voice.result(), "reply onset")
+            finally:
+                voice.cancel()
+            await quiet(onset + seconds - dependencies.monotonic())
+            capture.stop()
+
+        async def finish_turn(
+            index: int,
+            step: caller.ScriptStep,
+            retry_count: int,
+            preconnect: bool,
+            barge_after: float | None,
+            speech_started_at: float,
+            speech_end: float,
+            speech_end_wall: float,
+            answer: tuple[bytes, int, int, float],
+            after: asyncio.Task[None] | None,
+        ) -> None:
+            if after is not None:
+                await after
+            answer_pcm, sample_rate, channels, capture_started = answer
             capture_started = _finite_timestamp(capture_started, "capture start")
             try:
                 first_audio, overlap = _first_audio_after(
@@ -1462,6 +1463,8 @@ async def capture_script(
                     "buffer_seconds": PRECONNECT_BUFFER_SECONDS,
                     "overlap_seconds": PRECONNECT_BUFFER_SECONDS - PRECONNECT_LIVE_START_SECONDS,
                 }
+            if barge_after is not None:
+                trace["barge_in_after"] = barge_after
             traces.append(trace)
 
             if room_close_after == index + 1:
@@ -1493,8 +1496,85 @@ async def capture_script(
                         "room was deleted before all scripted lines were captured",
                     )
                 raise RuntimeError("room was deleted before all scripted lines were captured")
+
+        for index, (step, rendered) in enumerate(zip(steps, synthesized, strict=True)):
+            speech, retry_count, attempt = rendered
+            barge_after = barge_in.get(index + 1)
+            if barge_after is None:
+                await quiet(step.delay)
+            capture_end = asyncio.Event()
+            capture = dependencies.capture_factory(answer_tracks, capture_end)
+            await _with_deadline(
+                capture.start(),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "continuous answer capture start",
+            )
+            preconnect = preconnect_first_line and index == 0
+            if preconnect:
+                await send_preconnect_buffer(speech)
+            speech_started_at = time.time()
+            await push(
+                speech, step, index + 1, attempt,
+                live_start_sample if preconnect else 0,
+            )
+            speech_end = _finite_timestamp(
+                await _with_deadline(
+                    caller._speech_end_after_playout(source),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "speech playout completion",
+                ),
+                "speech_end",
+            )
+            paired_monotonic = _finite_timestamp(
+                dependencies.monotonic(), "paired monotonic speech end"
+            )
+            paired_wall_time = _finite_timestamp(
+                dependencies.wall_time(), "paired wall speech end"
+            )
+            speech_end_wall = _finite_timestamp(
+                paired_wall_time + speech_end - paired_monotonic,
+                "speech_end_wall",
+            )
+            if room_close_after == index + 1:
+                deletion_task = asyncio.create_task(
+                    _wait_for_room_deletion(
+                        api_client,
+                        dependencies.api,
+                        room_name,
+                        deadline=speech_end + room_delete_deadline,
+                        poll_interval=poll_interval,
+                        monotonic=dependencies.monotonic,
+                        sleep=dependencies.sleep,
+                    )
+                )
+            next_barge_after = barge_in.get(index + 2)
+            if next_barge_after is not None:
+                await hold_for_barge_in(capture, next_barge_after)
+            try:
+                answer = await asyncio.wait_for(
+                    capture.result(), timeout=ANSWER_CAPTURE_DEADLINE_SECONDS
+                )
+            except TimeoutError as error:
+                raise RuntimeError("agent audio capture exceeded its deadline") from error
+            turn = finish_turn(
+                index, step, retry_count, preconnect, barge_after,
+                speech_started_at, speech_end, speech_end_wall, answer, pending_finish,
+            )
+            if next_barge_after is None:
+                await turn
+            else:
+                pending_finish = asyncio.create_task(turn)
         return traces
     finally:
+        if pending_finish is not None:
+            if not pending_finish.done():
+                pending_finish.cancel()
+                try:
+                    await pending_finish
+                except asyncio.CancelledError:
+                    pass
+            elif not pending_finish.cancelled():
+                pending_finish.exception()
         if deletion_task is not None:
             if not deletion_task.done():
                 deletion_task.cancel()
@@ -3171,6 +3251,7 @@ async def _run_remote_capture_with_fake_phone(
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
     preconnect_first_line: bool = False,
+    barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
     log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
@@ -3204,6 +3285,7 @@ async def _run_remote_capture_with_fake_phone(
             retain_sms_audio_scenario=retain_sms_audio_scenario,
             retain_caller_audio_dir=retain_caller_audio_dir,
             preconnect_first_line=preconnect_first_line,
+            barge_in=barge_in,
         )
     finally:
         if process.poll() is None:
@@ -3224,6 +3306,7 @@ async def run_remote_capture(
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
     preconnect_first_line: bool = False,
+    barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     import aiohttp
 
@@ -3237,10 +3320,23 @@ async def run_remote_capture(
             retain_sms_audio_scenario=retain_sms_audio_scenario,
             retain_caller_audio_dir=retain_caller_audio_dir,
             preconnect_first_line=preconnect_first_line,
+            barge_in=barge_in,
         )
 
 
-def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
+def _barge_in_pair(value: str) -> tuple[int, float]:
+    import argparse
+
+    turn, separator, seconds = value.partition(":")
+    try:
+        if not separator:
+            raise ValueError(value)
+        return int(turn), float(seconds)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be TURN:SECONDS") from error
+
+
+def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None, dict[int, float]]:
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -3251,6 +3347,14 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
         "--preconnect-first-line",
         action="store_true",
         help="send the opening second of line 1 as a phone-style pre-connect buffer",
+    )
+    parser.add_argument(
+        "--barge-in",
+        action="append",
+        default=[],
+        type=_barge_in_pair,
+        metavar="TURN:SECONDS",
+        help="start line TURN SECONDS after the agent begins replying to the line before it",
     )
     parser.add_argument("room")
     parser.add_argument(
@@ -3270,7 +3374,14 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
             room_close_after = int(arguments.room_close_after)
         except ValueError:
             parser.error("--room-close-after must be a turn number, 'none', or 'last'")
-    return arguments.room, arguments.steps, room_close_after
+    barge_in = dict(arguments.barge_in)
+    if len(barge_in) != len(arguments.barge_in):
+        parser.error("--barge-in may name each turn only once")
+    try:
+        barge_in = _validated_barge_in(barge_in, len(arguments.steps))
+    except ValueError as error:
+        parser.error(str(error))
+    return arguments.room, arguments.steps, room_close_after, barge_in
 
 
 def _positive_int(value: str) -> int:
@@ -3701,7 +3812,7 @@ def main(argv: list[str] | None = None) -> int:
         retain_sms_audio_dir = Path(evidence_path)
     else:
         retain_sms_audio_dir = None
-    room, steps, room_close_after = _parse_arguments(arguments)
+    room, steps, room_close_after, barge_in = _parse_arguments(arguments)
     capture = _run_remote_capture_with_fake_phone if "--fake-phone" in arguments else run_remote_capture
     capture_options = {"room_close_after": room_close_after}
     if retain_sms_audio_scenario is not None:
@@ -3713,6 +3824,8 @@ def main(argv: list[str] | None = None) -> int:
         capture_options["retain_caller_audio_dir"] = retain_caller_audio_dir
     if "--preconnect-first-line" in arguments:
         capture_options["preconnect_first_line"] = True
+    if barge_in:
+        capture_options["barge_in"] = barge_in
     try:
         traces = asyncio.run(capture(room, steps, **capture_options))
     except NamedCapacityFailure as error:

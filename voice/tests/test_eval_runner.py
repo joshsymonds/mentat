@@ -598,7 +598,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._parse_arguments(
                 ["--preconnect-first-line", "android-selected-room", "First@0::answer"]
             ),
-            ("android-selected-room", ["First@0::answer"], 1),
+            ("android-selected-room", ["First@0::answer"], 1, {}),
         )
         calls = []
 
@@ -673,6 +673,268 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 room_close_after=None, preconnect_first_line=True,
             )
         self.assertTrue(remote_calls[0]["preconnect_first_line"])
+
+    BARGE_ONSET = 25.0
+    BARGE_REPLY_END = 45.0
+
+    def barge_in_harness(self, *, hold_first_transcription=False):
+        """Fake room on a fake clock whose first capture hears a reply from 25.0 to 45.0."""
+        clock = Clock()
+        dependencies = self.dependencies_for_failure("other")
+        record = SimpleNamespace(
+            events=[], pushes={}, silent_frames=0, stopped=[], transcribed=[],
+            hold_first_transcription=hold_first_transcription,
+            line_two_pushing=asyncio.Event(),
+        )
+        pushed_samples = []
+        voiced_replies = pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18))
+        onset = self.BARGE_ONSET
+        reply_end = self.BARGE_REPLY_END
+
+        class Source:
+            async def capture_frame(self, frame):
+                if any(frame.data):
+                    if not pushed_samples:
+                        record.pushes[len(record.pushes) + 1] = clock.now
+                        if len(record.pushes) == 2:
+                            record.line_two_pushing.set()
+                    pushed_samples.append(len(frame.data) // 2)
+                else:
+                    record.silent_frames += 1
+
+            async def wait_for_playout(self):
+                clock.now += sum(pushed_samples) / runner.RATE
+                pushed_samples.clear()
+
+        captures = []
+
+        class Capture:
+            def __init__(self, _queue, ended=None):
+                self.number = len(captures) + 1
+                self.is_stopped = False
+                captures.append(self)
+
+            async def start(self):
+                record.events.append(f"start-{self.number}")
+
+            async def wait_for_voice(self):
+                while clock.now < onset:
+                    await asyncio.sleep(0)
+                return onset
+
+            def stop(self):
+                self.is_stopped = True
+                record.stopped.append((self.number, clock.now))
+                record.events.append(f"stop-{self.number}")
+
+            async def result(self):
+                record.events.append(f"result-{self.number}")
+                if self.number == 1 and not self.is_stopped:
+                    clock.now = max(clock.now, reply_end)
+                return voiced_replies, 24000, 1, clock.monotonic() + 0.1
+
+        async def sleep(seconds):
+            await clock.sleep(seconds)
+            await asyncio.sleep(0)
+
+        dependencies.rtc.TrackPublishOptions = lambda **kwargs: SimpleNamespace(**kwargs)
+        dependencies.rtc.AudioFrame = lambda data, *_rest: SimpleNamespace(data=data)
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+        base_transcribe = dependencies.transcribe
+
+        async def transcribe(http, pcm, rate, channels):
+            if pcm == voiced_replies:
+                record.transcribed.append(clock.now)
+                if len(record.transcribed) == 1 and record.hold_first_transcription:
+                    await record.line_two_pushing.wait()
+                return [{"start": 0.1, "end": 0.14, "text": "answer"}]
+            return await base_transcribe(http, pcm, rate, channels)
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "capture_factory": Capture,
+            "transcribe": transcribe,
+            "monotonic": clock.monotonic,
+            "wall_time": clock.wall_time,
+            "sleep": sleep,
+        })
+        return dependencies, record, captures, clock
+
+    @staticmethod
+    async def run_barge_in_capture(dependencies, steps, **options):
+        async def speech_end(source):
+            await source.wait_for_playout()
+            return dependencies.monotonic()
+
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+        ):
+            return await asyncio.wait_for(
+                capture_script(
+                    "android-selected-room",
+                    steps,
+                    dependencies=dependencies,
+                    room_close_after=None,
+                    **options,
+                ),
+                timeout=5,
+            )
+
+    async def test_barge_in_pushes_the_line_over_the_reply_and_traces_both_turns(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness()
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@30::answer"],
+            barge_in={2: 9.0},
+        )
+
+        self.assertAlmostEqual(record.pushes[2], self.BARGE_ONSET + 9.0, places=6)
+        self.assertLess(record.pushes[2], self.BARGE_REPLY_END)
+        self.assertEqual([number for number, _at in record.stopped], [1])
+        self.assertAlmostEqual(record.stopped[0][1], self.BARGE_ONSET + 9.0, places=6)
+        self.assertEqual(
+            record.events,
+            ["start-1", "stop-1", "result-1", "start-2", "result-2"],
+        )
+        self.assertGreater(record.silent_frames, 0)
+        self.assertEqual([trace["turn"] for trace in traces], [1, 2])
+        self.assertEqual([trace["transcript"] for trace in traces], ["answer", "answer"])
+        self.assertEqual([trace["line"] for trace in traces], ["First question", "Second question"])
+        self.assertNotIn("barge_in_after", traces[0])
+        self.assertEqual(traces[1]["barge_in_after"], 9.0)
+
+    async def test_barge_in_push_is_not_delayed_by_the_interrupted_turns_transcription(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness(
+            hold_first_transcription=True
+        )
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@0::answer"],
+            barge_in={2: 9.0},
+        )
+
+        self.assertEqual([trace["turn"] for trace in traces], [1, 2])
+        self.assertAlmostEqual(record.pushes[2], self.BARGE_ONSET + 9.0, places=6)
+
+    async def test_without_barge_in_the_second_line_waits_for_the_reply_to_finish(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness()
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@4::answer"],
+        )
+
+        self.assertEqual(record.stopped, [])
+        self.assertEqual(record.events, ["start-1", "result-1", "start-2", "result-2"])
+        self.assertGreaterEqual(record.pushes[2], self.BARGE_REPLY_END + 4.0)
+        self.assertTrue(all("barge_in_after" not in trace for trace in traces))
+
+    async def test_barge_in_values_are_validated_before_connecting(self):
+        two_lines = ["First question@0::answer", "Second question@0::answer"]
+        for barge_in in (
+            {1: 5.0}, {0: 5.0}, {3: 5.0}, {2: 0}, {2: -1.0}, {2: float("nan")},
+            {2: float("inf")}, {2: "9"}, {2: True}, {"2": 5.0}, {True: 5.0},
+        ):
+            with self.subTest(barge_in=barge_in):
+                dependencies, record, _captures, _clock = self.barge_in_harness()
+                with self.assertRaises(ValueError):
+                    await self.run_barge_in_capture(dependencies, two_lines, barge_in=barge_in)
+                self.assertEqual(record.events, [])
+
+    async def test_barge_in_cli_flag_is_parsed_and_validated(self):
+        steps = ["First@0::answer", "Second@0::answer", "Third@0::answer"]
+        self.assertEqual(
+            runner._parse_arguments(
+                ["--barge-in", "2:9", "--barge-in", "3:1.5", "android-selected-room", *steps]
+            ),
+            ("android-selected-room", steps, 3, {2: 9.0, 3: 1.5}),
+        )
+        for flags in (
+            ["--barge-in", "2"], ["--barge-in", "x:1"], ["--barge-in", "2:x"],
+            ["--barge-in", "2:0"], ["--barge-in", "2:-1"], ["--barge-in", "2:nan"],
+            ["--barge-in", "2:inf"], ["--barge-in", "1:5"], ["--barge-in", "4:5"],
+            ["--barge-in", "2:1", "--barge-in", "2:2"],
+        ):
+            with (
+                self.subTest(flags=flags),
+                patch("sys.stderr"),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                runner._parse_arguments([*flags, "android-selected-room", *steps])
+            self.assertEqual(raised.exception.code, 2)
+
+    async def test_barge_in_cli_flag_reaches_capture_script_through_every_capture_entry(self):
+        calls = []
+
+        async def capture(room, steps, **options):
+            calls.append(options)
+            return []
+
+        for entry in ("run_remote_capture", "_run_remote_capture_with_fake_phone"):
+            arguments = ["--barge-in", "2:9", "android-selected-room", "First@0::a", "Second@0::a"]
+            if entry != "run_remote_capture":
+                arguments.insert(0, "--fake-phone")
+            with patch.object(runner, entry, capture), patch("sys.stdout"):
+                self.assertEqual(await asyncio.to_thread(runner.main, arguments), 0)
+            self.assertEqual(calls[-1]["barge_in"], {2: 9.0})
+
+        script_calls = []
+
+        async def capture_script_spy(room, steps, **options):
+            script_calls.append(options)
+            return []
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with (
+            patch.dict(sys.modules, {"aiohttp": SimpleNamespace(ClientSession=Session)}),
+            patch.object(runner, "capture_script", capture_script_spy),
+            patch.object(runner, "_dependencies", lambda _http: object()),
+        ):
+            await runner.run_remote_capture(
+                "android-selected-room", ["First@0::a", "Second@0::a"], barge_in={2: 9.0}
+            )
+        self.assertEqual(script_calls[0]["barge_in"], {2: 9.0})
+
+        class PhoneProcess:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        remote_calls = []
+
+        async def remote_capture(*_args, **options):
+            remote_calls.append(options)
+            return []
+
+        async def no_sleep(_seconds):
+            pass
+
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=PhoneProcess()),
+            patch.object(runner, "run_remote_capture", remote_capture),
+            patch.object(runner.asyncio, "sleep", no_sleep),
+        ):
+            await runner._run_remote_capture_with_fake_phone(
+                "android-selected-room", ["First@0::a", "Second@0::a"],
+                room_close_after=None, barge_in={2: 9.0},
+            )
+        self.assertEqual(remote_calls[0]["barge_in"], {2: 9.0})
 
     async def test_missing_worker_subscription_fails_within_participant_deadline(self):
         dependencies = self.dependencies_for_failure("other")
@@ -802,6 +1064,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 "android-selected-room",
                 ["First@0::answer", "Second@0::answer"],
                 None,
+                {},
             ),
         )
 
