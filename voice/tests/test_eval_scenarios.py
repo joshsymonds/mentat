@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "evals"))
 
 from evals.judge import JudgeUnavailable, ScriptedJudge, Verdict
+from evals.judge_qualify import load_fixtures
 from scenarios import (
     SCENARIOS,
     QuestionSpec,
@@ -35,6 +36,7 @@ def all_yes_judge():
             "sms_recipient", "sms_body", "sms_confirmation", "sms_sent",
             "alice_donor", "alice_father", "alice_wealth", "spanish_switch",
             "interpreter_turn", "required_1", "rejected_1",
+            "story_start", "barge_in_answer", "barge_in_dropped",
         )
     })
 
@@ -236,6 +238,11 @@ class ScenarioScoringTests(unittest.TestCase):
                 "Can we speak Spanish again, please?",
                 "¿De qué color es el cielo en un día despejado?",
             ),
+            "phone-first-line": ("Hey, what's the capital of Australia?",),
+            "barge-in-long-reply": (
+                "Tell me a long story about a lighthouse keeper and her cat.",
+                "Stop. What's the capital of Japan?",
+            ),
             "spanish-interpreter": (
                 "Please interpret for the Spanish-speaking gardener and tell them I'm ready.",
                 "La tierra está demasiado seca para plantar tomates.",
@@ -273,6 +280,74 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertTrue(by_name["place-search-navigation"].selected_place_pattern)
         for name in ("sms-say-back-yes", "sms-correction-new-yes"):
             self.assertEqual(by_name[name].commands[0]["to"], "+1-202-555-0142")
+
+    def test_first_line_and_barge_in_scenarios_declare_frozen_fields(self):
+        phone = self.scenario("phone-first-line")
+        self.assertEqual(phone.turns, (TurnExpectation((QuestionSpec("claims", {
+            "required": ["Canberra is the capital of Australia"],
+            "rejected": ["Sydney is the capital of Australia"],
+        }),)),))
+        self.assertEqual(phone.commands, ())
+        self.assertIsNone(phone.room_close_after)
+        self.assertTrue(phone.preconnect_first_line)
+        self.assertTrue(phone.exact_caller_stt)
+        self.assertEqual(phone.barge_in_after, ())
+
+        barge = self.scenario("barge-in-long-reply")
+        self.assertEqual(barge.turns, (
+            TurnExpectation((QuestionSpec("story_start", {
+                "subject": "a lighthouse keeper and her cat",
+            }),)),
+            TurnExpectation((QuestionSpec("barge_in_answer", {
+                "answer": "stating that Tokyo is the capital of Japan",
+                "abandoned": "the story about a lighthouse keeper and her cat",
+            }),)),
+        ))
+        self.assertEqual(barge.commands, ())
+        self.assertIsNone(barge.room_close_after)
+        self.assertEqual(barge.barge_in_after, (None, 9.0))
+        self.assertTrue(barge.exact_caller_stt)
+        self.assertFalse(barge.preconnect_first_line)
+
+    def test_existing_scenarios_keep_new_field_defaults(self):
+        new = {"phone-first-line", "barge-in-long-reply"}
+        for scenario in SCENARIOS:
+            if scenario.name in new:
+                continue
+            with self.subTest(scenario=scenario.name):
+                self.assertFalse(scenario.preconnect_first_line)
+                self.assertEqual(scenario.barge_in_after, ())
+                self.assertFalse(scenario.exact_caller_stt)
+
+    def test_barge_in_after_is_empty_or_one_entry_per_line_starting_with_none(self):
+        for scenario in SCENARIOS:
+            with self.subTest(scenario=scenario.name):
+                if scenario.barge_in_after:
+                    self.assertEqual(len(scenario.barge_in_after), len(scenario.caller_lines))
+                    self.assertIsNone(scenario.barge_in_after[0])
+
+    def test_judge_corpus_covers_new_turns_with_both_polarities(self):
+        fixtures = load_fixtures()
+        for name, turn in (("phone-first-line", 1), ("barge-in-long-reply", 1),
+                           ("barge-in-long-reply", 2)):
+            with self.subTest(scenario=name, turn=turn):
+                polarities = {
+                    fixture["expected"] for fixture in fixtures
+                    if fixture["scenario"] == name and fixture["turn"] == turn
+                }
+                self.assertEqual(polarities, {True, False})
+
+    def test_barge_in_turn_two_judges_answer_and_dropped_story(self):
+        scenario = self.scenario("barge-in-long-reply")
+        turns = ["Once, a lighthouse keeper and her cat.", "Tokyo."]
+        passing = ScriptedJudge({"story_start": 1.0, "barge_in_answer": 1.0,
+                                 "barge_in_dropped": 1.0})
+        self.assertEqual(evaluate_scenario_failures(
+            scenario, turns, [], None, judge=passing), [])
+        resumed = ScriptedJudge({"story_start": 1.0, "barge_in_answer": 1.0,
+                                 "barge_in_dropped": 0.0})
+        failures = evaluate_scenario_failures(scenario, turns, [], None, judge=resumed)
+        self.assertTrue(any(f.turn == 2 and "barge_in_dropped" in f.message for f in failures))
 
     def test_prefix_evaluator_keeps_navigation_action_validation(self):
         scenario = self.scenario("place-search-navigation")
