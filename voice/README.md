@@ -266,6 +266,12 @@ provider concurrency refusal found in that run's retained `voice.log`; repeated
 copies of one provider refusal count once per run. Generic setup, cleanup, or
 scenario-check failures do not count as capacity evidence.
 
+Each case also carries `phantom_finals`, the per-run count of final transcripts
+the worker logged with no user speech since the previous final (a phantom
+line that can cut the voice off), and the report totals them in the
+top-level `phantom_final_count`. A run whose retained voice log cannot be read
+reports `null` for that run and adds nothing to the total.
+
 The eval transcribes each reply clip with one Scribe batch request, so a 0.3 s
 acknowledgment such as "Got it." keeps its words. Each returned word goes to
 the pause window holding its start/end midpoint, or to the nearest window; the
@@ -300,14 +306,34 @@ python3 -m voice.evals.runner eval --live --runs 8 \
 
 The current scenarios are `timer-300-seconds`, `equivalent-alarm`,
 `place-search-navigation`, `sms-say-back-yes`, `sms-correction-new-yes`,
-`alice-keck-context-chain`, `spanish-language-switch`, and
-`spanish-interpreter`. The Spanish scenario switches from English to Spanish,
+`alice-keck-context-chain`, `spanish-language-switch`,
+`spanish-interpreter`, `phone-first-line`, and `barge-in-long-reply`. The
+Spanish scenario switches from English to Spanish,
 back to English, then to Spanish again; its pass verdict requires the recorded
 input transcripts, mode transitions, and synthesis voices to agree with each
 scripted turn. The report includes the first Spanish voice lookup duration. The
 interpreter scenario translates six English and Spanish turns for a generic
 gardener, including a timer imperative and a quoted stop-translation
 phrase; neither is acted on as a phone command or mode change.
+
+Two capture modes serve the first-line scenarios. `phone-first-line` runs with
+`--preconnect-first-line`: the opening second of line 1 goes to the worker as
+the phone's pre-connect buffer while line 1 also streams live from 0.3 s, so
+the two overlap by 0.7 s the way the Pixel's do, and the room must still hear
+the line once. In
+`barge-in-long-reply`, `--barge-in TURN:SECONDS` (one-based TURN, repeatable)
+starts that line SECONDS after the agent's reply begins; the scenario speaks
+its second line 9 seconds into a long story to check that the interruption
+commits during the agent's speech. Both scenarios set `exact_caller_stt`:
+each turn's input STT sidecar must match its scripted line, so a misheard or
+duplicated first line, or a missing sidecar, fails that turn, and the
+observation records the sidecars as `caller_stt`. The R4/R5 command runs both
+scenarios eight times on Opus 5.5:
+
+```sh
+MENTAT_VOICE_MODEL=claude-opus-5-5 python3 -m voice.evals.runner eval --live --runs 8 \
+  --scenario phone-first-line --scenario barge-in-long-reply
+```
 
 The eval prints a JSON report to stdout and exits nonzero if any scenario,
 observation-count, or latency gate fails. Keep the report when diagnosing a

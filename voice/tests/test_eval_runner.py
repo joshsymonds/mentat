@@ -5211,6 +5211,151 @@ class ScenarioObservationTests(unittest.TestCase):
                 with self.subTest(scenario=scenario.name):
                     self.assertNotIn("--retain-sms-audio", command)
 
+    def test_capture_command_carries_first_line_and_barge_in_modes_only_for_their_scenarios(self):
+        for scenario in SCENARIOS:
+            command = runner._capture_command(scenario, "safe-room", ["Question@0::answer"])
+            with self.subTest(scenario=scenario.name):
+                if scenario.name == "phone-first-line":
+                    self.assertIn("--preconnect-first-line", command)
+                else:
+                    self.assertNotIn("--preconnect-first-line", command)
+                if scenario.name == "barge-in-long-reply":
+                    self.assertEqual(command.count("--barge-in"), 1)
+                    self.assertEqual(command[command.index("--barge-in") + 1], "2:9.0")
+                else:
+                    self.assertNotIn("--barge-in", command)
+                if "--preconnect-first-line" in command or "--barge-in" in command:
+                    self.assertLess(
+                        max(
+                            command.index(flag)
+                            for flag in ("--preconnect-first-line", "--barge-in")
+                            if flag in command
+                        ),
+                        command.index("safe-room"),
+                    )
+
+    def observe_exact_caller_stt(self, scenario_name, sidecars):
+        import json
+        from subprocess import CompletedProcess
+
+        scenario = next(s for s in SCENARIOS if s.name == scenario_name)
+        room = "exact-stt-room"
+        traces = [
+            {
+                "turn": index,
+                "room": room,
+                "line": line,
+                "transcript": "Canberra is the capital of Australia.",
+                "speech_started_at": 100.0 + index,
+                "speech_end": 100.5 + index,
+                "speech_end_wall": 1_700_000_000.5 + index,
+                "first_audio": 101.0 + index,
+                "capture_started": 100.8 + index,
+                "overlap": False,
+                "segments": [{"start": 0.2, "end": 0.6, "text": "Canberra is the capital of Australia."}],
+                "room_deleted": 106.0 if index == len(scenario.caller_lines) else None,
+            }
+            for index, line in enumerate(scenario.caller_lines, 1)
+        ]
+        requested_paths = []
+        record_path = f"records/voice-{room}.jsonl"
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, json.dumps({"turns": traces}), "")
+
+            def run_remote(self, command):
+                import subprocess
+
+                path = command[-1]
+                requested_paths.append(path)
+                if path in {"voice/evals/phone.jsonl", "voice/evals/delegations.jsonl"}:
+                    return CompletedProcess(command, 0, "", "")
+                if path == record_path:
+                    raise subprocess.CalledProcessError(
+                        1, command, output="", stderr=f"cat: {record_path}: No such file or directory\n"
+                    )
+                prefix = "voice/evals/retained-evidence/input-audio/"
+                if path.startswith(prefix) and path.endswith(".txt"):
+                    sidecar = sidecars[int(path.rsplit("-", 1)[1][:-4]) - 1]
+                    if sidecar is None:
+                        raise subprocess.CalledProcessError(
+                            1, command, output="", stderr=f"cat: {path}: No such file or directory\n"
+                        )
+                    return CompletedProcess(command, 0, sidecar, "")
+                raise AssertionError(f"unexpected remote artifact {path!r}")
+
+        with patch.object(
+            runner,
+            "_voice_token",
+            return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"},
+        ):
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
+        return scenario, observation, requested_paths
+
+    def exact_stt_failures(self, observation):
+        return [
+            failure["message"]
+            for failure in observation.get("product_failures", [])
+            if "input STT sidecar" in failure["message"]
+        ]
+
+    def test_exact_caller_stt_passes_matching_sidecars_and_records_them(self):
+        scenario, observation, requested_paths = self.observe_exact_caller_stt(
+            "barge-in-long-reply", list(next(
+                s for s in SCENARIOS if s.name == "barge-in-long-reply"
+            ).caller_lines),
+        )
+
+        self.assertEqual(self.exact_stt_failures(observation), [])
+        self.assertEqual(observation["caller_stt"], list(scenario.caller_lines))
+        self.assertEqual(sum(path.endswith(".txt") for path in requested_paths), 2)
+
+    def test_exact_caller_stt_fails_the_mismatching_or_missing_turn(self):
+        lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
+        _, observation, _ = self.observe_exact_caller_stt(
+            "barge-in-long-reply", [lines[0], "Stop. What's the capital of Japan? What's"],
+        )
+        self.assertEqual(self.exact_stt_failures(observation), [
+            "barge-in-long-reply: input STT sidecar turn 2 did not match its scripted line"
+        ])
+        self.assertEqual(
+            [f["turn"] for f in observation["product_failures"]
+             if "input STT sidecar" in f["message"]],
+            [2],
+        )
+        self.assertEqual(observation["caller_stt"][0], lines[0])
+
+        _, observation, _ = self.observe_exact_caller_stt("barge-in-long-reply", [None, lines[1]])
+        self.assertEqual(self.exact_stt_failures(observation), [
+            "barge-in-long-reply: input STT sidecar turn 1 did not match its scripted line"
+        ])
+        self.assertEqual(observation["caller_stt"], [None, lines[1]])
+
+    def test_exact_caller_stt_covers_the_single_line_phone_first_line_scenario(self):
+        line = next(s for s in SCENARIOS if s.name == "phone-first-line").caller_lines[0]
+        _, observation, _ = self.observe_exact_caller_stt("phone-first-line", [line])
+        self.assertEqual(self.exact_stt_failures(observation), [])
+        self.assertEqual(observation["caller_stt"], [line])
+
+        _, observation, _ = self.observe_exact_caller_stt("phone-first-line", [None])
+        self.assertEqual(self.exact_stt_failures(observation), [
+            "phone-first-line: input STT sidecar turn 1 did not match its scripted line"
+        ])
+
+    def test_scenarios_without_exact_caller_stt_load_no_sidecars(self):
+        scenario = next(s for s in SCENARIOS if not s.exact_caller_stt and not s.reply_languages)
+        _, observation, requested_paths = self.observe_exact_caller_stt(scenario.name, [])
+        self.assertNotIn("caller_stt", observation)
+        self.assertFalse(any(path.endswith(".txt") for path in requested_paths))
+
     def test_cli_passes_private_retention_only_for_named_sms_scenario(self):
         import io
         import json

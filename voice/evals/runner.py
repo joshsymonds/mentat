@@ -2922,8 +2922,28 @@ def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str
     ]
     if getattr(scenario, "name", None) in SMS_AUDIO_SCENARIOS:
         command.extend(("--retain-sms-audio", scenario.name))
+    if getattr(scenario, "preconnect_first_line", False):
+        command.append("--preconnect-first-line")
+    for turn, seconds in enumerate(getattr(scenario, "barge_in_after", ()), 1):
+        if seconds is not None:
+            command.extend(("--barge-in", f"{turn}:{seconds}"))
     command.extend((room, *raw_steps))
     return command
+
+
+def _input_stt_sidecars(stack: Any, room: str, count: int) -> list[str | None]:
+    sidecars = []
+    for index in range(1, count + 1):
+        sidecar_path = (
+            f"voice/evals/retained-evidence/input-audio/"
+            f"{room}-turn-{index:03d}.txt"
+        )
+        sidecars.append(
+            _remote_artifact_text(
+                stack, sidecar_path, "input STT transcript", allow_missing=True
+            )
+        )
+    return sidecars
 
 
 def observe_scenario(
@@ -3016,16 +3036,9 @@ def observe_scenario(
             if voice_log_text is None
             else _json_lines(voice_log_text, "voice mode trace")
         )
-        transcript_sidecars = []
-        for index in range(1, len(scenario.caller_lines) + 1):
-            sidecar_path = (
-                f"voice/evals/retained-evidence/input-audio/"
-                f"{room}-turn-{index:03d}.txt"
-            )
-            sidecar = _remote_artifact_text(
-                stack, sidecar_path, "input STT transcript", allow_missing=True
-            )
-            transcript_sidecars.append(sidecar)
+        transcript_sidecars = _input_stt_sidecars(
+            stack, room, len(scenario.caller_lines)
+        )
         if getattr(scenario, "name", None) == "spanish-interpreter":
             interpreter_transcript_sidecars = transcript_sidecars
         else:
@@ -3034,6 +3047,22 @@ def observe_scenario(
                     scenario, room, voice_entries, transcript_sidecars
                 )
             )
+
+    caller_stt: list[str | None] | None = None
+    caller_stt_failures: list[tuple[int, str]] = []
+    if getattr(scenario, "exact_caller_stt", False):
+        caller_stt = _input_stt_sidecars(stack, room, len(scenario.caller_lines))
+        caller_stt_failures = [
+            (
+                turn,
+                f"{scenario.name}: input STT sidecar turn {turn} did not match its scripted line",
+            )
+            for turn, (expected, observed) in enumerate(
+                zip(scenario.caller_lines, caller_stt, strict=True), 1
+            )
+            if not isinstance(observed, str)
+            or _content_tokens(expected) != _content_tokens(observed)
+        ]
 
     phone_log_path = "voice/" + FAKE_PHONE_LOG
     phone_text = _remote_artifact_text(stack, phone_log_path, "fake phone log")
@@ -3222,6 +3251,9 @@ def observe_scenario(
         {"turn": 1, "message": failure}
         for failure in language_evidence_failures
     )
+    product_failures.extend(
+        {"turn": turn, "message": message} for turn, message in caller_stt_failures
+    )
     observation = {
         "room": room,
         "turns": traces,
@@ -3232,6 +3264,8 @@ def observe_scenario(
         observation["capacity_failures"] = remote_capacity_failures
     if getattr(scenario, "reply_languages", ()):
         observation["first_spanish_lookup_ms"] = first_spanish_lookup_ms
+    if caller_stt is not None:
+        observation["caller_stt"] = caller_stt
     if unattributed_model_calls:
         observation["unattributed_model_calls"] = unattributed_model_calls
     if capture_failure is not None and not early_close:
