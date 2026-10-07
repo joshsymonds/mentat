@@ -1,5 +1,6 @@
 import asyncio
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -168,6 +169,15 @@ class CaptureTests(unittest.IsolatedAsyncioTestCase):
             first_matching_latency([{"start": 0.0, "text": "Answer"}], "Answer", 100.0, capture_started),
             8.1,
         )
+
+    async def test_capture_feeds_every_agent_frame_to_echo_residual(self):
+        frames = [self.frame(False), self.frame(False)]
+        echo = Mock()
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=self.fake_rtc(frames))}):
+            await _capture_answer(queue, echo=echo)
+        self.assertEqual([call.args[0] for call in echo.feed.call_args_list], frames)
 
 
 class TranscribeTests(unittest.IsolatedAsyncioTestCase):
@@ -548,6 +558,17 @@ class ContinuousCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_frame_before_speech, [True])
         self.assertEqual(pcm, early.data + later.data)
         self.assertIsInstance(capture_started, float)
+
+    async def test_continuous_capture_feeds_every_agent_frame_to_echo_residual(self):
+        frames = [CaptureTests.frame(False), CaptureTests.frame(False)]
+        echo = Mock()
+        queue = asyncio.Queue()
+        queue.put_nowait(object())
+        capture = caller.ContinuousCapture(queue, echo=echo)
+        with patch.dict(sys.modules, {"livekit": SimpleNamespace(rtc=CaptureTests().fake_rtc(frames))}):
+            await capture.start()
+            await capture.result()
+        self.assertEqual([call.args[0] for call in echo.feed.call_args_list], frames)
 
     @staticmethod
     def live_stream(frames, tracks=None, pace=0.0, hang=True):
@@ -1217,6 +1238,83 @@ esac
                 self.assertIn("systemctl start mentat-voice", calls)
                 remote = remote_script.read_text()
                 self.assertIn('kill "$(cat "$DEV_DIR/agent.pid")"', remote)
+
+
+def echo_frame(samples, sample_rate=caller.RATE, channels=1):
+    return SimpleNamespace(
+        data=struct.pack(f"<{len(samples)}h", *samples),
+        samples_per_channel=len(samples) // channels,
+        sample_rate=sample_rate,
+        num_channels=channels,
+    )
+
+
+def mic_pcm(samples):
+    return struct.pack(f"<{len(samples)}h", *samples)
+
+
+def mic_samples(pcm):
+    return list(struct.unpack(f"<{len(pcm) // 2}h", pcm))
+
+
+class EchoResidualTests(unittest.TestCase):
+    def test_mixes_agent_audio_heard_150ms_earlier_attenuated_by_30db(self):
+        echo = caller.EchoResidual()
+        echo.feed(echo_frame([10000] * 2400), heard_at=0.0)
+        out = mic_samples(echo.mix(mic_pcm([0] * 240), started_at=0.15))
+        self.assertEqual(out, [316] * 240)
+
+    def test_mic_gets_the_agent_sample_heard_exactly_150ms_earlier(self):
+        echo = caller.EchoResidual()
+        agent = [30 * index for index in range(1000)]
+        echo.feed(echo_frame(agent), heard_at=0.5)
+        out = mic_samples(echo.mix(mic_pcm([0] * 240), started_at=0.65))
+        self.assertEqual(out, [round(sample * 10 ** (-30 / 20)) for sample in agent[:240]])
+
+    def test_mic_is_unchanged_before_the_echo_delay_elapses(self):
+        echo = caller.EchoResidual()
+        echo.feed(echo_frame([10000] * 2400), heard_at=0.0)
+        self.assertEqual(mic_samples(echo.mix(mic_pcm([0] * 240), started_at=0.0)), [0] * 240)
+
+    def test_agent_audio_heard_while_nothing_is_mixed_does_not_extend_the_delay(self):
+        echo = caller.EchoResidual()
+        echo.feed(echo_frame([10000] * 2400), heard_at=0.0)
+        echo.feed(echo_frame([20000] * 2400), heard_at=1.0)
+        out = mic_samples(echo.mix(mic_pcm([0] * 240), started_at=1.15))
+        self.assertEqual(out, [632] * 240)
+
+    def test_48khz_stereo_agent_audio_is_mixed_as_mono_24khz(self):
+        echo = caller.EchoResidual()
+        stereo = [value for index in range(480) for value in (60 * (index // 2), 0)]
+        echo.feed(echo_frame(stereo, sample_rate=48000, channels=2), heard_at=0.5)
+        out = mic_samples(echo.mix(mic_pcm([0] * 240), started_at=0.65))
+        self.assertEqual(out, [round(30 * index * 10 ** (-30 / 20)) for index in range(240)])
+
+    def test_48khz_mono_agent_audio_is_decimated_to_24khz(self):
+        echo = caller.EchoResidual()
+        agent = [30 * (index // 2) for index in range(480)]
+        echo.feed(echo_frame(agent, sample_rate=48000), heard_at=0.5)
+        out = mic_samples(echo.mix(mic_pcm([0] * 240), started_at=0.65))
+        self.assertEqual(out, [round(30 * index * 10 ** (-30 / 20)) for index in range(240)])
+
+    def test_rejects_agent_audio_at_an_unsupported_sample_rate(self):
+        echo = caller.EchoResidual()
+        with self.assertRaises(ValueError):
+            echo.feed(echo_frame([10000] * 4410, sample_rate=44100), heard_at=0.0)
+
+    def test_mixed_output_clips_to_int16(self):
+        echo = caller.EchoResidual()
+        echo.feed(echo_frame([32767] * 2400), heard_at=0.0)
+        echo.feed(echo_frame([-32767] * 2400), heard_at=0.1)
+        high = mic_samples(echo.mix(mic_pcm([32760] * 240), started_at=0.15))
+        low = mic_samples(echo.mix(mic_pcm([-32760] * 240), started_at=0.25))
+        self.assertEqual(high, [32767] * 240)
+        self.assertEqual(low, [-32768] * 240)
+
+    def test_mic_is_returned_unchanged_without_agent_audio(self):
+        echo = caller.EchoResidual()
+        pcm = mic_pcm([1, -2, 3] * 80)
+        self.assertEqual(echo.mix(pcm, started_at=5.0), pcm)
 
 
 if __name__ == "__main__":

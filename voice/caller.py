@@ -8,6 +8,7 @@ import struct
 import sys
 import time
 import wave
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -22,6 +23,9 @@ ANSWER_RMS_THRESHOLD = 200
 END_DRAIN_SECONDS = 0.1
 READINESS_TIMEOUT_SECONDS = 15
 MICROPHONE_SETTLE_SECONDS = 3.0
+ECHO_GAIN_DB = -30
+ECHO_DELAY_SECONDS = 0.150
+ECHO_GAIN = 10 ** (ECHO_GAIN_DB / 20)
 
 
 @dataclass(frozen=True)
@@ -206,6 +210,53 @@ def _frame_duration(frame: Any) -> float:
     return frame.samples_per_channel / frame.sample_rate
 
 
+def _mono_rate_samples(frame: Any) -> list[int]:
+    if frame.sample_rate == RATE:
+        factor = 1
+    elif frame.sample_rate == 2 * RATE:
+        factor = 2
+    else:
+        raise ValueError("agent audio must be 24 kHz or 48 kHz")
+    channels = frame.num_channels
+    interleaved = struct.unpack(f"<{len(frame.data) // 2}h", bytes(frame.data))
+    mono = [
+        sum(interleaved[offset : offset + channels]) // channels
+        for offset in range(0, len(interleaved), channels)
+    ]
+    return [
+        sum(mono[offset : offset + factor]) // len(mono[offset : offset + factor])
+        for offset in range(0, len(mono), factor)
+    ]
+
+
+class EchoResidual:
+    """Mix an attenuated copy of agent audio into mic PCM, heard ECHO_DELAY_SECONDS earlier."""
+
+    def __init__(self) -> None:
+        self._heard: deque[tuple[float, list[int]]] = deque()
+
+    def feed(self, frame: Any, heard_at: float) -> None:
+        self._heard.append((heard_at, _mono_rate_samples(frame)))
+
+    def mix(self, mic_pcm: bytes, started_at: float) -> bytes:
+        oldest_needed = started_at - ECHO_DELAY_SECONDS
+        while self._heard and self._heard[0][0] + len(self._heard[0][1]) / RATE < oldest_needed:
+            self._heard.popleft()
+        mic = struct.unpack(f"<{len(mic_pcm) // 2}h", mic_pcm)
+        mixed = []
+        for index, sample in enumerate(mic):
+            echo = self._echo_at(started_at + index / RATE - ECHO_DELAY_SECONDS)
+            mixed.append(max(-32768, min(32767, sample + round(ECHO_GAIN * echo))))
+        return struct.pack(f"<{len(mixed)}h", *mixed)
+
+    def _echo_at(self, when: float) -> int:
+        for heard_at, samples in self._heard:
+            offset = round((when - heard_at) * RATE)
+            if 0 <= offset < len(samples):
+                return samples[offset]
+        return 0
+
+
 async def _wait_any(events: list[asyncio.Event]) -> None:
     waits = [asyncio.create_task(event.wait()) for event in events]
     try:
@@ -221,6 +272,7 @@ async def _capture_answer(
     ended: asyncio.Event | None = None,
     stop: asyncio.Event | None = None,
     on_voice: Callable[[float], None] | None = None,
+    echo: EchoResidual | None = None,
 ) -> tuple[bytes, int, int, float]:
     from livekit import rtc
 
@@ -324,6 +376,8 @@ async def _capture_answer(
             except StopAsyncIteration:
                 break
             last_frame = event.frame
+            if echo is not None:
+                echo.feed(last_frame, time.monotonic())
             if capture_started is None:
                 capture_started = time.monotonic()
                 capture_started_at = loop.time()
@@ -356,10 +410,14 @@ class ContinuousCapture:
     """Capture agent audio from before caller speech through the answer window."""
 
     def __init__(
-        self, track_queue: asyncio.Queue[Any], ended: asyncio.Event | None = None
+        self,
+        track_queue: asyncio.Queue[Any],
+        ended: asyncio.Event | None = None,
+        echo: EchoResidual | None = None,
     ) -> None:
         self._track_queue = track_queue
         self._ended = ended
+        self._echo = echo
         self._task: asyncio.Task[tuple[bytes, int, int, float]] | None = None
         self._stop = asyncio.Event()
         self._voice: asyncio.Future[float] | None = None
@@ -385,7 +443,7 @@ class ContinuousCapture:
             voice.exception()
 
         self._task = asyncio.create_task(
-            _capture_answer(self._track_queue, self._ended, self._stop, on_voice)
+            _capture_answer(self._track_queue, self._ended, self._stop, on_voice, self._echo)
         )
         self._task.add_done_callback(settle_voice)
         await asyncio.sleep(0)
