@@ -419,6 +419,593 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             (samples + runner.FRAME_SAMPLES - 1) // runner.FRAME_SAMPLES
         ))
 
+    @staticmethod
+    def ramp_pcm(text, seconds):
+        """Return mono PCM whose every sample differs, so offsets are observable."""
+        samples = int(seconds * runner.RATE)
+        pcm = struct.pack(f"<{samples}h", *(1 + index % 30000 for index in range(samples)))
+        RENDERED_PCM_TEXT[pcm] = text
+        return pcm
+
+    @staticmethod
+    def frames_in(pcm):
+        samples = len(pcm) // 2
+        return (samples + runner.FRAME_SAMPLES - 1) // runner.FRAME_SAMPLES
+
+    def preconnect_dependencies(self, first_line_pcm, *, agent_after_sleeps=0):
+        """Fake rtc whose room records the publish options, byte stream and live frames."""
+        dependencies = self.dependencies_for_failure("other")
+        recorded = SimpleNamespace(
+            events=[], options=[], streams=[], frames=[], sleeps=[],
+        )
+        agent = SimpleNamespace(kind=1, identity="agent-worker-1")
+
+        class Writer:
+            def __init__(self, stream):
+                self.stream = stream
+
+            async def write(self, data):
+                self.stream["data"].extend(data)
+
+            async def aclose(self):
+                self.stream["closed"] = True
+                recorded.events.append("stream-closed")
+
+        async def stream_bytes(name, **kwargs):
+            stream = {"name": name, "kwargs": kwargs, "data": bytearray(), "closed": False}
+            recorded.streams.append(stream)
+            recorded.events.append("stream-opened")
+            return Writer(stream)
+
+        async def wait_for_subscription():
+            recorded.events.append("subscribed")
+
+        publication = SimpleNamespace(sid="TR_caller_mic", wait_for_subscription=wait_for_subscription)
+
+        async def publish_track(_track, options):
+            recorded.options.append(options)
+            return publication
+
+        participants = {} if agent_after_sleeps else {agent.identity: agent}
+        dependencies.rtc.Room.remote_participants = participants
+        dependencies.rtc.Room.local_participant = SimpleNamespace(
+            publish_track=publish_track, stream_bytes=stream_bytes,
+        )
+        dependencies.rtc.TrackPublishOptions = lambda **kwargs: SimpleNamespace(**kwargs)
+        dependencies.rtc.AudioFrame = lambda data, *_rest: SimpleNamespace(data=data)
+
+        class Source:
+            async def capture_frame(self, frame):
+                recorded.events.append("frame")
+                recorded.frames.append(frame.data)
+
+            async def wait_for_playout(self):
+                pass
+
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+
+        async def sleep(seconds):
+            recorded.sleeps.append(seconds)
+            if len(recorded.sleeps) == agent_after_sleeps:
+                participants[agent.identity] = agent
+
+        async def tts(_http, text):
+            if text.startswith("First"):
+                return first_line_pcm
+            return rendered_pcm(text)
+
+        dependencies = CaptureDependencies(**{**dependencies.__dict__, "sleep": sleep, "tts": tts})
+        return dependencies, recorded
+
+    @staticmethod
+    async def run_preconnect_capture(dependencies, *, preconnect_first_line):
+        async def speech_end(source):
+            await source.wait_for_playout()
+            return time.monotonic()
+
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+        ):
+            return await capture_script(
+                "android-selected-room",
+                ["First question@0::answer", "Second question@0::answer"],
+                dependencies=dependencies,
+                room_close_after=None,
+                **({"preconnect_first_line": True} if preconnect_first_line else {}),
+            )
+
+    async def test_preconnect_first_line_sends_phone_style_buffer_then_overlaps_live_stream(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first)
+
+        traces = await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertTrue(recorded.options[0].preconnect_buffer)
+        self.assertEqual(len(recorded.streams), 1)
+        stream = recorded.streams[0]
+        self.assertEqual(stream["kwargs"], {
+            "mime_type": "audio/pcm",
+            "topic": "lk.agent.pre-connect-audio-buffer",
+            "destination_identities": ["agent-worker-1"],
+            "attributes": {"trackId": "TR_caller_mic", "sampleRate": "48000", "channels": "1"},
+        })
+        opening = first[: runner.RATE * 2]
+        upsampled = b"".join(opening[index : index + 2] * 2 for index in range(0, len(opening), 2))
+        self.assertEqual(len(stream["data"]), 48000 * 1 * 2)
+        self.assertEqual(bytes(stream["data"]), upsampled)
+        self.assertTrue(stream["closed"])
+
+        first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
+        live = b"".join(first_frames)
+        self.assertEqual(live, first[int(0.3 * runner.RATE) * 2 :])
+        self.assertEqual(
+            recorded.events.index("subscribed") < recorded.events.index("stream-opened"), True
+        )
+        self.assertLess(recorded.events.index("stream-closed"), recorded.events.index("frame"))
+        self.assertNotIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
+        self.assertEqual(traces[0]["preconnect"], {"buffer_seconds": 1.0, "overlap_seconds": 0.7})
+        self.assertNotIn("preconnect", traces[1])
+        second = b"".join(recorded.frames[len(first_frames) :])
+        self.assertEqual(second, rendered_pcm("Second question"))
+
+    async def test_preconnect_first_line_waits_for_the_agent_participant(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=2)
+
+        await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertEqual(len(recorded.streams), 1)
+        self.assertEqual(
+            recorded.streams[0]["kwargs"]["destination_identities"], ["agent-worker-1"]
+        )
+        self.assertNotIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
+
+    async def test_preconnect_first_line_shorter_than_the_buffer_fails_before_connecting(self):
+        first = self.ramp_pcm("First question", 0.8)
+        dependencies, recorded = self.preconnect_dependencies(first)
+
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+
+        self.assertEqual(raised.exception.turns, [])
+        self.assertEqual(
+            raised.exception.failure["message"],
+            "scripted speech sample count mismatch for line 1",
+        )
+        envelope = json.dumps({"turns": [], "failure": raised.exception.failure})
+        self.assertEqual(
+            runner._capture_envelope(envelope, 1), ([], raised.exception.failure)
+        )
+        self.assertEqual(recorded.options, [])
+        self.assertEqual(recorded.streams, [])
+
+    async def test_without_preconnect_first_line_the_whole_line_streams_live_after_the_settle(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first)
+
+        traces = await self.run_preconnect_capture(dependencies, preconnect_first_line=False)
+
+        self.assertFalse(getattr(recorded.options[0], "preconnect_buffer", False))
+        self.assertEqual(recorded.streams, [])
+        self.assertIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
+        first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
+        self.assertEqual(b"".join(first_frames), first)
+        self.assertTrue(all("preconnect" not in trace for trace in traces))
+
+    async def test_cli_flag_reaches_capture_script_through_every_capture_entry(self):
+        self.assertEqual(
+            runner._parse_arguments(
+                ["--preconnect-first-line", "android-selected-room", "First@0::answer"]
+            ),
+            ("android-selected-room", ["First@0::answer"], 1, {}),
+        )
+        calls = []
+
+        async def capture(room, steps, **options):
+            calls.append((room, steps, options))
+            return []
+
+        for arguments, expected in (
+            (["--preconnect-first-line"], {"room_close_after": 1, "preconnect_first_line": True}),
+            ([], {"room_close_after": 1}),
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                patch.object(runner, "run_remote_capture", capture),
+                patch("sys.stdout"),
+            ):
+                result = await asyncio.to_thread(
+                    runner.main, [*arguments, "android-selected-room", "First@0::answer"]
+                )
+                self.assertEqual(result, 0)
+                self.assertEqual(calls[-1], ("android-selected-room", ["First@0::answer"], expected))
+
+        script_calls = []
+
+        async def capture_script_spy(room, steps, **options):
+            script_calls.append(options)
+            return []
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with (
+            patch.dict(sys.modules, {"aiohttp": SimpleNamespace(ClientSession=Session)}),
+            patch.object(runner, "capture_script", capture_script_spy),
+            patch.object(runner, "_dependencies", lambda _http: object()),
+        ):
+            await runner.run_remote_capture("android-selected-room", ["First@0::answer"], preconnect_first_line=True)
+        self.assertTrue(script_calls[0]["preconnect_first_line"])
+
+        class PhoneProcess:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        remote_calls = []
+
+        async def remote_capture(*_args, **options):
+            remote_calls.append(options)
+            return []
+
+        async def no_sleep(_seconds):
+            pass
+
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=PhoneProcess()),
+            patch.object(runner, "run_remote_capture", remote_capture),
+            patch.object(runner.asyncio, "sleep", no_sleep),
+        ):
+            await runner._run_remote_capture_with_fake_phone(
+                "android-selected-room", ["First@0::answer"],
+                room_close_after=None, preconnect_first_line=True,
+            )
+        self.assertTrue(remote_calls[0]["preconnect_first_line"])
+
+    BARGE_ONSET = 25.0
+    BARGE_REPLY_END = 45.0
+
+    def barge_in_harness(self, *, hold_first_transcription=False, second_answer=None):
+        """Fake room on a fake clock whose first capture hears a reply from 25.0 to 45.0.
+
+        SECOND_ANSWER, when given, is (pcm, words, lead): the second capture hears that audio
+        and starts LEAD seconds before the second line's speech end.
+        """
+        clock = Clock()
+        dependencies = self.dependencies_for_failure("other")
+        record = SimpleNamespace(
+            events=[], pushes={}, silent_frames=0, stopped=[], transcribed=[], speech_ends=[],
+            hold_first_transcription=hold_first_transcription,
+            line_two_pushing=asyncio.Event(),
+        )
+        pushed_samples = []
+        voiced_replies = pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18))
+        onset = self.BARGE_ONSET
+        reply_end = self.BARGE_REPLY_END
+
+        class Source:
+            async def capture_frame(self, frame):
+                if any(frame.data):
+                    if not pushed_samples:
+                        record.pushes[len(record.pushes) + 1] = clock.now
+                        if len(record.pushes) == 2:
+                            record.line_two_pushing.set()
+                    pushed_samples.append(len(frame.data) // 2)
+                else:
+                    record.silent_frames += 1
+
+            async def wait_for_playout(self):
+                clock.now += sum(pushed_samples) / runner.RATE
+                pushed_samples.clear()
+                record.speech_ends.append(clock.now)
+
+        captures = []
+
+        class Capture:
+            def __init__(self, _queue, ended=None):
+                self.number = len(captures) + 1
+                self.is_stopped = False
+                captures.append(self)
+
+            async def start(self):
+                record.events.append(f"start-{self.number}")
+
+            async def wait_for_voice(self):
+                while clock.now < onset:
+                    await asyncio.sleep(0)
+                return onset
+
+            def stop(self):
+                self.is_stopped = True
+                record.stopped.append((self.number, clock.now))
+                record.events.append(f"stop-{self.number}")
+
+            async def result(self):
+                record.events.append(f"result-{self.number}")
+                if self.number == 1 and not self.is_stopped:
+                    clock.now = max(clock.now, reply_end)
+                if self.number == 2 and second_answer is not None:
+                    pcm, _words, lead = second_answer
+                    return pcm, 24000, 1, record.speech_ends[1] - lead
+                return voiced_replies, 24000, 1, clock.monotonic() + 0.1
+
+        async def sleep(seconds):
+            await clock.sleep(seconds)
+            await asyncio.sleep(0)
+
+        dependencies.rtc.TrackPublishOptions = lambda **kwargs: SimpleNamespace(**kwargs)
+        dependencies.rtc.AudioFrame = lambda data, *_rest: SimpleNamespace(data=data)
+        dependencies.rtc.AudioSource = lambda *_args: Source()
+        base_transcribe = dependencies.transcribe
+
+        async def transcribe(http, pcm, rate, channels):
+            if second_answer is not None and pcm == second_answer[0]:
+                return second_answer[1]
+            if pcm == voiced_replies:
+                record.transcribed.append(clock.now)
+                if len(record.transcribed) == 1 and record.hold_first_transcription:
+                    await record.line_two_pushing.wait()
+                return [{"start": 0.1, "end": 0.14, "text": "answer"}]
+            return await base_transcribe(http, pcm, rate, channels)
+
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__,
+            "capture_factory": Capture,
+            "transcribe": transcribe,
+            "monotonic": clock.monotonic,
+            "wall_time": clock.wall_time,
+            "sleep": sleep,
+        })
+        return dependencies, record, captures, clock
+
+    @staticmethod
+    async def run_barge_in_capture(dependencies, steps, **options):
+        async def speech_end(source):
+            await source.wait_for_playout()
+            return dependencies.monotonic()
+
+        with (
+            patch.dict(os.environ, TEST_VOICE_ENV),
+            patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+        ):
+            return await asyncio.wait_for(
+                capture_script(
+                    "android-selected-room",
+                    steps,
+                    dependencies=dependencies,
+                    room_close_after=None,
+                    **options,
+                ),
+                timeout=5,
+            )
+
+    async def test_barge_in_pushes_the_line_over_the_reply_and_traces_both_turns(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness()
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@30::answer"],
+            barge_in={2: 9.0},
+        )
+
+        self.assertAlmostEqual(record.pushes[2], self.BARGE_ONSET + 9.0, places=6)
+        self.assertLess(record.pushes[2], self.BARGE_REPLY_END)
+        self.assertEqual([number for number, _at in record.stopped], [1])
+        self.assertAlmostEqual(record.stopped[0][1], self.BARGE_ONSET + 9.0, places=6)
+        self.assertEqual(
+            record.events,
+            ["start-1", "stop-1", "result-1", "start-2", "result-2"],
+        )
+        self.assertGreater(record.silent_frames, 0)
+        self.assertEqual([trace["turn"] for trace in traces], [1, 2])
+        self.assertEqual([trace["transcript"] for trace in traces], ["answer", "answer"])
+        self.assertEqual([trace["line"] for trace in traces], ["First question", "Second question"])
+        self.assertNotIn("barge_in_after", traces[0])
+        self.assertEqual(traces[1]["barge_in_after"], 9.0)
+
+    @staticmethod
+    def story_tail_then_answer():
+        """A capture opening 3.0 s before speech end: a story tail at 0.10 s, an answer at 3.0 s."""
+        pcm = pcm_windows(*([0] * 5), 600, 600, *([0] * 143), 600, 600, *([0] * 20))
+        words = [
+            {"start": 0.10, "end": 0.14, "text": "story"},
+            {"start": 3.00, "end": 3.04, "text": "answer"},
+        ]
+        return pcm, words, 3.0
+
+    async def test_barge_in_turn_scores_only_what_the_voice_said_after_the_line(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            second_answer=self.story_tail_then_answer()
+        )
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@30::answer"],
+            barge_in={2: 9.0},
+        )
+
+        barged = traces[1]
+        self.assertEqual([segment["text"] for segment in barged["segments"]], ["answer"])
+        self.assertEqual(barged["transcript"], "answer")
+        self.assertEqual(
+            [segment["text"] for segment in barged["raw_segments"]], ["story", "answer"]
+        )
+
+    async def test_turn_without_barge_in_keeps_every_window_of_the_same_audio(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            second_answer=self.story_tail_then_answer()
+        )
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@4::answer"],
+        )
+
+        plain = traces[1]
+        self.assertEqual([segment["text"] for segment in plain["segments"]], ["story", "answer"])
+        self.assertEqual(plain["transcript"], "story answer")
+        self.assertEqual(
+            [segment["text"] for segment in plain["raw_segments"]], ["story", "answer"]
+        )
+
+    async def test_barge_in_turn_with_only_the_interrupted_tail_fails_as_no_answer(self):
+        pcm, words, lead = self.story_tail_then_answer()
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            second_answer=(pcm, words[:1], lead)
+        )
+
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+
+        self.assertIn(runner.NO_ANSWER_FAILURE, str(raised.exception))
+
+    async def test_barge_in_push_is_not_delayed_by_the_interrupted_turns_transcription(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness(
+            hold_first_transcription=True
+        )
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@0::answer"],
+            barge_in={2: 9.0},
+        )
+
+        self.assertEqual([trace["turn"] for trace in traces], [1, 2])
+        self.assertAlmostEqual(record.pushes[2], self.BARGE_ONSET + 9.0, places=6)
+
+    async def test_without_barge_in_the_second_line_waits_for_the_reply_to_finish(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness()
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@4::answer"],
+        )
+
+        self.assertEqual(record.stopped, [])
+        self.assertEqual(record.events, ["start-1", "result-1", "start-2", "result-2"])
+        self.assertGreaterEqual(record.pushes[2], self.BARGE_REPLY_END + 4.0)
+        self.assertTrue(all("barge_in_after" not in trace for trace in traces))
+
+    async def test_barge_in_values_are_validated_before_connecting(self):
+        two_lines = ["First question@0::answer", "Second question@0::answer"]
+        for barge_in in (
+            {1: 5.0}, {0: 5.0}, {3: 5.0}, {2: 0}, {2: -1.0}, {2: float("nan")},
+            {2: float("inf")}, {2: "9"}, {2: True}, {"2": 5.0}, {True: 5.0},
+        ):
+            with self.subTest(barge_in=barge_in):
+                dependencies, record, _captures, _clock = self.barge_in_harness()
+                with self.assertRaises(ValueError):
+                    await self.run_barge_in_capture(dependencies, two_lines, barge_in=barge_in)
+                self.assertEqual(record.events, [])
+
+    async def test_barge_in_cli_flag_is_parsed_and_validated(self):
+        steps = ["First@0::answer", "Second@0::answer", "Third@0::answer"]
+        self.assertEqual(
+            runner._parse_arguments(
+                ["--barge-in", "2:9", "--barge-in", "3:1.5", "android-selected-room", *steps]
+            ),
+            ("android-selected-room", steps, 3, {2: 9.0, 3: 1.5}),
+        )
+        for flags in (
+            ["--barge-in", "2"], ["--barge-in", "x:1"], ["--barge-in", "2:x"],
+            ["--barge-in", "2:0"], ["--barge-in", "2:-1"], ["--barge-in", "2:nan"],
+            ["--barge-in", "2:inf"], ["--barge-in", "1:5"], ["--barge-in", "4:5"],
+            ["--barge-in", "2:1", "--barge-in", "2:2"],
+        ):
+            with (
+                self.subTest(flags=flags),
+                patch("sys.stderr"),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                runner._parse_arguments([*flags, "android-selected-room", *steps])
+            self.assertEqual(raised.exception.code, 2)
+
+    async def test_barge_in_cli_flag_reaches_capture_script_through_every_capture_entry(self):
+        calls = []
+
+        async def capture(room, steps, **options):
+            calls.append(options)
+            return []
+
+        for entry in ("run_remote_capture", "_run_remote_capture_with_fake_phone"):
+            arguments = ["--barge-in", "2:9", "android-selected-room", "First@0::a", "Second@0::a"]
+            if entry != "run_remote_capture":
+                arguments.insert(0, "--fake-phone")
+            with patch.object(runner, entry, capture), patch("sys.stdout"):
+                self.assertEqual(await asyncio.to_thread(runner.main, arguments), 0)
+            self.assertEqual(calls[-1]["barge_in"], {2: 9.0})
+
+        script_calls = []
+
+        async def capture_script_spy(room, steps, **options):
+            script_calls.append(options)
+            return []
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with (
+            patch.dict(sys.modules, {"aiohttp": SimpleNamespace(ClientSession=Session)}),
+            patch.object(runner, "capture_script", capture_script_spy),
+            patch.object(runner, "_dependencies", lambda _http: object()),
+        ):
+            await runner.run_remote_capture(
+                "android-selected-room", ["First@0::a", "Second@0::a"], barge_in={2: 9.0}
+            )
+        self.assertEqual(script_calls[0]["barge_in"], {2: 9.0})
+
+        class PhoneProcess:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        remote_calls = []
+
+        async def remote_capture(*_args, **options):
+            remote_calls.append(options)
+            return []
+
+        async def no_sleep(_seconds):
+            pass
+
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=PhoneProcess()),
+            patch.object(runner, "run_remote_capture", remote_capture),
+            patch.object(runner.asyncio, "sleep", no_sleep),
+        ):
+            await runner._run_remote_capture_with_fake_phone(
+                "android-selected-room", ["First@0::a", "Second@0::a"],
+                room_close_after=None, barge_in={2: 9.0},
+            )
+        self.assertEqual(remote_calls[0]["barge_in"], {2: 9.0})
+
     async def test_missing_worker_subscription_fails_within_participant_deadline(self):
         dependencies = self.dependencies_for_failure("other")
 
@@ -547,6 +1134,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 "android-selected-room",
                 ["First@0::answer", "Second@0::answer"],
                 None,
+                {},
             ),
         )
 
@@ -4693,6 +5281,151 @@ class ScenarioObservationTests(unittest.TestCase):
                 with self.subTest(scenario=scenario.name):
                     self.assertNotIn("--retain-sms-audio", command)
 
+    def test_capture_command_carries_first_line_and_barge_in_modes_only_for_their_scenarios(self):
+        for scenario in SCENARIOS:
+            command = runner._capture_command(scenario, "safe-room", ["Question@0::answer"])
+            with self.subTest(scenario=scenario.name):
+                if scenario.name == "phone-first-line":
+                    self.assertIn("--preconnect-first-line", command)
+                else:
+                    self.assertNotIn("--preconnect-first-line", command)
+                if scenario.name == "barge-in-long-reply":
+                    self.assertEqual(command.count("--barge-in"), 1)
+                    self.assertEqual(command[command.index("--barge-in") + 1], "2:9.0")
+                else:
+                    self.assertNotIn("--barge-in", command)
+                if "--preconnect-first-line" in command or "--barge-in" in command:
+                    self.assertLess(
+                        max(
+                            command.index(flag)
+                            for flag in ("--preconnect-first-line", "--barge-in")
+                            if flag in command
+                        ),
+                        command.index("safe-room"),
+                    )
+
+    def observe_exact_caller_stt(self, scenario_name, sidecars):
+        import json
+        from subprocess import CompletedProcess
+
+        scenario = next(s for s in SCENARIOS if s.name == scenario_name)
+        room = "exact-stt-room"
+        traces = [
+            {
+                "turn": index,
+                "room": room,
+                "line": line,
+                "transcript": "Canberra is the capital of Australia.",
+                "speech_started_at": 100.0 + index,
+                "speech_end": 100.5 + index,
+                "speech_end_wall": 1_700_000_000.5 + index,
+                "first_audio": 101.0 + index,
+                "capture_started": 100.8 + index,
+                "overlap": False,
+                "segments": [{"start": 0.2, "end": 0.6, "text": "Canberra is the capital of Australia."}],
+                "room_deleted": 106.0 if index == len(scenario.caller_lines) else None,
+            }
+            for index, line in enumerate(scenario.caller_lines, 1)
+        ]
+        requested_paths = []
+        record_path = f"records/voice-{room}.jsonl"
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, json.dumps({"turns": traces}), "")
+
+            def run_remote(self, command):
+                import subprocess
+
+                path = command[-1]
+                requested_paths.append(path)
+                if path in {"voice/evals/phone.jsonl", "voice/evals/delegations.jsonl"}:
+                    return CompletedProcess(command, 0, "", "")
+                if path == record_path:
+                    raise subprocess.CalledProcessError(
+                        1, command, output="", stderr=f"cat: {record_path}: No such file or directory\n"
+                    )
+                prefix = "voice/evals/retained-evidence/input-audio/"
+                if path.startswith(prefix) and path.endswith(".txt"):
+                    sidecar = sidecars[int(path.rsplit("-", 1)[1][:-4]) - 1]
+                    if sidecar is None:
+                        raise subprocess.CalledProcessError(
+                            1, command, output="", stderr=f"cat: {path}: No such file or directory\n"
+                        )
+                    return CompletedProcess(command, 0, sidecar, "")
+                raise AssertionError(f"unexpected remote artifact {path!r}")
+
+        with patch.object(
+            runner,
+            "_voice_token",
+            return_value={"token": "a.b.c", "room": room, "url": "wss://livekit.invalid"},
+        ):
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
+        return scenario, observation, requested_paths
+
+    def exact_stt_failures(self, observation):
+        return [
+            failure["message"]
+            for failure in observation.get("product_failures", [])
+            if "input STT sidecar" in failure["message"]
+        ]
+
+    def test_exact_caller_stt_passes_matching_sidecars_and_records_them(self):
+        scenario, observation, requested_paths = self.observe_exact_caller_stt(
+            "barge-in-long-reply", list(next(
+                s for s in SCENARIOS if s.name == "barge-in-long-reply"
+            ).caller_lines),
+        )
+
+        self.assertEqual(self.exact_stt_failures(observation), [])
+        self.assertEqual(observation["caller_stt"], list(scenario.caller_lines))
+        self.assertEqual(sum(path.endswith(".txt") for path in requested_paths), 2)
+
+    def test_exact_caller_stt_fails_the_mismatching_or_missing_turn(self):
+        lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
+        _, observation, _ = self.observe_exact_caller_stt(
+            "barge-in-long-reply", [lines[0], "Stop. What's the capital of Japan? What's"],
+        )
+        self.assertEqual(self.exact_stt_failures(observation), [
+            "barge-in-long-reply: input STT sidecar turn 2 did not match its scripted line"
+        ])
+        self.assertEqual(
+            [f["turn"] for f in observation["product_failures"]
+             if "input STT sidecar" in f["message"]],
+            [2],
+        )
+        self.assertEqual(observation["caller_stt"][0], lines[0])
+
+        _, observation, _ = self.observe_exact_caller_stt("barge-in-long-reply", [None, lines[1]])
+        self.assertEqual(self.exact_stt_failures(observation), [
+            "barge-in-long-reply: input STT sidecar turn 1 did not match its scripted line"
+        ])
+        self.assertEqual(observation["caller_stt"], [None, lines[1]])
+
+    def test_exact_caller_stt_covers_the_single_line_phone_first_line_scenario(self):
+        line = next(s for s in SCENARIOS if s.name == "phone-first-line").caller_lines[0]
+        _, observation, _ = self.observe_exact_caller_stt("phone-first-line", [line])
+        self.assertEqual(self.exact_stt_failures(observation), [])
+        self.assertEqual(observation["caller_stt"], [line])
+
+        _, observation, _ = self.observe_exact_caller_stt("phone-first-line", [None])
+        self.assertEqual(self.exact_stt_failures(observation), [
+            "phone-first-line: input STT sidecar turn 1 did not match its scripted line"
+        ])
+
+    def test_scenarios_without_exact_caller_stt_load_no_sidecars(self):
+        scenario = next(s for s in SCENARIOS if not s.exact_caller_stt and not s.reply_languages)
+        _, observation, requested_paths = self.observe_exact_caller_stt(scenario.name, [])
+        self.assertNotIn("caller_stt", observation)
+        self.assertFalse(any(path.endswith(".txt") for path in requested_paths))
+
     def test_cli_passes_private_retention_only_for_named_sms_scenario(self):
         import io
         import json
@@ -4920,6 +5653,166 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertEqual(observation["phone_commands"][0]["turn"], 2)
         self.assertEqual(observation["phone_commands"][0]["id"], "phone-id-independent-of-tool-id")
         self.assertEqual(observation["room_closed_after"], 2)
+
+
+PHANTOM_LOG_NORMAL_TURN = """\
+    21:54:24.754 INFO     mentat.voice       user listening -> speaking;
+                                             deadline=None end_tool=False
+                                             user_speaking=True
+                                             agent_speaking=False
+                                         {"pid": 1340556, "job_id":
+"job-41df36af8cbd", "room": "android-e02cecee-0fbe-478c-a19f-d1857ac52375"}
+    21:54:27.403 INFO     mentat.voice       user speaking -> listening;
+                                             deadline=None end_tool=False
+                                             user_speaking=False
+                                             agent_speaking=False
+                                         {"pid": 1340556, "job_id":
+"job-41df36af8cbd", "room": "android-e02cecee-0fbe-478c-a19f-d1857ac52375"}
+    21:54:27.834 DEBUG    livekit.agents     received user transcript
+                                         {"lk.pii.user_transcript": "Set a timer
+for five minutes.", "language": "en", "transcript_delay": 1.0073318481445312,
+"pid": 1340556, "job_id": "job-41df36af8cbd", "room":
+"android-e02cecee-0fbe-478c-a19f-d1857ac52375"}
+    21:54:27.864 DEBUG    livekit.…_detector eou prediction
+                                           {"eou_probability":
+0.3322869539260864, "duration": 0.023}
+"""
+
+PHANTOM_LOG_FINAL = """\
+    21:54:28.100 DEBUG    livekit.agents     received user transcript
+                                         {"lk.pii.user_transcript": "Thanks.",
+"language": "en", "pid": 1340556}
+"""
+
+PHANTOM_LOG_SPEAKING = """\
+    21:54:30.000 INFO     mentat.voice       user listening -> speaking;
+                                             deadline=None end_tool=False
+                                             user_speaking=True
+                                         {"pid": 1340556}
+"""
+
+PHANTOM_LOG_QUIET = """\
+    21:54:31.000 INFO     mentat.voice       user speaking -> listening;
+                                             deadline=None end_tool=False
+                                             user_speaking=False
+                                         {"pid": 1340556}
+"""
+
+
+class PhantomFinalCountTests(unittest.TestCase):
+    def count(self, log_text):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "voice.log").write_text(log_text)
+            return runner._phantom_final_count(SimpleNamespace(retained_evidence_dir=Path(directory)))
+
+    def test_one_normal_turn_counts_zero(self):
+        self.assertEqual(self.count(PHANTOM_LOG_NORMAL_TURN), 0)
+
+    def test_two_finals_for_one_continuous_utterance_count_zero(self):
+        log = PHANTOM_LOG_SPEAKING + PHANTOM_LOG_FINAL + PHANTOM_LOG_FINAL + PHANTOM_LOG_QUIET
+        self.assertEqual(self.count(log), 0)
+
+    def test_closing_final_after_speech_ends_counts_zero(self):
+        log = PHANTOM_LOG_SPEAKING + PHANTOM_LOG_FINAL + PHANTOM_LOG_QUIET + PHANTOM_LOG_FINAL
+        self.assertEqual(self.count(log), 0)
+
+    def test_final_with_no_speech_since_the_previous_final_counts_once(self):
+        log = PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_FINAL
+        self.assertEqual(self.count(log), 1)
+
+    def test_final_before_any_speech_counts_once(self):
+        self.assertEqual(self.count(PHANTOM_LOG_FINAL), 1)
+
+    def test_each_speechless_final_counts_separately(self):
+        log = PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_FINAL + PHANTOM_LOG_FINAL
+        self.assertEqual(self.count(log), 2)
+
+    def test_speech_after_a_final_makes_the_next_final_real(self):
+        log = PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_SPEAKING + PHANTOM_LOG_QUIET + PHANTOM_LOG_FINAL
+        self.assertEqual(self.count(log), 0)
+
+    def test_wrapped_records_parse_when_the_message_itself_wraps(self):
+        log = (
+            "    21:54:24.754 INFO     mentat.voice       user listening ->\n"
+            "                                             speaking; deadline=None\n"
+            "                                             user_speaking=True\n"
+            "                 DEBUG    livekit.agents     received user\n"
+            "                                             transcript\n"
+            '                                         {"pid": 1}\n'
+        )
+        self.assertEqual(self.count(log), 0)
+
+    def test_continuation_lines_never_start_a_record(self):
+        log = (
+            "    21:54:24.754 INFO     mentat.voice       something else\n"
+            "                                             received user transcript\n"
+        )
+        self.assertEqual(self.count(log), 0)
+
+    def test_unavailable_log_is_none(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(runner._phantom_final_count(SimpleNamespace(retained_evidence_dir=Path(directory))))
+        self.assertIsNone(runner._phantom_final_count(SimpleNamespace(retained_evidence_dir=None)))
+        self.assertIsNone(runner._phantom_final_count(None))
+
+    def test_empty_log_counts_zero(self):
+        self.assertEqual(self.count(""), 0)
+
+    def run_observations(self, log_text, *, observe):
+        import io
+        from contextlib import redirect_stdout
+
+        scenario = SimpleNamespace(name="phantoms", turns=(), commands=(), place_query=None)
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        retained = tempfile.TemporaryDirectory()
+        self.addCleanup(retained.cleanup)
+        evidence = Path(retained.name)
+        if log_text is not None:
+            (evidence / "voice.log").write_text(log_text)
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                yield SimpleNamespace(run_id=run_id, retained_evidence_dir=evidence if log_text is not None else None)
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield Batch()
+
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(io.StringIO()),
+        ):
+            runner._run_local_eval(["--live", "--runs", "1"])
+        return captured["observations"]["cases"][0]["runs"][0]
+
+    def test_run_observation_carries_the_count_from_the_retained_log(self):
+        run = self.run_observations(
+            PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_FINAL, observe=lambda _s, _k: {"turns": []}
+        )
+        self.assertEqual(run["phantom_finals"], 1)
+
+    def test_run_observation_without_a_retained_log_carries_none(self):
+        run = self.run_observations(None, observe=lambda _s, _k: {"turns": []})
+        self.assertIn("phantom_finals", run)
+        self.assertIsNone(run["phantom_finals"])
+
+    def test_failure_observation_carries_the_count(self):
+        def fail(_scenario, _stack):
+            raise RuntimeError("scenario broke")
+
+        run = self.run_observations(PHANTOM_LOG_FINAL, observe=fail)
+        self.assertIn("scenario execution failed", run["failure"])
+        self.assertEqual(run["phantom_finals"], 1)
 
 
 class LocalEvalCliTests(unittest.TestCase):

@@ -17,6 +17,8 @@ The fixture dispatcher accepts these family/input shapes:
 * ``alice_wealth``: ``person`` and ``source`` strings.
 * ``spanish_switch``: ``turn`` integer from 1 through 5.
 * ``interpreter_turn``: ``turn`` integer from 1 through 6.
+* ``story_start``: ``subject`` string.
+* ``barge_in_answer``: ``answer`` and ``abandoned`` strings.
 
 Question wording describes facts, never text-matching patterns. Each returned
 question is phrased so a ``yes`` means the reply satisfies that criterion.
@@ -309,6 +311,22 @@ def _build_interpreter_turn(inputs: Mapping[str, object]) -> dict[str, str]:
     return {"interpreter_turn": _INTERPRETER_TURN_QUESTIONS[turn]}
 
 
+def _build_story_start(inputs: Mapping[str, object]) -> dict[str, str]:
+    subject = _text(inputs, "subject")
+    return {"story_start": f"Does the reply begin telling a story about {subject}?"}
+
+
+def _build_barge_in_answer(inputs: Mapping[str, object]) -> dict[str, str]:
+    answer = _text(inputs, "answer")
+    abandoned = _text(inputs, "abandoned")
+    return {
+        "barge_in_answer": f"Does the reply respond to the caller's interruption by {answer}?",
+        "barge_in_dropped": (
+            f"Does the reply leave {abandoned} behind instead of resuming or continuing it?"
+        ),
+    }
+
+
 _BUILDERS = {
     "action_ack": _build_action_ack,
     "timer_duration": _build_timer_duration,
@@ -323,6 +341,8 @@ _BUILDERS = {
     "alice_wealth": _build_alice_wealth,
     "spanish_switch": _build_spanish_switch,
     "interpreter_turn": _build_interpreter_turn,
+    "story_start": _build_story_start,
+    "barge_in_answer": _build_barge_in_answer,
 }
 
 

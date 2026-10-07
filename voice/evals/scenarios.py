@@ -40,6 +40,9 @@ class Scenario:
     caller_languages: tuple[str, ...] = ()
     reply_languages: tuple[str, ...] = ()
     voice_mode_expectations: tuple[str, ...] = ()
+    preconnect_first_line: bool = False
+    barge_in_after: tuple[float | None, ...] = ()
+    exact_caller_stt: bool = False
 
 
 @dataclass(frozen=True)
@@ -193,6 +196,40 @@ SCENARIOS = (
         caller_languages=("en", "es", "en", "es", "es", "en"),
         reply_languages=("es", "en", "es", "en", "en", "en"),
         voice_mode_expectations=("es", "en"),
+    ),
+    Scenario(
+        name="phone-first-line",
+        caller_lines=("Hey, what's the capital of Australia?",),
+        turns=(TurnExpectation((_question(
+            "claims",
+            required=["Canberra is the capital of Australia"],
+            rejected=["Sydney is the capital of Australia"],
+        ),)),),
+        commands=(),
+        room_close_after=None,
+        preconnect_first_line=True,
+        exact_caller_stt=True,
+    ),
+    Scenario(
+        name="barge-in-long-reply",
+        caller_lines=(
+            "Tell me a long story about a lighthouse keeper and her cat.",
+            "Stop. What's the capital of Japan?",
+        ),
+        turns=(
+            TurnExpectation((_question(
+                "story_start", subject="a lighthouse keeper and her cat",
+            ),)),
+            TurnExpectation((_question(
+                "barge_in_answer",
+                answer="stating that Tokyo is the capital of Japan",
+                abandoned="the story about a lighthouse keeper and her cat",
+            ),)),
+        ),
+        commands=(),
+        room_close_after=None,
+        barge_in_after=(None, 9.0),
+        exact_caller_stt=True,
     ),
 )
 

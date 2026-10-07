@@ -511,5 +511,68 @@
     "expected": false,
     "tags": ["wrong-interpretation"],
     "source": {"kind": "scenario_corruption","based_on": "interpreter-turn-6","change": "changed the meaning or mode required for this interpreter turn"}
+  },
+  {
+    "id": "phone-first-line-canberra",
+    "scenario": "phone-first-line",
+    "turn": 1,
+    "reply": "Canberra is the capital of Australia.",
+    "expected": true,
+    "tags": ["scripted-first-line"],
+    "source": {"kind": "scripted","reason": "No retained eval reply answers the phone-style first line; this is the correct capital answer (DL14)."}
+  },
+  {
+    "id": "phone-first-line-sydney",
+    "scenario": "phone-first-line",
+    "turn": 1,
+    "reply": "Sydney is the capital of Australia.",
+    "expected": false,
+    "tags": ["wrong-fact"],
+    "source": {"kind": "scenario_corruption","based_on": "phone-first-line-canberra","change": "named Sydney as the capital instead of Canberra"}
+  },
+  {
+    "id": "barge-in-story-start",
+    "scenario": "barge-in-long-reply",
+    "turn": 1,
+    "reply": "Once upon a time, a lighthouse keeper named Mara lived with her grey cat at the edge of a windy cliff.",
+    "expected": true,
+    "tags": ["scripted-story"],
+    "source": {"kind": "scripted","reason": "No retained eval reply begins the lighthouse story that the barge-in scenario interrupts."}
+  },
+  {
+    "id": "barge-in-story-not-a-story",
+    "scenario": "barge-in-long-reply",
+    "turn": 1,
+    "reply": "The capital of Japan is Tokyo.",
+    "expected": false,
+    "tags": ["wrong-topic"],
+    "source": {"kind": "scenario_corruption","based_on": "barge-in-story-start","change": "answered an unrelated question instead of beginning the lighthouse story"}
+  },
+  {
+    "id": "barge-in-answer-tokyo",
+    "scenario": "barge-in-long-reply",
+    "turn": 2,
+    "reply": "Tokyo is the capital of Japan.",
+    "expected": true,
+    "tags": ["scripted-barge-in"],
+    "source": {"kind": "scripted","reason": "No retained eval reply answers the interruption after abandoning the story."}
+  },
+  {
+    "id": "barge-in-answer-resumes-story",
+    "scenario": "barge-in-long-reply",
+    "turn": 2,
+    "reply": "Tokyo is the capital of Japan. Anyway, as the lighthouse keeper climbed the stairs, her cat followed her up the spiral.",
+    "expected": false,
+    "tags": ["story-resumed"],
+    "source": {"kind": "scenario_corruption","based_on": "barge-in-answer-tokyo","change": "resumed the lighthouse story after answering the interruption"}
+  },
+  {
+    "id": "barge-in-answer-ignored",
+    "scenario": "barge-in-long-reply",
+    "turn": 2,
+    "reply": "The keeper lit the lamp as the storm rolled in, and her cat watched the waves.",
+    "expected": false,
+    "tags": ["interruption-ignored"],
+    "source": {"kind": "scenario_corruption","based_on": "barge-in-answer-tokyo","change": "ignored the interruption and kept telling the story"}
   }
 ]

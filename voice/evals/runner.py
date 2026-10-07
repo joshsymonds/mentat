@@ -61,6 +61,7 @@ ANSWER_TRANSCRIPTION_DEADLINE_SECONDS = 30.0
 ROOM_DELETE_DEADLINE_SECONDS = 60.0
 REMOTE_OPERATION_DEADLINE_SECONDS = 30.0
 ROOM_POLL_INTERVAL_SECONDS = 0.25
+BARGE_IN_POLL_SECONDS = 0.02
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
@@ -68,6 +69,54 @@ DEFAULT_VOICE_MODEL = "chatgpt/sol-fast"
 DEFAULT_CONCURRENCY = 8
 _SCHEDULER_DRAIN_TIMEOUT_SECONDS = 1.0
 _PROVIDER_CONCURRENCY_REFUSAL = re.compile(r"Too many concurrent requests", re.IGNORECASE)
+_LOG_RECORD_START = re.compile(
+    r"^ {0,20}(?:\d{2}:\d{2}:\d{2}\.\d{3}\s+)?(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+(\S+)\s*(.*)$"
+)
+_USER_STATE_CHANGE = re.compile(r"^user \w+ -> (\w+);")
+
+
+def _read_retained_voice_log(stack: Any) -> str | None:
+    """Read this run's retained worker log; None when it is unavailable."""
+    evidence_dir = getattr(stack, "retained_evidence_dir", None)
+    if not isinstance(evidence_dir, Path):
+        return None
+    try:
+        return (evidence_dir / "voice.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _log_records(log_text: str) -> list[tuple[str, str]]:
+    """Group Rich console lines into (logger, message) records."""
+    records: list[list[str]] = []
+    for line in log_text.splitlines():
+        start = _LOG_RECORD_START.match(line)
+        if start is not None:
+            records.append([start.group(1), start.group(2).strip()])
+        elif records and line.strip():
+            records[-1][1] = f"{records[-1][1]} {line.strip()}".strip()
+    return [(logger, message) for logger, message in records]
+
+
+def _phantom_final_count(stack: Any) -> int | None:
+    """Count finals logged with no user speech since the previous final."""
+    log_text = _read_retained_voice_log(stack)
+    if log_text is None:
+        return None
+    speaking = False
+    spoke_since_final = False
+    phantoms = 0
+    for logger, message in _log_records(log_text):
+        if logger == "mentat.voice":
+            change = _USER_STATE_CHANGE.match(message)
+            if change is not None:
+                speaking = change.group(1) == "speaking"
+                spoke_since_final = spoke_since_final or speaking
+        elif logger == "livekit.agents" and message.startswith("received user transcript"):
+            if not spoke_since_final:
+                phantoms += 1
+            spoke_since_final = speaking
+    return phantoms
 
 
 def _named_capacity_failures(error: BaseException | None = None, stack: Any = None) -> list[dict[str, str]]:
@@ -79,18 +128,13 @@ def _named_capacity_failures(error: BaseException | None = None, stack: Any = No
     elif isinstance(error, RemoteCommandError):
         for item in error.capacity_failures:
             found[(item["source"], item["cause"])] = item
-    evidence_dir = getattr(stack, "retained_evidence_dir", None)
-    if isinstance(evidence_dir, Path):
-        try:
-            voice_log = (evidence_dir / "voice.log").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            voice_log = ""
-        if _PROVIDER_CONCURRENCY_REFUSAL.search(voice_log):
-            item = {
-                "source": "provider session concurrency refusal",
-                "cause": "provider refused a session: Too many concurrent requests",
-            }
-            found[(item["source"], item["cause"])] = item
+    voice_log = _read_retained_voice_log(stack) or ""
+    if _PROVIDER_CONCURRENCY_REFUSAL.search(voice_log):
+        item = {
+            "source": "provider session concurrency refusal",
+            "cause": "provider refused a session: Too many concurrent requests",
+        }
+        found[(item["source"], item["cause"])] = item
     return [found[key] for key in sorted(found)]
 
 
@@ -226,6 +270,22 @@ def _retain_caller_audio(
         "pushed_filename": pushed_filename,
     }, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     _atomic_private_write(audio_dir / f"{stem}.json", metadata)
+
+
+PRECONNECT_TOPIC = "lk.agent.pre-connect-audio-buffer"
+PRECONNECT_BUFFER_SECONDS = 1.0
+PRECONNECT_LIVE_START_SECONDS = 0.3
+PRECONNECT_SAMPLE_RATE = 48000
+PRECONNECT_WRITE_BYTES = 16000
+
+
+def _upsample_2x(pcm: bytes) -> bytes:
+    """Double a 16-bit mono PCM rate by repeating each sample."""
+    doubled = bytearray(len(pcm) * 2)
+    for lane in (0, 1):
+        doubled[lane::4] = pcm[lane::2]
+        doubled[lane + 2 :: 4] = pcm[lane::2]
+    return bytes(doubled)
 
 
 SUPPORTED_VOICE_MODELS = frozenset({DEFAULT_VOICE_MODEL, "claude-opus-5-5", "claude-sonnet-5-5"})
@@ -824,6 +884,23 @@ async def _wait_for_room_deletion(
     return _finite_timestamp(monotonic(), "room deletion")
 
 
+def _validated_barge_in(barge_in: dict[int, float] | None, line_count: int) -> dict[int, float]:
+    """Return the barge-in turns, each a later line that starts over the previous reply."""
+    validated: dict[int, float] = {}
+    for turn, seconds in (barge_in or {}).items():
+        if isinstance(turn, bool) or not isinstance(turn, int) or not 2 <= turn <= line_count:
+            raise ValueError("barge_in must name scripted turns from 2 to the last line")
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds)
+            or seconds <= 0
+        ):
+            raise ValueError("barge_in seconds must be finite and positive")
+        validated[turn] = float(seconds)
+    return validated
+
+
 async def capture_script(
     room_name: str,
     raw_steps: list[str],
@@ -835,8 +912,19 @@ async def capture_script(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
+    preconnect_first_line: bool = False,
+    barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
-    """Capture every script turn and enforce its expected room-close policy."""
+    """Capture every script turn and enforce its expected room-close policy.
+
+    With preconnect_first_line the opening second of line 1 goes to the worker as a
+    phone-style pre-connect buffer while line 1 streams live from 0.3 s, so the two
+    overlap by 0.7 s the way the Pixel's do.
+
+    With barge_in={turn: seconds} line TURN starts that many seconds after the agent
+    begins speaking its reply to line TURN-1, over the reply instead of after it; the
+    line's own delay is ignored and the interrupted reply is captured up to that point.
+    """
     if not raw_steps:
         raise ValueError("at least one scripted line is required")
     if not math.isfinite(room_delete_deadline) or room_delete_deadline <= 0:
@@ -849,6 +937,7 @@ async def capture_script(
         or not 1 <= room_close_after <= len(raw_steps)
     ):
         raise ValueError("room_close_after must name a scripted turn or be None")
+    barge_in = _validated_barge_in(barge_in, len(raw_steps))
     if (retain_sms_audio_dir is None) != (retain_sms_audio_scenario is None):
         raise ValueError("SMS audio retention directory and scenario must be provided together")
     if retain_sms_audio_scenario is not None and retain_sms_audio_scenario not in SMS_AUDIO_SCENARIOS:
@@ -1012,6 +1101,13 @@ async def capture_script(
                     line=index + 1, retry_count=attempts - 1,
                 )
 
+    buffer_bytes = int(RATE * PRECONNECT_BUFFER_SECONDS) * 2
+    live_start_sample = int(RATE * PRECONNECT_LIVE_START_SECONDS)
+    if preconnect_first_line and len(synthesized[0][0].pcm) < buffer_bytes:
+        raise PartialCaptureFailure(
+            [], 1, "scripted speech sample count mismatch for line 1", line=1, retry_count=0,
+        )
+
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
     capture_end: asyncio.Event | None = None
@@ -1048,6 +1144,7 @@ async def capture_script(
     api_client = dependencies.api.LiveKitAPI(livekit_url, api_key, api_secret)
     traces: list[dict[str, Any]] = []
     deletion_task: asyncio.Task[float] | None = None
+    pending_finish: asyncio.Task[None] | None = None
     try:
         await _with_deadline(
             room.connect(livekit_url, token),
@@ -1056,19 +1153,30 @@ async def capture_script(
         )
         source = dependencies.rtc.AudioSource(RATE, 1)
         local_track = dependencies.rtc.LocalAudioTrack.create_audio_track("mic", source)
+        publish_options: dict[str, Any] = {
+            "source": dependencies.rtc.TrackSource.SOURCE_MICROPHONE
+        }
+        if preconnect_first_line:
+            publish_options["preconnect_buffer"] = True
         publication = await _with_deadline(
             room.local_participant.publish_track(
                 local_track,
-                dependencies.rtc.TrackPublishOptions(
-                    source=dependencies.rtc.TrackSource.SOURCE_MICROPHONE
-                ),
+                dependencies.rtc.TrackPublishOptions(**publish_options),
             ),
             REMOTE_OPERATION_DEADLINE_SECONDS,
             "LiveKit microphone publication",
         )
 
+        def agent_identity() -> str | None:
+            for participant in room.remote_participants.values():
+                if participant.kind == dependencies.rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+                    return participant.identity
+            return None
+
         participant_deadline = dependencies.monotonic() + PARTICIPANT_DEADLINE_SECONDS
-        while not room.remote_participants:
+        while (
+            agent_identity() is None if preconnect_first_line else not room.remote_participants
+        ):
             if dependencies.monotonic() >= participant_deadline:
                 raise RuntimeError("voice worker did not join the selected room before deadline")
             await _with_deadline(
@@ -1084,20 +1192,63 @@ async def capture_script(
                 "voice worker join polling",
             )
         try:
-            await caller.wait_for_microphone_ready(
-                publication,
-                deadline=participant_deadline,
-                monotonic=dependencies.monotonic,
-                sleep=dependencies.sleep,
-            )
+            if preconnect_first_line:
+                try:
+                    await asyncio.wait_for(
+                        publication.wait_for_subscription(),
+                        timeout=participant_deadline - dependencies.monotonic(),
+                    )
+                except TimeoutError as error:
+                    raise TimeoutError(
+                        "caller microphone subscription exceeded its deadline"
+                    ) from error
+            else:
+                await caller.wait_for_microphone_ready(
+                    publication,
+                    deadline=participant_deadline,
+                    monotonic=dependencies.monotonic,
+                    sleep=dependencies.sleep,
+                )
         except TimeoutError as error:
             raise DeadlineExceeded(str(error)) from error
 
+        async def send_preconnect_buffer(speech: caller.TTSResponse) -> None:
+            identity = agent_identity()
+            if identity is None:
+                raise RuntimeError("voice worker left the room before the pre-connect buffer")
+            writer = await _with_deadline(
+                room.local_participant.stream_bytes(
+                    "preconnect",
+                    mime_type="audio/pcm",
+                    topic=PRECONNECT_TOPIC,
+                    destination_identities=[identity],
+                    attributes={
+                        "trackId": publication.sid,
+                        "sampleRate": str(PRECONNECT_SAMPLE_RATE),
+                        "channels": "1",
+                    },
+                ),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "pre-connect buffer stream open",
+            )
+            buffered = _upsample_2x(speech.pcm[:buffer_bytes])
+            for offset in range(0, len(buffered), PRECONNECT_WRITE_BYTES):
+                await _with_deadline(
+                    writer.write(buffered[offset : offset + PRECONNECT_WRITE_BYTES]),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "pre-connect buffer write",
+                )
+            await _with_deadline(
+                writer.aclose(),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "pre-connect buffer close",
+            )
+
         async def push(
             speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
-            attempt: int,
+            attempt: int, start_sample: int = 0,
         ) -> None:
-            pcm = speech.pcm
+            pcm = speech.pcm[start_sample * 2 :]
             rendered_samples = len(pcm) // 2
             pushed_pcm = bytearray()
             pushed_frames = 0
@@ -1155,54 +1306,36 @@ async def capture_script(
                     "silence timing",
                 )
 
-        for index, (step, rendered) in enumerate(zip(steps, synthesized, strict=True)):
-            speech, retry_count, attempt = rendered
-            await quiet(step.delay)
-            capture_end = asyncio.Event()
-            capture = dependencies.capture_factory(answer_tracks, capture_end)
-            await _with_deadline(
-                capture.start(),
-                REMOTE_OPERATION_DEADLINE_SECONDS,
-                "continuous answer capture start",
-            )
-            speech_started_at = time.time()
-            await push(speech, step, index + 1, attempt)
-            speech_end = _finite_timestamp(
-                await _with_deadline(
-                    caller._speech_end_after_playout(source),
-                    REMOTE_OPERATION_DEADLINE_SECONDS,
-                    "speech playout completion",
-                ),
-                "speech_end",
-            )
-            paired_monotonic = _finite_timestamp(
-                dependencies.monotonic(), "paired monotonic speech end"
-            )
-            paired_wall_time = _finite_timestamp(
-                dependencies.wall_time(), "paired wall speech end"
-            )
-            speech_end_wall = _finite_timestamp(
-                paired_wall_time + speech_end - paired_monotonic,
-                "speech_end_wall",
-            )
-            if room_close_after == index + 1:
-                deletion_task = asyncio.create_task(
-                    _wait_for_room_deletion(
-                        api_client,
-                        dependencies.api,
-                        room_name,
-                        deadline=speech_end + room_delete_deadline,
-                        poll_interval=poll_interval,
-                        monotonic=dependencies.monotonic,
-                        sleep=dependencies.sleep,
-                    )
-                )
+        async def hold_for_barge_in(capture: Any, seconds: float) -> None:
+            """Keep the mic quiet until SECONDS after the reply starts, then end its capture."""
+            voice = asyncio.ensure_future(capture.wait_for_voice())
+            deadline = dependencies.monotonic() + ANSWER_CAPTURE_DEADLINE_SECONDS
             try:
-                answer_pcm, sample_rate, channels, capture_started = await asyncio.wait_for(
-                    capture.result(), timeout=ANSWER_CAPTURE_DEADLINE_SECONDS
-                )
-            except TimeoutError as error:
-                raise RuntimeError("agent audio capture exceeded its deadline") from error
+                while not voice.done():
+                    if dependencies.monotonic() >= deadline:
+                        raise RuntimeError("agent audio capture exceeded its deadline")
+                    await quiet(BARGE_IN_POLL_SECONDS)
+                onset = _finite_timestamp(voice.result(), "reply onset")
+            finally:
+                voice.cancel()
+            await quiet(onset + seconds - dependencies.monotonic())
+            capture.stop()
+
+        async def finish_turn(
+            index: int,
+            step: caller.ScriptStep,
+            retry_count: int,
+            preconnect: bool,
+            barge_after: float | None,
+            speech_started_at: float,
+            speech_end: float,
+            speech_end_wall: float,
+            answer: tuple[bytes, int, int, float],
+            after: asyncio.Task[None] | None,
+        ) -> None:
+            if after is not None:
+                await after
+            answer_pcm, sample_rate, channels, capture_started = answer
             capture_started = _finite_timestamp(capture_started, "capture start")
             try:
                 first_audio, overlap = _first_audio_after(
@@ -1299,6 +1432,11 @@ async def capture_script(
                     "answer transcription exceeded its deadline",
                     speech_started_at=speech_started_at,
                 )
+            if barge_after is not None:
+                segments = [
+                    segment for segment in segments
+                    if capture_started + segment["end"] > speech_end
+                ]
             if not segments:
                 raise PartialCaptureFailure(
                     traces,
@@ -1325,6 +1463,13 @@ async def capture_script(
                 "raw_segments": raw_segments,
                 "room_deleted": None,
             }
+            if preconnect:
+                trace["preconnect"] = {
+                    "buffer_seconds": PRECONNECT_BUFFER_SECONDS,
+                    "overlap_seconds": PRECONNECT_BUFFER_SECONDS - PRECONNECT_LIVE_START_SECONDS,
+                }
+            if barge_after is not None:
+                trace["barge_in_after"] = barge_after
             traces.append(trace)
 
             if room_close_after == index + 1:
@@ -1356,8 +1501,85 @@ async def capture_script(
                         "room was deleted before all scripted lines were captured",
                     )
                 raise RuntimeError("room was deleted before all scripted lines were captured")
+
+        for index, (step, rendered) in enumerate(zip(steps, synthesized, strict=True)):
+            speech, retry_count, attempt = rendered
+            barge_after = barge_in.get(index + 1)
+            if barge_after is None:
+                await quiet(step.delay)
+            capture_end = asyncio.Event()
+            capture = dependencies.capture_factory(answer_tracks, capture_end)
+            await _with_deadline(
+                capture.start(),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "continuous answer capture start",
+            )
+            preconnect = preconnect_first_line and index == 0
+            if preconnect:
+                await send_preconnect_buffer(speech)
+            speech_started_at = time.time()
+            await push(
+                speech, step, index + 1, attempt,
+                live_start_sample if preconnect else 0,
+            )
+            speech_end = _finite_timestamp(
+                await _with_deadline(
+                    caller._speech_end_after_playout(source),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "speech playout completion",
+                ),
+                "speech_end",
+            )
+            paired_monotonic = _finite_timestamp(
+                dependencies.monotonic(), "paired monotonic speech end"
+            )
+            paired_wall_time = _finite_timestamp(
+                dependencies.wall_time(), "paired wall speech end"
+            )
+            speech_end_wall = _finite_timestamp(
+                paired_wall_time + speech_end - paired_monotonic,
+                "speech_end_wall",
+            )
+            if room_close_after == index + 1:
+                deletion_task = asyncio.create_task(
+                    _wait_for_room_deletion(
+                        api_client,
+                        dependencies.api,
+                        room_name,
+                        deadline=speech_end + room_delete_deadline,
+                        poll_interval=poll_interval,
+                        monotonic=dependencies.monotonic,
+                        sleep=dependencies.sleep,
+                    )
+                )
+            next_barge_after = barge_in.get(index + 2)
+            if next_barge_after is not None:
+                await hold_for_barge_in(capture, next_barge_after)
+            try:
+                answer = await asyncio.wait_for(
+                    capture.result(), timeout=ANSWER_CAPTURE_DEADLINE_SECONDS
+                )
+            except TimeoutError as error:
+                raise RuntimeError("agent audio capture exceeded its deadline") from error
+            turn = finish_turn(
+                index, step, retry_count, preconnect, barge_after,
+                speech_started_at, speech_end, speech_end_wall, answer, pending_finish,
+            )
+            if next_barge_after is None:
+                await turn
+            else:
+                pending_finish = asyncio.create_task(turn)
         return traces
     finally:
+        if pending_finish is not None:
+            if not pending_finish.done():
+                pending_finish.cancel()
+                try:
+                    await pending_finish
+                except asyncio.CancelledError:
+                    pass
+            elif not pending_finish.cancelled():
+                pending_finish.exception()
         if deletion_task is not None:
             if not deletion_task.done():
                 deletion_task.cancel()
@@ -2705,8 +2927,28 @@ def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str
     ]
     if getattr(scenario, "name", None) in SMS_AUDIO_SCENARIOS:
         command.extend(("--retain-sms-audio", scenario.name))
+    if getattr(scenario, "preconnect_first_line", False):
+        command.append("--preconnect-first-line")
+    for turn, seconds in enumerate(getattr(scenario, "barge_in_after", ()), 1):
+        if seconds is not None:
+            command.extend(("--barge-in", f"{turn}:{seconds}"))
     command.extend((room, *raw_steps))
     return command
+
+
+def _input_stt_sidecars(stack: Any, room: str, count: int) -> list[str | None]:
+    sidecars = []
+    for index in range(1, count + 1):
+        sidecar_path = (
+            f"voice/evals/retained-evidence/input-audio/"
+            f"{room}-turn-{index:03d}.txt"
+        )
+        sidecars.append(
+            _remote_artifact_text(
+                stack, sidecar_path, "input STT transcript", allow_missing=True
+            )
+        )
+    return sidecars
 
 
 def observe_scenario(
@@ -2799,16 +3041,9 @@ def observe_scenario(
             if voice_log_text is None
             else _json_lines(voice_log_text, "voice mode trace")
         )
-        transcript_sidecars = []
-        for index in range(1, len(scenario.caller_lines) + 1):
-            sidecar_path = (
-                f"voice/evals/retained-evidence/input-audio/"
-                f"{room}-turn-{index:03d}.txt"
-            )
-            sidecar = _remote_artifact_text(
-                stack, sidecar_path, "input STT transcript", allow_missing=True
-            )
-            transcript_sidecars.append(sidecar)
+        transcript_sidecars = _input_stt_sidecars(
+            stack, room, len(scenario.caller_lines)
+        )
         if getattr(scenario, "name", None) == "spanish-interpreter":
             interpreter_transcript_sidecars = transcript_sidecars
         else:
@@ -2817,6 +3052,22 @@ def observe_scenario(
                     scenario, room, voice_entries, transcript_sidecars
                 )
             )
+
+    caller_stt: list[str | None] | None = None
+    caller_stt_failures: list[tuple[int, str]] = []
+    if getattr(scenario, "exact_caller_stt", False):
+        caller_stt = _input_stt_sidecars(stack, room, len(scenario.caller_lines))
+        caller_stt_failures = [
+            (
+                turn,
+                f"{scenario.name}: input STT sidecar turn {turn} did not match its scripted line",
+            )
+            for turn, (expected, observed) in enumerate(
+                zip(scenario.caller_lines, caller_stt, strict=True), 1
+            )
+            if not isinstance(observed, str)
+            or _content_tokens(expected) != _content_tokens(observed)
+        ]
 
     phone_log_path = "voice/" + FAKE_PHONE_LOG
     phone_text = _remote_artifact_text(stack, phone_log_path, "fake phone log")
@@ -3005,6 +3256,9 @@ def observe_scenario(
         {"turn": 1, "message": failure}
         for failure in language_evidence_failures
     )
+    product_failures.extend(
+        {"turn": turn, "message": message} for turn, message in caller_stt_failures
+    )
     observation = {
         "room": room,
         "turns": traces,
@@ -3015,6 +3269,8 @@ def observe_scenario(
         observation["capacity_failures"] = remote_capacity_failures
     if getattr(scenario, "reply_languages", ()):
         observation["first_spanish_lookup_ms"] = first_spanish_lookup_ms
+    if caller_stt is not None:
+        observation["caller_stt"] = caller_stt
     if unattributed_model_calls:
         observation["unattributed_model_calls"] = unattributed_model_calls
     if capture_failure is not None and not early_close:
@@ -3033,6 +3289,8 @@ async def _run_remote_capture_with_fake_phone(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
+    preconnect_first_line: bool = False,
+    barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
     log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
@@ -3065,6 +3323,8 @@ async def _run_remote_capture_with_fake_phone(
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
             retain_caller_audio_dir=retain_caller_audio_dir,
+            preconnect_first_line=preconnect_first_line,
+            barge_in=barge_in,
         )
     finally:
         if process.poll() is None:
@@ -3084,6 +3344,8 @@ async def run_remote_capture(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
+    preconnect_first_line: bool = False,
+    barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     import aiohttp
 
@@ -3096,16 +3358,43 @@ async def run_remote_capture(
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
             retain_caller_audio_dir=retain_caller_audio_dir,
+            preconnect_first_line=preconnect_first_line,
+            barge_in=barge_in,
         )
 
 
-def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
+def _barge_in_pair(value: str) -> tuple[int, float]:
+    import argparse
+
+    turn, separator, seconds = value.partition(":")
+    try:
+        if not separator:
+            raise ValueError(value)
+        return int(turn), float(seconds)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be TURN:SECONDS") from error
+
+
+def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None, dict[int, float]]:
     import argparse
 
     parser = argparse.ArgumentParser(
         description="Capture scripted caller turns from a remote voice room"
     )
     parser.add_argument("--fake-phone", action="store_true", help="run the loopback-only fake phone during capture")
+    parser.add_argument(
+        "--preconnect-first-line",
+        action="store_true",
+        help="send the opening second of line 1 as a phone-style pre-connect buffer",
+    )
+    parser.add_argument(
+        "--barge-in",
+        action="append",
+        default=[],
+        type=_barge_in_pair,
+        metavar="TURN:SECONDS",
+        help="start line TURN SECONDS after the agent begins replying to the line before it",
+    )
     parser.add_argument("room")
     parser.add_argument(
         "--room-close-after",
@@ -3124,7 +3413,14 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None]:
             room_close_after = int(arguments.room_close_after)
         except ValueError:
             parser.error("--room-close-after must be a turn number, 'none', or 'last'")
-    return arguments.room, arguments.steps, room_close_after
+    barge_in = dict(arguments.barge_in)
+    if len(barge_in) != len(arguments.barge_in):
+        parser.error("--barge-in may name each turn only once")
+    try:
+        barge_in = _validated_barge_in(barge_in, len(arguments.steps))
+    except ValueError as error:
+        parser.error(str(error))
+    return arguments.room, arguments.steps, room_close_after, barge_in
 
 
 def _positive_int(value: str) -> int:
@@ -3292,6 +3588,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 "concurrency": active["concurrency"],
             }
             capacity_failures = _named_capacity_failures(capacity_error, stack)
+            phantom_finals = _phantom_final_count(stack)
             if isinstance(observation, dict):
                 reported_capacity = observation.get("capacity_failures", [])
                 if isinstance(reported_capacity, list):
@@ -3300,6 +3597,7 @@ def _run_local_eval(argv: list[str]) -> int:
                     )
                 observation["timing"] = timing
                 observation["capacity_failures"] = capacity_failures
+                observation["phantom_finals"] = phantom_finals
                 if failure is not None and "failure" not in observation:
                     observation["failure"] = failure
             elif failure is not None:
@@ -3307,6 +3605,7 @@ def _run_local_eval(argv: list[str]) -> int:
                     "failure": failure,
                     "turns": [],
                     "capacity_failures": capacity_failures,
+                    "phantom_finals": phantom_finals,
                     "timing": timing,
                 }
         return scenario_index, run_index, observation, failure
@@ -3552,7 +3851,7 @@ def main(argv: list[str] | None = None) -> int:
         retain_sms_audio_dir = Path(evidence_path)
     else:
         retain_sms_audio_dir = None
-    room, steps, room_close_after = _parse_arguments(arguments)
+    room, steps, room_close_after, barge_in = _parse_arguments(arguments)
     capture = _run_remote_capture_with_fake_phone if "--fake-phone" in arguments else run_remote_capture
     capture_options = {"room_close_after": room_close_after}
     if retain_sms_audio_scenario is not None:
@@ -3562,6 +3861,10 @@ def main(argv: list[str] | None = None) -> int:
         })
     if retain_caller_audio:
         capture_options["retain_caller_audio_dir"] = retain_caller_audio_dir
+    if "--preconnect-first-line" in arguments:
+        capture_options["preconnect_first_line"] = True
+    if barge_in:
+        capture_options["barge_in"] = barge_in
     try:
         traces = asyncio.run(capture(room, steps, **capture_options))
     except NamedCapacityFailure as error:

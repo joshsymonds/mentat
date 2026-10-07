@@ -1215,6 +1215,45 @@ class ScoringTests(unittest.TestCase):
             ],
         )
 
+    def test_report_surfaces_phantom_finals_per_run_and_in_total(self):
+        observation = {"cases": [case(name="phantoms"), case(name="more phantoms")]}
+        first_runs = observation["cases"][0]["runs"]
+        first_runs[0]["phantom_finals"] = 0
+        first_runs[1]["phantom_finals"] = 2
+        first_runs[2]["phantom_finals"] = None
+        observation["cases"][1]["runs"][0]["phantom_finals"] = 3
+
+        result = score_observations(observation)
+
+        self.assertEqual(result["cases"][0]["phantom_finals"], [0, 2, *[None] * 8])
+        self.assertEqual(result["cases"][1]["phantom_finals"], [3, *[None] * 9])
+        self.assertEqual(result["phantom_final_count"], 5)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["failures"], [])
+
+    def test_report_counts_invalid_phantom_final_values_as_none(self):
+        observation = {"cases": [case(name="invalid phantoms")]}
+        runs = observation["cases"][0]["runs"]
+        runs[0]["phantom_finals"] = True
+        runs[1]["phantom_finals"] = -1
+        runs[2]["phantom_finals"] = "3"
+        runs[3]["phantom_finals"] = 1.5
+        runs[4]["phantom_finals"] = 1
+
+        result = score_observations(observation)
+
+        self.assertEqual(
+            result["cases"][0]["phantom_finals"],
+            [None, None, None, None, 1, *[None] * 5],
+        )
+        self.assertEqual(result["phantom_final_count"], 1)
+
+    def test_report_without_phantom_data_reports_none_and_zero_total(self):
+        result = score_observations({"cases": [case(name="no worker log")]})
+
+        self.assertEqual(result["cases"][0]["phantom_finals"], [None] * 10)
+        self.assertEqual(result["phantom_final_count"], 0)
+
     def test_report_preserves_batch_and_per_run_timing_without_changing_scores(self):
         batch_timing = {
             "started_at": 1_700_000_000.0,
