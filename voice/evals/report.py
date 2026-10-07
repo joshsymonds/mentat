@@ -268,6 +268,15 @@ def _capacity_failure_summary(runs: list[Any]) -> tuple[int, list[dict[str, Any]
     return total, per_run
 
 
+def _phantom_final_counts(runs: list[Any]) -> list[int | None]:
+    counts: list[int | None] = []
+    for run in runs:
+        value = run.get("phantom_finals") if isinstance(run, dict) else None
+        valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        counts.append(value if valid else None)
+    return counts
+
+
 def score_observations(
     observations: Any, required_runs: int = RUNS_REQUIRED
 ) -> dict[str, Any]:
@@ -282,16 +291,19 @@ def score_observations(
             "failures": ["input: required_runs must be a positive integer"],
             "cases": [],
             "capacity_failure_count": 0,
+            "phantom_final_count": 0,
         }
     failures: list[str] = []
     reports: list[dict[str, Any]] = []
     capacity_failure_count = 0
+    phantom_final_count = 0
     if not isinstance(observations, dict) or not isinstance(observations.get("cases"), list):
         return {
             "passed": False,
             "failures": ["input: expected an object containing a cases list"],
             "cases": [],
             "capacity_failure_count": 0,
+            "phantom_final_count": 0,
         }
     if not observations["cases"]:
         return {
@@ -299,6 +311,7 @@ def score_observations(
             "failures": ["input: cases list must not be empty"],
             "cases": [],
             "capacity_failure_count": 0,
+            "phantom_final_count": 0,
         }
 
     for case_index, scenario in enumerate(observations["cases"]):
@@ -320,6 +333,7 @@ def score_observations(
                 "failures": [message],
                 "capacity_failure_count": 0,
                 "run_capacity_failures": [],
+                "phantom_finals": [],
             })
             continue
         case_failures: list[str] = []
@@ -327,6 +341,8 @@ def score_observations(
             case_failures.append(f"{name}: expected {required_runs} runs, found {len(runs)}")
         case_capacity_failure_count, run_capacity_failures = _capacity_failure_summary(runs)
         capacity_failure_count += case_capacity_failure_count
+        phantom_finals = _phantom_final_counts(runs)
+        phantom_final_count += sum(count for count in phantom_finals if count is not None)
         turns: list[dict[str, Any]] = []
         capture_failures: list[dict[str, Any]] = []
         line_retry_counts: list[dict[str, int]] = []
@@ -687,6 +703,7 @@ def score_observations(
             "capture_failures": capture_failures,
             "capacity_failure_count": case_capacity_failure_count,
             "run_capacity_failures": run_capacity_failures,
+            "phantom_finals": phantom_finals,
             "line_retry_counts": sorted(
                 line_retry_counts, key=lambda item: (item["run"], item["line"])
             ),
@@ -707,6 +724,7 @@ def score_observations(
         "failures": failures,
         "cases": reports,
         "capacity_failure_count": capacity_failure_count,
+        "phantom_final_count": phantom_final_count,
     }
     if isinstance(observations, dict) and "batch_timing" in observations:
         result["batch_timing"] = observations["batch_timing"]
