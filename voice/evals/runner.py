@@ -55,6 +55,9 @@ from evals.scenarios import (
 
 RATE = caller.RATE
 FRAME_SAMPLES = caller.FRAME_SAMPLES
+# Echo mode keeps line audio queued at this much, under the residual's echo delay, so each
+# frame is mixed with agent audio the residual has already heard; half the delay is margin.
+ECHO_QUEUE_TARGET_SECONDS = caller.ECHO_DELAY_SECONDS / 2
 PARTICIPANT_DEADLINE_SECONDS = 30.0
 ANSWER_CAPTURE_DEADLINE_SECONDS = caller.MAX_CAPTURE_SECONDS + 30.0
 ANSWER_TRANSCRIPTION_DEADLINE_SECONDS = 30.0
@@ -914,6 +917,7 @@ async def capture_script(
     retain_caller_audio_dir: Path | None = None,
     preconnect_first_line: bool = False,
     barge_in: dict[int, float] | None = None,
+    echo_residual: bool = False,
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy.
 
@@ -924,6 +928,10 @@ async def capture_script(
     With barge_in={turn: seconds} line TURN starts that many seconds after the agent
     begins speaking its reply to line TURN-1, over the reply instead of after it; the
     line's own delay is ignored and the interrupted reply is captured up to that point.
+
+    With echo_residual every capture hears the agent through one caller.EchoResidual,
+    and every mic frame pushed is mixed with the agent audio that plays at its playout
+    time, so the caller hears itself the way a phone with an open speaker does.
     """
     if not raw_steps:
         raise ValueError("at least one scripted line is required")
@@ -1111,6 +1119,7 @@ async def capture_script(
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
     capture_end: asyncio.Event | None = None
+    echo = caller.EchoResidual() if echo_residual else None
 
     @room.on("track_subscribed")
     def track_subscribed(track: Any, publication: Any, participant: Any) -> None:
@@ -1152,6 +1161,13 @@ async def capture_script(
             "LiveKit room connection",
         )
         source = dependencies.rtc.AudioSource(RATE, 1)
+
+        def mic_frame(pcm: bytes) -> bytes:
+            """Return a mic frame as it plays: mixed with the agent audio playing at its time."""
+            if echo is None:
+                return pcm
+            return echo.mix(pcm, dependencies.monotonic() + source.queued_duration)
+
         local_track = dependencies.rtc.LocalAudioTrack.create_audio_track("mic", source)
         publish_options: dict[str, Any] = {
             "source": dependencies.rtc.TrackSource.SOURCE_MICROPHONE
@@ -1181,7 +1197,9 @@ async def capture_script(
                 raise RuntimeError("voice worker did not join the selected room before deadline")
             await _with_deadline(
                 source.capture_frame(
-                    dependencies.rtc.AudioFrame(bytes(FRAME_SAMPLES * 2), RATE, 1, FRAME_SAMPLES)
+                    dependencies.rtc.AudioFrame(
+                        mic_frame(bytes(FRAME_SAMPLES * 2)), RATE, 1, FRAME_SAMPLES,
+                    )
                 ),
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "LiveKit participant wait audio",
@@ -1255,7 +1273,15 @@ async def capture_script(
             pushed_samples = 0
             try:
                 for offset in range(0, len(pcm), FRAME_SAMPLES * 2):
-                    chunk = pcm[offset : offset + FRAME_SAMPLES * 2]
+                    if echo is not None:
+                        await _with_deadline(
+                            dependencies.sleep(
+                                max(0.0, source.queued_duration - ECHO_QUEUE_TARGET_SECONDS)
+                            ),
+                            REMOTE_OPERATION_DEADLINE_SECONDS,
+                            "LiveKit speech audio pacing",
+                        )
+                    chunk = mic_frame(pcm[offset : offset + FRAME_SAMPLES * 2])
                     frame_samples = len(chunk) // 2
                     await _with_deadline(
                         source.capture_frame(
@@ -1317,7 +1343,7 @@ async def capture_script(
             while dependencies.monotonic() < deadline:
                 await _with_deadline(
                     source.capture_frame(
-                        dependencies.rtc.AudioFrame(silence, RATE, 1, FRAME_SAMPLES)
+                        dependencies.rtc.AudioFrame(mic_frame(silence), RATE, 1, FRAME_SAMPLES)
                     ),
                     REMOTE_OPERATION_DEADLINE_SECONDS,
                     "LiveKit silence playout",
@@ -1530,7 +1556,8 @@ async def capture_script(
             if barge_after is None:
                 await quiet(step.delay)
             capture_end = asyncio.Event()
-            capture = dependencies.capture_factory(answer_tracks, capture_end)
+            capture_options = {"echo": echo} if echo is not None else {}
+            capture = dependencies.capture_factory(answer_tracks, capture_end, **capture_options)
             await _with_deadline(
                 capture.start(),
                 REMOTE_OPERATION_DEADLINE_SECONDS,
@@ -2952,6 +2979,8 @@ def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str
     for turn, seconds in enumerate(getattr(scenario, "barge_in_after", ()), 1):
         if seconds is not None:
             command.extend(("--barge-in", f"{turn}:{seconds}"))
+    if getattr(scenario, "echo_residual", False):
+        command.append("--echo-residual")
     command.extend((room, *raw_steps))
     return command
 
@@ -3311,6 +3340,7 @@ async def _run_remote_capture_with_fake_phone(
     retain_caller_audio_dir: Path | None = None,
     preconnect_first_line: bool = False,
     barge_in: dict[int, float] | None = None,
+    echo_residual: bool = False,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
     log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
@@ -3345,6 +3375,7 @@ async def _run_remote_capture_with_fake_phone(
             retain_caller_audio_dir=retain_caller_audio_dir,
             preconnect_first_line=preconnect_first_line,
             barge_in=barge_in,
+            echo_residual=echo_residual,
         )
     finally:
         if process.poll() is None:
@@ -3366,6 +3397,7 @@ async def run_remote_capture(
     retain_caller_audio_dir: Path | None = None,
     preconnect_first_line: bool = False,
     barge_in: dict[int, float] | None = None,
+    echo_residual: bool = False,
 ) -> list[dict[str, Any]]:
     import aiohttp
 
@@ -3380,6 +3412,7 @@ async def run_remote_capture(
             retain_caller_audio_dir=retain_caller_audio_dir,
             preconnect_first_line=preconnect_first_line,
             barge_in=barge_in,
+            echo_residual=echo_residual,
         )
 
 
@@ -3406,6 +3439,11 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None, dict[
         "--preconnect-first-line",
         action="store_true",
         help="send the opening second of line 1 as a phone-style pre-connect buffer",
+    )
+    parser.add_argument(
+        "--echo-residual",
+        action="store_true",
+        help="mix the agent's voice into the caller's mic as a phone with an open speaker would",
     )
     parser.add_argument(
         "--barge-in",
@@ -3883,6 +3921,8 @@ def main(argv: list[str] | None = None) -> int:
         capture_options["retain_caller_audio_dir"] = retain_caller_audio_dir
     if "--preconnect-first-line" in arguments:
         capture_options["preconnect_first_line"] = True
+    if "--echo-residual" in arguments:
+        capture_options["echo_residual"] = True
     if barge_in:
         capture_options["barge_in"] = barge_in
     try:
