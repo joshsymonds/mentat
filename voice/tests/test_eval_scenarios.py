@@ -295,17 +295,15 @@ class ScenarioScoringTests(unittest.TestCase):
 
         barge = self.scenario("barge-in-long-reply")
         self.assertEqual(barge.turns, (
-            TurnExpectation((QuestionSpec("story_start", {
-                "subject": "a lighthouse keeper and her cat",
-            }),)),
+            TurnExpectation((QuestionSpec("story_start", {}),)),
             TurnExpectation((QuestionSpec("barge_in_answer", {
-                "answer": "state that Tokyo is the capital of Japan",
+                "answer": "say Tokyo",
                 "abandoned": "the story about a lighthouse keeper and her cat",
             }),)),
         ))
         self.assertEqual(barge.commands, ())
         self.assertIsNone(barge.room_close_after)
-        self.assertEqual(barge.barge_in_after, (None, 9.0))
+        self.assertEqual(barge.barge_in_after, (None, 15.0))
         self.assertTrue(barge.exact_caller_stt)
         self.assertFalse(barge.preconnect_first_line)
 

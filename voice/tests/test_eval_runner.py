@@ -5291,7 +5291,7 @@ class ScenarioObservationTests(unittest.TestCase):
                     self.assertNotIn("--preconnect-first-line", command)
                 if scenario.name == "barge-in-long-reply":
                     self.assertEqual(command.count("--barge-in"), 1)
-                    self.assertEqual(command[command.index("--barge-in") + 1], "2:9.0")
+                    self.assertEqual(command[command.index("--barge-in") + 1], "2:15.0")
                 else:
                     self.assertNotIn("--barge-in", command)
                 if "--preconnect-first-line" in command or "--barge-in" in command:

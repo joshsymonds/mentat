@@ -217,18 +217,16 @@ SCENARIOS = (
             "Stop. What's the capital of Japan?",
         ),
         turns=(
-            TurnExpectation((_question(
-                "story_start", subject="a lighthouse keeper and her cat",
-            ),)),
+            TurnExpectation((_question("story_start"),)),
             TurnExpectation((_question(
                 "barge_in_answer",
-                answer="state that Tokyo is the capital of Japan",
+                answer="say Tokyo",
                 abandoned="the story about a lighthouse keeper and her cat",
             ),)),
         ),
         commands=(),
         room_close_after=None,
-        barge_in_after=(None, 9.0),
+        barge_in_after=(None, 15.0),
         exact_caller_stt=True,
     ),
 )

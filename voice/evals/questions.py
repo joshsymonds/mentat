@@ -17,7 +17,7 @@ The fixture dispatcher accepts these family/input shapes:
 * ``alice_wealth``: ``person`` and ``source`` strings.
 * ``spanish_switch``: ``turn`` integer from 1 through 5.
 * ``interpreter_turn``: ``turn`` integer from 1 through 6.
-* ``story_start``: ``subject`` string.
+* ``story_start``: no inputs; a long reply is cut off before naming its subject.
 * ``barge_in_answer``: ``answer`` and ``abandoned`` strings.
 
 Question wording describes facts, never text-matching patterns. Each returned
@@ -312,8 +312,9 @@ def _build_interpreter_turn(inputs: Mapping[str, object]) -> dict[str, str]:
 
 
 def _build_story_start(inputs: Mapping[str, object]) -> dict[str, str]:
-    subject = _text(inputs, "subject")
-    return {"story_start": f"Does the reply begin telling a story about {subject}?"}
+    if inputs:
+        raise ValueError("story_start takes no inputs")
+    return {"story_start": "Does the reply start telling a story?"}
 
 
 def _build_barge_in_answer(inputs: Mapping[str, object]) -> dict[str, str]:

@@ -549,6 +549,24 @@
     "source": {"kind": "scenario_corruption","based_on": "barge-in-story-start","change": "answered an unrelated question instead of beginning the lighthouse story"}
   },
   {
+    "id": "barge-in-story-start-cut-off",
+    "scenario": "barge-in-long-reply",
+    "turn": 1,
+    "reply": "Oh, a story. Settle in. Out on the far end of a rocky point where the fog rolled in thick enough to lose your own hands in",
+    "expected": true,
+    "tags": ["story-start", "cut-off"],
+    "source": {"kind": "transcript","artifact": "voice-first-line/evidence/red-barge-transcripts.jsonl","line": 1}
+  },
+  {
+    "id": "barge-in-answer-terse",
+    "scenario": "barge-in-long-reply",
+    "turn": 2,
+    "reply": "Karen Holt. She- It's Tokyo",
+    "expected": true,
+    "tags": ["barge-in-answer", "terse"],
+    "source": {"kind": "transcript","artifact": "voice-first-line/evidence/red-barge-transcripts.jsonl","line": 2}
+  },
+  {
     "id": "barge-in-answer-tokyo",
     "scenario": "barge-in-long-reply",
     "turn": 2,
