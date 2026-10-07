@@ -31,6 +31,11 @@ class QuestionBuilderTests(unittest.TestCase):
             "alice_wealth": {"person": "Alice Keck", "source": "family wealth from Superior Oil"},
             "spanish_switch": {"turn": 1},
             "interpreter_turn": {"turn": 1},
+            "story_start": {"subject": "a lighthouse keeper and her cat"},
+            "barge_in_answer": {
+                "answer": "stating that Tokyo is the capital of Japan",
+                "abandoned": "the story about a lighthouse keeper and her cat",
+            },
         }
         for family, inputs in fixtures.items():
             with self.subTest(family=family):
@@ -170,6 +175,42 @@ class QuestionBuilderTests(unittest.TestCase):
                 question = build_questions("interpreter_turn", {"turn": turn})["interpreter_turn"]
                 for fact in facts:
                     self.assertIn(fact, question)
+
+    def test_barge_in_families_build_exact_questions(self):
+        self.assertEqual(
+            build_questions("story_start", {"subject": " a lighthouse keeper and her cat "}),
+            {"story_start": "Does the reply begin telling a story about a lighthouse keeper and her cat?"},
+        )
+        self.assertEqual(
+            build_questions(
+                "barge_in_answer",
+                {
+                    "answer": "stating that Tokyo is the capital of Japan",
+                    "abandoned": "the story about a lighthouse keeper and her cat",
+                },
+            ),
+            {
+                "barge_in_answer": (
+                    "Does the reply respond to the caller's interruption by "
+                    "stating that Tokyo is the capital of Japan?"
+                ),
+                "barge_in_dropped": (
+                    "Does the reply leave the story about a lighthouse keeper and her cat "
+                    "behind instead of resuming or continuing it?"
+                ),
+            },
+        )
+
+    def test_barge_in_families_reject_missing_or_blank_inputs(self):
+        with self.assertRaises(ValueError):
+            build_questions("story_start", {})
+        with self.assertRaises(ValueError):
+            build_questions("story_start", {"subject": "  "})
+        answer = "stating that Tokyo is the capital of Japan"
+        abandoned = "the story about a lighthouse keeper and her cat"
+        for inputs in ({}, {"answer": answer}, {"abandoned": abandoned}, {"answer": " ", "abandoned": abandoned}, {"answer": answer, "abandoned": ""}):
+            with self.subTest(inputs=inputs), self.assertRaises(ValueError):
+                build_questions("barge_in_answer", inputs)
 
     def test_dispatcher_rejects_unknown_family_and_invalid_turn(self):
         with self.assertRaises(ValueError):
