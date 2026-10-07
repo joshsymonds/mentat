@@ -1432,6 +1432,11 @@ async def capture_script(
                     "answer transcription exceeded its deadline",
                     speech_started_at=speech_started_at,
                 )
+            if barge_after is not None:
+                segments = [
+                    segment for segment in segments
+                    if capture_started + segment["end"] > speech_end
+                ]
             if not segments:
                 raise PartialCaptureFailure(
                     traces,
