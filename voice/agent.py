@@ -311,7 +311,6 @@ class ScribeCommitController:
         self._interval = interval
         self._clock = clock
         self._stream: Any | None = None
-        self._agent_speaking = False
         self._user_speaking = False
         # A line is open from the start of Josh's speech until its final
         # transcript, the turn's completion, or a stall recovery: local VAD ends
@@ -338,10 +337,7 @@ class ScribeCommitController:
         self._wake.set()
 
     def agent_state(self, old_state: str | None, new_state: str) -> None:
-        if new_state == "speaking":
-            self._agent_speaking = True
-        elif old_state == "speaking":
-            self._agent_speaking = False
+        if old_state == "speaking" and new_state != "speaking":
             self._quiet_due = self._clock()
         self._wake.set()
 
@@ -362,12 +358,7 @@ class ScribeCommitController:
         self._wake.set()
 
     def _due_at(self) -> float | None:
-        if (
-            self._stream is None
-            or self._agent_speaking
-            or self._user_speaking
-            or self._line_open
-        ):
+        if self._stream is None or self._user_speaking or self._line_open:
             return None
         if self._last_commit_at is None:
             return self._quiet_due
