@@ -8,6 +8,7 @@ import struct
 import sys
 import time
 import wave
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -205,16 +206,32 @@ def _frame_duration(frame: Any) -> float:
     return frame.samples_per_channel / frame.sample_rate
 
 
+async def _wait_any(events: list[asyncio.Event]) -> None:
+    waits = [asyncio.create_task(event.wait()) for event in events]
+    try:
+        await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for wait in waits:
+            wait.cancel()
+        await asyncio.gather(*waits, return_exceptions=True)
+
+
 async def _capture_answer(
-    track_queue: asyncio.Queue[Any], ended: asyncio.Event | None = None
+    track_queue: asyncio.Queue[Any],
+    ended: asyncio.Event | None = None,
+    stop: asyncio.Event | None = None,
+    on_voice: Callable[[float], None] | None = None,
 ) -> tuple[bytes, int, int, float]:
     from livekit import rtc
 
-    if ended is None:
+    stops = [event for event in (ended, stop) if event is not None]
+    if stops and not track_queue.empty():
+        track = track_queue.get_nowait()
+    elif not stops:
         track = await asyncio.wait_for(track_queue.get(), timeout=15)
     else:
         track_task = asyncio.create_task(track_queue.get())
-        ended_task = asyncio.create_task(ended.wait())
+        ended_task = asyncio.create_task(_wait_any(stops))
         done, pending = await asyncio.wait(
             (track_task, ended_task), timeout=15, return_when=asyncio.FIRST_COMPLETED
         )
@@ -240,6 +257,8 @@ async def _capture_answer(
         heard_voice = False
         trailing_silence = 0.0
         while True:
+            if stop is not None and stop.is_set():
+                break
             if capture_started is None:
                 deadline = no_frame_deadline
             elif not heard_voice:
@@ -256,17 +275,17 @@ async def _capture_answer(
                 deadline = min(capture_deadline, idle_completion_deadline)
             remaining = max(0.0, deadline - loop.time())
             try:
-                if ended is None:
+                if not stops:
                     event = await asyncio.wait_for(audio_stream.__anext__(), timeout=remaining)
                 else:
-                    next_task = asyncio.create_task(audio_stream.__anext__())
-                    if ended.is_set():
+                    next_task = asyncio.Task(audio_stream.__anext__(), eager_start=True)
+                    if any(event.is_set() for event in stops):
                         try:
                             event = await asyncio.wait_for(next_task, timeout=min(remaining, END_DRAIN_SECONDS))
                         except TimeoutError:
                             break
                     else:
-                        ended_task = asyncio.create_task(ended.wait())
+                        ended_task = asyncio.create_task(_wait_any(stops))
                         done, pending = await asyncio.wait(
                             (next_task, ended_task),
                             timeout=remaining,
@@ -315,6 +334,8 @@ async def _capture_answer(
             captured_seconds += frame_seconds
             frames.append(bytes(last_frame.data))
             if _frame_has_voice(last_frame):
+                if not heard_voice and on_voice is not None:
+                    on_voice(time.monotonic())
                 heard_voice = True
                 last_voice_at = loop.time()
                 trailing_silence = 0.0
@@ -340,12 +361,44 @@ class ContinuousCapture:
         self._track_queue = track_queue
         self._ended = ended
         self._task: asyncio.Task[tuple[bytes, int, int, float]] | None = None
+        self._stop = asyncio.Event()
+        self._voice: asyncio.Future[float] | None = None
 
     async def start(self) -> None:
         if self._task is not None:
             raise RuntimeError("continuous capture already started")
-        self._task = asyncio.create_task(_capture_answer(self._track_queue, self._ended))
+        voice = asyncio.get_running_loop().create_future()
+        self._voice = voice
+
+        def on_voice(onset: float) -> None:
+            if not voice.done():
+                voice.set_result(onset)
+
+        def settle_voice(task: asyncio.Task[tuple[bytes, int, int, float]]) -> None:
+            if voice.done():
+                return
+            if task.cancelled():
+                voice.cancel()
+                return
+            error = task.exception() or RuntimeError("agent audio track produced no speech")
+            voice.set_exception(error)
+            voice.exception()
+
+        self._task = asyncio.create_task(
+            _capture_answer(self._track_queue, self._ended, self._stop, on_voice)
+        )
+        self._task.add_done_callback(settle_voice)
         await asyncio.sleep(0)
+
+    async def wait_for_voice(self) -> float:
+        if self._voice is None:
+            raise RuntimeError("continuous capture has not started")
+        return await asyncio.shield(self._voice)
+
+    def stop(self) -> None:
+        if self._task is None:
+            raise RuntimeError("continuous capture has not started")
+        self._stop.set()
 
     async def result(self) -> tuple[bytes, int, int, float]:
         if self._task is None:
