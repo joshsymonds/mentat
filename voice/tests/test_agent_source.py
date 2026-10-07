@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 
 def scribe_commits_double():
-    return SimpleNamespace(close_line=Mock(), aclose=AsyncMock())
+    return SimpleNamespace(close_line=Mock(), session_started=Mock(), aclose=AsyncMock())
 
 
 def _stt_language_helper(tree):
@@ -1774,6 +1774,7 @@ class AgentSourceContractTest(unittest.TestCase):
         spanish = make_agent("conversation", "es")
         namespace["recover_stalled_stt"](spanish, 2.5)
         spanish._stt_provider.update_options.assert_called_once_with(secondary_languages=["es"])
+        spanish._scribe_commits.session_started.assert_called_once_with()
         spanish._tts_provider.update_options.assert_not_called()
         spanish.session.say.assert_called_once_with("Say it again?", allow_interruptions=True)
 
@@ -1785,11 +1786,13 @@ class AgentSourceContractTest(unittest.TestCase):
         english = make_agent("normal", "en", stt_fails=True)
         namespace["recover_stalled_stt"](english, 1.0)
         english._stt_provider.update_options.assert_called_once_with(secondary_languages=[])
+        english._scribe_commits.session_started.assert_not_called()
         english.session.say.assert_called_once()
 
         closed = make_agent("normal", "en", closed=True)
         namespace["recover_stalled_stt"](closed, 1.0)
         closed._stt_provider.update_options.assert_not_called()
+        closed._scribe_commits.session_started.assert_not_called()
         closed.session.say.assert_not_called()
 
     def test_stt_secondary_languages_keep_english_primary(self):
@@ -1966,6 +1969,7 @@ class AgentSourceContractTest(unittest.TestCase):
                 _voice_id="default-voice",
                 _default_voice="default-voice",
                 _stt_provider=Provider(),
+                _scribe_commits=scribe_commits_double(),
                 _tts_provider=tts or Provider(),
                 _voice_resolver=resolver,
                 _traced_voices=None,
@@ -1987,6 +1991,7 @@ class AgentSourceContractTest(unittest.TestCase):
             agent._tts_provider.calls,
             [{"voice_id": "library-spanish"}],
         )
+        agent._scribe_commits.session_started.assert_called_once_with()
 
         separate_call = make_agent()
         self.assertEqual(
@@ -2003,6 +2008,7 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertEqual(
             agent._tts_provider.calls[-1], {"voice_id": "default-voice"}
         )
+        self.assertEqual(agent._scribe_commits.session_started.call_count, 2)
 
         agent._voice_resolver.spanish_voice = "hand-edited-spanish"
         self.assertTrue(asyncio.run(namespace["_apply_voice_mode"](agent, spanish)))
@@ -2039,6 +2045,15 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         self.assertTrue(failed._voice_mode_note)
         self.assertLessEqual(len(failed._voice_mode_note), 160)
+        # The mode apply reconnected Scribe once and its rollback reconnected it again.
+        self.assertEqual(failed._scribe_commits.session_started.call_count, 2)
+
+        failing_stt = Provider(fail_on={"secondary_languages": ["es"]})
+        stt_failed = make_agent()
+        stt_failed._stt_provider = failing_stt
+        self.assertFalse(asyncio.run(namespace["_apply_voice_mode"](stt_failed, spanish)))
+        # The failed reconnect started no session; only the rollback's reconnect did.
+        stt_failed._scribe_commits.session_started.assert_called_once_with()
 
     def test_eval_voice_trace_records_switches_and_actual_reply_synthesis(self):
         agent_path = Path(__file__).resolve().parents[1] / "agent.py"
@@ -2141,6 +2156,7 @@ class AgentSourceContractTest(unittest.TestCase):
                 _voice_id="default-voice",
                 _default_voice="default-voice",
                 _stt_provider=Provider(),
+                _scribe_commits=scribe_commits_double(),
                 _tts_provider=tts_provider,
                 _voice_resolver=resolver,
                 _traced_voices={},
@@ -2847,6 +2863,7 @@ class AgentSourceContractTest(unittest.TestCase):
             _voice_resolver=Resolver(),
             _traced_voices=None,
             _stt_provider=Provider(),
+            _scribe_commits=scribe_commits_double(),
             _tts_provider=Provider(),
             _room_name="call-one",
             _mentat_url="http://127.0.0.1:8484",
@@ -3033,6 +3050,7 @@ class AgentSourceContractTest(unittest.TestCase):
             _voice_id="default-voice",
             _default_voice="default-voice",
             _stt_provider=Provider(),
+            _scribe_commits=scribe_commits_double(),
             _tts_provider=Provider(),
             _voice_resolver=Resolver(),
             _traced_voices=None,
@@ -3162,6 +3180,7 @@ class AgentSourceContractTest(unittest.TestCase):
             _default_voice="default-voice",
             _tts_provider=provider,
             _stt_provider=SimpleNamespace(update_options=Mock()),
+            _scribe_commits=scribe_commits_double(),
             _voice_resolver=SimpleNamespace(resolve=lambda _language, _default: "library-spanish"),
             _traced_voices=None,
             _voice_mode_note=None,
