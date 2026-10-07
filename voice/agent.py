@@ -31,6 +31,7 @@ from livekit.agents.voice import room_io
 from livekit.plugins import dtln, elevenlabs, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+from preconnect import PreConnectRoomIO
 from request import (
     END_CONVERSATION_TOOL,
     PRIVATE_CONTEXT_ENV,
@@ -1115,7 +1116,7 @@ async def entrypoint(ctx: JobContext) -> None:
         },
         transcription_timeout=STT_STALL_TIMEOUT,
     )
-    voice_room_io = room_io.RoomIO(
+    voice_room_io = PreConnectRoomIO(
         agent_session=session,
         room=ctx.room,
         options=room_io.RoomOptions(

@@ -335,7 +335,11 @@ class AgentSourceContractTest(unittest.TestCase):
         self.assertLess(context, folded)
         self.assertLess(folded, session_start)
         self.assertNotIn("room=ctx.room", entry[session_start:])
-        self.assertIn("room_io.RoomIO(", entry)
+        room_io_build = entry.split("voice_room_io = ", 1)[1].split("voice_room_io_closed", 1)[0]
+        self.assertTrue(room_io_build.startswith("PreConnectRoomIO("))
+        self.assertIn("noise_cancellation=dtln.noise_suppression()", room_io_build)
+        self.assertNotIn("room_io.RoomIO(", entry)
+        self.assertIn("from preconnect import PreConnectRoomIO", source)
         self.assertNotIn("auto_subscribe=", entry)
         self.assertNotIn("AutoSubscribe.SUBSCRIBE_NONE", entry)
 
