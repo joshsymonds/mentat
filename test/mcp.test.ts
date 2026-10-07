@@ -642,7 +642,7 @@ describe('POST /mcp', () => {
     const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`));
     await client.connect(transport as Transport);
 
-    for (const conversation of ['sms:12', 'Justin']) {
+    for (const conversation of ['sms:12', 'Morgan']) {
       const call = client.callTool({ name: 'read_conversation', arguments: { conversation } });
       const command = JSON.parse(await readLine(reader)) as Record<string, unknown>;
       expect(command).toMatchObject({ kind: 'messages', conversation });
