@@ -68,6 +68,54 @@ DEFAULT_VOICE_MODEL = "chatgpt/sol-fast"
 DEFAULT_CONCURRENCY = 8
 _SCHEDULER_DRAIN_TIMEOUT_SECONDS = 1.0
 _PROVIDER_CONCURRENCY_REFUSAL = re.compile(r"Too many concurrent requests", re.IGNORECASE)
+_LOG_RECORD_START = re.compile(
+    r"^ {0,20}(?:\d{2}:\d{2}:\d{2}\.\d{3}\s+)?(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+(\S+)\s*(.*)$"
+)
+_USER_STATE_CHANGE = re.compile(r"^user \w+ -> (\w+);")
+
+
+def _read_retained_voice_log(stack: Any) -> str | None:
+    """Read this run's retained worker log; None when it is unavailable."""
+    evidence_dir = getattr(stack, "retained_evidence_dir", None)
+    if not isinstance(evidence_dir, Path):
+        return None
+    try:
+        return (evidence_dir / "voice.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _log_records(log_text: str) -> list[tuple[str, str]]:
+    """Group Rich console lines into (logger, message) records."""
+    records: list[list[str]] = []
+    for line in log_text.splitlines():
+        start = _LOG_RECORD_START.match(line)
+        if start is not None:
+            records.append([start.group(1), start.group(2).strip()])
+        elif records and line.strip():
+            records[-1][1] = f"{records[-1][1]} {line.strip()}".strip()
+    return [(logger, message) for logger, message in records]
+
+
+def _phantom_final_count(stack: Any) -> int | None:
+    """Count finals logged with no user speech since the previous final."""
+    log_text = _read_retained_voice_log(stack)
+    if log_text is None:
+        return None
+    speaking = False
+    spoke_since_final = False
+    phantoms = 0
+    for logger, message in _log_records(log_text):
+        if logger == "mentat.voice":
+            change = _USER_STATE_CHANGE.match(message)
+            if change is not None:
+                speaking = change.group(1) == "speaking"
+                spoke_since_final = spoke_since_final or speaking
+        elif logger == "livekit.agents" and message.startswith("received user transcript"):
+            if not spoke_since_final:
+                phantoms += 1
+            spoke_since_final = speaking
+    return phantoms
 
 
 def _named_capacity_failures(error: BaseException | None = None, stack: Any = None) -> list[dict[str, str]]:
@@ -79,18 +127,13 @@ def _named_capacity_failures(error: BaseException | None = None, stack: Any = No
     elif isinstance(error, RemoteCommandError):
         for item in error.capacity_failures:
             found[(item["source"], item["cause"])] = item
-    evidence_dir = getattr(stack, "retained_evidence_dir", None)
-    if isinstance(evidence_dir, Path):
-        try:
-            voice_log = (evidence_dir / "voice.log").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            voice_log = ""
-        if _PROVIDER_CONCURRENCY_REFUSAL.search(voice_log):
-            item = {
-                "source": "provider session concurrency refusal",
-                "cause": "provider refused a session: Too many concurrent requests",
-            }
-            found[(item["source"], item["cause"])] = item
+    voice_log = _read_retained_voice_log(stack) or ""
+    if _PROVIDER_CONCURRENCY_REFUSAL.search(voice_log):
+        item = {
+            "source": "provider session concurrency refusal",
+            "cause": "provider refused a session: Too many concurrent requests",
+        }
+        found[(item["source"], item["cause"])] = item
     return [found[key] for key in sorted(found)]
 
 
@@ -3395,6 +3438,7 @@ def _run_local_eval(argv: list[str]) -> int:
                 "concurrency": active["concurrency"],
             }
             capacity_failures = _named_capacity_failures(capacity_error, stack)
+            phantom_finals = _phantom_final_count(stack)
             if isinstance(observation, dict):
                 reported_capacity = observation.get("capacity_failures", [])
                 if isinstance(reported_capacity, list):
@@ -3403,6 +3447,7 @@ def _run_local_eval(argv: list[str]) -> int:
                     )
                 observation["timing"] = timing
                 observation["capacity_failures"] = capacity_failures
+                observation["phantom_finals"] = phantom_finals
                 if failure is not None and "failure" not in observation:
                     observation["failure"] = failure
             elif failure is not None:
@@ -3410,6 +3455,7 @@ def _run_local_eval(argv: list[str]) -> int:
                     "failure": failure,
                     "turns": [],
                     "capacity_failures": capacity_failures,
+                    "phantom_finals": phantom_finals,
                     "timing": timing,
                 }
         return scenario_index, run_index, observation, failure

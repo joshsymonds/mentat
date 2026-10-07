@@ -5177,6 +5177,166 @@ class ScenarioObservationTests(unittest.TestCase):
         self.assertEqual(observation["room_closed_after"], 2)
 
 
+PHANTOM_LOG_NORMAL_TURN = """\
+    21:54:24.754 INFO     mentat.voice       user listening -> speaking;
+                                             deadline=None end_tool=False
+                                             user_speaking=True
+                                             agent_speaking=False
+                                         {"pid": 1340556, "job_id":
+"job-41df36af8cbd", "room": "android-e02cecee-0fbe-478c-a19f-d1857ac52375"}
+    21:54:27.403 INFO     mentat.voice       user speaking -> listening;
+                                             deadline=None end_tool=False
+                                             user_speaking=False
+                                             agent_speaking=False
+                                         {"pid": 1340556, "job_id":
+"job-41df36af8cbd", "room": "android-e02cecee-0fbe-478c-a19f-d1857ac52375"}
+    21:54:27.834 DEBUG    livekit.agents     received user transcript
+                                         {"lk.pii.user_transcript": "Set a timer
+for five minutes.", "language": "en", "transcript_delay": 1.0073318481445312,
+"pid": 1340556, "job_id": "job-41df36af8cbd", "room":
+"android-e02cecee-0fbe-478c-a19f-d1857ac52375"}
+    21:54:27.864 DEBUG    livekit.…_detector eou prediction
+                                           {"eou_probability":
+0.3322869539260864, "duration": 0.023}
+"""
+
+PHANTOM_LOG_FINAL = """\
+    21:54:28.100 DEBUG    livekit.agents     received user transcript
+                                         {"lk.pii.user_transcript": "Thanks.",
+"language": "en", "pid": 1340556}
+"""
+
+PHANTOM_LOG_SPEAKING = """\
+    21:54:30.000 INFO     mentat.voice       user listening -> speaking;
+                                             deadline=None end_tool=False
+                                             user_speaking=True
+                                         {"pid": 1340556}
+"""
+
+PHANTOM_LOG_QUIET = """\
+    21:54:31.000 INFO     mentat.voice       user speaking -> listening;
+                                             deadline=None end_tool=False
+                                             user_speaking=False
+                                         {"pid": 1340556}
+"""
+
+
+class PhantomFinalCountTests(unittest.TestCase):
+    def count(self, log_text):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "voice.log").write_text(log_text)
+            return runner._phantom_final_count(SimpleNamespace(retained_evidence_dir=Path(directory)))
+
+    def test_one_normal_turn_counts_zero(self):
+        self.assertEqual(self.count(PHANTOM_LOG_NORMAL_TURN), 0)
+
+    def test_two_finals_for_one_continuous_utterance_count_zero(self):
+        log = PHANTOM_LOG_SPEAKING + PHANTOM_LOG_FINAL + PHANTOM_LOG_FINAL + PHANTOM_LOG_QUIET
+        self.assertEqual(self.count(log), 0)
+
+    def test_closing_final_after_speech_ends_counts_zero(self):
+        log = PHANTOM_LOG_SPEAKING + PHANTOM_LOG_FINAL + PHANTOM_LOG_QUIET + PHANTOM_LOG_FINAL
+        self.assertEqual(self.count(log), 0)
+
+    def test_final_with_no_speech_since_the_previous_final_counts_once(self):
+        log = PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_FINAL
+        self.assertEqual(self.count(log), 1)
+
+    def test_final_before_any_speech_counts_once(self):
+        self.assertEqual(self.count(PHANTOM_LOG_FINAL), 1)
+
+    def test_each_speechless_final_counts_separately(self):
+        log = PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_FINAL + PHANTOM_LOG_FINAL
+        self.assertEqual(self.count(log), 2)
+
+    def test_speech_after_a_final_makes_the_next_final_real(self):
+        log = PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_SPEAKING + PHANTOM_LOG_QUIET + PHANTOM_LOG_FINAL
+        self.assertEqual(self.count(log), 0)
+
+    def test_wrapped_records_parse_when_the_message_itself_wraps(self):
+        log = (
+            "    21:54:24.754 INFO     mentat.voice       user listening ->\n"
+            "                                             speaking; deadline=None\n"
+            "                                             user_speaking=True\n"
+            "                 DEBUG    livekit.agents     received user\n"
+            "                                             transcript\n"
+            '                                         {"pid": 1}\n'
+        )
+        self.assertEqual(self.count(log), 0)
+
+    def test_continuation_lines_never_start_a_record(self):
+        log = (
+            "    21:54:24.754 INFO     mentat.voice       something else\n"
+            "                                             received user transcript\n"
+        )
+        self.assertEqual(self.count(log), 0)
+
+    def test_unavailable_log_is_none(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(runner._phantom_final_count(SimpleNamespace(retained_evidence_dir=Path(directory))))
+        self.assertIsNone(runner._phantom_final_count(SimpleNamespace(retained_evidence_dir=None)))
+        self.assertIsNone(runner._phantom_final_count(None))
+
+    def test_empty_log_counts_zero(self):
+        self.assertEqual(self.count(""), 0)
+
+    def run_observations(self, log_text, *, observe):
+        import io
+        from contextlib import redirect_stdout
+
+        scenario = SimpleNamespace(name="phantoms", turns=(), commands=(), place_query=None)
+        captured = {}
+        original_score = runner.score_observations
+
+        def capture_score(observations, *, required_runs):
+            captured["observations"] = observations
+            return original_score(observations, required_runs=required_runs)
+
+        retained = tempfile.TemporaryDirectory()
+        self.addCleanup(retained.cleanup)
+        evidence = Path(retained.name)
+        if log_text is not None:
+            (evidence / "voice.log").write_text(log_text)
+
+        class Batch:
+            @contextmanager
+            def run(self, run_id):
+                yield SimpleNamespace(run_id=run_id, retained_evidence_dir=evidence if log_text is not None else None)
+
+        @contextmanager
+        def dev_stack(**_kwargs):
+            yield Batch()
+
+        with (
+            patch.object(runner, "SCENARIOS", (scenario,)),
+            patch.object(runner, "DevStack", side_effect=dev_stack),
+            patch.object(runner, "observe_scenario", side_effect=observe),
+            patch.object(runner, "score_observations", side_effect=capture_score),
+            redirect_stdout(io.StringIO()),
+        ):
+            runner._run_local_eval(["--live", "--runs", "1"])
+        return captured["observations"]["cases"][0]["runs"][0]
+
+    def test_run_observation_carries_the_count_from_the_retained_log(self):
+        run = self.run_observations(
+            PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_FINAL, observe=lambda _s, _k: {"turns": []}
+        )
+        self.assertEqual(run["phantom_finals"], 1)
+
+    def test_run_observation_without_a_retained_log_carries_none(self):
+        run = self.run_observations(None, observe=lambda _s, _k: {"turns": []})
+        self.assertIn("phantom_finals", run)
+        self.assertIsNone(run["phantom_finals"])
+
+    def test_failure_observation_carries_the_count(self):
+        def fail(_scenario, _stack):
+            raise RuntimeError("scenario broke")
+
+        run = self.run_observations(PHANTOM_LOG_FINAL, observe=fail)
+        self.assertIn("scenario execution failed", run["failure"])
+        self.assertEqual(run["phantom_finals"], 1)
+
+
 class LocalEvalCliTests(unittest.TestCase):
     def test_retained_provider_concurrency_refusal_is_counted_once_for_its_run(self):
         import io
