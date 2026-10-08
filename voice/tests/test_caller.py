@@ -1242,7 +1242,8 @@ esac
 
 def echo_frame(samples, sample_rate=caller.RATE, channels=1):
     return SimpleNamespace(
-        data=struct.pack(f"<{len(samples)}h", *samples),
+        # rtc.AudioFrame.data is an int16 memoryview, not bytes.
+        data=memoryview(struct.pack(f"<{len(samples)}h", *samples)).cast("h"),
         samples_per_channel=len(samples) // channels,
         sample_rate=sample_rate,
         num_channels=channels,

@@ -218,7 +218,8 @@ def _mono_rate_samples(frame: Any) -> list[int]:
     else:
         raise ValueError("agent audio must be 24 kHz or 48 kHz")
     channels = frame.num_channels
-    interleaved = struct.unpack(f"<{len(frame.data) // 2}h", bytes(frame.data))
+    data = bytes(frame.data)
+    interleaved = struct.unpack(f"<{len(data) // 2}h", data)
     mono = [
         sum(interleaved[offset : offset + channels]) // channels
         for offset in range(0, len(interleaved), channels)
