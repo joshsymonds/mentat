@@ -5,15 +5,9 @@ few LiveKit pieces it touches; where livekit is installed the real ones are used
 """
 
 import asyncio
-import gzip
 import importlib
 import importlib.util
-import math
-import random
-import re
-import struct
 import sys
-import threading
 import types
 import unittest
 from array import array
@@ -27,8 +21,6 @@ VOICE_DIR = Path(__file__).resolve().parent.parent
 LIVE_RATE = 24000
 BUFFER_RATE = 48000
 FRAME_SECONDS = 0.05
-BUFFER_END = 1.0
-TOLERANCE = LIVE_RATE // 1000  # a millisecond of live samples
 
 
 def _install_livekit_stand_ins():
@@ -201,104 +193,14 @@ else:
 
 # -- synthetic audio -------------------------------------------------------------------------
 
-def syllables(seed, start, end):
-    """A run of voiced syllables as (start, duration, pitch, amplitude) between two times."""
-    rng = random.Random(seed)
-    out, now = [], start
-    while True:
-        now += rng.uniform(0.02, 0.05)
-        length = rng.uniform(0.12, 0.2)
-        if now + length > end:
-            return out
-        out.append((now, length, rng.uniform(95, 220), rng.uniform(3000, 6000)))
-        now += length
+def ramp(seconds, rate=LIVE_RATE):
+    """Int16 samples that are each their own index, so any kept or dropped span is visible."""
+    return array("h", ((index % 65536) - 32768 for index in range(round(seconds * rate))))
 
 
-def voice_at(plan, moment, pitch_scale=1.0, phase=0.0):
-    for start, length, pitch, amplitude in plan:
-        if start <= moment < start + length:
-            into = moment - start
-            envelope = math.sin(math.pi * into / length) ** 2
-            glide = 1 + 0.03 * math.sin(2 * math.pi * 5 * into)
-            return amplitude * envelope * sum(
-                math.sin(2 * math.pi * harmonic * pitch * pitch_scale * into * glide + phase + harmonic) / harmonic
-                for harmonic in range(1, 7)
-            )
-    return 0.0
-
-
-def record(plan, begin, end, rate, *, seed, noise=0.0, gain=1.0, pitch_scale=1.0, phase=0.0):
-    """Int16 samples of the plan between two times, with a quiet room and optional codec noise."""
-    rng = random.Random(seed)
-    count = round((end - begin) * rate)
-    samples = array("h")
-    for index in range(count):
-        value = gain * voice_at(plan, begin + index / rate, pitch_scale, phase)
-        value += rng.gauss(0, 40 + noise)
-        samples.append(max(-32768, min(32767, round(value))))
-    return samples
-
-
-FIXTURE = VOICE_DIR / "tests" / "fixtures" / "preconnect-eval-line.pcm.gz"
-EVAL_TOLERANCE = LIVE_RATE // 100  # ten milliseconds of live samples
-# The fixture is four back-to-back sections of the eval's line at 24 kHz mono int16: the phone's
-# buffer (the rendered line, 0.0 to 1.0 s), a live head that is an Opus copy of the line from
-# 0.3 s, the same copy after 0.3 s of silence, and another TTS rendering of the same sentence.
-EVAL_SECTIONS = {
-    "buffer": (0, 24000),
-    "copy": (24000, 48000),
-    "copy_after_silence": (48000, 79200),
-    "other_rendering": (79200, 103200),
-}
-
-
-def eval_line(section):
-    """One section of the eval's recorded line, as int16 samples at 24 kHz."""
-    with gzip.open(FIXTURE) as recording:
-        raw = recording.read()
-    samples = struct.unpack(f"<{len(raw) // 2}h", raw)
-    first, last = EVAL_SECTIONS[section]
-    return array("h", samples[first:last])
-
-
-def eval_case(live_section):
-    """The eval's line as the phone sends it: the buffer repeated up to 48 kHz, the live head at 24 kHz."""
-    doubled = array("h", (value for value in eval_line("buffer") for _ in (0, 1)))
-    return SimpleNamespace(
-        buffer=frames_of(doubled, BUFFER_RATE),
-        live=frames_of(eval_line(live_section), LIVE_RATE),
-    )
-
-
-STRETCHED_FIXTURE = VOICE_DIR / "tests" / "fixtures" / "preconnect-eval-stretched.pcm.gz"
-# Live heads whose pauses the receiver's jitter buffer stretched: each buffer is the rendered line
-# and each live head is that run's live head rebuilt from its own speech-to-text input.
-STRETCHED_SECTIONS = {
-    "buffer_4w7v": (0, 24000),
-    "live_4w7v": (24000, 62400),
-    "buffer_7myd": (62400, 86400),
-    "live_7myd": (86400, 124800),
-    "buffer_pc9": (124800, 148800),
-    "live_pc9": (148800, 187200),
-    "other_7myd": (187200, 225600),
-}
-
-
-def stretched_case(live_section, buffer_section):
-    """A stretched live head against its run's buffer, the buffer sent at 48 kHz as the phone does."""
-    with gzip.open(STRETCHED_FIXTURE) as recording:
-        raw = recording.read()
-    samples = struct.unpack(f"<{len(raw) // 2}h", raw)
-
-    def section(name):
-        first, last = STRETCHED_SECTIONS[name]
-        return array("h", samples[first:last])
-
-    doubled = array("h", (value for value in section(buffer_section) for _ in (0, 1)))
-    return SimpleNamespace(
-        buffer=frames_of(doubled, BUFFER_RATE),
-        live=frames_of(section(live_section), LIVE_RATE),
-    )
+def silence(seconds, rate=BUFFER_RATE):
+    """Frames of silence, as the phone's pre-connect buffer is sent."""
+    return frames_of(array("h", bytes(2 * round(seconds * rate))), rate)
 
 
 def frames_of(samples, rate):
@@ -314,23 +216,6 @@ def samples_of(frames):
     for frame in frames:
         out.extend(array("h", bytes(frame.data)))
     return out
-
-
-class Overlap:
-    """One speaker: the phone buffer ends at BUFFER_END, the live track starts overlap seconds before."""
-
-    def __init__(self, plan, *, overlap, live_seconds=2.0, buffer_rate=BUFFER_RATE):
-        self.overlap = overlap
-        live_begin = BUFFER_END - overlap
-        self.buffer = frames_of(record(plan, 0.0, BUFFER_END, buffer_rate, seed=1), buffer_rate)
-        self.live = frames_of(
-            record(plan, live_begin, live_begin + live_seconds, LIVE_RATE, seed=2, noise=150, gain=0.96),
-            LIVE_RATE,
-        )
-
-    @property
-    def repeated(self):
-        return round(self.overlap * LIVE_RATE)
 
 
 # -- harness ---------------------------------------------------------------------------------
@@ -362,23 +247,68 @@ def recording_canceller():
 
 
 class ScriptedStream:
-    """Stands in for rtc.AudioStream: yields the frames, then waits like an open track."""
+    """Stands in for rtc.AudioStream: yields the frames, then ends."""
 
-    def __init__(self, frames, processor=None, ends=True):
+    def __init__(self, frames, processor=None):
         # rtc runs a processor handed to it on every frame as it arrives, before anyone reads it.
         self._frames = deque(processor._process(frame) if processor else frame for frame in frames)
-        self._ends = ends
         self.closed = False
 
     async def __anext__(self):
         if self._frames:
             return rtc.AudioFrameEvent(self._frames.popleft())
-        if self._ends:
-            raise StopAsyncIteration
-        await asyncio.Event().wait()
+        raise StopAsyncIteration
 
     async def aclose(self):
         self.closed = True
+
+
+class GatedStream:
+    """Stands in for rtc.AudioStream: frames reach it when the test pushes them, and it ends when told."""
+
+    def __init__(self):
+        self._frames = deque()
+        self._changed = asyncio.Event()
+        self._ended = False
+        self.closed = False
+
+    def push(self, frames):
+        self._frames.extend(frames)
+        self._changed.set()
+
+    def end(self):
+        self._ended = True
+        self._changed.set()
+
+    async def __anext__(self):
+        while not self._frames:
+            if self._ended:
+                raise StopAsyncIteration
+            self._changed.clear()
+            await self._changed.wait()
+        return rtc.AudioFrameEvent(self._frames.popleft())
+
+    async def aclose(self):
+        self.closed = True
+        self.end()
+
+
+class FakeTime:
+    """Stands in for the time module in preconnect, so tests choose when each frame is heard."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.reads = 0
+
+    def monotonic(self):
+        self.reads += 1
+        return self.now
+
+
+async def settle():
+    """Lets the input's stamping task take whatever the stream has been given."""
+    for _ in range(3):
+        await asyncio.sleep(0)
 
 
 async def drain(live):
@@ -386,44 +316,6 @@ async def drain(live):
     async for event in live:
         out.append(event.frame)
     return out
-
-
-async def dedupe(case, canceller=None):
-    """The live frames that come out for a buffer and a live track, with the buffer processed first."""
-    canceller = canceller or recording_canceller()
-    live = preconnect._LiveAudio(
-        ScriptedStream(case.live), sample_rate=LIVE_RATE, cancel=canceller._process
-    )
-    list(live.process_buffer(case.buffer))
-    return await drain(live)
-
-
-def kept_after_skipping(case, out):
-    """How many live samples were skipped, checking the rest is the live track unchanged."""
-    live = samples_of(case.live)
-    kept = samples_of(out)
-    skipped = len(live) - len(kept)
-    assert kept == live[skipped:], "the kept audio is not the tail of the live track"
-    return skipped
-
-
-MISS = re.compile(
-    r"no repeat of the (?P<buffer>[\d.]+) s pre-connect buffer in the (?P<held>[\d.]+) s of live audio "
-    r"held: best score (?P<score>-?[\d.]+), live onset (?P<onset>[\d.]+) s, "
-    r"buffer position (?P<position>[\d.]+) s"
-)
-
-
-def removed_span(case, out):
-    """The live samples the output lacks, as (begin, end), checking nothing else changed."""
-    live = samples_of(case.live)
-    kept = samples_of(out)
-    removed = len(live) - len(kept)
-    begin = next(
-        (at for at, (heard, said) in enumerate(zip(live, kept)) if heard != said), len(kept)
-    )
-    assert kept[begin:] == live[begin + removed:], "the output is not the live track minus one span"
-    return begin, begin + removed
 
 
 class FakeHandler:
@@ -478,232 +370,164 @@ class AsyncTest(unittest.IsolatedAsyncioTestCase):
 
 # -- tests -----------------------------------------------------------------------------------
 
-class PreConnectDedupeTest(AsyncTest):
-    async def test_buffer_and_overlapping_live_head_yield_one_copy_of_the_overlap(self):
-        case = Overlap(syllables(7, 0.0, 3.0), overlap=0.7)
+class LiveAudioTest(AsyncTest):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.clock = FakeTime()
+        clock = mock.patch.object(preconnect, "time", self.clock)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.canceller = recording_canceller()
+        self.stream = GatedStream()
+        self.live = preconnect._LiveAudio(
+            self.stream, sample_rate=LIVE_RATE, cancel=self.canceller._process
+        )
 
-        skipped = kept_after_skipping(case, await dedupe(case))
+    async def test_live_frames_heard_before_the_buffer_completed_are_dropped_and_the_rest_pass(self):
+        live = ramp(2.0)
+        frames = frames_of(live, LIVE_RATE)
+        self.stream.push(frames[:10])  # 0.5 s heard from t=0
+        await settle()
+        self.clock.now = 0.7
+        list(self.live.process_buffer(silence(1.0)))
+        self.stream.push(frames[10:])
+        self.stream.end()
 
-        self.assertAlmostEqual(skipped, case.repeated, delta=TOLERANCE)
+        out = await drain(self.live)
 
-    async def test_a_short_overlap_found_only_once_the_head_is_long_enough_is_still_skipped(self):
-        case = Overlap(syllables(11, 0.0, 3.0), overlap=0.3)
+        self.assertEqual(samples_of(out), live[round(0.5 * LIVE_RATE):])
 
-        skipped = kept_after_skipping(case, await dedupe(case))
+    async def test_a_frame_straddling_the_drop_bound_is_trimmed_to_the_samples_past_it(self):
+        live = ramp(2.0)
+        frames = frames_of(live, LIVE_RATE)
+        self.stream.push(frames[:15])  # 0.75 s heard from t=0; the buffer is 0.73 s, so frame 14 straddles
+        await settle()
+        self.clock.now = 0.8
+        list(self.live.process_buffer(silence(0.73)))
+        self.stream.push(frames[15:])
+        self.stream.end()
 
-        self.assertAlmostEqual(skipped, case.repeated, delta=TOLERANCE)
+        out = await drain(self.live)
 
-    async def test_no_overlap_keeps_every_sample(self):
-        plan = syllables(7, 0.0, 3.0)
-        case = Overlap(plan, overlap=-0.2)  # the live track starts after the buffer ended
+        self.assertEqual(samples_of(out), live[round(0.73 * LIVE_RATE):])
 
-        self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+    async def test_no_more_than_the_buffer_length_is_dropped(self):
+        live = ramp(2.0)
+        self.stream.push(frames_of(live, LIVE_RATE))  # all 2 s heard from t=0
+        await settle()
+        self.clock.now = 1.0
+        list(self.live.process_buffer(silence(0.5)))
+        self.stream.end()
 
-    async def test_no_overlap_logs_one_miss_with_the_held_length_and_the_best_fit(self):
-        case = Overlap(syllables(7, 0.0, 3.0), overlap=-0.2)
+        out = await drain(self.live)
+
+        self.assertEqual(samples_of(out), live[round(0.5 * LIVE_RATE):])
+
+    async def test_live_frames_heard_after_the_buffer_completed_all_pass(self):
+        live = ramp(1.0)
+        self.clock.now = 0.0
+        list(self.live.process_buffer(silence(1.0)))
+        self.clock.now = 0.5
+        self.stream.push(frames_of(live, LIVE_RATE))
+        self.stream.end()
+
+        out = await drain(self.live)
+
+        self.assertEqual(samples_of(out), live)
+
+    async def test_an_empty_buffer_drops_nothing(self):
+        live = ramp(1.0)
+        self.stream.push(frames_of(live, LIVE_RATE))
+        await settle()
+        self.clock.now = 0.5
+        list(self.live.process_buffer([]))
+        self.stream.end()
+
+        out = await drain(self.live)
+
+        self.assertEqual(samples_of(out), live)
+
+    async def test_without_a_buffer_live_audio_flows_unchanged_and_unheld(self):
+        frames = frames_of(ramp(1.0), LIVE_RATE)
+        self.stream.push(frames)  # not ended: the track stays open
+        await settle()
+
+        first = await asyncio.wait_for(anext(self.live), timeout=1)
+
+        self.assertIs(first.frame, frames[0])
+        self.assertEqual(len(self.canceller.seen), 1)
+
+    async def test_the_drop_logs_once_with_the_seconds_dropped_and_the_arrival_times(self):
+        self.stream.push(frames_of(ramp(0.5), LIVE_RATE))  # first live frame heard at t=0
+        await settle()
+        self.clock.now = 0.7
 
         with self.assertLogs("mentat.voice", level="INFO") as logs:
-            self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
-
-        self.assertMiss(logs, held=1.5, buffer=BUFFER_END)
-
-    async def test_a_silent_head_logs_that_no_onset_was_found(self):
-        case = Overlap(syllables(7, 0.0, 3.0), overlap=0.7)
-        case.live = frames_of(array("h", bytes(2 * 2 * LIVE_RATE)), LIVE_RATE)
-
-        with self.assertLogs("mentat.voice", level="INFO") as logs:
-            self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+            list(self.live.process_buffer(silence(1.0)))
 
         [record] = logs.records
         self.assertEqual(record.levelname, "INFO")
-        self.assertRegex(record.getMessage(), r"^no onset found in the 1\.50 s of live audio held ")
-        self.assertNotIn("score", record.getMessage())
-
-    async def test_a_matched_copy_logs_only_the_dropped_samples(self):
-        case = Overlap(syllables(7, 0.0, 3.0), overlap=0.7)
-
-        with self.assertLogs("mentat.voice", level="INFO") as logs:
-            skipped = kept_after_skipping(case, await dedupe(case))
-
-        [record] = logs.records
-        dropped = re.fullmatch(r"dropped (\d+) live samples repeating the pre-connect buffer", record.getMessage())
-        self.assertIsNotNone(dropped, record.getMessage())
-        self.assertEqual(int(dropped[1]), skipped)
-
-    def assertMiss(self, logs, *, held, buffer):
-        """Exactly one INFO record on mentat.voice, saying the head was held and matched to nothing."""
-        [record] = logs.records
-        self.assertEqual(record.levelname, "INFO")
-        miss = MISS.fullmatch(record.getMessage())
-        self.assertIsNotNone(miss, record.getMessage())
-        self.assertAlmostEqual(float(miss["held"]), held, delta=0.01)
-        self.assertAlmostEqual(float(miss["buffer"]), buffer, delta=0.01)
-        self.assertLess(float(miss["score"]), preconnect.MATCH_SCORE)
-        self.assertLess(float(miss["onset"]), float(miss["held"]))
-        self.assertLessEqual(float(miss["position"]), float(miss["buffer"]))
-
-    async def test_buffer_with_a_silent_tail_still_dedupes_the_earlier_speech(self):
-        speech = syllables(5, 0.0, 0.62) + syllables(6, 1.1, 3.0)  # nothing is said from 0.62 to 1.1
-        case = Overlap(speech, overlap=0.85)
-
-        skipped = kept_after_skipping(case, await dedupe(case))
-
-        self.assertAlmostEqual(skipped, case.repeated, delta=TOLERANCE)
-
-    async def test_a_word_said_again_after_the_copy_is_kept(self):
-        word = syllables(9, 0.3, 0.9)
-        said_again = [(start + 0.9, length, pitch, amplitude) for start, length, pitch, amplitude in word]
-        case = Overlap(word + said_again, overlap=0.65)
-        live_begin = BUFFER_END - 0.65
-        again = record(word, 0.3, 0.9, LIVE_RATE, seed=3, noise=150, gain=0.96, pitch_scale=1.05, phase=2.0)
-        case.live = frames_of(
-            record(word, live_begin, BUFFER_END, LIVE_RATE, seed=2, noise=150, gain=0.96)
-            + record([], 0.0, 0.2, LIVE_RATE, seed=4)
-            + again,
-            LIVE_RATE,
+        self.assertRegex(
+            record.getMessage(),
+            r"^dropped 0\.50 s of live audio .*first live frame at 0\.000, buffer completed at 0\.700$",
         )
 
-        skipped = kept_after_skipping(case, await dedupe(case))
+    async def test_aclose_stops_the_stamping_and_closes_the_stream(self):
+        self.stream.push(frames_of(ramp(0.5), LIVE_RATE))
+        await settle()
+        stamped = self.clock.reads
+        self.assertGreater(stamped, 0)
 
-        self.assertAlmostEqual(skipped, case.repeated, delta=TOLERANCE)
+        await self.live.aclose()
+        self.stream.push(frames_of(ramp(0.5), LIVE_RATE))
+        await settle()
 
-    async def test_similar_speech_that_is_not_a_copy_is_kept(self):
-        word = syllables(9, 0.3, 0.9)
-        case = Overlap(word, overlap=-0.1)
-        case.live = frames_of(
-            record(word, 0.3, 0.9, LIVE_RATE, seed=3, noise=150, gain=0.96, pitch_scale=1.05, phase=2.0)
-            + record([], 0.0, 1.0, LIVE_RATE, seed=4),
-            LIVE_RATE,
-        )
+        self.assertTrue(self.stream.closed)
+        self.assertEqual(self.clock.reads, stamped)
 
-        self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+    async def test_the_canceller_sees_the_buffer_then_each_kept_live_frame_once(self):
+        buffer = silence(1.0)
+        frames = frames_of(ramp(2.0), LIVE_RATE)
+        self.stream.push(frames[:10])  # 0.5 s heard from t=0, dropped
+        await settle()
+        self.clock.now = 0.7
+        list(self.live.process_buffer(buffer))
+        self.stream.push(frames[10:])
+        self.stream.end()
 
-    async def test_the_opus_copy_of_the_eval_line_is_skipped_from_its_start(self):
-        case = eval_case("copy")
+        await drain(self.live)
 
-        skipped = kept_after_skipping(case, await dedupe(case))
-
-        self.assertAlmostEqual(skipped, round(0.7 * LIVE_RATE), delta=EVAL_TOLERANCE)
-
-    async def test_the_opus_copy_after_a_quiet_lead_keeps_the_lead_and_skips_the_copy(self):
-        case = eval_case("copy_after_silence")
-
-        begin, end = removed_span(case, await dedupe(case))
-
-        self.assertGreaterEqual(begin, 0.28 * LIVE_RATE)
-        self.assertLessEqual(begin, 0.30 * LIVE_RATE)
-        self.assertAlmostEqual(end, LIVE_RATE, delta=EVAL_TOLERANCE)
-
-    async def test_another_rendering_of_the_eval_line_is_kept_whole(self):
-        case = eval_case("other_rendering")
-
-        with self.assertLogs("mentat.voice", level="INFO") as logs:
-            self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
-
-        self.assertMiss(logs, held=1.0, buffer=1.0)
-
-    async def test_another_rendering_after_a_quiet_lead_is_kept_whole(self):
-        case = eval_case("other_rendering")
-        silence = array("h", bytes(round(0.3 * LIVE_RATE) * 2))
-        case.live = frames_of(silence + eval_line("other_rendering"), LIVE_RATE)
-
-        self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
-
-    async def assertStretchedRepeatSkipped(self, live_section, buffer_section, first_voice, repeat_end):
-        """The live head loses one span from just before its first voiced sample to the buffer's end."""
-        case = stretched_case(live_section, buffer_section)
-
-        begin, end = removed_span(case, await dedupe(case))
-
-        self.assertGreaterEqual(begin, first_voice - EVAL_TOLERANCE)
-        self.assertLessEqual(begin, first_voice)
-        self.assertAlmostEqual(end, repeat_end * LIVE_RATE, delta=EVAL_TOLERANCE)
-
-    async def test_stretched_copy_after_a_lead_skips_its_repeat_to_the_buffer_end(self):
-        await self.assertStretchedRepeatSkipped("live_4w7v", "buffer_4w7v", 0.110 * LIVE_RATE, 0.90)
-
-    async def test_stretched_copy_of_a_slower_speaker_skips_its_repeat_past_the_buffer(self):
-        await self.assertStretchedRepeatSkipped("live_7myd", "buffer_7myd", 0.230 * LIVE_RATE, 1.29)
-
-    async def test_stretched_copy_with_a_longer_lead_skips_its_repeat_past_the_buffer(self):
-        await self.assertStretchedRepeatSkipped("live_pc9", "buffer_pc9", 0.310 * LIVE_RATE, 1.24)
-
-    async def test_a_repeat_stalled_after_its_first_word_waits_for_the_rest_of_the_copy(self):
-        speech = syllables(5, 0.0, 0.5) + syllables(6, 0.75, 1.75)  # a pause from 0.5 to 0.75
-        case = Overlap(speech, overlap=0.7)
-        stall = array("h", bytes(round(0.3 * LIVE_RATE) * 2))  # the jitter buffer adds 0.3 s of silence
-        case.live = frames_of(
-            record(speech, 0.3, 0.75, LIVE_RATE, seed=2, gain=0.96)
-            + stall
-            + record(speech, 0.75, 1.75, LIVE_RATE, seed=3, gain=0.96),
-            LIVE_RATE,
-        )
-
-        begin, end = removed_span(case, await dedupe(case))
-
-        self.assertLessEqual(begin, EVAL_TOLERANCE)
-        self.assertAlmostEqual(end, LIVE_RATE, delta=EVAL_TOLERANCE)
-
-    async def test_another_rendering_of_a_stretched_line_is_kept_whole(self):
-        case = stretched_case("other_7myd", "buffer_7myd")
-
-        out = await dedupe(case)
-
-        self.assertEqual(kept_after_skipping(case, out), 0)
         self.assertEqual(
-            [frame.samples_per_channel for frame in out],
-            [frame.samples_per_channel for frame in case.live],
+            [id(frame) for frame in self.canceller.seen],
+            [id(frame) for frame in buffer + frames[10:]],
         )
 
-    async def test_matching_runs_off_the_event_loop(self):
-        case = Overlap(syllables(7, 0.0, 3.0), overlap=0.7)
-        threads = []
-        real = preconnect._repeated_samples
 
-        def noting(*arguments):
-            threads.append(threading.current_thread())
-            return real(*arguments)
-
-        with mock.patch.object(preconnect, "_repeated_samples", noting):
-            await dedupe(case)
-
-        self.assertTrue(threads)
-        self.assertNotIn(threading.current_thread(), threads)
-
-    async def test_the_canceller_sees_every_buffer_frame_then_every_live_frame(self):
-        case = Overlap(syllables(7, 0.0, 3.0), overlap=0.7, buffer_rate=LIVE_RATE)
+class PreConnectDedupeTest(AsyncTest):
+    async def test_the_input_hands_rtc_no_canceller_and_the_canceller_sees_buffer_then_live_audio(self):
+        buffer = silence(1.0, LIVE_RATE)
+        live = frames_of(ramp(2.0), LIVE_RATE)
         canceller = recording_canceller()
 
-        _, built = await run_input(case.live, case.buffer, canceller)
+        forwarded, built = await run_input(live, buffer, canceller)
 
         # rtc must not be handed the canceller: it would run it on live frames while the buffer waits.
         self.assertIsNone(built["processor"])
-        buffer_ids = {id(frame) for frame in case.buffer}
-        shown = ["buffer" if id(frame) in buffer_ids else "live" for frame in canceller.seen]
-        live_shown = shown.count("live")
-        self.assertEqual(shown, ["buffer"] * len(case.buffer) + ["live"] * live_shown)
-        self.assertGreater(live_shown, 0)
-        self.assertLess(live_shown, len(case.live), "the repeated head should never reach the canceller")
-
-    async def test_without_a_preconnect_buffer_live_audio_flows_unchanged_and_unheld(self):
-        case = Overlap(syllables(7, 0.0, 3.0), overlap=0.7)
-        canceller = recording_canceller()
-        live = preconnect._LiveAudio(
-            ScriptedStream(case.live, ends=False), sample_rate=LIVE_RATE, cancel=canceller._process
+        self.assertEqual([id(frame) for frame in forwarded[:len(buffer)]], [id(frame) for frame in buffer])
+        buffer_ids = {id(frame) for frame in buffer}
+        shown = [id(frame) in buffer_ids for frame in canceller.seen]
+        self.assertEqual(shown, [True] * len(buffer) + [False] * (len(shown) - len(buffer)))
+        self.assertEqual(
+            samples_of(canceller.seen[len(buffer):]), samples_of(forwarded[len(buffer):-1])
         )
 
-        first = await asyncio.wait_for(anext(live), timeout=1)
-
-        self.assertIs(first.frame, case.live[0])
-        self.assertEqual(len(canceller.seen), 1)
-
     async def test_a_timed_out_buffer_leaves_live_audio_untouched(self):
-        case = Overlap(syllables(7, 0.0, 3.0), overlap=0.7)
+        live = frames_of(ramp(2.0), LIVE_RATE)
         canceller = recording_canceller()
 
-        forwarded, _ = await run_input(case.live, case.buffer, canceller, buffered=False)
+        forwarded, _ = await run_input(live, silence(1.0), canceller, buffered=False)
 
-        self.assertEqual(samples_of(forwarded[:-1]), samples_of(case.live))
+        self.assertEqual(samples_of(forwarded[:-1]), samples_of(live))
 
 
 class PreConnectRoomIOTest(AsyncTest):
