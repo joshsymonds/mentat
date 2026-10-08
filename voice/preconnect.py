@@ -67,15 +67,18 @@ def _mono(frames: Iterable[Any]) -> array[int]:
 
 
 def _decimate(samples: Sequence[int], rate: int) -> list[float]:
-    """Block averages of the samples at COMMON_RATE, with the mean removed."""
+    """Differenced block averages of the samples at COMMON_RATE.
+
+    Each block is taken relative to the one before it. That weights down the low frequencies,
+    where the Opus copy drifts in phase, and the first block is taken against silence.
+    """
     size = rate / COMMON_RATE
     totals = list(accumulate(samples, initial=0))
     edges = [round(block * size) for block in range(int(len(samples) / size) + 1)]
     blocks = [
         (totals[end] - totals[start]) / (end - start) for start, end in zip(edges, edges[1:])
     ]
-    mean = sum(blocks) / len(blocks) if blocks else 0.0
-    return [value - mean for value in blocks]
+    return [value - before for before, value in zip([0.0, *blocks], blocks)]
 
 
 def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> int | None:
