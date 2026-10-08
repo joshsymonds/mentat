@@ -900,6 +900,70 @@ class ScoringTests(unittest.TestCase):
                 self.assertNotIn("invalid partial capture failure metadata", failures)
                 self.assertNotIn("product failure", failures)
 
+    def test_preflight_transcription_rejection_is_line_indexed_infrastructure_failure(self):
+        message = "scripted speech transcription rejected for line 1 (HTTP 401; quota_exceeded)"
+        result = score_observations({
+            "cases": [{
+                "name": "sms-say-back-yes",
+                "runs": [{
+                    "turns": [],
+                    "failure": {
+                        "turn": 1,
+                        "message": message,
+                        "line": 1,
+                        "retry_count": 0,
+                    },
+                    "product_failures": [],
+                }],
+            }]
+        }, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["cases"][0]["capture_failures"], [{
+            "run": 1,
+            "turn": 1,
+            "message": message,
+            "line": 1,
+            "retry_count": 0,
+        }])
+        failures = " ".join(result["failures"])
+        self.assertIn(f"run 1 turn 1: eval infrastructure failure: {message}", failures)
+        self.assertNotIn("invalid partial capture failure metadata", failures)
+        self.assertNotIn("product failure", failures)
+
+    def test_reply_clip_transcription_capacity_failure_is_named_capture_failure(self):
+        message = "Transcription rejected reply clip (HTTP 429; concurrent_limit_exceeded)"
+        capacity_failure = {
+            "source": "audio transcription",
+            "cause": "ElevenLabs concurrent_limit_exceeded",
+        }
+        result = score_observations({
+            "cases": [{
+                "name": "timer",
+                "runs": [{
+                    "turns": [],
+                    "failure": {
+                        "turn": 1,
+                        "message": message,
+                        "speech_started_at": 1_700_000_000.0,
+                        "capacity_failure": capacity_failure,
+                    },
+                    "product_failures": [],
+                }],
+            }]
+        }, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["cases"][0]["capture_failures"], [{
+            "run": 1,
+            "turn": 1,
+            "message": message,
+        }])
+        failures = " ".join(result["failures"])
+        self.assertIn(f"timer run 1 turn 1: capture failed: {message}", failures)
+        self.assertNotIn("eval infrastructure failure", failures)
+        self.assertNotIn("invalid partial capture failure metadata", failures)
+
     def test_first_turn_capture_failure_is_named_with_no_completed_turns(self):
         observation = {
             "cases": [{
@@ -975,6 +1039,65 @@ class ScoringTests(unittest.TestCase):
                 }
 
                 result = score_observations(observation, required_runs=1)
+
+                self.assertFalse(result["passed"])
+                self.assertIn("invalid partial capture failure", " ".join(result["failures"]))
+
+    def test_malformed_capacity_failure_metadata_fails_closed(self):
+        reply_clip = "Transcription rejected reply clip (HTTP 429; concurrent_limit_exceeded)"
+        malformed_failures = (
+            {
+                "turn": 1,
+                "message": reply_clip,
+                "speech_started_at": 100.0,
+                "capacity_failure": {"source": "audio transcription"},
+            },
+            {
+                "turn": 1,
+                "message": reply_clip,
+                "speech_started_at": 100.0,
+                "capacity_failure": {"source": "", "cause": "ElevenLabs concurrent_limit_exceeded"},
+            },
+            {
+                "turn": 1,
+                "message": reply_clip,
+                "speech_started_at": 100.0,
+                "capacity_failure": {"source": "audio transcription", "cause": "  "},
+            },
+            {
+                "turn": 1,
+                "message": reply_clip,
+                "speech_started_at": 100.0,
+                "capacity_failure": "concurrent_limit_exceeded",
+            },
+            {
+                "turn": 1,
+                "message": NO_ANSWER_FAILURE,
+                "speech_started_at": 100.0,
+                "capacity_failure": {
+                    "source": "audio transcription",
+                    "cause": "ElevenLabs concurrent_limit_exceeded",
+                },
+            },
+            {
+                "turn": 1,
+                "message": "scripted speech transcription rejected for line 1 (HTTP 429; concurrent_limit_exceeded)",
+                "line": 1,
+                "retry_count": 0,
+                "capacity_failure": {
+                    "source": "audio transcription",
+                    "cause": "ElevenLabs concurrent_limit_exceeded",
+                },
+            },
+        )
+        for failure in malformed_failures:
+            with self.subTest(failure=failure):
+                result = score_observations({
+                    "cases": [{
+                        "name": "timer",
+                        "runs": [{"turns": [], "failure": failure}],
+                    }]
+                }, required_runs=1)
 
                 self.assertFalse(result["passed"])
                 self.assertIn("invalid partial capture failure", " ".join(result["failures"]))

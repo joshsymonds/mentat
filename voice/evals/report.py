@@ -37,6 +37,7 @@ SCRIPTED_TTS_PREFLIGHT_FAILURE_PATTERN = re.compile(
     r"scripted speech synthesis for line ([1-9][0-9]*) exceeded its deadline"
     r"|scripted speech sample count mismatch for line ([1-9][0-9]*)"
     r"|scripted speech content verification failed for line ([1-9][0-9]*)"
+    rf"|scripted speech transcription rejected for line ([1-9][0-9]*) \({TRANSCRIPTION_FAILURE_DETAIL}\)"
 )
 
 
@@ -387,6 +388,7 @@ def score_observations(
                     {"turn", "message"},
                     {"turn", "message", "speech_started_at"},
                     {"turn", "message", "speech_started_at", "segments"},
+                    {"turn", "message", "speech_started_at", "capacity_failure"},
                     {"turn", "message", "line", "retry_count"},
                 )
                 try:
@@ -451,6 +453,18 @@ def score_observations(
                             or isinstance(retry_count, bool)
                             or not isinstance(retry_count, int)
                             or not 0 <= retry_count <= 2
+                        ):
+                            valid_failure = False
+                    if valid_failure and "capacity_failure" in failure:
+                        capacity = failure["capacity_failure"]
+                        if (
+                            not is_transcription_failure(failure.get("message"))
+                            or not isinstance(capacity, dict)
+                            or set(capacity) != {"source", "cause"}
+                            or not all(
+                                isinstance(capacity[key], str) and capacity[key].strip()
+                                for key in ("source", "cause")
+                            )
                         ):
                             valid_failure = False
                     if valid_failure and "segments" in failure:
