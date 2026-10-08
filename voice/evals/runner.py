@@ -3212,14 +3212,18 @@ def observe_scenario(
     caller_stt: list[str | None] | None = None
     caller_stt_failures: list[tuple[int, str]] = []
     if getattr(scenario, "exact_caller_stt", False):
-        caller_stt = _input_stt_sidecars(stack, room, len(scenario.caller_lines))
+        # A partial capture never answered the lines after its failed turn.
+        checked_turns = (
+            len(traces) if capture_failure is not None else len(scenario.caller_lines)
+        )
+        caller_stt = _input_stt_sidecars(stack, room, checked_turns)
         caller_stt_failures = [
             (
                 turn,
                 f"{scenario.name}: input STT sidecar turn {turn} did not match its scripted line",
             )
             for turn, (expected, observed) in enumerate(
-                zip(scenario.caller_lines, caller_stt, strict=True), 1
+                zip(scenario.caller_lines[:checked_turns], caller_stt, strict=True), 1
             )
             if not isinstance(observed, str)
             or _content_tokens(expected) != _content_tokens(observed)

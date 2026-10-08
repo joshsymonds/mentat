@@ -6070,13 +6070,13 @@ class ScenarioObservationTests(unittest.TestCase):
                         command.index("safe-room"),
                     )
 
-    def observe_exact_caller_stt(self, scenario_name, sidecars):
+    def observe_exact_caller_stt(self, scenario_name, sidecars, *, captured=None):
         import json
         from subprocess import CompletedProcess
 
         scenario = next(s for s in SCENARIOS if s.name == scenario_name)
         room = "exact-stt-room"
-        traces = [
+        all_traces = [
             {
                 "turn": index,
                 "room": room,
@@ -6093,6 +6093,17 @@ class ScenarioObservationTests(unittest.TestCase):
             }
             for index, line in enumerate(scenario.caller_lines, 1)
         ]
+        if captured is None:
+            capture = {"turns": all_traces}
+        else:
+            capture = {
+                "turns": all_traces[:captured],
+                "failure": {
+                    "turn": captured + 1,
+                    "message": "Transcription rejected reply clip (HTTP 401; quota_exceeded)",
+                    "speech_started_at": 100.0 + captured + 1,
+                },
+            }
         requested_paths = []
         record_path = f"records/voice-{room}.jsonl"
 
@@ -6103,7 +6114,7 @@ class ScenarioObservationTests(unittest.TestCase):
                 pass
 
             def run_voice(self, command, *, token, livekit_url):
-                return CompletedProcess(command, 0, json.dumps({"turns": traces}), "")
+                return CompletedProcess(command, 0, json.dumps(capture), "")
 
             def run_remote(self, command):
                 import subprocess
@@ -6174,6 +6185,29 @@ class ScenarioObservationTests(unittest.TestCase):
             "barge-in-long-reply: input STT sidecar turn 1 did not match its scripted line"
         ])
         self.assertEqual(observation["caller_stt"], [None, lines[1]])
+
+    def test_exact_caller_stt_checks_only_turns_a_partial_capture_reached(self):
+        lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
+        _, observation, _ = self.observe_exact_caller_stt(
+            "barge-in-long-reply", [lines[0], None], captured=0,
+        )
+        self.assertIn("failure", observation)
+        self.assertEqual(self.exact_stt_failures(observation), [])
+
+    def test_exact_caller_stt_keeps_a_mismatch_on_a_partial_capture_reached_turn(self):
+        lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
+        _, observation, _ = self.observe_exact_caller_stt(
+            "barge-in-long-reply", [lines[1], lines[1]], captured=1,
+        )
+        self.assertIn("failure", observation)
+        self.assertEqual(self.exact_stt_failures(observation), [
+            "barge-in-long-reply: input STT sidecar turn 1 did not match its scripted line"
+        ])
+        self.assertEqual(
+            [f["turn"] for f in observation["product_failures"]
+             if "input STT sidecar" in f["message"]],
+            [1],
+        )
 
     def test_exact_caller_stt_covers_the_single_line_phone_first_line_scenario(self):
         line = next(s for s in SCENARIOS if s.name == "phone-first-line").caller_lines[0]
