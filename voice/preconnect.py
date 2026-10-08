@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterable, Sequence
 from itertools import accumulate
 from math import sqrt
 from operator import mul
-from typing import Any
+from typing import Any, NamedTuple
 
 import livekit.agents.voice.room_io.room_io as upstream
 from livekit import rtc
@@ -37,7 +37,8 @@ logger = logging.getLogger("mentat.voice")
 
 # Matching runs on block averages at this rate; the live and buffer rates differ.
 COMMON_RATE = 2000
-# Live audio is held for matching no longer than this, and never past the buffer's length.
+# Live audio is held for matching no longer than this, nor past the buffer's end by more than
+# STRETCH_SECONDS.
 HEAD_SECONDS = 1.5
 FIRST_LOOK_SECONDS = 0.5
 LOOK_STEP_SECONDS = 0.25
@@ -45,6 +46,15 @@ LOOK_STEP_SECONDS = 0.25
 MIN_OVERLAP_SECONDS = 0.25
 # Normalised correlation over the repeat. Opus copies score near 1, other speech far lower.
 MATCH_SCORE = 0.85
+# The receiver's jitter buffer stretches the pauses inside the repeat by up to this much each.
+STRETCH_SECONDS = 0.6
+# A piece of the repeat that starts within this of where the previous piece ended is in place.
+JITTER_SECONDS = 0.01
+# The buffer is cut into pieces at pauses at least this long, which the repeat may stretch.
+PAUSE_SECONDS = 0.1
+PIECE_WINDOW_SECONDS = 0.01
+# A piece placed away from its rigid position must match this well on its own.
+PIECE_SCORE = 0.9
 # Windows quieter than this (int16 units, after averaging) carry nothing to match.
 MIN_RMS = 30.0
 # The live lead ends at the first window this long at or above MIN_RMS. The repeat is scored from
@@ -96,58 +106,180 @@ def _onset(live: Sequence[float]) -> int | None:
     return None
 
 
-def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> tuple[int, int] | None:
-    """Where the live lead ends, and how many blocks of the buffer's end the live head repeats.
+class _Fit(NamedTuple):
+    """The live lead's end, and the best fit of the live head against the buffer."""
+
+    onset: int  # the live block where the lead ends
+    anchor: int  # the buffer block that the live onset lines up with in the best fit
+    score: float  # the best fit's normalised correlation over the repeat, 0.0 when none was scored
+    repeat_end: int  # the live block, counted from the onset, where an accepted repeat ends; else 0
+    complete: bool  # whether the best fit has placed the buffer's last piece
+
+
+def _cut_pieces(buffer: Sequence[float]) -> list[tuple[int, int]]:
+    """The buffer's loud stretches, each with the quiet pause after it, as (begin, end) blocks.
+
+    A pause shorter than PAUSE_SECONDS stays inside its piece. The first piece begins at the
+    buffer's start and the last ends at its end. Empty when the buffer is silent.
+    """
+    window = int(PIECE_WINDOW_SECONDS * COMMON_RATE)
+    pause = int(PAUSE_SECONDS * COMMON_RATE) // window
+    quiet = MIN_RMS * MIN_RMS * window
+    count = len(buffer) // window
+    loud = [
+        sum(value * value for value in buffer[at * window:(at + 1) * window]) >= quiet
+        for at in range(count)
+    ]
+    starts: list[int] = []
+    at = 0
+    while at < count:
+        if not loud[at]:
+            at += 1
+            continue
+        starts.append(at * window)
+        while True:
+            while at < count and loud[at]:
+                at += 1
+            end = at
+            while end < count and not loud[end]:
+                end += 1
+            if end < count and end - at < pause:
+                at = end
+                continue
+            break
+    if not starts:
+        return []
+    edges = [0, *starts[1:], len(buffer)]
+    return list(zip(edges, edges[1:]))
+
+
+def _cross(
+    buffer: Sequence[float],
+    live: Sequence[float],
+    start: int,
+    at: int,
+    width: int,
+    buffer_energy: Sequence[float],
+    live_energy: Sequence[float],
+) -> tuple[float, float, float] | None:
+    """The dot product and the two energies of buffer[start:] against live[at:], or None if silent."""
+    heard = buffer_energy[start + width] - buffer_energy[start]
+    said = live_energy[at + width] - live_energy[at]
+    if heard <= 0.0 or said <= 0.0:
+        return None
+    return sum(map(mul, buffer[start:start + width], live[at:at + width])), heard, said
+
+
+def _place_piece(
+    buffer: Sequence[float],
+    live: Sequence[float],
+    piece: tuple[int, int],
+    end: int,
+    buffer_energy: Sequence[float],
+    live_energy: Sequence[float],
+) -> tuple[float, int, int, float, float, int] | None:
+    """The best placement of a piece at or after the live block end, within the stretch allowed.
+
+    Returns (score, live start, width, dot, buffer energy, delay from end), or None when no
+    placement overlaps enough to score.
+    """
+    first, last = piece
+    slack = round(JITTER_SECONDS * COMMON_RATE)
+    stretch = round(STRETCH_SECONDS * COMMON_RATE)
+    best = None
+    for delay in range(-slack, stretch):
+        at = end + delay
+        width = min(last - first, len(live) - at)
+        if width < 2 * round(PIECE_WINDOW_SECONDS * COMMON_RATE):
+            break
+        cross = _cross(buffer, live, first, at, width, buffer_energy, live_energy)
+        if cross is None:
+            continue
+        dot, heard, said = cross
+        score = dot / sqrt(heard * said)
+        if best is None or score > best[0]:
+            best = (score, at, width, dot, heard, delay)
+    return best
+
+
+def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> _Fit | None:
+    """Where the live lead ends, and how the live head repeats the buffer, piece by piece.
 
     The live track and the buffer record the same microphone, so the live head repeats the
-    buffer from some point to its very end, after a lead that may be quiet. The lead ends at
-    the onset, and the repeat is scored from ONSET_LAG_SECONDS past it. The best fit is the
-    buffer start whose normalised correlation over the overlap is highest.
+    buffer from some point, after a lead that may be quiet. The lead ends at the onset, and the
+    repeat is scored from ONSET_LAG_SECONDS past it. The first piece of the buffer is placed
+    rigidly at its best-correlating start; each later piece follows the previous one's live end
+    within the stretch the jitter buffer allows. The repeat is accepted when the whole placement
+    scores at least MATCH_SCORE, is at least MIN_OVERLAP_SECONDS long, and any piece placed away
+    from its rigid position scores at least PIECE_SCORE on its own. None when there is no onset.
     """
     onset = _onset(live)
     if onset is None:
         return None
+    live = live[onset:]
     lag = int(ONSET_LAG_SECONDS * COMMON_RATE)
-    live = live[onset + lag:]
     least = int(MIN_OVERLAP_SECONDS * COMMON_RATE)
-    if len(buffer) < least or len(live) < least:
-        return None
-    quiet = MIN_RMS * MIN_RMS
+    pieces = _cut_pieces(buffer)
+    if not pieces or len(live) - lag < least:
+        return _Fit(onset, 0, 0.0, 0, False)
     buffer_energy = list(accumulate((value * value for value in buffer), initial=0.0))
     live_energy = list(accumulate((value * value for value in live), initial=0.0))
-    best_score, best_start = 0.0, lag
-    for start in range(lag, len(buffer) - least + 1):
-        width = min(len(live), len(buffer) - start)
-        heard = buffer_energy[start + width] - buffer_energy[start]
-        said = live_energy[width]
-        if heard < quiet * width or said < quiet * width:
-            continue
-        score = sum(map(mul, buffer[start:start + width], live)) / sqrt(heard * said)
-        if score > best_score:
-            best_score, best_start = score, start
-    if best_score < MATCH_SCORE:
-        return None
-    return onset, len(buffer) - (best_start - lag)
+    slack = round(JITTER_SECONDS * COMMON_RATE)
+    window = round(PIECE_WINDOW_SECONDS * COMMON_RATE)
+    best: tuple[float, int, int, int, float, float] | None = None
+    for index, (first, last) in enumerate(pieces):
+        for start in range(max(first, lag), last - 2 * window):
+            width = min(last - start, len(live) - lag)
+            cross = _cross(buffer, live, start, lag, width, buffer_energy, live_energy)
+            if cross is None:
+                continue
+            dot, heard, said = cross
+            score = dot / sqrt(heard * said)
+            if best is None or score > best[0]:
+                best = (score, index, start, width, dot, heard)
+    if best is None:
+        return _Fit(onset, 0, 0.0, 0, False)
+    score, index, start, width, dot, heard = best
+    dots, heard_total = dot, heard
+    end = lag + width
+    anchored = True
+    complete = start + width >= pieces[index][1]
+    for piece in pieces[index + 1:]:
+        if not complete:
+            break
+        placed = _place_piece(buffer, live, piece, end, buffer_energy, live_energy)
+        if placed is None:
+            complete = False
+            break
+        score, at, span, dot, heard, delay = placed
+        dots += dot
+        heard_total += heard
+        if abs(delay) > slack and score < PIECE_SCORE:
+            anchored = False
+        end = at + span
+        complete = span == piece[1] - piece[0]
+    said_total = live_energy[end] - live_energy[lag]
+    overall = dots / sqrt(heard_total * said_total)
+    accepted = overall >= MATCH_SCORE and anchored and end - lag >= least
+    return _Fit(onset, start - lag, overall, end if accepted else 0, complete)
 
 
 def _repeated_samples(
     buffer: Sequence[Any], live: Sequence[Any], live_rate: int
-) -> tuple[int, int]:
-    """Samples per channel of the live lead, then of the live repeat of the buffer's end.
+) -> tuple[int, int, _Fit | None]:
+    """Samples per channel of the live lead, then of the live repeat of the buffer, and the fit.
 
-    Both are zero when the live head repeats nothing.
+    Both counts are zero when the live head repeats nothing. The fit is None when there is no onset.
     """
     buffer_rate = buffer[0].sample_rate
     buffer_blocks = _decimate(_mono(buffer), buffer_rate)
-    found = _find_repeat(buffer_blocks, _decimate(_mono(live), live_rate))
-    if found is None:
-        return 0, 0
-    onset, blocks = found
-    buffer_samples = sum(frame.samples_per_channel for frame in buffer)
-    longest = round(buffer_samples * live_rate / buffer_rate)
+    fit = _find_repeat(buffer_blocks, _decimate(_mono(live), live_rate))
+    if fit is None or not fit.repeat_end:
+        return 0, 0, fit
     return (
-        round(onset * live_rate / COMMON_RATE),
-        min(round(blocks * live_rate / COMMON_RATE), longest),
+        round(fit.onset * live_rate / COMMON_RATE),
+        round(fit.repeat_end * live_rate / COMMON_RATE),
+        fit,
     )
 
 
@@ -233,34 +365,52 @@ class _LiveAudio:
             if begin < end:
                 self._ready.append(self._cancel(_part(frame, begin, end)))
 
+    def _buffer_seconds(self) -> float:
+        if not self._buffer:
+            return 0.0
+        samples = sum(frame.samples_per_channel for frame in self._buffer)
+        return samples / self._buffer[0].sample_rate
+
     def _begin(self) -> None:
-        seconds = 0.0
-        if self._buffer:
-            samples = sum(frame.samples_per_channel for frame in self._buffer)
-            seconds = samples / self._buffer[0].sample_rate
+        seconds = self._buffer_seconds()
         if seconds < MIN_OVERLAP_SECONDS:
             self._state = _PASSING
             return
         self._state = _LOOKING
-        head = min(HEAD_SECONDS, seconds)
+        head = min(HEAD_SECONDS, seconds + STRETCH_SECONDS)
         self._limit = round(head * self._sample_rate)
         self._next_look = round(min(FIRST_LOOK_SECONDS, head) * self._sample_rate)
 
     async def _settle(self, *, final: bool) -> None:
         if self._state != _LOOKING or not self._held:
             return
-        lead, repeated = await asyncio.to_thread(
+        lead, repeated, fit = await asyncio.to_thread(
             _repeated_samples, self._buffer, self._held, self._sample_rate
         )
-        if not repeated and not final and self._held_samples < self._limit:
+        complete = fit is not None and fit.complete and repeated > 0
+        if not complete and not final and self._held_samples < self._limit:
             step = round(LOOK_STEP_SECONDS * self._sample_rate)
             self._next_look = min(self._held_samples + step, self._limit)
             return
         held, self._held = self._held, []
+        held_seconds = self._held_samples / self._sample_rate
         self._lead, self._to_skip = lead, repeated
         self._state = _PASSING
         if repeated:
             logger.info("dropped %d live samples repeating the pre-connect buffer", repeated)
+        elif fit is None:
+            logger.info(
+                "no onset found in the %.2f s of live audio held against the %.2f s "
+                "pre-connect buffer",
+                held_seconds, self._buffer_seconds(),
+            )
+        else:
+            logger.info(
+                "no repeat of the %.2f s pre-connect buffer in the %.2f s of live audio held: "
+                "best score %.3f, live onset %.2f s, buffer position %.2f s",
+                self._buffer_seconds(), held_seconds, fit.score,
+                fit.onset / COMMON_RATE, fit.anchor / COMMON_RATE,
+            )
         for frame in held:
             await self._take(frame)
 

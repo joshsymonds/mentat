@@ -1071,6 +1071,128 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         report = score_observations({"cases": [{"name": scenario.name, "runs": [observation]}]}, required_runs=1)
         self.assertFalse(report["passed"])
 
+    @staticmethod
+    def with_room_gone(dependencies):
+        """The same dependencies with LiveKit listing no rooms, as after the voice ends the call."""
+
+        class EmptyRoomsAPI:
+            def __init__(self, *_args, **_kwargs):
+                self.room = self
+
+            async def list_rooms(self, _request):
+                return SimpleNamespace(rooms=[])
+
+            async def aclose(self):
+                pass
+
+        api = SimpleNamespace(**{**dependencies.api.__dict__, "LiveKitAPI": EmptyRoomsAPI})
+        return CaptureDependencies(**{**dependencies.__dict__, "api": api})
+
+    async def test_room_deleted_after_the_final_line_fails_the_run_and_keeps_every_turn(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness()
+
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                self.with_room_gone(dependencies), ["First question@0::answer"]
+            )
+
+        self.assertEqual([trace["transcript"] for trace in raised.exception.turns], ["answer"])
+        self.assertEqual(raised.exception.failure, {
+            "turn": 1,
+            "message": "room was deleted after the final scripted line was captured",
+        })
+
+    async def test_room_deleted_before_a_later_line_still_fails_at_that_line(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness()
+
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                self.with_room_gone(dependencies),
+                ["First question@0::answer", "Second question@0::answer"],
+            )
+
+        self.assertEqual([trace["turn"] for trace in raised.exception.turns], [1])
+        self.assertEqual(raised.exception.failure, {
+            "turn": 2,
+            "message": "room was deleted before all scripted lines were captured",
+        })
+
+    async def test_room_deleted_after_the_final_line_is_observed_as_the_runs_failure(self):
+        import dataclasses
+        import json
+        from subprocess import CompletedProcess
+
+        from evals.report import score_observations
+
+        scenario = dataclasses.replace(
+            next(item for item in SCENARIOS if item.name == "phone-first-line"),
+            exact_caller_stt=False,
+        )
+        room = "android-selected-room"
+        dependencies, _record, _captures, _clock = self.barge_in_harness()
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                self.with_room_gone(dependencies), ["First question@0::answer"]
+            )
+        envelope = json.dumps({
+            "turns": raised.exception.turns,
+            "failure": raised.exception.failure,
+        })
+        # The voice's one SDK turn ran after the caller's line started, so it is recorded and delegated.
+        delegation_markers = json.dumps({
+            "room": room,
+            "id": "d1",
+            "created_at": raised.exception.turns[0]["speech_started_at"] + 1.0,
+        }) + "\n"
+        record = "".join(json.dumps(message) + "\n" for message in (
+            {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1", "model": "claude-opus-5"}}},
+            {"type": "result", "session_id": "voice-" + room},
+        ))
+        grant = {"token": "header.payload.signature", "room": room, "url": "wss://livekit.invalid"}
+
+        class Stack:
+            base_url = "http://127.0.0.1:8485"
+
+            def start_worker(self, _room):
+                pass
+
+            def run_voice(self, command, *, token, livekit_url):
+                return CompletedProcess(command, 0, envelope, "")
+
+            def run_remote(self, command):
+                outputs = {
+                    "voice/evals/phone.jsonl": "",
+                    "voice/evals/delegations.jsonl": delegation_markers,
+                    f"records/voice-{room}.jsonl": record,
+                }
+                return CompletedProcess(command, 0, outputs[command[-1]], "")
+
+        with patch.object(runner, "_voice_token", return_value=grant):
+            observation = runner.observe_scenario(
+                scenario, Stack(), judge=scripted_yes_judge()
+            )
+
+        self.assertEqual(len(observation["turns"]), 1)
+        self.assertNotIn("failure", observation)
+        self.assertEqual(observation["room_closed_after"], 1)
+        self.assertIn(
+            {"turn": 1, "message": "call ended after turn 1 with 0 follow-ups remaining"},
+            observation["product_failures"],
+        )
+        report = score_observations(
+            {"cases": [{"name": scenario.name, "runs": [observation]}]},
+            required_runs=1,
+        )
+        self.assertFalse(report["passed"])
+        failures = " ".join(report["failures"])
+        self.assertIn(
+            "run 1 turn 1: product failure: call ended after turn 1 with 0 follow-ups remaining",
+            failures,
+        )
+        self.assertNotIn("invalid partial capture failure metadata", failures)
+        self.assertNotIn("capture failed", failures)
+        self.assertEqual(len(report["cases"][0]["turns"]), 1)
+
     async def test_other_capture_errors_still_raise_as_they_did(self):
         for failing_capture in (1, 2):
             with self.subTest(capture=failing_capture):
@@ -4757,6 +4879,60 @@ class ScenarioObservationTests(unittest.TestCase):
                 RuntimeError, "invalid"
             ):
                 runner._capture_envelope(json.dumps(malformed), 2)
+
+    def test_final_line_room_deletion_envelope_requires_every_scripted_turn(self):
+        import json
+
+        message = "room was deleted after the final scripted line was captured"
+        trace = {"turn": 1, "speech_started_at": 1_699_999_999.0}
+        accepted = json.dumps({
+            "turns": [trace, {"turn": 2}],
+            "failure": {"turn": 2, "message": message},
+        })
+        self.assertEqual(runner._capture_envelope(accepted, 2), (
+            [trace, {"turn": 2}],
+            {"turn": 2, "message": message},
+        ))
+        for malformed in (
+            {"turns": [trace], "failure": {"turn": 1, "message": message}},
+            {"turns": [trace, {"turn": 2}], "failure": {"turn": 3, "message": message}},
+            {"turns": [trace, {"turn": 2}], "failure": {"turn": 1, "message": message}},
+            {"turns": [trace], "failure": {"turn": 2, "message": message}},
+            {"turns": [], "failure": {"turn": 1, "message": message}},
+            {
+                "turns": [trace, {"turn": 2}],
+                "failure": {"turn": 2, "message": message, "speech_started_at": 1_700_000_000.0},
+            },
+        ):
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                RuntimeError, "invalid"
+            ):
+                runner._capture_envelope(json.dumps(malformed), 2)
+
+    def test_remote_cli_final_line_room_deletion_envelope_is_accepted_by_the_parent(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+
+        message = "room was deleted after the final scripted line was captured"
+        trace = {"turn": 1, "speech_started_at": 1_699_999_999.0}
+
+        async def delete_after_the_only_line(_room, _steps, *, room_close_after):
+            raise runner.PartialCaptureFailure([trace], 1, message)
+
+        output = io.StringIO()
+        with patch.object(runner, "run_remote_capture", delete_after_the_only_line), redirect_stdout(output):
+            result = runner.main(["android-selected-room", "Question@0::answer"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), {
+            "turns": [trace],
+            "failure": {"turn": 1, "message": message},
+        })
+        self.assertEqual(runner._capture_envelope(output.getvalue(), 1), (
+            [trace],
+            {"turn": 1, "message": message},
+        ))
 
     def test_remote_cli_emits_partial_capture_envelope_with_zero_completed_turns(self):
         import io

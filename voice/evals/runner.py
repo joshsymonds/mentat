@@ -64,6 +64,8 @@ ROOM_POLL_INTERVAL_SECONDS = 0.25
 BARGE_IN_POLL_SECONDS = 0.02
 # voice/caller.py's message when the agent's reply never starts before its deadline.
 REPLY_NOT_STARTED_FAILURE = "agent audio response did not start before its deadline"
+# The voice closed the room after the final scripted line's reply, which the scenario did not expect.
+ROOM_DELETED_AFTER_FINAL_LINE_FAILURE = "room was deleted after the final scripted line was captured"
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
 SMS_AUDIO_SCENARIOS = frozenset({"sms-say-back-yes", "sms-correction-new-yes"})
@@ -1527,7 +1529,11 @@ async def capture_script(
                         index + 2,
                         "room was deleted before all scripted lines were captured",
                     )
-                raise RuntimeError("room was deleted before all scripted lines were captured")
+                raise PartialCaptureFailure(
+                    traces,
+                    index + 1,
+                    ROOM_DELETED_AFTER_FINAL_LINE_FAILURE,
+                )
 
         async def await_reply(index: int, speech_started_at: float, reply: Awaitable[Any]) -> Any:
             """Await turn INDEX + 1's reply, failing that turn if the agent never starts it."""
@@ -2776,6 +2782,13 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         and traces[-1].get("turn") == failure["turn"]
         and traces[-1].get("room_deleted") is None
     )
+    final_line_room_deleted = (
+        isinstance(failure, dict)
+        and failure.get("message") == ROOM_DELETED_AFTER_FINAL_LINE_FAILURE
+        and len(traces) == expected_turns
+        and bool(traces)
+        and failure.get("turn") == len(traces)
+    )
     if (
         not isinstance(failure, dict)
         or set(failure) not in allowed_failure_fields
@@ -2783,8 +2796,12 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         or not isinstance(failure.get("turn"), int)
         or not (
             same_turn_hangup_timeout
+            or final_line_room_deleted
             or (
-                failure.get("message") != "room deletion was not observed before deadline"
+                failure.get("message") not in {
+                    "room deletion was not observed before deadline",
+                    ROOM_DELETED_AFTER_FINAL_LINE_FAILURE,
+                }
                 and (
                     (preflight_tts_failure and not traces and failure["turn"] == 1)
                     or (
@@ -2802,6 +2819,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
                 NO_ANSWER_FAILURE,
                 REPLY_NOT_STARTED_FAILURE,
                 "room was deleted before all scripted lines were captured",
+                ROOM_DELETED_AFTER_FINAL_LINE_FAILURE,
                 "room deletion was not observed before deadline",
             }
             or is_transcription_failure(failure.get("message"))
@@ -3215,10 +3233,12 @@ def observe_scenario(
         raise RuntimeError("capture observed room deletion more than once")
     early_close = (
         capture_failure is not None
-        and capture_failure["message"]
-        == "room was deleted before all scripted lines were captured"
+        and capture_failure["message"] in {
+            "room was deleted before all scripted lines were captured",
+            ROOM_DELETED_AFTER_FINAL_LINE_FAILURE,
+        }
     )
-    early_close_after = capture_failure["turn"] - 1 if early_close else None
+    early_close_after = len(traces) if early_close else None
     room_closed_after = (
         early_close_after
         if early_close
