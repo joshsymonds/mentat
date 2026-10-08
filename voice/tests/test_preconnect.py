@@ -10,6 +10,7 @@ import importlib
 import importlib.util
 import math
 import random
+import re
 import struct
 import sys
 import threading
@@ -375,6 +376,13 @@ def kept_after_skipping(case, out):
     return skipped
 
 
+MISS = re.compile(
+    r"no repeat of the (?P<buffer>[\d.]+) s pre-connect buffer in the (?P<held>[\d.]+) s of live audio "
+    r"held: best score (?P<score>-?[\d.]+), live onset (?P<onset>[\d.]+) s, "
+    r"buffer position (?P<position>[\d.]+) s"
+)
+
+
 def removed_span(case, out):
     """The live samples the output lacks, as (begin, end), checking nothing else changed."""
     live = samples_of(case.live)
@@ -460,6 +468,49 @@ class PreConnectDedupeTest(AsyncTest):
 
         self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
 
+    async def test_no_overlap_logs_one_miss_with_the_held_length_and_the_best_fit(self):
+        case = Overlap(syllables(7, 0.0, 3.0), overlap=-0.2)
+
+        with self.assertLogs("mentat.voice", level="INFO") as logs:
+            self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+
+        self.assertMiss(logs, held=1.0, buffer=BUFFER_END)
+
+    async def test_a_silent_head_logs_that_no_onset_was_found(self):
+        case = Overlap(syllables(7, 0.0, 3.0), overlap=0.7)
+        case.live = frames_of(array("h", bytes(2 * 2 * LIVE_RATE)), LIVE_RATE)
+
+        with self.assertLogs("mentat.voice", level="INFO") as logs:
+            self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+
+        [record] = logs.records
+        self.assertEqual(record.levelname, "INFO")
+        self.assertRegex(record.getMessage(), r"^no onset found in the 1\.00 s of live audio held ")
+        self.assertNotIn("score", record.getMessage())
+
+    async def test_a_matched_copy_logs_only_the_dropped_samples(self):
+        case = Overlap(syllables(7, 0.0, 3.0), overlap=0.7)
+
+        with self.assertLogs("mentat.voice", level="INFO") as logs:
+            skipped = kept_after_skipping(case, await dedupe(case))
+
+        [record] = logs.records
+        dropped = re.fullmatch(r"dropped (\d+) live samples repeating the pre-connect buffer", record.getMessage())
+        self.assertIsNotNone(dropped, record.getMessage())
+        self.assertEqual(int(dropped[1]), skipped)
+
+    def assertMiss(self, logs, *, held, buffer):
+        """Exactly one INFO record on mentat.voice, saying the head was held and matched to nothing."""
+        [record] = logs.records
+        self.assertEqual(record.levelname, "INFO")
+        miss = MISS.fullmatch(record.getMessage())
+        self.assertIsNotNone(miss, record.getMessage())
+        self.assertAlmostEqual(float(miss["held"]), held, delta=0.01)
+        self.assertAlmostEqual(float(miss["buffer"]), buffer, delta=0.01)
+        self.assertLess(float(miss["score"]), preconnect.MATCH_SCORE)
+        self.assertLess(float(miss["onset"]), float(miss["held"]))
+        self.assertLessEqual(float(miss["position"]), float(miss["buffer"]))
+
     async def test_buffer_with_a_silent_tail_still_dedupes_the_earlier_speech(self):
         speech = syllables(5, 0.0, 0.62) + syllables(6, 1.1, 3.0)  # nothing is said from 0.62 to 1.1
         case = Overlap(speech, overlap=0.85)
@@ -515,7 +566,10 @@ class PreConnectDedupeTest(AsyncTest):
     async def test_another_rendering_of_the_eval_line_is_kept_whole(self):
         case = eval_case("other_rendering")
 
-        self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+        with self.assertLogs("mentat.voice", level="INFO") as logs:
+            self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+
+        self.assertMiss(logs, held=1.0, buffer=1.0)
 
     async def test_another_rendering_after_a_quiet_lead_is_kept_whole(self):
         case = eval_case("other_rendering")

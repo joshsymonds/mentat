@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterable, Sequence
 from itertools import accumulate
 from math import sqrt
 from operator import mul
-from typing import Any
+from typing import Any, NamedTuple
 
 import livekit.agents.voice.room_io.room_io as upstream
 from livekit import rtc
@@ -96,13 +96,22 @@ def _onset(live: Sequence[float]) -> int | None:
     return None
 
 
-def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> tuple[int, int] | None:
-    """Where the live lead ends, and how many blocks of the buffer's end the live head repeats.
+class _Fit(NamedTuple):
+    """The live lead's end, and the best fit of the live head against the buffer."""
+
+    onset: int  # the live block where the lead ends
+    anchor: int  # the buffer block that the live onset lines up with in the best fit
+    score: float  # the best normalised correlation found, 0.0 when no overlap was scored
+
+
+def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> _Fit | None:
+    """Where the live lead ends, and how the live head lines up with the buffer.
 
     The live track and the buffer record the same microphone, so the live head repeats the
     buffer from some point to its very end, after a lead that may be quiet. The lead ends at
     the onset, and the repeat is scored from ONSET_LAG_SECONDS past it. The best fit is the
-    buffer start whose normalised correlation over the overlap is highest.
+    buffer start whose normalised correlation over the overlap is highest. None when there is
+    no onset at all.
     """
     onset = _onset(live)
     if onset is None:
@@ -111,7 +120,7 @@ def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> tuple[int, i
     live = live[onset + lag:]
     least = int(MIN_OVERLAP_SECONDS * COMMON_RATE)
     if len(buffer) < least or len(live) < least:
-        return None
+        return _Fit(onset, 0, 0.0)
     quiet = MIN_RMS * MIN_RMS
     buffer_energy = list(accumulate((value * value for value in buffer), initial=0.0))
     live_energy = list(accumulate((value * value for value in live), initial=0.0))
@@ -125,29 +134,28 @@ def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> tuple[int, i
         score = sum(map(mul, buffer[start:start + width], live)) / sqrt(heard * said)
         if score > best_score:
             best_score, best_start = score, start
-    if best_score < MATCH_SCORE:
-        return None
-    return onset, len(buffer) - (best_start - lag)
+    return _Fit(onset, best_start - lag, best_score)
 
 
 def _repeated_samples(
     buffer: Sequence[Any], live: Sequence[Any], live_rate: int
-) -> tuple[int, int]:
-    """Samples per channel of the live lead, then of the live repeat of the buffer's end.
+) -> tuple[int, int, _Fit | None]:
+    """Samples per channel of the live lead, then of the live repeat of the buffer's end, and the fit.
 
-    Both are zero when the live head repeats nothing.
+    Both counts are zero when the live head repeats nothing. The fit is None when there is no onset.
     """
     buffer_rate = buffer[0].sample_rate
     buffer_blocks = _decimate(_mono(buffer), buffer_rate)
-    found = _find_repeat(buffer_blocks, _decimate(_mono(live), live_rate))
-    if found is None:
-        return 0, 0
-    onset, blocks = found
+    fit = _find_repeat(buffer_blocks, _decimate(_mono(live), live_rate))
+    if fit is None or fit.score < MATCH_SCORE:
+        return 0, 0, fit
     buffer_samples = sum(frame.samples_per_channel for frame in buffer)
     longest = round(buffer_samples * live_rate / buffer_rate)
+    blocks = len(buffer_blocks) - fit.anchor
     return (
-        round(onset * live_rate / COMMON_RATE),
+        round(fit.onset * live_rate / COMMON_RATE),
         min(round(blocks * live_rate / COMMON_RATE), longest),
+        fit,
     )
 
 
@@ -233,11 +241,14 @@ class _LiveAudio:
             if begin < end:
                 self._ready.append(self._cancel(_part(frame, begin, end)))
 
+    def _buffer_seconds(self) -> float:
+        if not self._buffer:
+            return 0.0
+        samples = sum(frame.samples_per_channel for frame in self._buffer)
+        return samples / self._buffer[0].sample_rate
+
     def _begin(self) -> None:
-        seconds = 0.0
-        if self._buffer:
-            samples = sum(frame.samples_per_channel for frame in self._buffer)
-            seconds = samples / self._buffer[0].sample_rate
+        seconds = self._buffer_seconds()
         if seconds < MIN_OVERLAP_SECONDS:
             self._state = _PASSING
             return
@@ -249,7 +260,7 @@ class _LiveAudio:
     async def _settle(self, *, final: bool) -> None:
         if self._state != _LOOKING or not self._held:
             return
-        lead, repeated = await asyncio.to_thread(
+        lead, repeated, fit = await asyncio.to_thread(
             _repeated_samples, self._buffer, self._held, self._sample_rate
         )
         if not repeated and not final and self._held_samples < self._limit:
@@ -257,10 +268,24 @@ class _LiveAudio:
             self._next_look = min(self._held_samples + step, self._limit)
             return
         held, self._held = self._held, []
+        held_seconds = self._held_samples / self._sample_rate
         self._lead, self._to_skip = lead, repeated
         self._state = _PASSING
         if repeated:
             logger.info("dropped %d live samples repeating the pre-connect buffer", repeated)
+        elif fit is None:
+            logger.info(
+                "no onset found in the %.2f s of live audio held against the %.2f s "
+                "pre-connect buffer",
+                held_seconds, self._buffer_seconds(),
+            )
+        else:
+            logger.info(
+                "no repeat of the %.2f s pre-connect buffer in the %.2f s of live audio held: "
+                "best score %.3f, live onset %.2f s, buffer position %.2f s",
+                self._buffer_seconds(), held_seconds, fit.score,
+                fit.onset / COMMON_RATE, fit.anchor / COMMON_RATE,
+            )
         for frame in held:
             await self._take(frame)
 
