@@ -325,7 +325,7 @@ the room must still hear the line once. The live track carries silence after
 the line until the buffer is sent, and the trace records the buffer's actual
 seconds. In `barge-in-long-reply`,
 `--barge-in TURN:SECONDS` (one-based TURN, repeatable) starts that line SECONDS
-after the agent's reply begins; the scenario speaks its second line 15 seconds
+after the agent's reply begins; the scenario speaks its second line 8 seconds
 into a long story to check that the interruption commits during the agent's
 speech. Both scenarios set `exact_caller_stt`:
 each turn's input STT sidecar must match its scripted line, so a misheard or

@@ -303,7 +303,7 @@ class ScenarioScoringTests(unittest.TestCase):
         ))
         self.assertEqual(barge.commands, ())
         self.assertIsNone(barge.room_close_after)
-        self.assertEqual(barge.barge_in_after, (None, 15.0))
+        self.assertEqual(barge.barge_in_after, (None, 8.0))
         self.assertTrue(barge.exact_caller_stt)
         self.assertFalse(barge.preconnect_first_line)
 
@@ -638,6 +638,7 @@ class BargeInDocumentationTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, paragraph)
         self.assertNotIn("9 seconds", paragraph)
+        self.assertNotIn("15 seconds", paragraph)
 
 
 if __name__ == "__main__":
