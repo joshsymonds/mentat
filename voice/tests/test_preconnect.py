@@ -108,7 +108,7 @@ def _install_livekit_stand_ins():
                     self._pre_connect_audio_publications.add(key)
                     for frame in self._resample_frames(self._apply_audio_processor(frames)):
                         await self._data_ch.send(frame)
-                except TimeoutError:
+                except Exception:
                     self._pre_connect_audio_publications.add(key)
             async for event in stream:
                 self._process_frame(event.frame)
@@ -340,9 +340,32 @@ def build_input(canceller, handler):
     )
 
 
-async def run_input(case_live, case_buffer, canceller, *, buffered=True):
+class LateBufferHandler:
+    """A handler whose wait gives up, and whose buffer completes only after that.
+
+    As in LiveKit's handler, a buffer that completes after a wait timed out is kept, and a
+    later wait for the same track returns it at once.
+    """
+
+    def __init__(self):
+        self.give_up = asyncio.Event()
+        self.late = asyncio.get_running_loop().create_future()
+
+    async def wait_for_data(self, track_id):
+        if self.late.done():
+            return self.late.result()
+        await self.give_up.wait()
+        raise TimeoutError
+
+
+def track_streams(*streams):
+    """Patches rtc.AudioStream.from_track to hand out the given streams, one per call."""
+    pending = list(streams)
+    return mock.patch.object(rtc.AudioStream, "from_track", staticmethod(lambda **kwargs: pending.pop(0)))
+
+
+async def run_input(case_live, canceller, handler):
     """Drive the input's forward task over a track the way LiveKit does; returns what it forwarded."""
-    handler = FakeHandler(case_buffer if buffered else None, error=None if buffered else TimeoutError())
     built = {}
 
     def from_track(**kwargs):
@@ -509,7 +532,7 @@ class PreConnectDedupeTest(AsyncTest):
         live = frames_of(ramp(2.0), LIVE_RATE)
         canceller = recording_canceller()
 
-        forwarded, built = await run_input(live, buffer, canceller)
+        forwarded, built = await run_input(live, canceller, FakeHandler(buffer))
 
         # rtc must not be handed the canceller: it would run it on live frames while the buffer waits.
         self.assertIsNone(built["processor"])
@@ -525,7 +548,55 @@ class PreConnectDedupeTest(AsyncTest):
         live = frames_of(ramp(2.0), LIVE_RATE)
         canceller = recording_canceller()
 
-        forwarded, _ = await run_input(live, silence(1.0), canceller, buffered=False)
+        forwarded, _ = await run_input(live, canceller, FakeHandler(error=TimeoutError()))
+
+        self.assertEqual(samples_of(forwarded[:-1]), samples_of(live))
+
+    async def test_a_buffer_error_other_than_a_timeout_leaves_live_audio_untouched(self):
+        live = frames_of(ramp(2.0), LIVE_RATE)
+        canceller = recording_canceller()
+
+        forwarded, _ = await run_input(live, canceller, FakeHandler(error=RuntimeError("byte stream failed")))
+
+        self.assertEqual(samples_of(forwarded[:-1]), samples_of(live))
+
+    async def test_a_buffer_completing_after_the_timeout_drops_no_live_audio_before_or_after(self):
+        live = frames_of(ramp(3.0), LIVE_RATE)
+        canceller = recording_canceller()
+        handler = LateBufferHandler()
+        first, second = GatedStream(), GatedStream()
+        track = SimpleNamespace(sid="TR_audio")
+        publication = SimpleNamespace(sid="TR_audio", source=0, audio_features=[PRECONNECT_FEATURE])
+        participant = SimpleNamespace(identity="phone")
+
+        with track_streams(first, second):
+            audio_input = build_input(canceller, handler)
+            first_live = audio_input._create_stream(track, participant)
+            first_task = asyncio.create_task(
+                audio_input._forward_task(None, first_live, track, publication, participant)
+            )
+            first.push(live[:10])  # heard while the wait for the buffer is still open
+            await settle()
+            handler.give_up.set()
+            await settle()
+            first.push(live[10:20])  # heard after the timeout, before the buffer completes
+            await settle()
+            handler.late.set_result(silence(1.0))  # the buffer completes late
+            await settle()
+            first.push(live[20:30])  # heard after the late completion
+            await settle()
+
+            first_task.cancel()
+            second_live = audio_input._create_stream(track, participant)
+            second_task = asyncio.create_task(
+                audio_input._forward_task(None, second_live, track, publication, participant)
+            )
+            second.push(live[30:])
+            second.end()
+            await second_task
+
+        audio_input._data_ch.close()
+        forwarded = [frame async for frame in audio_input._data_ch]
 
         self.assertEqual(samples_of(forwarded[:-1]), samples_of(live))
 
