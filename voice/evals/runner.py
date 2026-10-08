@@ -3108,19 +3108,64 @@ def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str
     return command
 
 
+def _input_stt_sidecar(stack: Any, room: str, index: int) -> str | None:
+    sidecar_path = (
+        f"voice/evals/retained-evidence/input-audio/"
+        f"{room}-turn-{index:03d}.txt"
+    )
+    return _remote_artifact_text(
+        stack, sidecar_path, "input STT transcript", allow_missing=True
+    )
+
+
 def _input_stt_sidecars(stack: Any, room: str, count: int) -> list[str | None]:
-    sidecars = []
-    for index in range(1, count + 1):
-        sidecar_path = (
-            f"voice/evals/retained-evidence/input-audio/"
-            f"{room}-turn-{index:03d}.txt"
-        )
-        sidecars.append(
-            _remote_artifact_text(
-                stack, sidecar_path, "input STT transcript", allow_missing=True
-            )
-        )
+    return [_input_stt_sidecar(stack, room, index) for index in range(1, count + 1)]
+
+
+def _input_stt_sidecars_through_commits(
+    stack: Any, room: str, scripted_count: int
+) -> list[str | None]:
+    """Read every scripted turn's sidecar, then any committed turn past them.
+
+    The scripted turns always get a slot, None when missing. A sidecar past the
+    last scripted turn exists only if the caller committed another turn, so
+    reading stops at the first missing one.
+    """
+    sidecars = _input_stt_sidecars(stack, room, scripted_count)
+    index = scripted_count + 1
+    sidecar = _input_stt_sidecar(stack, room, index)
+    while sidecar is not None:
+        sidecars.append(sidecar)
+        index += 1
+        sidecar = _input_stt_sidecar(stack, room, index)
     return sidecars
+
+
+def _caller_stt_failure_turn(
+    scripted_lines: tuple[str, ...], sidecars: list[str | None]
+) -> int | None:
+    """Return the turn where the whole-call caller-STT check first fails.
+
+    The sidecars' content tokens, concatenated in turn order, must equal the
+    scripted lines' content tokens concatenated. The failure is the first turn
+    whose sidecar is missing or after which the transcript stops being a prefix
+    of the scripted tokens, clamped to the last scripted turn so a phantom
+    sidecar past the last line is reported there. If every sidecar is present
+    but the transcript falls short, the failure is the last scripted turn.
+    """
+    last_line = len(scripted_lines)
+    expected = _content_tokens(" ".join(scripted_lines))
+    heard: list[str] = []
+    for turn, sidecar in enumerate(sidecars, 1):
+        if sidecar is None:
+            return min(turn, last_line)
+        heard.append(sidecar)
+        heard_tokens = _content_tokens(" ".join(heard))
+        if heard_tokens != expected[: len(heard_tokens)]:
+            return min(turn, last_line)
+    if _content_tokens(" ".join(heard)) != expected:
+        return last_line
+    return None
 
 
 def observe_scenario(
@@ -3229,22 +3274,26 @@ def observe_scenario(
     caller_stt: list[str | None] | None = None
     caller_stt_failures: list[tuple[int, str]] = []
     if getattr(scenario, "exact_caller_stt", False):
-        # A partial capture never answered the lines after its failed turn.
-        checked_turns = (
-            len(traces) if capture_failure is not None else len(scenario.caller_lines)
-        )
-        caller_stt = _input_stt_sidecars(stack, room, checked_turns)
-        caller_stt_failures = [
-            (
-                turn,
-                f"{scenario.name}: input STT sidecar turn {turn} did not match its scripted line",
+        # A partial capture never answered the lines after its failed turn, so it
+        # checks and reads only the turns it reached. A full capture also reads
+        # every committed sidecar past its last line, which exposes a phantom turn.
+        if capture_failure is None:
+            checked_lines = scenario.caller_lines
+            caller_stt = _input_stt_sidecars_through_commits(
+                stack, room, len(checked_lines)
             )
-            for turn, (expected, observed) in enumerate(
-                zip(scenario.caller_lines[:checked_turns], caller_stt, strict=True), 1
-            )
-            if not isinstance(observed, str)
-            or _content_tokens(expected) != _content_tokens(observed)
-        ]
+        else:
+            checked_lines = scenario.caller_lines[: len(traces)]
+            caller_stt = _input_stt_sidecars(stack, room, len(checked_lines))
+        failure_turn = _caller_stt_failure_turn(checked_lines, caller_stt)
+        if failure_turn is not None:
+            caller_stt_failures = [
+                (
+                    failure_turn,
+                    f"{scenario.name}: input STT sidecars did not match the scripted "
+                    "lines as a whole call",
+                )
+            ]
 
     phone_log_path = "voice/" + FAKE_PHONE_LOG
     phone_text = _remote_artifact_text(stack, phone_log_path, "fake phone log")

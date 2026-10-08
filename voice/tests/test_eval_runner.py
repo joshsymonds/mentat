@@ -1344,7 +1344,14 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 return CompletedProcess(command, 0, json.dumps(envelope), "")
 
             def run_remote(self, command):
-                return CompletedProcess(command, 0, outputs[command[-1]], "")
+                import subprocess
+
+                path = command[-1]
+                if path.startswith("voice/evals/retained-evidence/input-audio/") and path not in outputs:
+                    raise subprocess.CalledProcessError(
+                        1, command, output="", stderr=f"cat: {path}: No such file or directory\n"
+                    )
+                return CompletedProcess(command, 0, outputs[path], "")
 
         with patch.object(runner, "_voice_token", return_value=grant):
             return runner.observe_scenario(scenario, Stack(), judge=scripted_yes_judge())
@@ -6176,7 +6183,8 @@ class ScenarioObservationTests(unittest.TestCase):
                     )
                 prefix = "voice/evals/retained-evidence/input-audio/"
                 if path.startswith(prefix) and path.endswith(".txt"):
-                    sidecar = sidecars[int(path.rsplit("-", 1)[1][:-4]) - 1]
+                    index = int(path.rsplit("-", 1)[1][:-4])
+                    sidecar = sidecars[index - 1] if index <= len(sidecars) else None
                     if sidecar is None:
                         raise subprocess.CalledProcessError(
                             1, command, output="", stderr=f"cat: {path}: No such file or directory\n"
@@ -6196,10 +6204,17 @@ class ScenarioObservationTests(unittest.TestCase):
 
     def exact_stt_failures(self, observation):
         return [
-            failure["message"]
+            (failure["turn"], failure["message"])
             for failure in observation.get("product_failures", [])
             if "input STT sidecar" in failure["message"]
         ]
+
+    def whole_call_message(self, scenario_name, turn):
+        return (
+            turn,
+            f"{scenario_name}: input STT sidecars did not match the scripted lines "
+            "as a whole call",
+        )
 
     def test_exact_caller_stt_passes_matching_sidecars_and_records_them(self):
         scenario, observation, requested_paths = self.observe_exact_caller_stt(
@@ -6210,7 +6225,81 @@ class ScenarioObservationTests(unittest.TestCase):
 
         self.assertEqual(self.exact_stt_failures(observation), [])
         self.assertEqual(observation["caller_stt"], list(scenario.caller_lines))
-        self.assertEqual(sum(path.endswith(".txt") for path in requested_paths), 2)
+        # Two lines, plus one probe past the last line that finds no sidecar.
+        self.assertEqual(sum(path.endswith(".txt") for path in requested_paths), 3)
+
+    def test_exact_caller_stt_passes_a_line_split_across_two_turns(self):
+        sidecars = [
+            "Tell me a long story about a lighthouse",
+            "keeper and her cat.",
+            "Stop. What's the capital of Japan?",
+        ]
+        _, observation, _ = self.observe_exact_caller_stt(
+            "barge-in-long-reply", sidecars,
+        )
+        self.assertEqual(self.exact_stt_failures(observation), [])
+        self.assertEqual(observation["caller_stt"], sidecars)
+
+    def test_exact_caller_stt_passes_three_sidecars_for_two_lines(self):
+        lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
+        sidecars = [lines[0], "Stop.", "What's the capital of Japan?"]
+        _, observation, _ = self.observe_exact_caller_stt("barge-in-long-reply", sidecars)
+        self.assertEqual(self.exact_stt_failures(observation), [])
+        self.assertEqual(observation["caller_stt"], sidecars)
+
+    def test_exact_caller_stt_fails_a_stutter_across_turns(self):
+        lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
+        _, observation, _ = self.observe_exact_caller_stt(
+            "barge-in-long-reply", [lines[0], "Stop. Stop. What's the capital of Japan?"],
+        )
+        self.assertEqual(self.exact_stt_failures(observation), [
+            self.whole_call_message("barge-in-long-reply", 2)
+        ])
+
+    def test_exact_caller_stt_fails_a_missing_word_across_turns(self):
+        lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
+        _, observation, _ = self.observe_exact_caller_stt(
+            "barge-in-long-reply",
+            ["Tell me a long story about a lighthouse keeper.", "Stop. What's the capital of Japan?"],
+        )
+        self.assertEqual(self.exact_stt_failures(observation), [
+            self.whole_call_message("barge-in-long-reply", 2)
+        ])
+
+    def test_exact_caller_stt_reports_a_phantom_sidecar_at_the_last_scripted_turn(self):
+        lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
+        _, observation, _ = self.observe_exact_caller_stt(
+            "barge-in-long-reply", [lines[0], lines[1], "Thanks for the answer."],
+        )
+        # The phantom sits past the last scripted line, so its failure is reported at that line.
+        self.assertEqual(self.exact_stt_failures(observation), [
+            self.whole_call_message("barge-in-long-reply", 2)
+        ])
+
+    def test_exact_caller_stt_fails_a_phantom_sidecar_after_many_split_turns(self):
+        sidecars = [
+            "Tell me a long story",
+            "about a lighthouse",
+            "keeper",
+            "and her cat.",
+            "Stop. What's the capital of Japan?",
+            "Thanks for the answer.",
+        ]
+        _, observation, _ = self.observe_exact_caller_stt("barge-in-long-reply", sidecars)
+        self.assertEqual(self.exact_stt_failures(observation), [
+            self.whole_call_message("barge-in-long-reply", 2)
+        ])
+        self.assertEqual(observation["caller_stt"], sidecars)
+
+    def test_exact_caller_stt_fails_a_missing_sidecar_between_turns(self):
+        lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
+        _, observation, _ = self.observe_exact_caller_stt(
+            "barge-in-long-reply", [lines[0], None, "What's the capital of Japan?"],
+        )
+        self.assertEqual(self.exact_stt_failures(observation), [
+            self.whole_call_message("barge-in-long-reply", 2)
+        ])
+        self.assertEqual(observation["caller_stt"], [lines[0], None, "What's the capital of Japan?"])
 
     def test_exact_caller_stt_fails_the_mismatching_or_missing_turn(self):
         lines = next(s for s in SCENARIOS if s.name == "barge-in-long-reply").caller_lines
@@ -6218,7 +6307,7 @@ class ScenarioObservationTests(unittest.TestCase):
             "barge-in-long-reply", [lines[0], "Stop. What's the capital of Japan? What's"],
         )
         self.assertEqual(self.exact_stt_failures(observation), [
-            "barge-in-long-reply: input STT sidecar turn 2 did not match its scripted line"
+            self.whole_call_message("barge-in-long-reply", 2)
         ])
         self.assertEqual(
             [f["turn"] for f in observation["product_failures"]
@@ -6229,7 +6318,7 @@ class ScenarioObservationTests(unittest.TestCase):
 
         _, observation, _ = self.observe_exact_caller_stt("barge-in-long-reply", [None, lines[1]])
         self.assertEqual(self.exact_stt_failures(observation), [
-            "barge-in-long-reply: input STT sidecar turn 1 did not match its scripted line"
+            self.whole_call_message("barge-in-long-reply", 1)
         ])
         self.assertEqual(observation["caller_stt"], [None, lines[1]])
 
@@ -6248,7 +6337,7 @@ class ScenarioObservationTests(unittest.TestCase):
         )
         self.assertIn("failure", observation)
         self.assertEqual(self.exact_stt_failures(observation), [
-            "barge-in-long-reply: input STT sidecar turn 1 did not match its scripted line"
+            self.whole_call_message("barge-in-long-reply", 1)
         ])
         self.assertEqual(
             [f["turn"] for f in observation["product_failures"]
@@ -6264,7 +6353,7 @@ class ScenarioObservationTests(unittest.TestCase):
 
         _, observation, _ = self.observe_exact_caller_stt("phone-first-line", [None])
         self.assertEqual(self.exact_stt_failures(observation), [
-            "phone-first-line: input STT sidecar turn 1 did not match its scripted line"
+            self.whole_call_message("phone-first-line", 1)
         ])
 
     def test_scenarios_without_exact_caller_stt_load_no_sidecars(self):
