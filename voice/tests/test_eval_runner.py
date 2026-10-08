@@ -436,15 +436,18 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self, first_line_pcm, *, agent_after_sleeps=0, slow_io=False,
         buffer_error=None, live_error=None,
     ):
-        """Fake rtc whose room records the publish options, byte stream and live frames.
+        """Fake rtc and clock whose room records the publish options, byte stream and live frames.
 
-        slow_io makes each buffer write and each live frame yield to the event loop, so
-        the two can interleave the way real I/O does. buffer_error fails the first buffer
-        write; live_error fails the first live frame sent after the buffer stream opens.
+        The clock advances only by the caller's sleeps. Each sleep yields once per 10 ms
+        live frame it spans, and each live frame yields once, so the live stream and the
+        sleeps move in step the way real I/O does. slow_io also yields on each buffer write.
+        buffer_error fails the first buffer write; live_error fails the first live frame
+        sent after the buffer stream opens.
         """
         dependencies = self.dependencies_for_failure("other")
+        clock = Clock()
         recorded = SimpleNamespace(
-            events=[], options=[], streams=[], frames=[], sleeps=[],
+            events=[], options=[], streams=[], frames=[], sleeps=[], playout_ends=[],
         )
         agent = SimpleNamespace(kind=1, identity="agent-worker-1")
 
@@ -492,8 +495,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     raise live_error
                 recorded.events.append("frame")
                 recorded.frames.append(frame.data)
-                if slow_io:
-                    await asyncio.sleep(0)
+                await asyncio.sleep(0)
 
             async def wait_for_playout(self):
                 pass
@@ -502,22 +504,36 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         async def sleep(seconds):
             recorded.sleeps.append(seconds)
+            recorded.events.append(f"sleep {seconds}")
+            clock.now += seconds
             if len(recorded.sleeps) == agent_after_sleeps:
                 participants[agent.identity] = agent
+                recorded.events.append("agent-joined")
+            for _ in range(round(seconds * runner.RATE / runner.FRAME_SAMPLES)):
+                await asyncio.sleep(0)
 
         async def tts(_http, text):
             if text.startswith("First"):
                 return first_line_pcm
             return rendered_pcm(text)
 
-        dependencies = CaptureDependencies(**{**dependencies.__dict__, "sleep": sleep, "tts": tts})
+        dependencies = CaptureDependencies(**{
+            **dependencies.__dict__, "sleep": sleep, "tts": tts,
+            "monotonic": clock.monotonic, "wall_time": clock.wall_time,
+        })
         return dependencies, recorded
 
     @staticmethod
-    async def run_preconnect_capture(dependencies, *, preconnect_first_line):
+    def upsample_2x(pcm):
+        """Double 24 kHz mono PCM to 48 kHz by repeating each sample."""
+        return b"".join(pcm[index : index + 2] * 2 for index in range(0, len(pcm), 2))
+
+    @staticmethod
+    async def run_preconnect_capture(dependencies, recorded, *, preconnect_first_line):
         async def speech_end(source):
+            recorded.playout_ends.append(len(recorded.frames))
             await source.wait_for_playout()
-            return time.monotonic()
+            return dependencies.monotonic()
 
         with (
             patch.dict(os.environ, TEST_VOICE_ENV),
@@ -531,11 +547,22 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 **({"preconnect_first_line": True} if preconnect_first_line else {}),
             )
 
-    async def test_preconnect_first_line_sends_phone_style_buffer_then_overlaps_live_stream(self):
+    async def test_preconnect_first_line_streams_live_from_its_first_sample_before_the_agent_joins(self):
         first = self.ramp_pcm("First question", 2.0)
-        dependencies, recorded = self.preconnect_dependencies(first)
+        dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=3)
 
-        traces = await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+        await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
+
+        self.assertLess(recorded.events.index("frame"), recorded.events.index("agent-joined"))
+        self.assertEqual(recorded.frames[0], first[: runner.FRAME_SAMPLES * 2])
+        first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
+        self.assertEqual(b"".join(first_frames)[: len(first)], first)
+
+    async def test_preconnect_buffer_is_sent_after_agent_subscription_and_the_send_delay(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=3)
+
+        traces = await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
 
         self.assertTrue(recorded.options[0].preconnect_buffer)
         self.assertEqual(len(recorded.streams), 1)
@@ -546,58 +573,96 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             "destination_identities": ["agent-worker-1"],
             "attributes": {"trackId": "TR_caller_mic", "sampleRate": "48000", "channels": "1"},
         })
-        opening = first[: runner.RATE * 2]
-        upsampled = b"".join(opening[index : index + 2] * 2 for index in range(0, len(opening), 2))
-        self.assertEqual(len(stream["data"]), 48000 * 1 * 2)
-        self.assertEqual(bytes(stream["data"]), upsampled)
+        # Three 0.2 s polls bring the agent in, then the buffer waits 0.7 s after
+        # subscription: 1.3 s of mic audio, from the first sample to the send.
+        send_samples = round(1.3 * runner.RATE)
+        self.assertEqual(bytes(stream["data"]), self.upsample_2x(first[: send_samples * 2]))
+        self.assertEqual(len(stream["data"]), 4 * send_samples)
         self.assertTrue(stream["closed"])
+        self.assertLess(recorded.events.index("agent-joined"), recorded.events.index("subscribed"))
+        self.assertLess(recorded.events.index("subscribed"), recorded.events.index("sleep 0.7"))
+        self.assertLess(recorded.events.index("sleep 0.7"), recorded.events.index("stream-opened"))
+        self.assertAlmostEqual(
+            traces[0]["preconnect"]["buffer_seconds"],
+            len(stream["data"]) / (runner.PRECONNECT_SAMPLE_RATE * 2),
+        )
+        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 1.3)
+        self.assertAlmostEqual(traces[0]["preconnect"]["overlap_seconds"], 0.7)
+        self.assertNotIn("preconnect", traces[1])
+        second = b"".join(recorded.frames[-self.frames_in(rendered_pcm("Second question")):])
+        self.assertEqual(second, rendered_pcm("Second question"))
 
+    async def test_preconnect_live_track_holds_silence_after_the_line_until_the_buffer_is_sent(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=15)
+
+        traces = await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
+
+        # Fifteen 0.2 s polls and the 0.7 s send delay put the send at 3.7 s, 1.7 s past the line.
+        send_samples = round(3.7 * runner.RATE)
+        mic = first + bytes(send_samples * 2 - len(first))
+        self.assertEqual(bytes(recorded.streams[0]["data"]), self.upsample_2x(mic))
+        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 3.7)
         first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
         live = b"".join(first_frames)
-        self.assertEqual(live, first[int(0.3 * runner.RATE) * 2 :])
-        self.assertEqual(
-            recorded.events.index("subscribed") < recorded.events.index("stream-opened"), True
-        )
-        self.assertLess(recorded.events.index("frame"), recorded.events.index("stream-closed"))
-        self.assertNotIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
-        self.assertEqual(traces[0]["preconnect"], {"buffer_seconds": 1.0, "overlap_seconds": 0.7})
-        self.assertNotIn("preconnect", traces[1])
-        second = b"".join(recorded.frames[len(first_frames) :])
-        self.assertEqual(second, rendered_pcm("Second question"))
+        self.assertEqual(live[: len(first)], first)
+        self.assertGreater(len(live), len(first))
+        self.assertEqual(live[len(first) :], bytes(len(live) - len(first)))
+
+    async def test_preconnect_buffer_shorter_than_the_send_time_is_the_line_then_silence(self):
+        first = self.ramp_pcm("First question", 0.8)
+        dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=3)
+
+        traces = await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
+
+        send_samples = round(1.3 * runner.RATE)
+        mic = first + bytes(send_samples * 2 - len(first))
+        self.assertEqual(bytes(recorded.streams[0]["data"]), self.upsample_2x(mic))
+        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 1.3)
+
+    async def test_preconnect_speech_end_is_the_end_of_line_one_playout_before_any_silence(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=3)
+
+        await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
+
+        self.assertEqual(recorded.playout_ends[0], self.frames_in(first))
 
     async def test_preconnect_live_head_streams_while_the_buffer_writes_are_in_flight(self):
         first = self.ramp_pcm("First question", 2.0)
-        dependencies, recorded = self.preconnect_dependencies(first, slow_io=True)
+        dependencies, recorded = self.preconnect_dependencies(
+            first, agent_after_sleeps=3, slow_io=True,
+        )
 
-        await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+        await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
 
-        self.assertLess(recorded.events.index("subscribed"), recorded.events.index("frame"))
-        self.assertLess(recorded.events.index("frame"), recorded.events.index("stream-closed"))
-        first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
-        self.assertEqual(b"".join(first_frames), first[int(0.3 * runner.RATE) * 2 :])
-        opening = first[: runner.RATE * 2]
-        upsampled = b"".join(opening[index : index + 2] * 2 for index in range(0, len(opening), 2))
-        self.assertEqual(bytes(recorded.streams[0]["data"]), upsampled)
+        opened = recorded.events.index("stream-opened")
+        closed = recorded.events.index("stream-closed")
+        self.assertIn("frame", recorded.events[opened:closed])
+        send_samples = round(1.3 * runner.RATE)
+        self.assertEqual(
+            bytes(recorded.streams[0]["data"]), self.upsample_2x(first[: send_samples * 2]),
+        )
 
     async def test_preconnect_buffer_failure_fails_the_capture_and_leaves_no_task_running(self):
         first = self.ramp_pcm("First question", 2.0)
-        dependencies, _recorded = self.preconnect_dependencies(
+        dependencies, recorded = self.preconnect_dependencies(
             first, slow_io=True, buffer_error=RuntimeError("buffer write broke"),
         )
 
         with self.assertRaisesRegex(RuntimeError, "buffer write broke"):
-            await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+            await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
 
         self.assertEqual(self.other_tasks(), [])
 
     async def test_preconnect_live_push_failure_fails_the_capture_and_leaves_no_task_running(self):
         first = self.ramp_pcm("First question", 2.0)
-        dependencies, _recorded = self.preconnect_dependencies(
+        dependencies, recorded = self.preconnect_dependencies(
             first, slow_io=True, live_error=RuntimeError("live frame broke"),
         )
 
         with self.assertRaisesRegex(RuntimeError, "live frame broke"):
-            await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+            await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
 
         self.assertEqual(self.other_tasks(), [])
 
@@ -610,7 +675,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         first = self.ramp_pcm("First question", 2.0)
         dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=2)
 
-        await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
+        await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
 
         self.assertEqual(len(recorded.streams), 1)
         self.assertEqual(
@@ -618,30 +683,11 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(runner.caller.MICROPHONE_SETTLE_SECONDS, recorded.sleeps)
 
-    async def test_preconnect_first_line_shorter_than_the_buffer_fails_before_connecting(self):
-        first = self.ramp_pcm("First question", 0.8)
-        dependencies, recorded = self.preconnect_dependencies(first)
-
-        with self.assertRaises(runner.PartialCaptureFailure) as raised:
-            await self.run_preconnect_capture(dependencies, preconnect_first_line=True)
-
-        self.assertEqual(raised.exception.turns, [])
-        self.assertEqual(
-            raised.exception.failure["message"],
-            "scripted speech sample count mismatch for line 1",
-        )
-        envelope = json.dumps({"turns": [], "failure": raised.exception.failure})
-        self.assertEqual(
-            runner._capture_envelope(envelope, 1), ([], raised.exception.failure)
-        )
-        self.assertEqual(recorded.options, [])
-        self.assertEqual(recorded.streams, [])
-
     async def test_without_preconnect_first_line_the_whole_line_streams_live_after_the_settle(self):
         first = self.ramp_pcm("First question", 2.0)
         dependencies, recorded = self.preconnect_dependencies(first)
 
-        traces = await self.run_preconnect_capture(dependencies, preconnect_first_line=False)
+        traces = await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=False)
 
         self.assertFalse(getattr(recorded.options[0], "preconnect_buffer", False))
         self.assertEqual(recorded.streams, [])

@@ -317,10 +317,13 @@ gardener, including a timer imperative and a quoted stop-translation
 phrase; neither is acted on as a phone command or mode change.
 
 Two capture modes serve the first-line and barge-in scenarios.
-`phone-first-line` runs with `--preconnect-first-line`: the opening second of
-line 1 goes to the worker as the phone's pre-connect buffer while line 1 also
-streams live from 0.3 s, so the two overlap by 0.7 s the way the Pixel's do, and
-the room must still hear the line once. In `barge-in-long-reply`,
+`phone-first-line` runs with `--preconnect-first-line`: line 1 streams live from
+its first sample as soon as the mic is published, as the Pixel's does. Once the
+agent is subscribed and 0.7 s have passed, the mic audio up to that moment goes
+to the worker as the phone's pre-connect buffer, so the two overlap by 0.7 s and
+the room must still hear the line once. The live track carries silence after
+the line until the buffer is sent, and the trace records the buffer's actual
+seconds. In `barge-in-long-reply`,
 `--barge-in TURN:SECONDS` (one-based TURN, repeatable) starts that line SECONDS
 after the agent's reply begins; the scenario speaks its second line 15 seconds
 into a long story to check that the interruption commits during the agent's
