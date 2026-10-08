@@ -5,10 +5,12 @@ few LiveKit pieces it touches; where livekit is installed the real ones are used
 """
 
 import asyncio
+import gzip
 import importlib
 import importlib.util
 import math
 import random
+import struct
 import sys
 import threading
 import types
@@ -236,6 +238,37 @@ def record(plan, begin, end, rate, *, seed, noise=0.0, gain=1.0, pitch_scale=1.0
     return samples
 
 
+FIXTURE = VOICE_DIR / "tests" / "fixtures" / "preconnect-eval-line.pcm.gz"
+EVAL_TOLERANCE = LIVE_RATE // 100  # ten milliseconds of live samples
+# The fixture is four back-to-back sections of the eval's line at 24 kHz mono int16: the phone's
+# buffer (the rendered line, 0.0 to 1.0 s), a live head that is an Opus copy of the line from
+# 0.3 s, the same copy after 0.3 s of silence, and another TTS rendering of the same sentence.
+EVAL_SECTIONS = {
+    "buffer": (0, 24000),
+    "copy": (24000, 48000),
+    "copy_after_silence": (48000, 79200),
+    "other_rendering": (79200, 103200),
+}
+
+
+def eval_line(section):
+    """One section of the eval's recorded line, as int16 samples at 24 kHz."""
+    with gzip.open(FIXTURE) as recording:
+        raw = recording.read()
+    samples = struct.unpack(f"<{len(raw) // 2}h", raw)
+    first, last = EVAL_SECTIONS[section]
+    return array("h", samples[first:last])
+
+
+def eval_case(live_section):
+    """The eval's line as the phone sends it: the buffer repeated up to 48 kHz, the live head at 24 kHz."""
+    doubled = array("h", (value for value in eval_line("buffer") for _ in (0, 1)))
+    return SimpleNamespace(
+        buffer=frames_of(doubled, BUFFER_RATE),
+        live=frames_of(eval_line(live_section), LIVE_RATE),
+    )
+
+
 def frames_of(samples, rate):
     step = round(rate * FRAME_SECONDS)
     return [
@@ -340,6 +373,18 @@ def kept_after_skipping(case, out):
     skipped = len(live) - len(kept)
     assert kept == live[skipped:], "the kept audio is not the tail of the live track"
     return skipped
+
+
+def removed_span(case, out):
+    """The live samples the output lacks, as (begin, end), checking nothing else changed."""
+    live = samples_of(case.live)
+    kept = samples_of(out)
+    removed = len(live) - len(kept)
+    begin = next(
+        (at for at, (heard, said) in enumerate(zip(live, kept)) if heard != said), len(kept)
+    )
+    assert kept[begin:] == live[begin + removed:], "the output is not the live track minus one span"
+    return begin, begin + removed
 
 
 class FakeHandler:
@@ -448,6 +493,34 @@ class PreConnectDedupeTest(AsyncTest):
             + record([], 0.0, 1.0, LIVE_RATE, seed=4),
             LIVE_RATE,
         )
+
+        self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+
+    async def test_the_opus_copy_of_the_eval_line_is_skipped_from_its_start(self):
+        case = eval_case("copy")
+
+        skipped = kept_after_skipping(case, await dedupe(case))
+
+        self.assertAlmostEqual(skipped, round(0.7 * LIVE_RATE), delta=EVAL_TOLERANCE)
+
+    async def test_the_opus_copy_after_a_quiet_lead_keeps_the_lead_and_skips_the_copy(self):
+        case = eval_case("copy_after_silence")
+
+        begin, end = removed_span(case, await dedupe(case))
+
+        self.assertGreaterEqual(begin, 0.28 * LIVE_RATE)
+        self.assertLessEqual(begin, 0.30 * LIVE_RATE)
+        self.assertAlmostEqual(end, LIVE_RATE, delta=EVAL_TOLERANCE)
+
+    async def test_another_rendering_of_the_eval_line_is_kept_whole(self):
+        case = eval_case("other_rendering")
+
+        self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+
+    async def test_another_rendering_after_a_quiet_lead_is_kept_whole(self):
+        case = eval_case("other_rendering")
+        silence = array("h", bytes(round(0.3 * LIVE_RATE) * 2))
+        case.live = frames_of(silence + eval_line("other_rendering"), LIVE_RATE)
 
         self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
 

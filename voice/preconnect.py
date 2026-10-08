@@ -47,8 +47,12 @@ MIN_OVERLAP_SECONDS = 0.25
 MATCH_SCORE = 0.85
 # Windows quieter than this (int16 units, after averaging) carry nothing to match.
 MIN_RMS = 30.0
+# The live lead ends at the first window this long at or above MIN_RMS. The repeat is scored from
+# ONSET_LAG_SECONDS past that onset, because Opus smears the attack and the onset itself fails.
+ONSET_WINDOW_SECONDS = 0.01
+ONSET_LAG_SECONDS = 0.02
 
-_LOOKING, _SKIPPING, _PASSING = "looking", "skipping", "passing"
+_LOOKING, _PASSING = "looking", "passing"
 
 
 def _mono(frames: Iterable[Any]) -> array[int]:
@@ -67,33 +71,52 @@ def _mono(frames: Iterable[Any]) -> array[int]:
 
 
 def _decimate(samples: Sequence[int], rate: int) -> list[float]:
-    """Block averages of the samples at COMMON_RATE, with the mean removed."""
+    """Differenced block averages of the samples at COMMON_RATE.
+
+    Each block is taken relative to the one before it. That weights down the low frequencies,
+    where the Opus copy drifts in phase, and the first block is taken against silence.
+    """
     size = rate / COMMON_RATE
     totals = list(accumulate(samples, initial=0))
     edges = [round(block * size) for block in range(int(len(samples) / size) + 1)]
     blocks = [
         (totals[end] - totals[start]) / (end - start) for start, end in zip(edges, edges[1:])
     ]
-    mean = sum(blocks) / len(blocks) if blocks else 0.0
-    return [value - mean for value in blocks]
+    return [value - before for before, value in zip([0.0, *blocks], blocks)]
 
 
-def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> int | None:
-    """How many blocks at the end of the buffer the start of live repeats, or None.
+def _onset(live: Sequence[float]) -> int | None:
+    """The first block of the first window at or above MIN_RMS, or None if there is none."""
+    window = int(ONSET_WINDOW_SECONDS * COMMON_RATE)
+    quiet = MIN_RMS * MIN_RMS
+    energy = list(accumulate((value * value for value in live), initial=0.0))
+    for start in range(len(live) - window + 1):
+        if energy[start + window] - energy[start] >= quiet * window:
+            return start
+    return None
 
-    The live track and the buffer record the same microphone, so the live head, when it
-    repeats anything, repeats the buffer from some point to its very end. That leaves one
-    unknown, where in the buffer the live head begins, and the best fit is the start
-    whose normalised correlation over the overlap is highest.
+
+def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> tuple[int, int] | None:
+    """Where the live lead ends, and how many blocks of the buffer's end the live head repeats.
+
+    The live track and the buffer record the same microphone, so the live head repeats the
+    buffer from some point to its very end, after a lead that may be quiet. The lead ends at
+    the onset, and the repeat is scored from ONSET_LAG_SECONDS past it. The best fit is the
+    buffer start whose normalised correlation over the overlap is highest.
     """
+    onset = _onset(live)
+    if onset is None:
+        return None
+    lag = int(ONSET_LAG_SECONDS * COMMON_RATE)
+    live = live[onset + lag:]
     least = int(MIN_OVERLAP_SECONDS * COMMON_RATE)
     if len(buffer) < least or len(live) < least:
         return None
     quiet = MIN_RMS * MIN_RMS
     buffer_energy = list(accumulate((value * value for value in buffer), initial=0.0))
     live_energy = list(accumulate((value * value for value in live), initial=0.0))
-    best_score, best_start = 0.0, 0
-    for start in range(len(buffer) - least + 1):
+    best_score, best_start = 0.0, lag
+    for start in range(lag, len(buffer) - least + 1):
         width = min(len(live), len(buffer) - start)
         heard = buffer_energy[start + width] - buffer_energy[start]
         said = live_energy[width]
@@ -104,27 +127,37 @@ def _find_repeat(buffer: Sequence[float], live: Sequence[float]) -> int | None:
             best_score, best_start = score, start
     if best_score < MATCH_SCORE:
         return None
-    return len(buffer) - best_start
+    return onset, len(buffer) - (best_start - lag)
 
 
-def _repeated_samples(buffer: Sequence[Any], live: Sequence[Any], live_rate: int) -> int:
-    """Samples per channel at the start of the live frames that repeat the buffer's end."""
+def _repeated_samples(
+    buffer: Sequence[Any], live: Sequence[Any], live_rate: int
+) -> tuple[int, int]:
+    """Samples per channel of the live lead, then of the live repeat of the buffer's end.
+
+    Both are zero when the live head repeats nothing.
+    """
     buffer_rate = buffer[0].sample_rate
     buffer_blocks = _decimate(_mono(buffer), buffer_rate)
-    blocks = _find_repeat(buffer_blocks, _decimate(_mono(live), live_rate))
-    if blocks is None:
-        return 0
+    found = _find_repeat(buffer_blocks, _decimate(_mono(live), live_rate))
+    if found is None:
+        return 0, 0
+    onset, blocks = found
     buffer_samples = sum(frame.samples_per_channel for frame in buffer)
     longest = round(buffer_samples * live_rate / buffer_rate)
-    return min(round(blocks * live_rate / COMMON_RATE), longest)
-
-
-def _drop(frame: Any, count: int) -> Any:
-    """The frame without its first count samples per channel."""
-    data = bytes(frame.data)[count * frame.num_channels * 2:]
-    return rtc.AudioFrame(
-        data, frame.sample_rate, frame.num_channels, frame.samples_per_channel - count
+    return (
+        round(onset * live_rate / COMMON_RATE),
+        min(round(blocks * live_rate / COMMON_RATE), longest),
     )
+
+
+def _part(frame: Any, begin: int, end: int) -> Any:
+    """The frame's samples per channel from begin to end, as a frame of their own."""
+    if begin == 0 and end == frame.samples_per_channel:
+        return frame
+    width = frame.num_channels * 2
+    data = bytes(frame.data)[begin * width:end * width]
+    return rtc.AudioFrame(data, frame.sample_rate, frame.num_channels, end - begin)
 
 
 class _LiveAudio:
@@ -149,6 +182,7 @@ class _LiveAudio:
         self._held_samples = 0
         self._next_look = 0
         self._limit = 0
+        self._lead = 0
         self._to_skip = 0
         self._ready: deque[Any] = deque()
         self._ended = False
@@ -185,15 +219,19 @@ class _LiveAudio:
             self._held_samples += frame.samples_per_channel
             if self._held_samples >= self._next_look:
                 await self._settle(final=False)
-        elif self._state == _SKIPPING:
-            dropped = min(self._to_skip, frame.samples_per_channel)
-            self._to_skip -= dropped
-            if self._to_skip == 0:
-                self._state = _PASSING
-            if dropped < frame.samples_per_channel:
-                self._ready.append(self._cancel(_drop(frame, dropped)))
         else:
-            self._ready.append(self._cancel(frame))
+            self._pass(frame)
+
+    def _pass(self, frame: Any) -> None:
+        """Queue the frame without the repeat: the lead before it passes, then the repeat is cut."""
+        count = frame.samples_per_channel
+        lead = min(self._lead, count)
+        dropped = min(self._to_skip, count - lead)
+        self._lead -= lead
+        self._to_skip -= dropped
+        for begin, end in ((0, lead), (lead + dropped, count)):
+            if begin < end:
+                self._ready.append(self._cancel(_part(frame, begin, end)))
 
     def _begin(self) -> None:
         seconds = 0.0
@@ -211,7 +249,7 @@ class _LiveAudio:
     async def _settle(self, *, final: bool) -> None:
         if self._state != _LOOKING or not self._held:
             return
-        repeated = await asyncio.to_thread(
+        lead, repeated = await asyncio.to_thread(
             _repeated_samples, self._buffer, self._held, self._sample_rate
         )
         if not repeated and not final and self._held_samples < self._limit:
@@ -219,8 +257,8 @@ class _LiveAudio:
             self._next_look = min(self._held_samples + step, self._limit)
             return
         held, self._held = self._held, []
-        self._to_skip = repeated
-        self._state = _SKIPPING if repeated else _PASSING
+        self._lead, self._to_skip = lead, repeated
+        self._state = _PASSING
         if repeated:
             logger.info("dropped %d live samples repeating the pre-connect buffer", repeated)
         for frame in held:
