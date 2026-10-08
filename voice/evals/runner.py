@@ -64,6 +64,11 @@ ROOM_POLL_INTERVAL_SECONDS = 0.25
 BARGE_IN_POLL_SECONDS = 0.02
 # voice/caller.py's message when the agent's reply never starts before its deadline.
 REPLY_NOT_STARTED_FAILURE = "agent audio response did not start before its deadline"
+# voice/caller.py's messages when the agent's audio track ends before any speech is heard.
+NO_REPLY_AUDIO_FAILURES = frozenset({
+    "agent audio track produced no speech",
+    "agent audio track produced no frames",
+})
 # The voice closed the room after the final scripted line's reply, which the scenario did not expect.
 ROOM_DELETED_AFTER_FINAL_LINE_FAILURE = "room was deleted after the final scripted line was captured"
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
@@ -1536,18 +1541,25 @@ async def capture_script(
                 )
 
         async def await_reply(index: int, speech_started_at: float, reply: Awaitable[Any]) -> Any:
-            """Await turn INDEX + 1's reply, failing that turn if the agent never starts it."""
+            """Await turn INDEX + 1's reply, failing that turn if the agent never starts it.
+
+            In a barge-in run, an agent audio track that ends without speech is also a reply
+            that never started.
+            """
             try:
                 return await reply
             except RuntimeError as error:
-                if str(error) != REPLY_NOT_STARTED_FAILURE:
+                never_started = str(error) == REPLY_NOT_STARTED_FAILURE or (
+                    bool(barge_in) and str(error) in NO_REPLY_AUDIO_FAILURES
+                )
+                if not never_started:
                     raise
                 if pending_finish is not None:
                     await pending_finish
                 raise PartialCaptureFailure(
                     traces,
                     index + 1,
-                    str(error),
+                    REPLY_NOT_STARTED_FAILURE,
                     speech_started_at=speech_started_at,
                 ) from error
 

@@ -943,6 +943,9 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
     # voice/caller.py's message when the agent's reply never starts before its deadline.
     CALLER_REPLY_NOT_STARTED = "agent audio response did not start before its deadline"
+    # voice/caller.py's messages when the agent's audio track ends before any speech.
+    CALLER_NO_SPEECH = "agent audio track produced no speech"
+    CALLER_NO_FRAMES = "agent audio track produced no frames"
 
     def assert_reply_not_started(self, failure, turn, started_before, started_after):
         """The failed turn names its speech start, which capture_script read between the bounds."""
@@ -993,6 +996,66 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.failure, 2, started_before, started_after
         )
 
+    async def test_barge_in_reply_track_without_speech_or_frames_fails_that_turn(self):
+        for message in (self.CALLER_NO_SPEECH, self.CALLER_NO_FRAMES):
+            with self.subTest(message=message):
+                dependencies, record, _captures, _clock = self.barge_in_harness(
+                    capture_failures={1: RuntimeError(message)}
+                )
+
+                started_before = time.time()
+                with self.assertRaises(runner.PartialCaptureFailure) as raised:
+                    await self.run_barge_in_capture(
+                        dependencies,
+                        ["First question@0::answer", "Second question@30::answer"],
+                        barge_in={2: 9.0},
+                    )
+                started_after = time.time()
+
+                self.assertEqual(raised.exception.turns, [])
+                self.assert_reply_not_started(
+                    raised.exception.failure, 1, started_before, started_after
+                )
+                self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+                self.assertNotIn(2, record.pushes)
+
+    async def test_barge_in_reply_track_without_speech_or_frames_keeps_the_turn_before_it(self):
+        for message in (self.CALLER_NO_SPEECH, self.CALLER_NO_FRAMES):
+            with self.subTest(message=message):
+                dependencies, _record, _captures, _clock = self.barge_in_harness(
+                    capture_failures={2: RuntimeError(message)}
+                )
+
+                started_before = time.time()
+                with self.assertRaises(runner.PartialCaptureFailure) as raised:
+                    await self.run_barge_in_capture(
+                        dependencies,
+                        ["First question@0::answer", "Second question@30::answer"],
+                        barge_in={2: 9.0},
+                    )
+                started_after = time.time()
+
+                self.assertEqual([trace["turn"] for trace in raised.exception.turns], [1])
+                self.assertEqual(raised.exception.turns[0]["transcript"], "answer")
+                self.assert_reply_not_started(
+                    raised.exception.failure, 2, started_before, started_after
+                )
+
+    async def test_barge_in_reply_failure_other_than_missing_audio_still_propagates(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            capture_failures={1: RuntimeError("agent audio capture lost its room")}
+        )
+
+        with self.assertRaises(RuntimeError) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+
+        self.assertNotIsInstance(raised.exception, runner.PartialCaptureFailure)
+        self.assertEqual(str(raised.exception), "agent audio capture lost its room")
+
     async def test_turn_whose_reply_never_starts_after_a_plain_turn_is_a_partial_failure(self):
         dependencies, _record, _captures, _clock = self.barge_in_harness(
             capture_failures={2: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
@@ -1012,64 +1075,66 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_first_turn_reply_that_never_starts_is_observed_and_scored_without_aborting(self):
-        from subprocess import CompletedProcess
+        for message in (self.CALLER_REPLY_NOT_STARTED, self.CALLER_NO_SPEECH, self.CALLER_NO_FRAMES):
+            with self.subTest(message=message):
+                from subprocess import CompletedProcess
 
-        dependencies, _record, _captures, _clock = self.barge_in_harness(
-            capture_failures={1: RuntimeError(self.CALLER_REPLY_NOT_STARTED)}
-        )
-        room = "android-selected-room"
-        scenario = SCENARIOS[0]
+                dependencies, _record, _captures, _clock = self.barge_in_harness(
+                    capture_failures={1: RuntimeError(message)}
+                )
+                room = "android-selected-room"
+                scenario = SCENARIOS[0]
 
-        with self.assertRaises(runner.PartialCaptureFailure) as raised:
-            await self.run_barge_in_capture(
-                dependencies,
-                ["First question@0::answer", "Second question@30::answer"],
-                barge_in={2: 9.0},
-            )
-        # The delegation starts after the line's speech start, which capture_script recorded.
-        delegation_at = time.time()
-        envelope = json.dumps({
-            "turns": raised.exception.turns,
-            "failure": raised.exception.failure,
-        })
-        delegation_markers = json.dumps({"room": room, "id": "d1", "created_at": delegation_at}) + "\n"
-        record = "".join(json.dumps(message) + "\n" for message in (
-            {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1", "model": "claude-opus-5"}}},
-            {"type": "result", "session_id": "voice-" + room},
-        ))
-        grant = {"token": "header.payload.signature", "room": room, "url": "wss://livekit.invalid"}
+                with self.assertRaises(runner.PartialCaptureFailure) as raised:
+                    await self.run_barge_in_capture(
+                        dependencies,
+                        ["First question@0::answer", "Second question@30::answer"],
+                        barge_in={2: 9.0},
+                    )
+                # The delegation starts after the line's speech start, which capture_script recorded.
+                delegation_at = time.time()
+                envelope = json.dumps({
+                    "turns": raised.exception.turns,
+                    "failure": raised.exception.failure,
+                })
+                delegation_markers = json.dumps({"room": room, "id": "d1", "created_at": delegation_at}) + "\n"
+                record = "".join(json.dumps(entry) + "\n" for entry in (
+                    {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1", "model": "claude-opus-5"}}},
+                    {"type": "result", "session_id": "voice-" + room},
+                ))
+                grant = {"token": "header.payload.signature", "room": room, "url": "wss://livekit.invalid"}
 
-        class Stack:
-            base_url = "http://127.0.0.1:8485"
+                class Stack:
+                    base_url = "http://127.0.0.1:8485"
 
-            def start_worker(self, _room):
-                pass
+                    def start_worker(self, _room):
+                        pass
 
-            def run_voice(self, command, *, token, livekit_url):
-                return CompletedProcess(command, 0, envelope, "")
+                    def run_voice(self, command, *, token, livekit_url):
+                        return CompletedProcess(command, 0, envelope, "")
 
-            def run_remote(self, command):
-                if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
-                    output = ""
-                elif command == ["sudo", "cat", "voice/evals/delegations.jsonl"]:
-                    output = delegation_markers
-                elif command == ["sudo", "cat", f"records/voice-{room}.jsonl"]:
-                    output = record
-                else:
-                    raise AssertionError(f"unexpected remote command {command!r}")
-                return CompletedProcess(command, 0, output, "")
+                    def run_remote(self, command):
+                        if command == ["sudo", "cat", "voice/evals/phone.jsonl"]:
+                            output = ""
+                        elif command == ["sudo", "cat", "voice/evals/delegations.jsonl"]:
+                            output = delegation_markers
+                        elif command == ["sudo", "cat", f"records/voice-{room}.jsonl"]:
+                            output = record
+                        else:
+                            raise AssertionError(f"unexpected remote command {command!r}")
+                        return CompletedProcess(command, 0, output, "")
 
-        with patch.object(runner, "_voice_token", return_value=grant):
-            observation = runner.observe_scenario(
-                scenario, Stack(), judge=scripted_yes_judge()
-            )
+                with patch.object(runner, "_voice_token", return_value=grant):
+                    observation = runner.observe_scenario(
+                        scenario, Stack(), judge=scripted_yes_judge()
+                    )
 
-        self.assertEqual(observation["turns"], [])
-        self.assertEqual(observation["failure"], raised.exception.failure)
-        from evals.report import score_observations
+                self.assertEqual(observation["turns"], [])
+                self.assertEqual(observation["failure"], raised.exception.failure)
+                from evals.report import score_observations
 
-        report = score_observations({"cases": [{"name": scenario.name, "runs": [observation]}]}, required_runs=1)
-        self.assertFalse(report["passed"])
+                report = score_observations({"cases": [{"name": scenario.name, "runs": [observation]}]}, required_runs=1)
+                self.assertFalse(report["passed"])
 
     @staticmethod
     def with_room_gone(dependencies):
