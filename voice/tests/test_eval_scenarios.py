@@ -291,6 +291,7 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertIsNone(phone.room_close_after)
         self.assertTrue(phone.preconnect_first_line)
         self.assertTrue(phone.exact_caller_stt)
+        self.assertTrue(phone.close_after_final_line_optional)
         self.assertEqual(phone.barge_in_after, ())
 
         barge = self.scenario("barge-in-long-reply")
@@ -306,6 +307,7 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertEqual(barge.barge_in_after, (None, 8.0))
         self.assertTrue(barge.exact_caller_stt)
         self.assertFalse(barge.preconnect_first_line)
+        self.assertFalse(barge.close_after_final_line_optional)
 
     def test_existing_scenarios_keep_new_field_defaults(self):
         new = {"phone-first-line", "barge-in-long-reply"}
@@ -316,6 +318,7 @@ class ScenarioScoringTests(unittest.TestCase):
                 self.assertFalse(scenario.preconnect_first_line)
                 self.assertEqual(scenario.barge_in_after, ())
                 self.assertFalse(scenario.exact_caller_stt)
+                self.assertFalse(scenario.close_after_final_line_optional)
 
     def test_barge_in_after_is_empty_or_one_entry_per_line_starting_with_none(self):
         for scenario in SCENARIOS:

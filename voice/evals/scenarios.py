@@ -43,6 +43,7 @@ class Scenario:
     preconnect_first_line: bool = False
     barge_in_after: tuple[float | None, ...] = ()
     exact_caller_stt: bool = False
+    close_after_final_line_optional: bool = False
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,7 @@ SCENARIOS = (
         room_close_after=None,
         preconnect_first_line=True,
         exact_caller_stt=True,
+        close_after_final_line_optional=True,
     ),
     Scenario(
         name="barge-in-long-reply",
@@ -561,7 +563,10 @@ def _scenario_failures(
 
     if complete:
         close_turn = room_closed_after if room_closed_after is not None else scenario.room_close_after or max(1, len(turns))
-        require(room_closed_after == scenario.room_close_after, close_turn,
+        expected_close = {scenario.room_close_after}
+        if getattr(scenario, "close_after_final_line_optional", False):
+            expected_close.add(len(scenario.turns))
+        require(room_closed_after in expected_close, close_turn,
                 f"{scenario.name}: expected room close after turn {scenario.room_close_after!r}, got {room_closed_after!r}")
     elif room_closed_after is not None and room_closed_after != scenario.room_close_after:
         fail(room_closed_after, f"{scenario.name}: room closed after unexpected turn {room_closed_after}")

@@ -69,7 +69,7 @@ NO_REPLY_AUDIO_FAILURES = frozenset({
     "agent audio track produced no speech",
     "agent audio track produced no frames",
 })
-# The voice closed the room after the final scripted line's reply, which the scenario did not expect.
+# The voice closed the room after the final scripted line's reply; a scenario without close_after_final_line_optional fails on it.
 ROOM_DELETED_AFTER_FINAL_LINE_FAILURE = "room was deleted after the final scripted line was captured"
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
 FAKE_PHONE_LOG = "evals/phone.jsonl"
@@ -3297,6 +3297,14 @@ def observe_scenario(
         if early_close
         else room_deleted_turns[0] if room_deleted_turns else None
     )
+    if (
+        early_close
+        and capture_failure["message"] == ROOM_DELETED_AFTER_FINAL_LINE_FAILURE
+        and getattr(scenario, "close_after_final_line_optional", False)
+    ):
+        # The scenario allows the voice to close after its final line, so that capture is complete.
+        capture_failure = None
+        early_close = False
     from evals.scenarios import evaluate_scenario_failures, evaluate_scenario_prefix
 
     transcripts = [trace["transcript"] for trace in traces]
