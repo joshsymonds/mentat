@@ -442,6 +442,84 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
             {"source": "audio transcription", "cause": "ElevenLabs concurrent_limit_exceeded"},
         )
 
+    async def test_401_quota_rejection_is_capacity_failure_without_retry(self):
+        class FormData:
+            def add_field(self, *_args, **_kwargs):
+                return None
+
+        class ContentTypeError(Exception):
+            pass
+
+        class Response:
+            def __init__(self, status, payload=None, json_error=None):
+                self.status = status
+                self.payload = payload
+                self.json_error = json_error
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def json(self):
+                if self.json_error is not None:
+                    raise self.json_error
+                return self.payload
+
+            def raise_for_status(self):
+                raise RuntimeError("unexpected status handling")
+
+        quota_payload = {
+            "detail": {
+                "type": "authentication_error",
+                "code": "quota_exceeded",
+                "message": "Quota exceeded.",
+                "status": "quota_exceeded",
+            }
+        }
+        delays = []
+
+        async def sleep(delay):
+            delays.append(delay)
+
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": "test-key"}):
+            with patch.dict(sys.modules, {
+                "aiohttp": SimpleNamespace(FormData=FormData, ContentTypeError=ContentTypeError)
+            }):
+                with patch.object(caller, "_transcription_retry_sleep", sleep, create=True):
+                    http = Mock()
+                    http.post.return_value = Response(401, payload=quota_payload)
+                    with self.assertRaises(caller.TranscriptionCapacityError) as raised:
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+                    self.assertEqual(http.post.call_count, 1)
+                    self.assertEqual(delays, [])
+                    self.assertEqual(raised.exception.status, 401)
+                    self.assertEqual(raised.exception.code, "quota_exceeded")
+                    self.assertEqual(
+                        str(raised.exception),
+                        "Transcription rejected clip (HTTP 401; quota_exceeded)",
+                    )
+                    self.assertEqual(
+                        raised.exception.capacity_failure,
+                        {"source": "audio transcription", "cause": "ElevenLabs quota_exceeded"},
+                    )
+
+                    http = Mock()
+                    http.post.return_value = Response(
+                        401, json_error=ContentTypeError("error body is not JSON")
+                    )
+                    with self.assertRaises(caller.TranscriptionCapacityError) as bare:
+                        await caller._transcribe(http, b"\0\0" * 2400, 24000, 1)
+                    self.assertEqual(http.post.call_count, 1)
+                    self.assertEqual(delays, [])
+                    self.assertEqual(bare.exception.status, 401)
+                    self.assertIsNone(bare.exception.code)
+                    self.assertEqual(
+                        bare.exception.capacity_failure,
+                        {"source": "audio transcription", "cause": "ElevenLabs HTTP 401"},
+                    )
+
     async def test_other_429_and_4xx_are_named_and_server_transport_failures_surface(self):
         class FormData:
             def add_field(self, *_args, **_kwargs):

@@ -48,13 +48,14 @@ class TranscriptionError(RuntimeError):
 
 
 class TranscriptionCapacityError(TranscriptionError):
-    """Scribe rejected a request because provider concurrency was exhausted."""
+    """Scribe rejected a request because provider capacity was exhausted: concurrency or quota."""
 
-    def __init__(self, status: int = 429):
-        super().__init__(status, "concurrent_limit_exceeded")
+    def __init__(self, status: int = 429, code: str | None = "concurrent_limit_exceeded"):
+        super().__init__(status, code)
+        cause = f"ElevenLabs {code}" if code else f"ElevenLabs HTTP {status}"
         self.capacity_failure = {
             "source": "audio transcription",
-            "cause": "ElevenLabs concurrent_limit_exceeded",
+            "cause": cause,
         }
 
 
@@ -482,7 +483,10 @@ async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) ->
                     error_payload = None
                 detail = error_payload.get("detail") if isinstance(error_payload, dict) else None
                 code = detail.get("code") if isinstance(detail, dict) else None
-                raise TranscriptionError(status, code if isinstance(code, str) else None)
+                code = code if isinstance(code, str) else None
+                if status == 401:
+                    raise TranscriptionCapacityError(status, code)
+                raise TranscriptionError(status, code)
             response.raise_for_status()
             result = await response.json()
 
