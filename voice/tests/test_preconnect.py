@@ -375,6 +375,18 @@ def kept_after_skipping(case, out):
     return skipped
 
 
+def removed_span(case, out):
+    """The live samples the output lacks, as (begin, end), checking nothing else changed."""
+    live = samples_of(case.live)
+    kept = samples_of(out)
+    removed = len(live) - len(kept)
+    begin = next(
+        (at for at, (heard, said) in enumerate(zip(live, kept)) if heard != said), len(kept)
+    )
+    assert kept[begin:] == live[begin + removed:], "the output is not the live track minus one span"
+    return begin, begin + removed
+
+
 class FakeHandler:
     def __init__(self, frames=None, error=None):
         self._frames, self._error = frames, error
@@ -491,8 +503,24 @@ class PreConnectDedupeTest(AsyncTest):
 
         self.assertAlmostEqual(skipped, round(0.7 * LIVE_RATE), delta=EVAL_TOLERANCE)
 
+    async def test_the_opus_copy_after_a_quiet_lead_keeps_the_lead_and_skips_the_copy(self):
+        case = eval_case("copy_after_silence")
+
+        begin, end = removed_span(case, await dedupe(case))
+
+        self.assertGreaterEqual(begin, 0.28 * LIVE_RATE)
+        self.assertLessEqual(begin, 0.30 * LIVE_RATE)
+        self.assertAlmostEqual(end, LIVE_RATE, delta=EVAL_TOLERANCE)
+
     async def test_another_rendering_of_the_eval_line_is_kept_whole(self):
         case = eval_case("other_rendering")
+
+        self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
+
+    async def test_another_rendering_after_a_quiet_lead_is_kept_whole(self):
+        case = eval_case("other_rendering")
+        silence = array("h", bytes(round(0.3 * LIVE_RATE) * 2))
+        case.live = frames_of(silence + eval_line("other_rendering"), LIVE_RATE)
 
         self.assertEqual(kept_after_skipping(case, await dedupe(case)), 0)
 
