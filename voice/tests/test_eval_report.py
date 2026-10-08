@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evals.report import nearest_rank, score_observations
-from evals.runner import NO_ANSWER_FAILURE
+from evals.runner import NO_ANSWER_FAILURE, REPLY_NOT_STARTED_FAILURE
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -507,6 +507,100 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("missing answer pattern 'Alice Keck Park'", failures)
         self.assertEqual(report["turns"][0]["model_call_count"], 1)
         self.assertEqual(report["turns"][0]["latency_seconds"]["first_audio"], 2.0)
+
+    def test_reply_not_started_partial_failure_scores_completed_turns_and_names_failed_turn(self):
+        completed = turn()
+        completed["speech_started_at"] = 1_700_000_000.0
+        observation = {
+            "cases": [{
+                "name": "barge-in long reply",
+                "runs": [{
+                    "turns": [completed],
+                    "failure": {
+                        "turn": 2,
+                        "message": REPLY_NOT_STARTED_FAILURE,
+                        "speech_started_at": 1_700_000_001.0,
+                    },
+                    "product_failures": [],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        report = result["cases"][0]
+        self.assertEqual(len(report["turns"]), 1)
+        self.assertEqual(report["turns"][0]["latency_seconds"]["first_audio"], 2.0)
+        self.assertEqual(report["capture_failures"], [{
+            "run": 1,
+            "turn": 2,
+            "message": REPLY_NOT_STARTED_FAILURE,
+        }])
+        failures = " ".join(result["failures"])
+        self.assertIn(
+            "barge-in long reply run 1 turn 2: capture failed: " + REPLY_NOT_STARTED_FAILURE,
+            failures,
+        )
+        self.assertNotIn("invalid partial capture failure metadata", failures)
+
+    def test_reply_not_started_on_first_turn_names_failed_turn(self):
+        observation = {
+            "cases": [{
+                "name": "barge-in long reply",
+                "runs": [{
+                    "turns": [],
+                    "failure": {
+                        "turn": 1,
+                        "message": REPLY_NOT_STARTED_FAILURE,
+                        "speech_started_at": 1_700_000_001.0,
+                    },
+                    "product_failures": [],
+                }],
+            }]
+        }
+
+        result = score_observations(observation, required_runs=1)
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["cases"][0]["capture_failures"], [{
+            "run": 1,
+            "turn": 1,
+            "message": REPLY_NOT_STARTED_FAILURE,
+        }])
+        self.assertIn(
+            "barge-in long reply run 1 turn 1: capture failed: " + REPLY_NOT_STARTED_FAILURE,
+            " ".join(result["failures"]),
+        )
+        self.assertNotIn("invalid partial capture failure metadata", " ".join(result["failures"]))
+
+    def test_reply_not_started_failure_fails_closed_without_start_or_matching_turn(self):
+        completed = turn()
+        completed["speech_started_at"] = 1_700_000_000.0
+        invalid_failures = (
+            {"turn": 2, "message": REPLY_NOT_STARTED_FAILURE},
+            {"turn": 2, "message": REPLY_NOT_STARTED_FAILURE, "speech_started_at": 1_700_000_000.0},
+            {"turn": 1, "message": REPLY_NOT_STARTED_FAILURE, "speech_started_at": 1_700_000_001.0},
+            {"turn": 3, "message": REPLY_NOT_STARTED_FAILURE, "speech_started_at": 1_700_000_001.0},
+        )
+        for failure in invalid_failures:
+            with self.subTest(failure=failure):
+                result = score_observations({
+                    "cases": [{
+                        "name": "barge-in long reply",
+                        "runs": [{
+                            "turns": [completed],
+                            "failure": failure,
+                            "product_failures": [],
+                        }],
+                    }]
+                }, required_runs=1)
+
+                self.assertFalse(result["passed"])
+                self.assertIn(
+                    "invalid partial capture failure metadata",
+                    " ".join(result["failures"]),
+                )
 
     def test_same_turn_hangup_timeout_scores_answer_and_keeps_fake_phone_evidence(self):
         captured = turn(first_audio=2.25, confirmation=None, room_deleted=None, calls=2)

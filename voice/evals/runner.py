@@ -64,6 +64,11 @@ ROOM_POLL_INTERVAL_SECONDS = 0.25
 BARGE_IN_POLL_SECONDS = 0.02
 # voice/caller.py's message when the agent's reply never starts before its deadline.
 REPLY_NOT_STARTED_FAILURE = "agent audio response did not start before its deadline"
+# voice/caller.py's messages when the agent's audio track ends before any speech is heard.
+NO_REPLY_AUDIO_FAILURES = frozenset({
+    "agent audio track produced no speech",
+    "agent audio track produced no frames",
+})
 # The voice closed the room after the final scripted line's reply, which the scenario did not expect.
 ROOM_DELETED_AFTER_FINAL_LINE_FAILURE = "room was deleted after the final scripted line was captured"
 TOKEN_REQUEST_DEADLINE_SECONDS = 10.0
@@ -277,8 +282,7 @@ def _retain_caller_audio(
 
 
 PRECONNECT_TOPIC = "lk.agent.pre-connect-audio-buffer"
-PRECONNECT_BUFFER_SECONDS = 1.0
-PRECONNECT_LIVE_START_SECONDS = 0.3
+PRECONNECT_SEND_DELAY_SECONDS = 0.7
 PRECONNECT_SAMPLE_RATE = 48000
 PRECONNECT_WRITE_BYTES = 16000
 
@@ -921,9 +925,10 @@ async def capture_script(
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy.
 
-    With preconnect_first_line the opening second of line 1 goes to the worker as a
-    phone-style pre-connect buffer while line 1 streams live from 0.3 s, so the two
-    overlap by 0.7 s the way the Pixel's do.
+    With preconnect_first_line line 1 streams live from its first sample as soon as the
+    mic is published, the way the Pixel's does. Once the agent is subscribed and
+    PRECONNECT_SEND_DELAY_SECONDS have passed, the mic audio up to that moment goes to the
+    worker as the pre-connect buffer, so the two overlap by that delay.
 
     With barge_in={turn: seconds} line TURN starts that many seconds after the agent
     begins speaking its reply to line TURN-1, over the reply instead of after it; the
@@ -1105,13 +1110,6 @@ async def capture_script(
                     line=index + 1, retry_count=attempts - 1,
                 )
 
-    buffer_bytes = int(RATE * PRECONNECT_BUFFER_SECONDS) * 2
-    live_start_sample = int(RATE * PRECONNECT_LIVE_START_SECONDS)
-    if preconnect_first_line and len(synthesized[0][0].pcm) < buffer_bytes:
-        raise PartialCaptureFailure(
-            [], 1, "scripted speech sample count mismatch for line 1", line=1, retry_count=0,
-        )
-
     room = dependencies.rtc.Room()
     answer_tracks: asyncio.Queue[Any] = asyncio.Queue()
     capture_end: asyncio.Event | None = None
@@ -1178,51 +1176,74 @@ async def capture_script(
                     return participant.identity
             return None
 
-        participant_deadline = dependencies.monotonic() + PARTICIPANT_DEADLINE_SECONDS
-        while (
-            agent_identity() is None if preconnect_first_line else not room.remote_participants
-        ):
-            if dependencies.monotonic() >= participant_deadline:
-                raise RuntimeError("voice worker did not join the selected room before deadline")
-            await _with_deadline(
-                source.capture_frame(
-                    dependencies.rtc.AudioFrame(
-                        bytes(FRAME_SAMPLES * 2), RATE, 1, FRAME_SAMPLES,
+        if not preconnect_first_line:
+            participant_deadline = dependencies.monotonic() + PARTICIPANT_DEADLINE_SECONDS
+            while not room.remote_participants:
+                if dependencies.monotonic() >= participant_deadline:
+                    raise RuntimeError(
+                        "voice worker did not join the selected room before deadline"
                     )
-                ),
-                REMOTE_OPERATION_DEADLINE_SECONDS,
-                "LiveKit participant wait audio",
-            )
-            await _with_deadline(
-                dependencies.sleep(0.2),
-                REMOTE_OPERATION_DEADLINE_SECONDS,
-                "voice worker join polling",
-            )
-        try:
-            if preconnect_first_line:
-                try:
-                    await asyncio.wait_for(
-                        publication.wait_for_subscription(),
-                        timeout=participant_deadline - dependencies.monotonic(),
-                    )
-                except TimeoutError as error:
-                    raise TimeoutError(
-                        "caller microphone subscription exceeded its deadline"
-                    ) from error
-            else:
+                await _with_deadline(
+                    source.capture_frame(
+                        dependencies.rtc.AudioFrame(
+                            bytes(FRAME_SAMPLES * 2), RATE, 1, FRAME_SAMPLES,
+                        )
+                    ),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "LiveKit participant wait audio",
+                )
+                await _with_deadline(
+                    dependencies.sleep(0.2),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "voice worker join polling",
+                )
+            try:
                 await caller.wait_for_microphone_ready(
                     publication,
                     deadline=participant_deadline,
                     monotonic=dependencies.monotonic,
                     sleep=dependencies.sleep,
                 )
-        except TimeoutError as error:
-            raise DeadlineExceeded(str(error)) from error
+            except TimeoutError as error:
+                raise DeadlineExceeded(str(error)) from error
 
-        async def send_preconnect_buffer(speech: caller.TTSResponse) -> None:
+        async def send_preconnect_buffer(
+            speech: caller.TTSResponse, started: float, sent: asyncio.Event,
+        ) -> float:
+            """Send the mic audio from the first live sample to now, once the agent is subscribed.
+
+            Like the phone, the buffer goes out PRECONNECT_SEND_DELAY_SECONDS after the agent
+            subscribes to the live track, so it overlaps the live head by that delay. Mic audio
+            past the end of the line is silence. Returns the buffer's seconds.
+            """
+            deadline = dependencies.monotonic() + PARTICIPANT_DEADLINE_SECONDS
+            while agent_identity() is None:
+                if dependencies.monotonic() >= deadline:
+                    raise RuntimeError("voice worker did not join the selected room before deadline")
+                await _with_deadline(
+                    dependencies.sleep(0.2),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "voice worker join polling",
+                )
+            try:
+                await asyncio.wait_for(
+                    publication.wait_for_subscription(),
+                    timeout=deadline - dependencies.monotonic(),
+                )
+            except TimeoutError as error:
+                raise DeadlineExceeded(
+                    "caller microphone subscription exceeded its deadline"
+                ) from error
+            await _with_deadline(
+                dependencies.sleep(PRECONNECT_SEND_DELAY_SECONDS),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "pre-connect send delay",
+            )
             identity = agent_identity()
             if identity is None:
                 raise RuntimeError("voice worker left the room before the pre-connect buffer")
+            samples = round((dependencies.monotonic() - started) * RATE)
+            mic = speech.pcm[: samples * 2].ljust(samples * 2, b"\x00")
             writer = await _with_deadline(
                 room.local_participant.stream_bytes(
                     "preconnect",
@@ -1238,7 +1259,7 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "pre-connect buffer stream open",
             )
-            buffered = _upsample_2x(speech.pcm[:buffer_bytes])
+            buffered = _upsample_2x(mic)
             for offset in range(0, len(buffered), PRECONNECT_WRITE_BYTES):
                 await _with_deadline(
                     writer.write(buffered[offset : offset + PRECONNECT_WRITE_BYTES]),
@@ -1250,12 +1271,14 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "pre-connect buffer close",
             )
+            sent.set()
+            return samples / RATE
 
         async def push(
             speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
-            attempt: int, start_sample: int = 0,
+            attempt: int,
         ) -> None:
-            pcm = speech.pcm[start_sample * 2 :]
+            pcm = speech.pcm
             rendered_samples = len(pcm) // 2
             pushed_pcm = bytearray()
             pushed_frames = 0
@@ -1295,27 +1318,60 @@ async def capture_script(
                     f"scripted speech sample count mismatch for line {line_number}",
                 )
 
+        async def measure_playout_end() -> tuple[float, float, float]:
+            speech_end = _finite_timestamp(
+                await _with_deadline(
+                    caller._speech_end_after_playout(source),
+                    REMOTE_OPERATION_DEADLINE_SECONDS,
+                    "speech playout completion",
+                ),
+                "speech_end",
+            )
+            paired_monotonic = _finite_timestamp(
+                dependencies.monotonic(), "paired monotonic speech end"
+            )
+            paired_wall_time = _finite_timestamp(
+                dependencies.wall_time(), "paired wall speech end"
+            )
+            return speech_end, paired_monotonic, paired_wall_time
+
         async def push_with_preconnect_buffer(
             speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
             attempt: int,
-        ) -> None:
-            """Start line 1's live overlap while its pre-connect buffer is still sent.
+        ) -> tuple[float, tuple[float, float, float]]:
+            """Stream line 1 live from its first sample while its pre-connect buffer is sent.
 
-            Like the phone, the live track is already flowing when the buffer lands, so
-            the worker hears the buffer and the live head in the order it expects. A
-            failure on either side cancels the other before the capture fails.
+            Like the phone, the live track carries the line and then silence until the buffer
+            has been sent, so the worker hears the buffer and the live head in the order it
+            expects. Returns the buffer's seconds and line 1's playout end. A failure on either
+            side cancels the other before the capture fails.
             """
-            live = asyncio.ensure_future(
-                push(speech, step, line_number, attempt, live_start_sample)
-            )
-            buffer = asyncio.ensure_future(send_preconnect_buffer(speech))
+            sent = asyncio.Event()
+            started = dependencies.monotonic()
+
+            async def stream_live() -> tuple[float, float, float]:
+                await push(speech, step, line_number, attempt)
+                playout = await measure_playout_end()
+                while not sent.is_set():
+                    await _with_deadline(
+                        source.capture_frame(
+                            dependencies.rtc.AudioFrame(silence, RATE, 1, FRAME_SAMPLES)
+                        ),
+                        REMOTE_OPERATION_DEADLINE_SECONDS,
+                        "LiveKit silence playout",
+                    )
+                return playout
+
+            live = asyncio.ensure_future(stream_live())
+            buffer = asyncio.ensure_future(send_preconnect_buffer(speech, started, sent))
             try:
-                await asyncio.gather(live, buffer)
+                playout, buffer_seconds = await asyncio.gather(live, buffer)
             except BaseException:
                 live.cancel()
                 buffer.cancel()
                 await asyncio.gather(live, buffer, return_exceptions=True)
                 raise
+            return buffer_seconds, playout
 
         silence = bytes(FRAME_SAMPLES * 2)
 
@@ -1354,7 +1410,7 @@ async def capture_script(
             index: int,
             step: caller.ScriptStep,
             retry_count: int,
-            preconnect: bool,
+            preconnect_buffer_seconds: float | None,
             barge_after: float | None,
             speech_started_at: float,
             speech_end: float,
@@ -1492,10 +1548,10 @@ async def capture_script(
                 "raw_segments": raw_segments,
                 "room_deleted": None,
             }
-            if preconnect:
+            if preconnect_buffer_seconds is not None:
                 trace["preconnect"] = {
-                    "buffer_seconds": PRECONNECT_BUFFER_SECONDS,
-                    "overlap_seconds": PRECONNECT_BUFFER_SECONDS - PRECONNECT_LIVE_START_SECONDS,
+                    "buffer_seconds": preconnect_buffer_seconds,
+                    "overlap_seconds": PRECONNECT_SEND_DELAY_SECONDS,
                 }
             if barge_after is not None:
                 trace["barge_in_after"] = barge_after
@@ -1536,18 +1592,25 @@ async def capture_script(
                 )
 
         async def await_reply(index: int, speech_started_at: float, reply: Awaitable[Any]) -> Any:
-            """Await turn INDEX + 1's reply, failing that turn if the agent never starts it."""
+            """Await turn INDEX + 1's reply, failing that turn if the agent never starts it.
+
+            In a barge-in run, an agent audio track that ends without speech is also a reply
+            that never started.
+            """
             try:
                 return await reply
             except RuntimeError as error:
-                if str(error) != REPLY_NOT_STARTED_FAILURE:
+                never_started = str(error) == REPLY_NOT_STARTED_FAILURE or (
+                    bool(barge_in) and str(error) in NO_REPLY_AUDIO_FAILURES
+                )
+                if not never_started:
                     raise
                 if pending_finish is not None:
                     await pending_finish
                 raise PartialCaptureFailure(
                     traces,
                     index + 1,
-                    str(error),
+                    REPLY_NOT_STARTED_FAILURE,
                     speech_started_at=speech_started_at,
                 ) from error
 
@@ -1563,26 +1626,16 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "continuous answer capture start",
             )
-            preconnect = preconnect_first_line and index == 0
+            preconnect_buffer_seconds: float | None = None
             speech_started_at = time.time()
-            if preconnect:
-                await push_with_preconnect_buffer(speech, step, index + 1, attempt)
+            if preconnect_first_line and index == 0:
+                preconnect_buffer_seconds, playout = await push_with_preconnect_buffer(
+                    speech, step, index + 1, attempt,
+                )
             else:
                 await push(speech, step, index + 1, attempt)
-            speech_end = _finite_timestamp(
-                await _with_deadline(
-                    caller._speech_end_after_playout(source),
-                    REMOTE_OPERATION_DEADLINE_SECONDS,
-                    "speech playout completion",
-                ),
-                "speech_end",
-            )
-            paired_monotonic = _finite_timestamp(
-                dependencies.monotonic(), "paired monotonic speech end"
-            )
-            paired_wall_time = _finite_timestamp(
-                dependencies.wall_time(), "paired wall speech end"
-            )
+                playout = await measure_playout_end()
+            speech_end, paired_monotonic, paired_wall_time = playout
             speech_end_wall = _finite_timestamp(
                 paired_wall_time + speech_end - paired_monotonic,
                 "speech_end_wall",
@@ -1613,7 +1666,7 @@ async def capture_script(
             except TimeoutError as error:
                 raise RuntimeError("agent audio capture exceeded its deadline") from error
             turn = finish_turn(
-                index, step, retry_count, preconnect, barge_after,
+                index, step, retry_count, preconnect_buffer_seconds, barge_after,
                 speech_started_at, speech_end, speech_end_wall, answer, pending_finish,
             )
             if next_barge_after is None:

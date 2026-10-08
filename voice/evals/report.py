@@ -19,9 +19,11 @@ RUNS_REQUIRED = 10
 NO_ANSWER_FAILURE = (
     "no-answer: captured PCM is silent, malformed, or has no qualifying post-playout onset"
 )
+REPLY_NOT_STARTED_FAILURE = "agent audio response did not start before its deadline"
 PARTIAL_CAPTURE_MESSAGES = {
     "answer transcription exceeded its deadline",
     NO_ANSWER_FAILURE,
+    REPLY_NOT_STARTED_FAILURE,
     "room deletion was not observed before deadline",
 }
 TRANSCRIPTION_FAILURE_DETAIL = (
@@ -424,6 +426,7 @@ def score_observations(
                         and (
                             failure.get("message") in {
                                 NO_ANSWER_FAILURE,
+                                REPLY_NOT_STARTED_FAILURE,
                                 "answer transcription exceeded its deadline",
                             }
                             or is_transcription_failure(failure.get("message"))
