@@ -781,12 +781,15 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     BARGE_REPLY_END = 45.0
 
     def barge_in_harness(
-        self, *, hold_first_transcription=False, second_answer=None, capture_failures=None,
+        self, *, hold_first_transcription=False, second_answer=None, playout_words=(),
+        capture_failures=None,
     ):
         """Fake room on a fake clock whose first capture hears a reply from 25.0 to 45.0.
 
         SECOND_ANSWER, when given, is (pcm, words, lead): the second capture hears that audio
-        and starts LEAD seconds before the second line's speech end.
+        and starts LEAD seconds before the second line's speech end. WORDS is what transcribing
+        the whole second capture returns; PLAYOUT_WORDS is what transcribing the audio from its
+        playout end onward returns, timed from that start.
         CAPTURE_FAILURES maps a capture number to the error its wait_for_voice and result raise.
         """
         failures = capture_failures or {}
@@ -795,7 +798,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         record = SimpleNamespace(
             events=[], pushes={}, silent_frames=0, stopped=[], transcribed=[], speech_ends=[],
             hold_first_transcription=hold_first_transcription,
-            line_two_pushing=asyncio.Event(), mic=[],
+            line_two_pushing=asyncio.Event(), mic=[], answer_clips=[],
         )
         pushed_samples = []
         voiced_replies = pcm_windows(0, 0, 0, 0, 0, 600, 600, *([0] * 18))
@@ -864,7 +867,11 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         async def transcribe(http, pcm, rate, channels):
             if second_answer is not None and pcm == second_answer[0]:
+                record.answer_clips.append("whole")
                 return second_answer[1]
+            if second_answer is not None and second_answer[0].endswith(pcm):
+                record.answer_clips.append("from playout end")
+                return list(playout_words)
             if pcm == voiced_replies:
                 record.transcribed.append(clock.now)
                 if len(record.transcribed) == 1 and record.hold_first_transcription:
@@ -986,6 +993,77 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIn(runner.NO_ANSWER_FAILURE, str(raised.exception))
+
+    @staticmethod
+    def tail_then_late_reply():
+        """A capture opening 3.0 s before speech end: a story tail at 0.10 s, a reply at 5.20 s.
+
+        The reply follows the tail after about 5 s of silence and sits 2.20 s past speech end.
+        """
+        pcm = pcm_windows(*([0] * 5), 600, 600, *([0] * 253), 600, 600, *([0] * 20))
+        words = [{"start": 0.10, "end": 0.14, "text": "story"}]
+        return pcm, words, 3.0
+
+    async def test_barge_in_turn_whose_whole_clip_misses_the_reply_transcribes_from_playout_end(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness(
+            second_answer=self.tail_then_late_reply(),
+            playout_words=[{"start": 2.20, "end": 2.24, "text": "answer"}],
+        )
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@30::answer"],
+            barge_in={2: 9.0},
+        )
+
+        barged = traces[1]
+        self.assertEqual(record.answer_clips, ["whole", "from playout end"])
+        self.assertEqual([segment["text"] for segment in barged["raw_segments"]], ["story", "answer"])
+        self.assertAlmostEqual(barged["raw_segments"][1]["start"], 5.2, places=6)
+        self.assertEqual(barged["transcript"], "answer")
+        self.assertEqual([segment["text"] for segment in barged["segments"]], ["answer"])
+        self.assertAlmostEqual(barged["segments"][0]["start"], 5.2, places=6)
+
+    async def test_barge_in_turn_with_words_after_the_line_transcribes_once(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness(
+            second_answer=self.story_tail_then_answer()
+        )
+
+        await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@30::answer"],
+            barge_in={2: 9.0},
+        )
+
+        self.assertEqual(record.answer_clips, ["whole"])
+
+    async def test_barge_in_turn_whose_playout_clip_also_misses_fails_as_no_answer(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness(
+            second_answer=self.tail_then_late_reply()
+        )
+
+        with self.assertRaises(runner.PartialCaptureFailure) as raised:
+            await self.run_barge_in_capture(
+                dependencies,
+                ["First question@0::answer", "Second question@30::answer"],
+                barge_in={2: 9.0},
+            )
+
+        self.assertIn(runner.NO_ANSWER_FAILURE, str(raised.exception))
+        self.assertEqual(record.answer_clips, ["whole", "from playout end"])
+
+    async def test_turn_without_barge_in_transcribes_once_even_when_the_reply_is_late(self):
+        dependencies, record, _captures, _clock = self.barge_in_harness(
+            second_answer=self.tail_then_late_reply()
+        )
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@4::answer"],
+        )
+
+        self.assertEqual(record.answer_clips, ["whole"])
+        self.assertEqual(traces[1]["transcript"], "story")
 
     # voice/caller.py's message when the agent's reply never starts before its deadline.
     CALLER_REPLY_NOT_STARTED = "agent audio response did not start before its deadline"

@@ -664,6 +664,16 @@ def _window_segments(
     ]
 
 
+def _heard_after_playout(
+    segments: list[dict[str, Any]], capture_started: float, speech_end: float
+) -> list[dict[str, Any]]:
+    """Keep the segments that end after the caller's playout end, in capture time."""
+    return [
+        segment for segment in segments
+        if capture_started + segment["end"] > speech_end
+    ]
+
+
 def _trace_text(segments: list[dict[str, Any]]) -> str:
     return " ".join(str(segment.get("text", "")).strip() for segment in segments).strip()
 
@@ -1447,34 +1457,65 @@ async def capture_script(
             transcription_deadline = (
                 dependencies.monotonic() + ANSWER_TRANSCRIPTION_DEADLINE_SECONDS
             )
-            pending: set[asyncio.Task[Any]] = set()
+
+            async def transcribe_by_deadline(clip: bytes) -> list[dict[str, Any]] | None:
+                """Words for CLIP, or None when the turn's transcription deadline passes first."""
+                transcription_task = asyncio.create_task(
+                    dependencies.transcribe(dependencies.http, clip, sample_rate, channels)
+                )
+                remaining = transcription_deadline - dependencies.monotonic()
+                if remaining > 0:
+                    _done, pending = await asyncio.wait(
+                        {transcription_task},
+                        timeout=remaining,
+                        return_when=asyncio.ALL_COMPLETED,
+                    )
+                else:
+                    pending = {transcription_task}
+                if pending:
+                    transcription_task.cancel()
+                    await asyncio.gather(transcription_task, return_exceptions=True)
+                    return None
+                return transcription_task.result()
+
+            transcription_overdue = False
             try:
                 if utterances:
-                    transcription_task = asyncio.create_task(
-                        dependencies.transcribe(
-                            dependencies.http, answer_pcm, sample_rate, channels
-                        )
-                    )
-                    remaining = transcription_deadline - dependencies.monotonic()
-                    if remaining > 0:
-                        _done, pending = await asyncio.wait(
-                            {transcription_task},
-                            timeout=remaining,
-                            return_when=asyncio.ALL_COMPLETED,
-                        )
+                    words = await transcribe_by_deadline(answer_pcm)
+                    if words is None:
+                        transcription_overdue = True
                     else:
-                        pending = {transcription_task}
-                    if pending:
-                        transcription_task.cancel()
-                        await asyncio.gather(transcription_task, return_exceptions=True)
-                    else:
-                        try:
-                            words = transcription_task.result()
-                        except caller.TranscriptionError as error:
-                            transcription_failure = error
-                        else:
-                            raw_segments = _validated_words(words)
-                            segments = _window_segments(utterances, raw_segments)
+                        raw_segments = _validated_words(words)
+                        segments = _window_segments(utterances, raw_segments)
+                        if barge_after is not None and not _heard_after_playout(
+                            segments, capture_started, speech_end
+                        ):
+                            # The whole clip missed the reply, so transcribe the audio from the
+                            # playout end on and place its words on the whole clip's timeline.
+                            playout_frame = max(
+                                0, math.ceil((speech_end - capture_started) * sample_rate)
+                            )
+                            playout_words = await transcribe_by_deadline(
+                                answer_pcm[playout_frame * channels * 2 :]
+                            )
+                            if playout_words is None:
+                                transcription_overdue = True
+                            else:
+                                playout_offset = playout_frame / sample_rate
+                                raw_segments = [
+                                    *raw_segments,
+                                    *(
+                                        {
+                                            **word,
+                                            "start": word["start"] + playout_offset,
+                                            "end": word["end"] + playout_offset,
+                                        }
+                                        for word in _validated_words(playout_words)
+                                    ),
+                                ]
+                                segments = _window_segments(utterances, raw_segments)
+            except caller.TranscriptionError as error:
+                transcription_failure = error
             finally:
                 if retain_sms_audio_dir is not None and retain_sms_audio_scenario is not None:
                     _retain_sms_audio(
@@ -1510,7 +1551,7 @@ async def capture_script(
                     ),
                 )
                 raise failure from error
-            if pending:
+            if transcription_overdue:
                 raise PartialCaptureFailure(
                     traces,
                     index + 1,
@@ -1518,10 +1559,7 @@ async def capture_script(
                     speech_started_at=speech_started_at,
                 )
             if barge_after is not None:
-                segments = [
-                    segment for segment in segments
-                    if capture_started + segment["end"] > speech_end
-                ]
+                segments = _heard_after_playout(segments, capture_started, speech_end)
             if not segments:
                 raise PartialCaptureFailure(
                     traces,
