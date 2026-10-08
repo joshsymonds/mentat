@@ -592,5 +592,14 @@
     "expected": false,
     "tags": ["interruption-ignored"],
     "source": {"kind": "scenario_corruption","based_on": "barge-in-answer-tokyo","change": "ignored the interruption and kept telling the story"}
+  },
+  {
+    "id": "barge-in-answer-offers-resume",
+    "scenario": "barge-in-long-reply",
+    "turn": 2,
+    "reply": "It was kept by a woman- Tokyo. Want me to pick the lighthouse story back up, or are we done with Madden and her bossy cat?",
+    "expected": true,
+    "tags": ["barge-in-answer", "offer-to-resume"],
+    "source": {"kind": "trace_segment_join","artifact": "voice-first-line/evidence/green6.log","case": "barge-in-long-reply","run": 2,"turn": 2,"segments": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25]}
   }
 ]

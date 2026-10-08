@@ -205,6 +205,32 @@ class QualificationTests(unittest.TestCase):
         self.assertFalse(unanchored.get("context", ""))
         self.assertNotIn("verified_recipient", unanchored["inputs"])
 
+    def test_barge_in_corpus_retains_offer_to_resume_as_correct_reply(self):
+        fixture = next(
+            item for item in load_fixtures(FIXTURE_PATH)
+            if item["id"] == "barge-in-answer-offers-resume"
+        )
+        self.assertEqual(fixture["scenario"], "barge-in-long-reply")
+        self.assertEqual(fixture["turn"], 2)
+        self.assertEqual(
+            fixture["reply"],
+            "It was kept by a woman- Tokyo. Want me to pick the lighthouse story back up, "
+            "or are we done with Madden and her bossy cat?",
+        )
+        self.assertIs(fixture["expected"], True)
+        self.assertIn("offer-to-resume", fixture["tags"])
+        self.assertEqual(
+            fixture["source"],
+            {
+                "kind": "trace_segment_join",
+                "artifact": "voice-first-line/evidence/green6.log",
+                "case": "barge-in-long-reply",
+                "run": 2,
+                "turn": 2,
+                "segments": list(range(26)),
+            },
+        )
+
     def test_live_recipe_is_opt_in_and_not_part_of_the_default(self):
         root = Path(__file__).resolve().parents[2]
         justfile = (root / "Justfile").read_text(encoding="utf-8")
