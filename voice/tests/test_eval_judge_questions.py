@@ -192,8 +192,9 @@ class QuestionBuilderTests(unittest.TestCase):
             {
                 "barge_in_answer": "Does the reply say Tokyo?",
                 "barge_in_dropped": (
-                    "Does the reply leave the story about a lighthouse keeper and her cat "
-                    "behind instead of resuming or continuing it?"
+                    "Does the reply stop telling the story about a lighthouse keeper and her "
+                    "cat, counting as stopping even if it offers to return to the story later, "
+                    "and not counting as stopping if it keeps telling the story?"
                 ),
             },
         )

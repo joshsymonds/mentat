@@ -323,7 +323,9 @@ def _build_barge_in_answer(inputs: Mapping[str, object]) -> dict[str, str]:
     return {
         "barge_in_answer": f"Does the reply {answer}?",
         "barge_in_dropped": (
-            f"Does the reply leave {abandoned} behind instead of resuming or continuing it?"
+            f"Does the reply stop telling {abandoned}, counting as stopping even if it offers to "
+            "return to the story later, and not counting as stopping if it keeps telling the "
+            "story?"
         ),
     }
 
