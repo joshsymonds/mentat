@@ -2813,6 +2813,31 @@ def _remote_artifact_text(
     return _completed_stdout(result, f"{label} at {path} read")
 
 
+def _is_transcription_capacity_failure(capacity: Any) -> bool:
+    return (
+        isinstance(capacity, dict)
+        and set(capacity) == {"source", "cause"}
+        and capacity.get("source") == "audio transcription"
+        and isinstance(capacity.get("cause"), str)
+        and capacity["cause"].startswith("ElevenLabs ")
+        and bool(capacity["cause"].removeprefix("ElevenLabs ").strip())
+    )
+
+
+def _transcription_capacity_message(cause: str) -> str:
+    """Rebuild the rejection detail, since the capacity envelope carries no HTTP status.
+
+    Scribe answers concurrency with 429 and every other capacity rejection with 401.
+    """
+    code = cause.removeprefix("ElevenLabs ")
+    if code.startswith("HTTP "):
+        detail = code
+    else:
+        status = 429 if code == "concurrent_limit_exceeded" else 401
+        detail = f"HTTP {status}; {code}"
+    return f"scripted speech transcription rejected for line 1 ({detail})"
+
+
 def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     try:
         payload = json.loads(text)
@@ -2824,19 +2849,13 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
         raise RuntimeError("remote scripted capture returned an invalid envelope")
     if "capacity_failure" in payload:
         capacity = payload["capacity_failure"]
-        if (
-            not isinstance(capacity, dict)
-            or set(capacity) != {"source", "cause"}
-            or capacity.get("source") != "audio transcription"
-            or capacity.get("cause") != "ElevenLabs concurrent_limit_exceeded"
-        ):
+        if not _is_transcription_capacity_failure(capacity):
             raise RuntimeError("remote scripted capture returned invalid capacity failure metadata")
         payload = {
             "turns": payload["turns"],
             "failure": {
                 "turn": 1,
-                "message": "scripted speech transcription rejected for line 1 "
-                "(HTTP 429; concurrent_limit_exceeded)",
+                "message": _transcription_capacity_message(capacity["cause"]),
                 "capacity_failure": capacity,
             },
         }
@@ -2932,10 +2951,7 @@ def _capture_envelope(text: str, expected_turns: int) -> tuple[list[dict[str, An
     if "capacity_failure" in failure:
         capacity = failure.get("capacity_failure")
         if (
-            not isinstance(capacity, dict)
-            or set(capacity) != {"source", "cause"}
-            or capacity.get("source") != "audio transcription"
-            or capacity.get("cause") != "ElevenLabs concurrent_limit_exceeded"
+            not _is_transcription_capacity_failure(capacity)
             or not (
                 is_transcription_failure(failure.get("message"))
                 or SCRIPTED_TRANSCRIPTION_FAILURE_PATTERN.fullmatch(
@@ -3173,7 +3189,8 @@ def observe_scenario(
     if not traces and remote_capacity_failures:
         return {
             "turns": [],
-            "failure": "scripted speech transcription exhausted provider concurrency",
+            "failure": "scripted speech transcription exhausted provider capacity "
+            f"({remote_capacity_failures[0]['cause']})",
             "capacity_failures": remote_capacity_failures,
         }
     if capture_returncode != 0 and not _is_preflight_tts_capture_failure(

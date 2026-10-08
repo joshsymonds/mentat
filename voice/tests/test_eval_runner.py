@@ -2515,6 +2515,53 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             }),
         )
 
+    def test_capacity_envelope_carries_elevenlabs_causes_and_fails_closed_on_foreign_metadata(self):
+        import json
+
+        quota = {"source": "audio transcription", "cause": "ElevenLabs quota_exceeded"}
+        self.assertEqual(
+            runner._capture_envelope(
+                json.dumps({"turns": [], "capacity_failure": quota}), 1
+            ),
+            ([], {
+                "turn": 1,
+                "message": "scripted speech transcription rejected for line 1 "
+                "(HTTP 401; quota_exceeded)",
+                "capacity_failure": quota,
+            }),
+        )
+        completed_turn = {"turn": 1, "speech_started_at": 1.0}
+        reply_failure = {
+            "turn": 2,
+            "message": "Transcription rejected reply clip (HTTP 401; quota_exceeded)",
+            "speech_started_at": 2.0,
+            "capacity_failure": quota,
+        }
+        self.assertEqual(
+            runner._capture_envelope(
+                json.dumps({"turns": [completed_turn], "failure": reply_failure}), 2
+            ),
+            ([completed_turn], reply_failure),
+        )
+        for capacity in (
+            {"source": "room dispatch", "cause": "ElevenLabs quota_exceeded"},
+            {"source": "audio transcription", "cause": "quota_exceeded"},
+            {"source": "audio transcription", "cause": "ElevenLabs "},
+        ):
+            with self.subTest(capacity=capacity):
+                with self.assertRaisesRegex(RuntimeError, "invalid capacity failure metadata"):
+                    runner._capture_envelope(
+                        json.dumps({"turns": [], "capacity_failure": capacity}), 1
+                    )
+                with self.assertRaisesRegex(RuntimeError, "invalid capacity failure metadata"):
+                    runner._capture_envelope(
+                        json.dumps({
+                            "turns": [completed_turn],
+                            "failure": {**reply_failure, "capacity_failure": capacity},
+                        }),
+                        2,
+                    )
+
     async def test_scribe_capacity_failure_preserves_completed_turns_and_allows_later_run(self):
         import json
 
@@ -6684,9 +6731,13 @@ class LocalEvalCliTests(unittest.TestCase):
             "url": "wss://livekit.invalid",
             "expires_at": "2030-01-01T00:00:00Z",
         }
-        capacity = {
+        concurrency_capacity = {
             "source": "audio transcription",
             "cause": "ElevenLabs concurrent_limit_exceeded",
+        }
+        quota_capacity = {
+            "source": "audio transcription",
+            "cause": "ElevenLabs quota_exceeded",
         }
         calls = []
         reports = []
@@ -6775,6 +6826,9 @@ class LocalEvalCliTests(unittest.TestCase):
                     "docs_url": "https://elevenlabs.io/docs/eleven-api/resources/errors#rate-limiting-and-concurrency",
                 }
             }
+
+        def quota_limit():
+            return 401, {"detail": {"code": "quota_exceeded"}}
 
         async def no_wait(_delay):
             return None
@@ -6966,42 +7020,62 @@ class LocalEvalCliTests(unittest.TestCase):
                     f"remote envelope={stack.envelope!r}; observed run={run!r}; report={report!r}",
                 )
 
-        prompt_responses = [
-            concurrency_limit()
-            for _ in range(runner.caller.TRANSCRIPTION_MAX_ATTEMPTS)
-        ]
-        run_case(prompt_responses)
-        self.assertEqual(reports[-1][0], {
-            "turns": [],
-            "capacity_failure": capacity,
-        })
-        self.assertEqual(reports[-1][1]["turns"], [])
-        self.assertEqual(reports[-1][2]["capacity_failure_count"], 1)
-
-        reply_responses = [
-            rate_limit(),
-            transcript(scenario.caller_lines[0]),
-            transcript(scenario.caller_lines[1]),
-            transcript(scenario.caller_lines[2]),
-            rate_limit(),
-            transcript("Alice bought and donated Alice Keck Park Memorial Garden."),
-            *[
-                concurrency_limit()
-                for _ in range(runner.caller.TRANSCRIPTION_MAX_ATTEMPTS)
-            ],
-        ]
-        run_case(reply_responses)
-        envelope, run, report = reports[-1]
-        self.assertEqual(len(envelope["turns"]), 1)
-        self.assertEqual(envelope["failure"]["capacity_failure"], capacity)
-        self.assertEqual(len(run["turns"]), 1)
-        self.assertEqual(
-            run["turns"][0]["transcript"],
-            "Alice bought and donated Alice Keck Park Memorial Garden.",
+        limit_cases = (
+            (
+                "concurrency",
+                concurrency_capacity,
+                concurrency_limit,
+                runner.caller.TRANSCRIPTION_MAX_ATTEMPTS,
+            ),
+            ("quota", quota_capacity, quota_limit, 1),
         )
-        self.assertEqual(run["capacity_failures"], [capacity])
-        self.assertEqual(report["capacity_failure_count"], 1)
-        self.assertEqual(len(calls), 4 + 10)
+        for name, capacity, limit, attempts in limit_cases:
+            with self.subTest(name):
+                calls.clear()
+                prompt_responses = [limit() for _ in range(attempts)]
+                run_case(prompt_responses)
+                envelope, run, report = reports[-1]
+                self.assertEqual(envelope, {
+                    "turns": [],
+                    "capacity_failure": capacity,
+                })
+                self.assertEqual(run["turns"], [])
+                self.assertEqual(
+                    run["failure"],
+                    "scripted speech transcription exhausted provider capacity "
+                    f"({capacity['cause']})",
+                )
+                self.assertEqual(run["capacity_failures"], [capacity])
+                self.assertEqual(report["capacity_failure_count"], 1)
+                self.assertEqual(len(calls), len(prompt_responses))
+
+                calls.clear()
+                reply_responses = [
+                    rate_limit(),
+                    transcript(scenario.caller_lines[0]),
+                    transcript(scenario.caller_lines[1]),
+                    transcript(scenario.caller_lines[2]),
+                    rate_limit(),
+                    transcript("Alice bought and donated Alice Keck Park Memorial Garden."),
+                    *[limit() for _ in range(attempts)],
+                ]
+                run_case(reply_responses)
+                envelope, run, report = reports[-1]
+                self.assertEqual(len(envelope["turns"]), 1)
+                self.assertEqual(envelope["failure"]["capacity_failure"], capacity)
+                self.assertEqual(len(run["turns"]), 1)
+                self.assertEqual(
+                    run["turns"][0]["transcript"],
+                    "Alice bought and donated Alice Keck Park Memorial Garden.",
+                )
+                self.assertEqual(run["capacity_failures"], [capacity])
+                self.assertEqual(report["capacity_failure_count"], 1)
+                failure_lines = report["failures"] + report["cases"][0]["capture_failures"]
+                self.assertFalse(
+                    any("invalid" in line for line in map(str, failure_lines)),
+                    failure_lines,
+                )
+                self.assertEqual(len(calls), len(reply_responses))
 
     def test_scenario_failure_capacity_wording_is_not_capacity_evidence(self):
         import io
