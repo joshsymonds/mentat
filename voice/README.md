@@ -328,9 +328,10 @@ seconds. In `barge-in-long-reply`,
 after the agent's reply begins; the scenario speaks its second line 8 seconds
 into a long story to check that the interruption commits during the agent's
 speech. Both scenarios set `exact_caller_stt`:
-each turn's input STT sidecar must match its scripted line, so a misheard or
-duplicated first line, or a missing sidecar, fails that turn, and the
-observation records the sidecars as `caller_stt`. The R4/R5 command runs both
+the words of every committed input STT sidecar, in order, must match the
+scripted lines' words, so a misheard or duplicated first line, a missing or
+phantom sidecar fails the call, while a line the worker commits as two turns
+still passes. The observation records the sidecars as `caller_stt`. The R4/R5 command runs both
 scenarios eight times on Opus 5.5:
 
 ```sh
