@@ -230,6 +230,7 @@ SCENARIOS = (
         room_close_after=None,
         barge_in_after=(None, 8.0),
         exact_caller_stt=True,
+        close_after_final_line_optional=True,
     ),
 )
 

@@ -307,7 +307,7 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertEqual(barge.barge_in_after, (None, 8.0))
         self.assertTrue(barge.exact_caller_stt)
         self.assertFalse(barge.preconnect_first_line)
-        self.assertFalse(barge.close_after_final_line_optional)
+        self.assertTrue(barge.close_after_final_line_optional)
 
     def test_existing_scenarios_keep_new_field_defaults(self):
         new = {"phone-first-line", "barge-in-long-reply"}
@@ -349,6 +349,17 @@ class ScenarioScoringTests(unittest.TestCase):
                                  "barge_in_dropped": 0.0})
         failures = evaluate_scenario_failures(scenario, turns, [], None, judge=resumed)
         self.assertTrue(any(f.turn == 2 and "barge_in_dropped" in f.message for f in failures))
+
+    def test_barge_in_done_close_after_final_line_completes_the_run(self):
+        scenario = self.scenario("barge-in-long-reply")
+        turns = ["Once, a lighthouse keeper and her cat.", "Tokyo."]
+        self.assertEqual(
+            evaluate_scenario_failures(scenario, turns, [], 2, judge=all_yes_judge()),
+            [],
+        )
+        early_close = evaluate_scenario_failures(scenario, turns, [], 1, judge=all_yes_judge())
+        self.assertTrue(any("expected room close after turn None, got 1" in failure.message
+                            for failure in early_close))
 
     def test_prefix_evaluator_keeps_navigation_action_validation(self):
         scenario = self.scenario("place-search-navigation")
