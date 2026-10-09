@@ -962,6 +962,37 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             [segment["text"] for segment in barged["raw_segments"]], ["story", "answer"]
         )
 
+    @staticmethod
+    def tail_straddling_the_line_then_answer():
+        """A capture opening 3.0 s before speech end: a story tail from 2.0 s to 3.4 s, an answer at 4.6 s.
+
+        The tail starts before speech end and runs past it, so only the answer may count.
+        """
+        pcm = pcm_windows(*([0] * 100), *([600] * 70), *([0] * 60), *([600] * 20), *([0] * 20))
+        words = [
+            {"start": 2.50, "end": 3.20, "text": "story"},
+            {"start": 4.70, "end": 4.90, "text": "answer"},
+        ]
+        return pcm, words, 3.0
+
+    async def test_barge_in_turn_drops_a_tail_that_straddles_the_line(self):
+        dependencies, _record, _captures, _clock = self.barge_in_harness(
+            second_answer=self.tail_straddling_the_line_then_answer()
+        )
+
+        traces = await self.run_barge_in_capture(
+            dependencies,
+            ["First question@0::answer", "Second question@30::answer"],
+            barge_in={2: 9.0},
+        )
+
+        barged = traces[1]
+        self.assertEqual([segment["text"] for segment in barged["segments"]], ["answer"])
+        self.assertEqual(barged["transcript"], "answer")
+        self.assertEqual(
+            [segment["text"] for segment in barged["raw_segments"]], ["story", "answer"]
+        )
+
     async def test_turn_without_barge_in_keeps_every_window_of_the_same_audio(self):
         dependencies, _record, _captures, _clock = self.barge_in_harness(
             second_answer=self.story_tail_then_answer()

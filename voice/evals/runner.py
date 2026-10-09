@@ -667,10 +667,14 @@ def _window_segments(
 def _heard_after_playout(
     segments: list[dict[str, Any]], capture_started: float, speech_end: float
 ) -> list[dict[str, Any]]:
-    """Keep the segments that end after the caller's playout end, in capture time."""
+    """Keep the segments that start at or after the caller's playout end, in capture time.
+
+    A segment that starts before the playout end is the interrupted reply's tail, even when
+    it runs past the end, so it never counts as the caller hearing an answer.
+    """
     return [
         segment for segment in segments
-        if capture_started + segment["end"] > speech_end
+        if segment["start"] >= speech_end - capture_started
     ]
 
 
