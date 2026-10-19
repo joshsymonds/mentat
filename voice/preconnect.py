@@ -23,12 +23,18 @@ from collections import deque
 from collections.abc import Iterable
 from typing import Any
 
+import numpy as np
 import livekit.agents.voice.room_io.room_io as upstream
 from livekit import rtc
 from livekit.agents.voice import room_io
 from livekit.agents.voice.room_io._input import _ParticipantAudioInputStream
 
 logger = logging.getLogger("mentat.voice")
+
+REPEAT_TAIL_SECONDS = (0.2, 0.4, 0.6)
+REPEAT_SEARCH_EXTRA_SECONDS = 0.2
+REPEAT_AGREE_SECONDS = 0.03
+REPEAT_MIN_CORRELATION = 0.3
 
 
 def _part(frame: Any, begin: int, end: int) -> Any:
@@ -38,6 +44,53 @@ def _part(frame: Any, begin: int, end: int) -> Any:
     width = frame.num_channels * 2
     data = bytes(frame.data)[begin * width:end * width]
     return rtc.AudioFrame(data, frame.sample_rate, frame.num_channels, end - begin)
+
+
+def cut_repeat(buffer: np.ndarray, live: np.ndarray, rate: int, heard_before_open: int) -> tuple[int, str]:
+    """How many live samples repeat the pre-connect buffer, and the path that decided it.
+
+    The live audio opens by repeating the buffer's last half second or so, time-stretched and
+    reshaped on the way through the jitter buffer. Each of the buffer's last 0.2, 0.4 and 0.6 s is
+    matched within the first len(buffer) plus 0.2 s of live by zero-mean normalized
+    cross-correlation. When all three correlate at least 0.3 and end within 30 ms of each other,
+    the repeat ends at their median end ("aligned"). Otherwise the repeat is the live audio heard
+    before the buffer opened, at most the buffer's length ("timing").
+    """
+    timing = min(heard_before_open, len(buffer)), "timing"
+    window = live[:min(len(live), len(buffer) + round(REPEAT_SEARCH_EXTRA_SECONDS * rate))]
+    ends = []
+    for seconds in REPEAT_TAIL_SECONDS:
+        length = round(seconds * rate)
+        if length > len(buffer) or length > len(window):
+            return timing
+        end, correlation = _best_match(buffer[-length:], window)
+        if correlation < REPEAT_MIN_CORRELATION:
+            return timing
+        ends.append(end)
+    if max(ends) - min(ends) > round(REPEAT_AGREE_SECONDS * rate):
+        return timing
+    return sorted(ends)[1], "aligned"
+
+
+def _best_match(tail: np.ndarray, window: np.ndarray) -> tuple[int, float]:
+    """Where the tail ends in the window at its best zero-mean normalized correlation, and that correlation."""
+    length = len(tail)
+    centred = tail.astype(np.float64) - tail.mean()
+    tail_energy = float(np.dot(centred, centred))
+    if tail_energy == 0.0:
+        return 0, 0.0
+    samples = window.astype(np.float64)
+    products = np.fft.irfft(np.fft.rfft(samples) * np.conj(np.fft.rfft(centred, len(samples))), len(samples))
+    products = products[:len(samples) - length + 1]
+    sums = np.concatenate([[0.0], np.cumsum(samples)])
+    squares = np.concatenate([[0.0], np.cumsum(samples * samples)])
+    window_sums = sums[length:] - sums[:-length]
+    window_squares = squares[length:] - squares[:-length]
+    spread = np.maximum(window_squares - window_sums * window_sums / length, 0.0)
+    denominator = np.sqrt(spread * tail_energy)
+    correlations = np.divide(products, denominator, out=np.zeros_like(products), where=denominator > 0.0)
+    best = int(np.argmax(correlations))
+    return best + length, float(correlations[best])
 
 
 class _LiveAudio:

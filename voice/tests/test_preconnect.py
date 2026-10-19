@@ -17,6 +17,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
+
 VOICE_DIR = Path(__file__).resolve().parent.parent
 LIVE_RATE = 24000
 BUFFER_RATE = 48000
@@ -209,6 +211,30 @@ def samples_of(frames):
     for frame in frames:
         out.extend(array("h", bytes(frame.data)))
     return out
+
+
+def speechlike(seconds, seed, rate=LIVE_RATE):
+    """Low-passed noise at speech-like levels as int16 samples, so a tail matches only its own repeat."""
+    count = round(seconds * rate)
+    smooth = np.convolve(np.random.default_rng(seed).standard_normal(count), np.ones(4) / 4, mode="same")
+    return np.round(smooth / smooth.std() * 4000).astype(np.int16)
+
+
+def jittered_repeat(tail, *, noise_scale, seed, rate=LIVE_RATE):
+    """The tail as a jittered live track replays it: 20 ms chunks, one dropped and two duplicated
+    (about 2% longer), with noise at noise_scale times the tail's own level."""
+    chunk = round(0.02 * rate)
+    chunks = [tail[at:at + chunk] for at in range(0, len(tail), chunk)]
+    played = []
+    for index, piece in enumerate(chunks):
+        if index == 20:
+            continue
+        played.append(piece)
+        if index in (9, 31):
+            played.append(piece)
+    stretched = np.concatenate(played).astype(np.float64)
+    noise = np.random.default_rng(seed).standard_normal(len(stretched)) * noise_scale * tail.std()
+    return np.round(stretched + noise).astype(np.int16)
 
 
 # -- harness ---------------------------------------------------------------------------------
@@ -603,6 +629,73 @@ class PreConnectRoomIOTest(AsyncTest):
 
     def test_it_is_a_room_io(self):
         self.assertTrue(issubclass(preconnect.PreConnectRoomIO, preconnect.room_io.RoomIO))
+
+
+class CutRepeatTest(unittest.TestCase):
+    def setUp(self):
+        self.buffer = speechlike(1.04, seed=1)
+        self.tail = self.buffer[-round(0.92 * LIVE_RATE):]
+
+    def test_a_stretched_jittered_repeat_is_aligned_and_cut_at_its_end(self):
+        repeat = jittered_repeat(self.tail, noise_scale=1.2, seed=3)
+        live = np.concatenate([repeat, speechlike(0.6, seed=4)])
+
+        cut, path = preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        self.assertLessEqual(abs(cut - len(repeat)), round(0.05 * LIVE_RATE))
+
+    def test_no_repeat_is_timing_cut_at_the_samples_heard_before_open(self):
+        live = speechlike(1.0, seed=2)
+
+        self.assertEqual(
+            preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.5 * LIVE_RATE)),
+            (round(0.5 * LIVE_RATE), "timing"),
+        )
+
+    def test_timing_is_capped_at_the_buffer_length(self):
+        live = speechlike(1.0, seed=2)
+
+        self.assertEqual(
+            preconnect.cut_repeat(self.buffer, live, LIVE_RATE, 2 * LIVE_RATE),
+            (len(self.buffer), "timing"),
+        )
+
+    def test_tails_that_end_apart_are_timing(self):
+        tail = self.buffer[-round(0.6 * LIVE_RATE):]
+        split = round(0.4 * LIVE_RATE)
+        live = np.concatenate([tail[:split], speechlike(0.04, seed=5), tail[split:], speechlike(0.5, seed=6)])
+
+        self.assertEqual(
+            preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
+            (round(0.3 * LIVE_RATE), "timing"),
+        )
+
+    def test_tails_that_correlate_below_point_three_are_timing(self):
+        repeat = jittered_repeat(self.tail, noise_scale=4.0, seed=3)
+        live = np.concatenate([repeat, speechlike(0.6, seed=4)])
+
+        self.assertEqual(
+            preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
+            (round(0.3 * LIVE_RATE), "timing"),
+        )
+
+    def test_a_buffer_too_short_for_the_longest_tail_is_timing(self):
+        buffer = speechlike(0.5, seed=1)
+        live = np.concatenate([buffer, speechlike(0.5, seed=4)])
+
+        self.assertEqual(
+            preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
+            (round(0.3 * LIVE_RATE), "timing"),
+        )
+
+    def test_a_live_head_too_short_for_the_longest_tail_is_timing(self):
+        live = self.buffer[-round(0.3 * LIVE_RATE):]
+
+        self.assertEqual(
+            preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.4 * LIVE_RATE)),
+            (round(0.4 * LIVE_RATE), "timing"),
+        )
 
 
 if __name__ == "__main__":
