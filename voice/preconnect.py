@@ -11,10 +11,6 @@ length in total, counted from the first live frame. Every later live frame passe
 Frames carry no receive time, so each live frame is stamped as it comes off the track,
 from the moment the track is created. The buffer's completion is the moment LiveKit hands
 it to the input.
-
-The input also runs one noise canceller over the buffer and then the kept live audio, in
-order: LiveKit hands the canceller to its audio stream, which would run it on live frames
-while the buffer is still being processed.
 """
 
 from __future__ import annotations
@@ -24,14 +20,13 @@ import contextvars
 import logging
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import Any
 
 import livekit.agents.voice.room_io.room_io as upstream
 from livekit import rtc
 from livekit.agents.voice import room_io
 from livekit.agents.voice.room_io._input import _ParticipantAudioInputStream
-from livekit.agents.voice.room_io.types import NoiseCancellationParams
 
 logger = logging.getLogger("mentat.voice")
 
@@ -45,56 +40,21 @@ def _part(frame: Any, begin: int, end: int) -> Any:
     return rtc.AudioFrame(data, frame.sample_rate, frame.num_channels, end - begin)
 
 
-def _silence(frame: Any) -> Any:
-    """A frame of silence in the frame's format and length."""
-    return rtc.AudioFrame(
-        bytes(frame.samples_per_channel * frame.num_channels * 2),
-        frame.sample_rate,
-        frame.num_channels,
-        frame.samples_per_channel,
-    )
-
-
-def _settle_startup(cancelled: list[tuple[Any, bool]]) -> list[Any]:
-    """The cancelled buffer with the canceller's raw startup frames silenced.
-
-    A canceller still filling up hands its input back unchanged, and the denoised copy of that
-    audio comes out with a later frame. So the unchanged frames ahead of the first changed one
-    are silenced rather than forwarded, keeping the sample count. A buffer with no changed frame
-    is forwarded as it is.
-    """
-    startup = 0
-    while startup < len(cancelled) and cancelled[startup][1]:
-        startup += 1
-    if startup == len(cancelled):
-        return [frame for frame, _ in cancelled]
-    silent = [_silence(frame) for frame, _ in cancelled[:startup]]
-    return silent + [frame for frame, _ in cancelled[startup:]]
-
-
 class _LiveAudio:
-    """The live track as the audio input reads it: the repeat dropped, noise cancelled in order.
+    """The live track as the audio input reads it, with the repeat dropped.
 
     Stands in for rtc.AudioStream, which the input only iterates and closes. The stream is
     read from creation, so every frame is stamped with the time it arrived.
     """
 
-    def __init__(
-        self,
-        stream: Any,
-        *,
-        sample_rate: int,
-        cancel: Callable[[rtc.AudioFrame], rtc.AudioFrame | None],
-    ) -> None:
+    def __init__(self, stream: Any, *, sample_rate: int) -> None:
         self._stream = stream
         self._sample_rate = sample_rate
-        self._cancel = cancel
         self._stamped: deque[tuple[float, Any]] = deque()
         self._changed = asyncio.Event()
         self._ended = False
         self._first: float | None = None
         self._skip = 0
-        self._warming = False
         self._stamping = asyncio.create_task(self._stamp())
 
     async def _stamp(self) -> None:
@@ -114,10 +74,9 @@ class _LiveAudio:
             self._changed.set()
 
     def process_buffer(self, frames: Iterable[Any]) -> list[Any]:
-        """Drop the live audio heard before the buffer completed, and cancel noise from the buffer.
+        """Drop the live audio heard before the buffer completed; return the buffer as it arrived.
 
-        The returned frames are the buffer through the canceller, in order, with its startup
-        silenced; they are consumed before the live audio is read.
+        The buffer comes back in order and is consumed before the live audio is read.
         """
         buffer = list(frames)
         completed = time.monotonic()
@@ -137,15 +96,7 @@ class _LiveAudio:
             "none" if self._first is None else f"{self._first:.3f}",
             completed,
         )
-        cancelled = [self._cancelled(frame) for frame in buffer]
-        # The canceller re-warms when its input switches from the buffer's rate to the live rate. A
-        # canceller that changed no buffer frame is not running, so live audio passes as it is.
-        self._warming = (
-            bool(buffer)
-            and buffer[0].sample_rate != self._sample_rate
-            and any(not unchanged for _, unchanged in cancelled)
-        )
-        return _settle_startup(cancelled)
+        return buffer
 
     def __aiter__(self) -> _LiveAudio:
         return self
@@ -154,27 +105,7 @@ class _LiveAudio:
         while True:
             kept = self._keep(await self._next_stamped())
             if kept is not None:
-                return rtc.AudioFrameEvent(self._live_output(kept))
-
-    def _live_output(self, frame: Any) -> Any:
-        """The kept live frame through the canceller, with its unchanged re-warming frames silenced."""
-        out, unchanged = self._cancelled(frame)
-        if not self._warming:
-            return out
-        if unchanged:
-            return _silence(frame)
-        self._warming = False
-        return out
-
-    def _cancelled(self, frame: Any) -> tuple[Any, bool]:
-        """The frame through the canceller, and whether it came back unchanged.
-
-        A frame the canceller failed on, None, passes through as it arrived and counts as changed.
-        """
-        out = self._cancel(frame)
-        if out is None:
-            return frame, False
-        return out, out is frame
+                return rtc.AudioFrameEvent(kept)
 
     async def aclose(self) -> None:
         self._stamping.cancel()
@@ -212,34 +143,14 @@ _LIVE: contextvars.ContextVar[_LiveAudio] = contextvars.ContextVar("preconnect_l
 class _PreConnectAudioInput(_ParticipantAudioInputStream):
     """LiveKit's participant audio input, reading the track through _LiveAudio."""
 
-    def _cancel_noise(self, frame: rtc.AudioFrame) -> rtc.AudioFrame | None:
-        """The frame through the canceller, or None when the canceller failed on it."""
-        processor = self._processor
-        if processor is None or not processor.enabled:
-            return frame
-        try:
-            return processor._process(frame)
-        except Exception:
-            logger.warning("noise cancellation failed, passing the frame through", exc_info=True)
-            return None
-
     def _create_stream(self, track: rtc.Track, participant: rtc.Participant) -> Any:
-        noise_cancellation = self._noise_cancellation
-        if callable(noise_cancellation):
-            noise_cancellation = noise_cancellation(NoiseCancellationParams(participant, track))
-            self._update_processor(
-                noise_cancellation if isinstance(noise_cancellation, rtc.FrameProcessor) else None
-            )
         stream = rtc.AudioStream.from_track(
             track=track,
             sample_rate=self._sample_rate,
             num_channels=self._num_channels,
             frame_size_ms=self._frame_size_ms,
-            noise_cancellation=(
-                None if isinstance(noise_cancellation, rtc.FrameProcessor) else noise_cancellation
-            ),
         )
-        return _LiveAudio(stream, sample_rate=self._sample_rate, cancel=self._cancel_noise)
+        return _LiveAudio(stream, sample_rate=self._sample_rate)
 
     async def _forward_task(self, old_task: Any, stream: Any, *rest: Any) -> None:
         _LIVE.set(stream)
