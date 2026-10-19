@@ -6720,6 +6720,45 @@ PHANTOM_LOG_QUIET = """\
 """
 
 
+def observe_single_run(test_case, log_text, *, observe, name="phantoms", **scenario_fields):
+    """Run one local eval run through execute_run's finally and return its observation."""
+    import io
+    from contextlib import redirect_stdout
+
+    scenario = SimpleNamespace(name=name, turns=(), commands=(), place_query=None, **scenario_fields)
+    captured = {}
+    original_score = runner.score_observations
+
+    def capture_score(observations, *, required_runs):
+        captured["observations"] = observations
+        return original_score(observations, required_runs=required_runs)
+
+    retained = tempfile.TemporaryDirectory()
+    test_case.addCleanup(retained.cleanup)
+    evidence = Path(retained.name)
+    if log_text is not None:
+        (evidence / "voice.log").write_text(log_text)
+
+    class Batch:
+        @contextmanager
+        def run(self, run_id):
+            yield SimpleNamespace(run_id=run_id, retained_evidence_dir=evidence if log_text is not None else None)
+
+    @contextmanager
+    def dev_stack(**_kwargs):
+        yield Batch()
+
+    with (
+        patch.object(runner, "SCENARIOS", (scenario,)),
+        patch.object(runner, "DevStack", side_effect=dev_stack),
+        patch.object(runner, "observe_scenario", side_effect=observe),
+        patch.object(runner, "score_observations", side_effect=capture_score),
+        redirect_stdout(io.StringIO()),
+    ):
+        runner._run_local_eval(["--live", "--runs", "1"])
+    return captured["observations"]["cases"][0]["runs"][0]
+
+
 class PhantomFinalCountTests(unittest.TestCase):
     def count(self, log_text):
         with tempfile.TemporaryDirectory() as directory:
@@ -6779,51 +6818,14 @@ class PhantomFinalCountTests(unittest.TestCase):
     def test_empty_log_counts_zero(self):
         self.assertEqual(self.count(""), 0)
 
-    def run_observations(self, log_text, *, observe):
-        import io
-        from contextlib import redirect_stdout
-
-        scenario = SimpleNamespace(name="phantoms", turns=(), commands=(), place_query=None)
-        captured = {}
-        original_score = runner.score_observations
-
-        def capture_score(observations, *, required_runs):
-            captured["observations"] = observations
-            return original_score(observations, required_runs=required_runs)
-
-        retained = tempfile.TemporaryDirectory()
-        self.addCleanup(retained.cleanup)
-        evidence = Path(retained.name)
-        if log_text is not None:
-            (evidence / "voice.log").write_text(log_text)
-
-        class Batch:
-            @contextmanager
-            def run(self, run_id):
-                yield SimpleNamespace(run_id=run_id, retained_evidence_dir=evidence if log_text is not None else None)
-
-        @contextmanager
-        def dev_stack(**_kwargs):
-            yield Batch()
-
-        with (
-            patch.object(runner, "SCENARIOS", (scenario,)),
-            patch.object(runner, "DevStack", side_effect=dev_stack),
-            patch.object(runner, "observe_scenario", side_effect=observe),
-            patch.object(runner, "score_observations", side_effect=capture_score),
-            redirect_stdout(io.StringIO()),
-        ):
-            runner._run_local_eval(["--live", "--runs", "1"])
-        return captured["observations"]["cases"][0]["runs"][0]
-
     def test_run_observation_carries_the_count_from_the_retained_log(self):
-        run = self.run_observations(
-            PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_FINAL, observe=lambda _s, _k: {"turns": []}
+        run = observe_single_run(
+            self, PHANTOM_LOG_NORMAL_TURN + PHANTOM_LOG_FINAL, observe=lambda _s, _k: {"turns": []}
         )
         self.assertEqual(run["phantom_finals"], 1)
 
     def test_run_observation_without_a_retained_log_carries_none(self):
-        run = self.run_observations(None, observe=lambda _s, _k: {"turns": []})
+        run = observe_single_run(self, None, observe=lambda _s, _k: {"turns": []})
         self.assertIn("phantom_finals", run)
         self.assertIsNone(run["phantom_finals"])
 
@@ -6831,9 +6833,88 @@ class PhantomFinalCountTests(unittest.TestCase):
         def fail(_scenario, _stack):
             raise RuntimeError("scenario broke")
 
-        run = self.run_observations(PHANTOM_LOG_FINAL, observe=fail)
+        run = observe_single_run(self, PHANTOM_LOG_FINAL, observe=fail)
         self.assertIn("scenario execution failed", run["failure"])
         self.assertEqual(run["phantom_finals"], 1)
+
+
+PRECONNECT_CUT_ALIGNED = """\
+    21:54:23.100 INFO     mentat.voice       pre-connect cut: path=aligned dropped=0.92 s
+                                         {"pid": 1340556, "job_id": "job-41df36af8cbd"}
+"""
+
+PRECONNECT_CUT_TIMING = """\
+    21:54:23.100 INFO     mentat.voice       pre-connect cut: path=timing dropped=0.31 s
+                                         {"pid": 1340556}
+"""
+
+PRECONNECT_CUT_NONE = """\
+    21:54:23.100 INFO     mentat.voice       pre-connect cut: path=none dropped=0.00 s
+                                         {"pid": 1340556}
+"""
+
+
+class PreconnectCutCheckTests(unittest.TestCase):
+    def observe_first_line(self, log_text, *, preconnect_first_line=True, observe=None):
+        return observe_single_run(
+            self,
+            log_text,
+            observe=observe or (lambda _s, _k: {"turns": []}),
+            name="first-line",
+            preconnect_first_line=preconnect_first_line,
+        )
+
+    def test_aligned_cut_gains_no_product_failure(self):
+        run = self.observe_first_line(PRECONNECT_CUT_ALIGNED + PHANTOM_LOG_NORMAL_TURN)
+        self.assertNotIn("product_failures", run)
+
+    def test_timing_cut_fails_turn_one_naming_the_scenario_and_path(self):
+        run = self.observe_first_line(PRECONNECT_CUT_TIMING + PHANTOM_LOG_NORMAL_TURN)
+        self.assertEqual(run["product_failures"], [{
+            "turn": 1,
+            "message": "first-line: worker log shows pre-connect cut path=timing; first line must be path=aligned",
+        }])
+
+    def test_none_cut_fails_turn_one_naming_the_path(self):
+        run = self.observe_first_line(PRECONNECT_CUT_NONE + PHANTOM_LOG_NORMAL_TURN)
+        self.assertEqual(run["product_failures"], [{
+            "turn": 1,
+            "message": "first-line: worker log shows pre-connect cut path=none; first line must be path=aligned",
+        }])
+
+    def test_missing_cut_line_fails_turn_one(self):
+        run = self.observe_first_line(PHANTOM_LOG_NORMAL_TURN)
+        self.assertEqual(run["product_failures"], [{
+            "turn": 1,
+            "message": "first-line: worker log has no pre-connect cut line; first line must be path=aligned",
+        }])
+
+    def test_cut_line_from_another_logger_does_not_count(self):
+        other_logger = (
+            "    21:54:23.100 DEBUG    livekit.agents     pre-connect cut: path=aligned dropped=0.92 s\n"
+        )
+        run = self.observe_first_line(other_logger + PHANTOM_LOG_NORMAL_TURN)
+        self.assertEqual(run["product_failures"][0]["turn"], 1)
+        self.assertIn("has no pre-connect cut line", run["product_failures"][0]["message"])
+
+    def test_missing_retained_log_fails_turn_one(self):
+        run = self.observe_first_line(None)
+        self.assertEqual(run["product_failures"], [{
+            "turn": 1,
+            "message": "first-line: no retained worker log to confirm the pre-connect cut",
+        }])
+
+    def test_scenario_without_first_line_capture_is_unaffected(self):
+        run = self.observe_first_line(PRECONNECT_CUT_TIMING + PHANTOM_LOG_NORMAL_TURN, preconnect_first_line=False)
+        self.assertNotIn("product_failures", run)
+
+    def test_failed_run_keeps_its_existing_failure_and_gains_no_product_failure(self):
+        def fail(_scenario, _stack):
+            raise RuntimeError("scenario broke")
+
+        run = self.observe_first_line(PRECONNECT_CUT_TIMING, observe=fail)
+        self.assertIn("scenario execution failed", run["failure"])
+        self.assertNotIn("product_failures", run)
 
 
 class LocalEvalCliTests(unittest.TestCase):
@@ -8129,12 +8210,16 @@ class LocalEvalCliTests(unittest.TestCase):
 
         lifecycle = []
         calls = []
+        retained = tempfile.TemporaryDirectory()
+        self.addCleanup(retained.cleanup)
+        evidence = Path(retained.name)
+        (evidence / "voice.log").write_text(PRECONNECT_CUT_ALIGNED)
 
         @contextmanager
         def dev_stack(**kwargs):
             lifecycle.append(("enter", kwargs["opt_in"]))
             try:
-                yield _batch_for(SimpleNamespace(base_url="http://127.0.0.1:8485"))
+                yield _batch_for(SimpleNamespace(base_url="http://127.0.0.1:8485", retained_evidence_dir=evidence))
             finally:
                 lifecycle.append(("exit",))
 

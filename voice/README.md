@@ -328,7 +328,10 @@ seconds and the room must still hear the line once. `phone-first-line` repeats
 1.5 s; it is otherwise the same line, run with `--preconnect-first-line 0.8:1.5`.
 The live track carries silence after the line until the buffer is sent, and the
 trace records the buffer's actual seconds, `repeat_seconds`, and
-`send_lag_seconds`. In `barge-in-long-reply`,
+`send_lag_seconds`. A first-line run fails unless its retained worker log
+(`voice.log`) contains the worker's pre-connect cut line with `path=aligned`;
+a `path=timing` or `path=none` cut, a missing cut line, or no retained log is a
+turn-1 product failure. In `barge-in-long-reply`,
 `--barge-in TURN:SECONDS` (one-based TURN, repeatable) starts that line SECONDS
 after the agent's reply begins; the scenario speaks its second line 8 seconds
 into a long story to check that the interruption commits during the agent's

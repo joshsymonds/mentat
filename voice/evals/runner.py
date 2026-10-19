@@ -82,6 +82,7 @@ _LOG_RECORD_START = re.compile(
     r"^ {0,20}(?:\d{2}:\d{2}:\d{2}\.\d{3}\s+)?(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+(\S+)\s*(.*)$"
 )
 _USER_STATE_CHANGE = re.compile(r"^user \w+ -> (\w+);")
+_PRECONNECT_CUT = re.compile(r"^pre-connect cut: path=(aligned|timing|none) dropped=\d+\.\d{2} s(?=\s|$)")
 
 
 def _read_retained_voice_log(stack: Any) -> str | None:
@@ -126,6 +127,24 @@ def _phantom_final_count(stack: Any) -> int | None:
                 phantoms += 1
             spoke_since_final = speaking
     return phantoms
+
+
+def _preconnect_cut_failure(scenario_name: str, stack: Any) -> str | None:
+    """Name why a first-line run's worker log lacks the aligned pre-connect cut; None when it has it."""
+    log_text = _read_retained_voice_log(stack)
+    if log_text is None:
+        return f"{scenario_name}: no retained worker log to confirm the pre-connect cut"
+    paths = []
+    for logger, message in _log_records(log_text):
+        if logger == "mentat.voice":
+            cut = _PRECONNECT_CUT.match(message)
+            if cut is not None:
+                paths.append(cut.group(1))
+    if "aligned" in paths:
+        return None
+    if not paths:
+        return f"{scenario_name}: worker log has no pre-connect cut line; first line must be path=aligned"
+    return f"{scenario_name}: worker log shows pre-connect cut path={paths[-1]}; first line must be path=aligned"
 
 
 def _named_capacity_failures(error: BaseException | None = None, stack: Any = None) -> list[dict[str, str]]:
@@ -3878,6 +3897,10 @@ def _run_local_eval(argv: list[str]) -> int:
                 observation["phantom_finals"] = phantom_finals
                 if failure is not None and "failure" not in observation:
                     observation["failure"] = failure
+                if getattr(scenario, "preconnect_first_line", False) and "failure" not in observation:
+                    cut_failure = _preconnect_cut_failure(scenario.name, stack)
+                    if cut_failure is not None:
+                        observation.setdefault("product_failures", []).append({"turn": 1, "message": cut_failure})
             elif failure is not None:
                 observation = {
                     "failure": failure,
