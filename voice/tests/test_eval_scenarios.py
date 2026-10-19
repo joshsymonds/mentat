@@ -239,8 +239,8 @@ class ScenarioScoringTests(unittest.TestCase):
                 "Can we speak Spanish again, please?",
                 "¿De qué color es el cielo en un día despejado?",
             ),
-            "phone-first-line": ("Hey, what's the capital of Australia?",),
-            "phone-first-line-slow-send": ("Hey, what's the capital of Australia?",),
+            "phone-first-line": ("Hey, I'm out on a walk with my nephew right now and we got curious, so tell me, what's the capital city of Australia?",),
+            "phone-first-line-slow-send": ("Hey, I'm out on a walk with my nephew right now and we got curious, so tell me, what's the capital city of Australia?",),
             "barge-in-long-reply": (
                 "Tell me a long story about a lighthouse keeper and her cat.",
                 "Stop. What's the capital of Japan?",
@@ -282,6 +282,12 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertTrue(by_name["place-search-navigation"].selected_place_pattern)
         for name in ("sms-say-back-yes", "sms-correction-new-yes"):
             self.assertEqual(by_name[name].commands[0]["to"], "+1-202-555-0142")
+
+    def test_first_line_scenarios_speak_a_long_first_line(self):
+        for name in ("phone-first-line", "phone-first-line-slow-send"):
+            with self.subTest(scenario=name):
+                first_line = self.scenario(name).caller_lines[0]
+                self.assertGreaterEqual(len(first_line.split()), 20, first_line)
 
     def test_first_line_and_barge_in_scenarios_declare_frozen_fields(self):
         phone = self.scenario("phone-first-line")

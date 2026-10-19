@@ -202,7 +202,7 @@ SCENARIOS = (
     ),
     Scenario(
         name="phone-first-line",
-        caller_lines=("Hey, what's the capital of Australia?",),
+        caller_lines=("Hey, I'm out on a walk with my nephew right now and we got curious, so tell me, what's the capital city of Australia?",),
         turns=(TurnExpectation((_question(
             "claims",
             required=["Canberra is the capital of Australia"],
@@ -218,7 +218,7 @@ SCENARIOS = (
     ),
     Scenario(
         name="phone-first-line-slow-send",
-        caller_lines=("Hey, what's the capital of Australia?",),
+        caller_lines=("Hey, I'm out on a walk with my nephew right now and we got curious, so tell me, what's the capital city of Australia?",),
         turns=(TurnExpectation((_question(
             "claims",
             required=["Canberra is the capital of Australia"],
