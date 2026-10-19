@@ -952,16 +952,16 @@ async def capture_script(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
-    preconnect_timing: tuple[float, float] | None = None,
+    preconnect_timing: tuple[float, float, float] | None = None,
     barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy.
 
-    With preconnect_timing=(repeat, send_lag) line 1 streams live from its first sample as
-    soon as the mic is published, the way the Pixel's does. The pre-connect buffer records
-    the mic audio from that first sample until REPEAT seconds after the agent subscribes to
-    the live track, then opens its stream SEND_LAG seconds later, so the two overlap by
-    REPEAT seconds of the line.
+    With preconnect_timing=(repeat, send_lag, lead) line 1 streams live as soon as the mic is
+    published, the way the Pixel's does, but from its LEAD-second sample on: the pre-connect
+    buffer records the mic audio from line 1's first sample, so the line's first LEAD seconds
+    reach the worker only through the buffer. The buffer records until REPEAT seconds after
+    the agent subscribes to the live track, then opens its stream SEND_LAG seconds later.
 
     With barge_in={turn: seconds} line TURN starts that many seconds after the agent
     begins speaking its reply to line TURN-1, over the reply instead of after it; the
@@ -1242,15 +1242,17 @@ async def capture_script(
 
         async def send_preconnect_buffer(
             speech: caller.TTSResponse, started: float, sent: asyncio.Event,
-            timing: tuple[float, float],
+            timing: tuple[float, float, float],
         ) -> float:
-            """Send the mic audio from the first live sample to REPEAT seconds past subscription.
+            """Send the mic audio from line 1's first sample to REPEAT seconds past subscription.
 
             Like the phone, the buffer stops recording REPEAT seconds after the agent subscribes
-            to the live track, and its stream opens SEND_LAG seconds after that. Mic audio past
+            to the live track, and its stream opens SEND_LAG seconds after that. The buffer
+            also holds the LEAD seconds the live track starts in, so it runs from the line's
+            first sample to LEAD plus the live time elapsed at recording stop. Mic audio past
             the end of the line is silence. Returns the buffer's seconds.
             """
-            repeat_seconds, send_lag_seconds = timing
+            repeat_seconds, send_lag_seconds, lead_seconds = timing
             deadline = dependencies.monotonic() + PARTICIPANT_DEADLINE_SECONDS
             while agent_identity() is None:
                 if dependencies.monotonic() >= deadline:
@@ -1274,7 +1276,8 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "pre-connect repeat",
             )
-            samples = round((dependencies.monotonic() - started) * RATE)
+            lead_samples = round(lead_seconds * RATE)
+            samples = lead_samples + round((dependencies.monotonic() - started) * RATE)
             mic = speech.pcm[: samples * 2].ljust(samples * 2, b"\x00")
             await _with_deadline(
                 dependencies.sleep(send_lag_seconds),
@@ -1316,9 +1319,9 @@ async def capture_script(
 
         async def push(
             speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
-            attempt: int,
+            attempt: int, skip_samples: int = 0,
         ) -> None:
-            pcm = speech.pcm
+            pcm = speech.pcm[skip_samples * 2 :]
             rendered_samples = len(pcm) // 2
             pushed_pcm = bytearray()
             pushed_frames = 0
@@ -1377,20 +1380,21 @@ async def capture_script(
 
         async def push_with_preconnect_buffer(
             speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
-            attempt: int, timing: tuple[float, float],
+            attempt: int, timing: tuple[float, float, float],
         ) -> tuple[float, tuple[float, float, float]]:
-            """Stream line 1 live from its first sample while its pre-connect buffer is sent.
+            """Stream line 1 live from its LEAD-second sample while its pre-connect buffer is sent.
 
             Like the phone, the live track carries the line and then silence until the buffer
             has been sent, so the worker hears the buffer and the live head in the order it
-            expects. Returns the buffer's seconds and line 1's playout end. A failure on either
+            expects. The live track omits the line's first LEAD seconds, which only the buffer
+            carries. Returns the buffer's seconds and line 1's playout end. A failure on either
             side cancels the other before the capture fails.
             """
             sent = asyncio.Event()
             started = dependencies.monotonic()
 
             async def stream_live() -> tuple[float, float, float]:
-                await push(speech, step, line_number, attempt)
+                await push(speech, step, line_number, attempt, round(timing[2] * RATE))
                 playout = await measure_playout_end()
                 while not sent.is_set():
                     await _with_deadline(
@@ -1701,6 +1705,7 @@ async def capture_script(
                     "buffer_seconds": buffer_seconds,
                     "repeat_seconds": preconnect_timing[0],
                     "send_lag_seconds": preconnect_timing[1],
+                    "lead_seconds": preconnect_timing[2],
                 }
             else:
                 await push(speech, step, index + 1, attempt)
@@ -3134,7 +3139,8 @@ def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str
     if getattr(scenario, "preconnect_first_line", False):
         command.extend((
             "--preconnect-first-line",
-            f"{scenario.preconnect_repeat_seconds:g}:{scenario.preconnect_send_lag_seconds:g}",
+            f"{scenario.preconnect_repeat_seconds:g}:{scenario.preconnect_send_lag_seconds:g}"
+            f":{scenario.preconnect_lead_seconds:g}",
         ))
     for turn, seconds in enumerate(getattr(scenario, "barge_in_after", ()), 1):
         if seconds is not None:
@@ -3560,7 +3566,7 @@ async def _run_remote_capture_with_fake_phone(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
-    preconnect_timing: tuple[float, float] | None = None,
+    preconnect_timing: tuple[float, float, float] | None = None,
     barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
@@ -3615,7 +3621,7 @@ async def run_remote_capture(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
-    preconnect_timing: tuple[float, float] | None = None,
+    preconnect_timing: tuple[float, float, float] | None = None,
     barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     import aiohttp
@@ -3634,18 +3640,18 @@ async def run_remote_capture(
         )
 
 
-def _preconnect_timing(value: str) -> tuple[float, float]:
+def _preconnect_timing(value: str) -> tuple[float, float, float]:
     import argparse
 
-    repeat, separator, send_lag = value.partition(":")
+    parts = value.split(":")
     try:
-        if not separator:
+        if len(parts) != 3:
             raise ValueError(value)
-        timing = (float(repeat), float(send_lag))
+        timing = (float(parts[0]), float(parts[1]), float(parts[2]))
     except ValueError as error:
-        raise argparse.ArgumentTypeError("must be REPEAT:SEND_LAG") from error
+        raise argparse.ArgumentTypeError("must be REPEAT:SEND_LAG:LEAD") from error
     if not all(math.isfinite(seconds) and seconds >= 0 for seconds in timing):
-        raise argparse.ArgumentTypeError("must be REPEAT:SEND_LAG")
+        raise argparse.ArgumentTypeError("must be REPEAT:SEND_LAG:LEAD")
     return timing
 
 
@@ -3663,7 +3669,7 @@ def _barge_in_pair(value: str) -> tuple[int, float]:
 
 def _parse_arguments(
     argv: list[str],
-) -> tuple[str, list[str], int | None, dict[int, float], tuple[float, float] | None]:
+) -> tuple[str, list[str], int | None, dict[int, float], tuple[float, float, float] | None]:
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -3674,9 +3680,10 @@ def _parse_arguments(
         "--preconnect-first-line",
         type=_preconnect_timing,
         default=None,
-        metavar="REPEAT:SEND_LAG",
-        help="send line 1 as a phone-style pre-connect buffer: record until REPEAT s after "
-        "agent subscription, open the stream SEND_LAG s later",
+        metavar="REPEAT:SEND_LAG:LEAD",
+        help="send line 1 as a phone-style pre-connect buffer: record from line 1's first sample "
+        "until REPEAT s after agent subscription, open the stream SEND_LAG s later, and start "
+        "the live track LEAD s into line 1",
     )
     parser.add_argument(
         "--barge-in",
