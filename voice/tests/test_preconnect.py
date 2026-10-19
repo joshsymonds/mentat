@@ -7,6 +7,7 @@ few LiveKit pieces it touches; where livekit is installed the real ones are used
 import asyncio
 import importlib
 import importlib.util
+import re
 import sys
 import types
 import unittest
@@ -380,12 +381,10 @@ async def drain(live):
 
 
 class FakeHandler:
-    def __init__(self, frames=None, error=None):
-        self._frames, self._error = frames, error
+    def __init__(self, frames):
+        self._frames = frames
 
     async def wait_for_data(self, track_id):
-        if self._error:
-            raise self._error
         return self._frames
 
     def opened_at(self, track_id):
@@ -532,7 +531,7 @@ class LiveAudioTest(AsyncTest):
 
         self.assertIs(first.frame, frames[0])
 
-    async def test_the_drop_logs_once_with_the_seconds_dropped_and_the_arrival_times(self):
+    async def test_the_cut_logs_once_with_its_path_and_the_seconds_dropped(self):
         self.stream.push(frames_of(ramp(0.5), LIVE_RATE))  # first live frame heard at t=0
         await settle()
         self.clock.now = 0.7
@@ -542,10 +541,7 @@ class LiveAudioTest(AsyncTest):
 
         [record] = logs.records
         self.assertEqual(record.levelname, "INFO")
-        self.assertRegex(
-            record.getMessage(),
-            r"^dropped 0\.50 s of live audio .*first live frame at 0\.000, buffer completed at 0\.700$",
-        )
+        self.assertEqual(record.getMessage(), "pre-connect cut: path=timing dropped=0.50 s")
 
     async def test_aclose_stops_the_stamping_and_closes_the_stream(self):
         self.stream.push(frames_of(ramp(0.5), LIVE_RATE))
@@ -604,17 +600,25 @@ class PreConnectDedupeTest(AsyncTest):
 
     async def test_a_timed_out_buffer_leaves_live_audio_untouched(self):
         live = frames_of(ramp(2.0), LIVE_RATE)
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=0.01)
 
-        forwarded = await run_input(live, FakeHandler(error=TimeoutError()))
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            forwarded = await run_input(live, handler)
 
         self.assertEqual(samples_of(forwarded[:-1]), samples_of(live))
+        self.assertEqual(pre_connect_messages(logs, "pre-connect cut:"), [NO_CUT])
 
     async def test_a_buffer_error_other_than_a_timeout_leaves_live_audio_untouched(self):
         live = frames_of(ramp(2.0), LIVE_RATE)
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+        failing = mock.AsyncMock(side_effect=RuntimeError("byte stream failed"))
 
-        forwarded = await run_input(live, FakeHandler(error=RuntimeError("byte stream failed")))
+        with mock.patch.object(preconnect.PreConnectAudioHandler, "wait_for_data", failing):
+            with self.assertLogs("mentat.voice", "INFO") as logs:
+                forwarded = await run_input(live, handler)
 
         self.assertEqual(samples_of(forwarded[:-1]), samples_of(live))
+        self.assertEqual(pre_connect_messages(logs, "pre-connect cut:"), [NO_CUT])
 
     async def test_a_buffer_completing_after_the_timeout_drops_no_live_audio_before_or_after(self):
         live = frames_of(ramp(3.0), LIVE_RATE)
@@ -713,6 +717,155 @@ class OpenTimeInputTest(AsyncTest):
         self.assertEqual(samples_of(forwarded[len(buffer):-1]), live[round(0.3 * LIVE_RATE):])
 
 
+NO_CUT = "pre-connect cut: path=none dropped=0.00 s"
+
+
+def pre_connect_messages(logs, prefix):
+    return [record.getMessage() for record in logs.records if record.getMessage().startswith(prefix)]
+
+
+def start_input(stream, handler):
+    """Starts the input's forward task over one track's stream, as LiveKit does on subscription."""
+    track = SimpleNamespace(sid="TR_audio")
+    publication = SimpleNamespace(sid="TR_audio", source=0, audio_features=[PRECONNECT_FEATURE])
+    participant = SimpleNamespace(identity="phone")
+    with track_streams(stream):
+        audio_input = build_input(handler)
+        live_stream = audio_input._create_stream(track, participant)
+    forward = asyncio.create_task(audio_input._forward_task(None, live_stream, track, publication, participant))
+    return audio_input, forward
+
+
+class CutTest(AsyncTest):
+    async def test_a_jittered_repeat_of_the_buffer_tail_is_cut_by_alignment(self):
+        buffer = speechlike(1.04, seed=1, rate=BUFFER_RATE)
+        at_live_rate = np.interp(
+            np.arange(round(len(buffer) * LIVE_RATE / BUFFER_RATE)) * BUFFER_RATE / LIVE_RATE,
+            np.arange(len(buffer)), buffer,
+        )
+        tail = np.round(at_live_rate).astype(np.int16)[-round(0.9 * LIVE_RATE):]
+        repeat = jittered_repeat(tail, noise_scale=1.2, seed=3)
+        live = np.concatenate([repeat, speechlike(0.6, seed=4)])
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+        await arrive(handler, pcm_chunks(buffer, BUFFER_RATE))
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            await run_input(frames_of(live, LIVE_RATE), handler)
+
+        [cut] = pre_connect_messages(logs, "pre-connect cut:")
+        match = re.fullmatch(r"pre-connect cut: path=aligned dropped=(\d+\.\d{2}) s", cut)
+        self.assertIsNotNone(match, cut)
+        self.assertLessEqual(abs(float(match[1]) - len(repeat) / LIVE_RATE), 0.05)
+
+    async def test_no_repeat_is_cut_by_timing_at_the_live_heard_before_the_stream_opened(self):
+        clock = FakeTime()
+        patch = mock.patch.object(preconnect, "time", clock)
+        patch.start()
+        self.addCleanup(patch.stop)
+        buffer = speechlike(1.0, seed=1, rate=BUFFER_RATE)
+        live = speechlike(2.0, seed=2)
+        frames = frames_of(live, LIVE_RATE)
+        stream = GatedStream()
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            audio_input, forward = start_input(stream, handler)
+            stream.push(frames[:6])  # 0.3 s heard before the stream opens
+            await settle()
+            clock.now = 0.3
+            await arrive(handler, pcm_chunks(buffer, BUFFER_RATE))
+            stream.push(frames[6:])
+            stream.end()
+            await forward
+        audio_input._data_ch.close()
+        forwarded = [frame async for frame in audio_input._data_ch]
+
+        self.assertEqual(pre_connect_messages(logs, "pre-connect cut:"), ["pre-connect cut: path=timing dropped=0.30 s"])
+        live_forwarded = [frame for frame in forwarded if any(frame is heard for heard in frames)]
+        self.assertEqual([id(frame) for frame in live_forwarded], [id(frame) for frame in frames[6:]])
+
+    async def test_an_empty_buffer_is_cut_as_none(self):
+        live = frames_of(ramp(1.0), LIVE_RATE)
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+        await arrive(handler, [])
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            forwarded = await run_input(live, handler)
+
+        self.assertEqual(samples_of(forwarded[:-1]), samples_of(live))
+        self.assertEqual(pre_connect_messages(logs, "pre-connect cut:"), [NO_CUT])
+        self.assertEqual(pre_connect_messages(logs, "pre-connect hold:"), [])
+
+
+class HoldTest(AsyncTest):
+    async def test_the_buffer_is_held_until_the_live_head_covers_its_window(self):
+        buffer = speechlike(1.0, seed=1, rate=BUFFER_RATE)
+        live = frames_of(speechlike(2.0, seed=2), LIVE_RATE)
+        stream = GatedStream()
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            audio_input, forward = start_input(stream, handler)
+            await arrive(handler, pcm_chunks(buffer, BUFFER_RATE))
+            stream.push(live[:20])  # 1.0 s of live, short of the 1.2 s window
+            await settle()
+            self.assertEqual(pre_connect_messages(logs, "pre-connect cut:"), [])
+
+            stream.push(live[20:24])  # 1.2 s of live covers the window
+            await settle()
+            self.assertEqual(len(pre_connect_messages(logs, "pre-connect cut:")), 1)
+
+            stream.end()
+            await forward
+
+        self.assertEqual(len(pre_connect_messages(logs, "pre-connect hold:")), 1)
+
+    async def test_a_stream_that_ends_before_the_window_releases_the_held_buffer(self):
+        buffer = speechlike(1.0, seed=1, rate=BUFFER_RATE)
+        live = frames_of(speechlike(2.0, seed=2), LIVE_RATE)
+        stream = GatedStream()
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            audio_input, forward = start_input(stream, handler)
+            await arrive(handler, pcm_chunks(buffer, BUFFER_RATE))
+            stream.push(live[:10])
+            stream.end()
+            await asyncio.wait_for(forward, 0.5)  # well inside the 1.2 s span
+
+        self.assertEqual(
+            pre_connect_messages(logs, "pre-connect cut:"), ["pre-connect cut: path=timing dropped=0.00 s"]
+        )
+
+    def test_a_stalled_live_track_releases_the_held_buffer_after_the_window_span(self):
+        loop = ClockLoop()
+        clock = SimpleNamespace(monotonic=loop.time)
+        with mock.patch.object(preconnect, "time", clock), asyncio.Runner(loop_factory=lambda: loop) as runner:
+            runner.run(self._stalls())
+
+    async def _stalls(self):
+        buffer = speechlike(1.0, seed=1, rate=BUFFER_RATE)
+        live = frames_of(speechlike(2.0, seed=2), LIVE_RATE)
+        stream = GatedStream()
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            audio_input, forward = start_input(stream, handler)
+            await arrive(handler, pcm_chunks(buffer, BUFFER_RATE))
+            stream.push(live[:10])  # 0.5 s of live, then the track stalls
+            await asyncio.sleep(1.5)
+            self.assertEqual(
+                pre_connect_messages(logs, "pre-connect cut:"), ["pre-connect cut: path=timing dropped=0.00 s"]
+            )
+            stream.end()
+            await forward
+
+        [hold] = pre_connect_messages(logs, "pre-connect hold:")
+        match = re.fullmatch(r"pre-connect hold: (\d+\.\d{2}) s", hold)
+        self.assertIsNotNone(match, hold)
+        self.assertAlmostEqual(float(match[1]), 1.2, delta=0.1)
+
+
 def room_options(timeout=3.0):
     if STAND_INS:
         audio = SimpleNamespace(sample_rate=LIVE_RATE, noise_cancellation=None,
@@ -757,6 +910,23 @@ class GatedReader:
         return self._chunks.popleft()
 
 
+def pcm_chunks(samples, rate, seconds=FRAME_SECONDS):
+    """The samples as the phone's buffer stream sends them, one chunk per frame's worth of audio."""
+    step = round(rate * seconds)
+    return [samples[at:at + step].tobytes() for at in range(0, len(samples), step)]
+
+
+async def arrive(handler, chunks, track_id="TR_audio"):
+    """Hands the handler a pre-connect buffer stream of the given chunks, which then ends."""
+    reader = GatedReader(track_id)
+    reading = asyncio.create_task(handler._read_audio_task(reader, "phone"))
+    await settle()
+    for chunk in chunks:
+        reader.push(chunk)
+    reader.end()
+    await reading
+
+
 class ClockLoop(asyncio.SelectorEventLoop):
     """An event loop whose clock moves only when it would otherwise sleep, so a 9 s wait takes no time."""
 
@@ -798,6 +968,46 @@ class OpenRecordingHandlerTest(AsyncTest):
 
         self.assertEqual(handler.opened_at("TR_audio"), 0.7)
 
+    async def test_an_arrived_buffer_is_held_by_the_handler_until_the_live_head_covers_its_window(self):
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+        stream = GatedStream()
+        live = frames_of(speechlike(2.0, seed=2), LIVE_RATE)
+        preconnect._LIVE.set(preconnect._LiveAudio(stream, sample_rate=LIVE_RATE, track_id="TR_audio"))
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            wait = asyncio.create_task(handler.wait_for_data("TR_audio"))
+            await arrive(handler, pcm_chunks(speechlike(1.0, seed=1, rate=BUFFER_RATE), BUFFER_RATE))
+            stream.push(live[:20])  # 1.0 s of live, short of the 1.2 s window
+            await settle()
+            self.assertFalse(wait.done())
+
+            stream.push(live[20:24])  # 1.2 s of live covers the window
+            frames = await asyncio.wait_for(wait, timeout=1)
+            stream.end()
+
+        self.assertEqual(sum(frame.samples_per_channel for frame in frames), BUFFER_RATE)
+        self.assertEqual(len(pre_connect_messages(logs, "pre-connect hold:")), 1)
+
+    async def test_a_timeout_is_logged_as_none_and_raised_by_the_handler(self):
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=0.01)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            with self.assertRaises(TimeoutError):
+                await handler.wait_for_data("TR_audio")
+
+        self.assertEqual(pre_connect_messages(logs, "pre-connect cut:"), [NO_CUT])
+
+    async def test_a_wait_error_is_logged_as_none_and_raised_by_the_handler(self):
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+        failing = mock.AsyncMock(side_effect=RuntimeError("byte stream failed"))
+
+        with mock.patch.object(preconnect.PreConnectAudioHandler, "wait_for_data", failing):
+            with self.assertLogs("mentat.voice", "INFO") as logs:
+                with self.assertRaises(RuntimeError):
+                    await handler.wait_for_data("TR_audio")
+
+        self.assertEqual(pre_connect_messages(logs, "pre-connect cut:"), [NO_CUT])
+
     def test_a_buffer_completing_nine_seconds_after_the_wait_begins_is_used(self):
         loop = ClockLoop()
         clock = SimpleNamespace(monotonic=loop.time)
@@ -808,6 +1018,7 @@ class OpenRecordingHandlerTest(AsyncTest):
         handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
         reader = GatedReader("TR_audio")
         buffer = bytes(2 * BUFFER_RATE)
+        preconnect._LIVE.set(preconnect._LiveAudio(GatedStream(), sample_rate=LIVE_RATE, track_id="TR_audio"))
         wait = asyncio.create_task(handler.wait_for_data("TR_audio"))  # the wait begins at subscription
         await asyncio.sleep(0.7)
         reading = asyncio.create_task(handler._read_audio_task(reader, "phone"))  # the stream opens
