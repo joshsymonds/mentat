@@ -4,13 +4,13 @@ The phone records the first words into a buffer while it connects and sends it a
 byte stream; its live track then starts a moment before the end of that buffer, so the
 live audio opens by repeating the buffer's last half second or so. LiveKit feeds both to
 the speech-to-text and the first words arrive twice. This input drops the repeat by
-timing: a live frame the worker received before the buffer finished arriving is the
-repeat, so the live frames heard before that moment are dropped, at most the buffer's
-length in total, counted from the first live frame. Every later live frame passes.
+timing: a live frame the worker received before the buffer's stream opened is the repeat,
+so the live frames heard before that moment are dropped, at most the buffer's length in
+total, counted from the first live frame. Every later live frame passes.
 
 Frames carry no receive time, so each live frame is stamped as it comes off the track,
-from the moment the track is created. The buffer's completion is the moment LiveKit hands
-it to the input.
+from the moment the track is created. The buffer's stream opening is recorded by the
+handler as the phone's byte stream arrives, per track.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import livekit.agents.voice.room_io.room_io as upstream
 from livekit import rtc
 from livekit.agents.voice import room_io
 from livekit.agents.voice.room_io._input import _ParticipantAudioInputStream
+from livekit.agents.voice.room_io._pre_connect_audio import PreConnectAudioHandler
 
 logger = logging.getLogger("mentat.voice")
 
@@ -100,9 +101,10 @@ class _LiveAudio:
     read from creation, so every frame is stamped with the time it arrived.
     """
 
-    def __init__(self, stream: Any, *, sample_rate: int) -> None:
+    def __init__(self, stream: Any, *, sample_rate: int, track_id: str) -> None:
         self._stream = stream
         self._sample_rate = sample_rate
+        self.track_id = track_id
         self._stamped: deque[tuple[float, Any]] = deque()
         self._changed = asyncio.Event()
         self._ended = False
@@ -126,8 +128,8 @@ class _LiveAudio:
             self._ended = True
             self._changed.set()
 
-    def process_buffer(self, frames: Iterable[Any]) -> list[Any]:
-        """Drop the live audio heard before the buffer completed; return the buffer as it arrived.
+    def process_buffer(self, frames: Iterable[Any], opened: float) -> list[Any]:
+        """Drop the live audio heard before the buffer's stream opened; return the buffer as it arrived.
 
         The buffer comes back in order and is consumed before the live audio is read.
         """
@@ -135,7 +137,7 @@ class _LiveAudio:
         completed = time.monotonic()
         heard = 0
         for stamp, frame in self._stamped:
-            if stamp >= completed:
+            if stamp >= opened:
                 break
             heard += frame.samples_per_channel
         seconds = 0.0
@@ -203,25 +205,48 @@ class _PreConnectAudioInput(_ParticipantAudioInputStream):
             num_channels=self._num_channels,
             frame_size_ms=self._frame_size_ms,
         )
-        return _LiveAudio(stream, sample_rate=self._sample_rate)
+        return _LiveAudio(stream, sample_rate=self._sample_rate, track_id=track.sid)
 
     async def _forward_task(self, old_task: Any, stream: Any, *rest: Any) -> None:
         _LIVE.set(stream)
         await super()._forward_task(old_task, stream, *rest)
 
     def _apply_audio_processor(self, frames: Iterable[rtc.AudioFrame]) -> Iterable[rtc.AudioFrame]:
-        return _LIVE.get().process_buffer(frames)
+        live = _LIVE.get()
+        return live.process_buffer(frames, self._pre_connect_audio_handler.opened_at(live.track_id))
+
+
+class _OpenRecordingHandler(PreConnectAudioHandler):
+    """LiveKit's pre-connect handler, recording when each track's buffer stream opened."""
+
+    def __init__(self, room: rtc.Room, *, timeout: float) -> None:
+        super().__init__(room, timeout=timeout)
+        self._opened: dict[str, float] = {}
+
+    def opened_at(self, track_id: str) -> float:
+        """When the track's buffer stream opened, on the monotonic clock."""
+        return self._opened[track_id]
+
+    async def _read_audio_task(self, reader: rtc.ByteStreamReader, participant_id: str) -> None:
+        # A buffer is only ever set by a stream that reaches this point, so every buffer has its open time.
+        attributes = reader.info.attributes
+        if attributes and (track_id := attributes.get("trackId")):
+            self._opened[track_id] = time.monotonic()
+        await super()._read_audio_task(reader, participant_id)
 
 
 class PreConnectRoomIO(room_io.RoomIO):
     """RoomIO whose microphone input hears the pre-connect buffer once."""
 
     async def start(self) -> None:
-        # RoomIO.start builds its audio input from this module global and never yields to
-        # the loop while it does, so the swap cannot be seen by another RoomIO.
-        stock = upstream._ParticipantAudioInputStream
+        # RoomIO.start builds its audio input and pre-connect handler from these module globals
+        # and never yields to the loop before it does, so the swaps cannot be seen by another RoomIO.
+        stock_input = upstream._ParticipantAudioInputStream
+        stock_handler = upstream.PreConnectAudioHandler
         upstream._ParticipantAudioInputStream = _PreConnectAudioInput
+        upstream.PreConnectAudioHandler = _OpenRecordingHandler
         try:
             await super().start()
         finally:
-            upstream._ParticipantAudioInputStream = stock
+            upstream._ParticipantAudioInputStream = stock_input
+            upstream.PreConnectAudioHandler = stock_handler

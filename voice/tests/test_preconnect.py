@@ -113,21 +113,62 @@ def _install_livekit_stand_ins():
                 await self._data_ch.send(event.frame)
             await self._data_ch.send(AudioFrame(b"\0\0", self._sample_rate, 1, 1))
 
+    PRE_CONNECT_AUDIO_BUFFER_STREAM = "lk.agent.pre-connect-audio-buffer"
+
+    class PreConnectAudioHandler:
+        """LiveKit 1.8.1's pre-connect handler, for the raw PCM the tests send."""
+
+        def __init__(self, room, *, timeout, max_delta_s=1.0):
+            self._room = room
+            self._timeout = timeout
+            self._max_delta_s = max_delta_s
+            self._buffers = {}
+
+        def register(self):
+            def _handler(reader, participant_id):
+                asyncio.create_task(self._read_audio_task(reader, participant_id))
+
+            self._room.register_byte_stream_handler(PRE_CONNECT_AUDIO_BUFFER_STREAM, _handler)
+
+        async def wait_for_data(self, track_id):
+            fut = self._buffers.setdefault(track_id, asyncio.get_running_loop().create_future())
+            try:
+                return await asyncio.wait_for(fut, self._timeout)
+            finally:
+                self._buffers.pop(track_id)
+
+        async def _read_audio_task(self, reader, participant_id):
+            attributes = reader.info.attributes
+            if not attributes or not (track_id := attributes.get("trackId")):
+                return
+            fut = self._buffers.setdefault(track_id, asyncio.get_running_loop().create_future())
+            rate, channels = int(attributes["sampleRate"]), int(attributes["channels"])
+            frames = []
+            async for chunk in reader:
+                frames.append(rtc.AudioFrame(chunk, rate, channels, len(chunk) // (2 * channels)))
+            if not fut.done():
+                fut.set_result(frames)
+
     class RoomIO:
         def __init__(self, agent_session, room, *, participant=None, options=None):
             self._room = room
             self._options = options
             self._audio_input = None
+            self._pre_connect_audio_handler = None
 
         async def start(self):
-            audio = self._options.audio_input
+            audio = self._options.get_audio_input_options()
+            if audio.pre_connect_audio:
+                self._pre_connect_audio_handler = upstream.PreConnectAudioHandler(
+                    room=self._room, timeout=audio.pre_connect_audio_timeout)
+                self._pre_connect_audio_handler.register()
             self._audio_input = upstream._ParticipantAudioInputStream(
                 self._room,
                 sample_rate=audio.sample_rate,
                 num_channels=1,
                 noise_cancellation=audio.noise_cancellation,
                 auto_gain_control=False,
-                pre_connect_audio_handler=None,
+                pre_connect_audio_handler=self._pre_connect_audio_handler,
             )
 
         @property
@@ -142,10 +183,15 @@ def _install_livekit_stand_ins():
     track_pb2 = module("livekit.rtc._proto.track_pb2",
                        AudioTrackFeature=SimpleNamespace(TF_PRECONNECT_BUFFER=1))
     upstream = module("livekit.agents.voice.room_io.room_io",
-                      RoomIO=RoomIO, _ParticipantAudioInputStream=ParticipantAudioInputStream)
+                      RoomIO=RoomIO, _ParticipantAudioInputStream=ParticipantAudioInputStream,
+                      PreConnectAudioHandler=PreConnectAudioHandler)
+    pre_connect_audio = module("livekit.agents.voice.room_io._pre_connect_audio",
+                               PreConnectAudioHandler=PreConnectAudioHandler,
+                               PRE_CONNECT_AUDIO_BUFFER_STREAM=PRE_CONNECT_AUDIO_BUFFER_STREAM)
     room_io = module("livekit.agents.voice.room_io", RoomIO=RoomIO, room_io=upstream,
                      _input=module("livekit.agents.voice.room_io._input",
-                                   _ParticipantAudioInputStream=ParticipantAudioInputStream))
+                                   _ParticipantAudioInputStream=ParticipantAudioInputStream),
+                     _pre_connect_audio=pre_connect_audio)
     rtc = module("livekit.rtc", AudioFrame=AudioFrame, AudioFrameEvent=AudioFrameEvent,
                  FrameProcessor=FrameProcessor, AudioStream=AudioStream, Track=object, Participant=object,
                  _proto=module("livekit.rtc._proto", track_pb2=track_pb2))
@@ -158,6 +204,7 @@ def _install_livekit_stand_ins():
         "livekit.agents.voice": voice, "livekit.agents.voice.room_io": room_io,
         "livekit.agents.voice.room_io.room_io": upstream,
         "livekit.agents.voice.room_io._input": room_io._input,
+        "livekit.agents.voice.room_io._pre_connect_audio": pre_connect_audio,
     }
 
 
@@ -341,6 +388,9 @@ class FakeHandler:
             raise self._error
         return self._frames
 
+    def opened_at(self, track_id):
+        return 0.0
+
 
 def build_input(handler):
     return preconnect._PreConnectAudioInput(
@@ -407,7 +457,7 @@ class LiveAudioTest(AsyncTest):
         clock.start()
         self.addCleanup(clock.stop)
         self.stream = GatedStream()
-        self.live = preconnect._LiveAudio(self.stream, sample_rate=LIVE_RATE)
+        self.live = preconnect._LiveAudio(self.stream, sample_rate=LIVE_RATE, track_id="TR_audio")
 
     async def test_live_frames_heard_before_the_buffer_completed_are_dropped_and_the_rest_pass(self):
         live = ramp(2.0)
@@ -415,7 +465,7 @@ class LiveAudioTest(AsyncTest):
         self.stream.push(frames[:10])  # 0.5 s heard from t=0
         await settle()
         self.clock.now = 0.7
-        list(self.live.process_buffer(silence(1.0)))
+        list(self.live.process_buffer(silence(1.0), opened=0.7))
         self.stream.push(frames[10:])
         self.stream.end()
 
@@ -429,7 +479,7 @@ class LiveAudioTest(AsyncTest):
         self.stream.push(frames[:15])  # 0.75 s heard from t=0; the buffer is 0.73 s, so frame 14 straddles
         await settle()
         self.clock.now = 0.8
-        list(self.live.process_buffer(silence(0.73)))
+        list(self.live.process_buffer(silence(0.73), opened=0.8))
         self.stream.push(frames[15:])
         self.stream.end()
 
@@ -442,7 +492,7 @@ class LiveAudioTest(AsyncTest):
         self.stream.push(frames_of(live, LIVE_RATE))  # all 2 s heard from t=0
         await settle()
         self.clock.now = 1.0
-        list(self.live.process_buffer(silence(0.5)))
+        list(self.live.process_buffer(silence(0.5), opened=1.0))
         self.stream.end()
 
         out = await drain(self.live)
@@ -452,7 +502,7 @@ class LiveAudioTest(AsyncTest):
     async def test_live_frames_heard_after_the_buffer_completed_all_pass(self):
         live = ramp(1.0)
         self.clock.now = 0.0
-        list(self.live.process_buffer(silence(1.0)))
+        list(self.live.process_buffer(silence(1.0), opened=0.0))
         self.clock.now = 0.5
         self.stream.push(frames_of(live, LIVE_RATE))
         self.stream.end()
@@ -466,7 +516,7 @@ class LiveAudioTest(AsyncTest):
         self.stream.push(frames_of(live, LIVE_RATE))
         await settle()
         self.clock.now = 0.5
-        list(self.live.process_buffer([]))
+        list(self.live.process_buffer([], opened=0.5))
         self.stream.end()
 
         out = await drain(self.live)
@@ -488,7 +538,7 @@ class LiveAudioTest(AsyncTest):
         self.clock.now = 0.7
 
         with self.assertLogs("mentat.voice", level="INFO") as logs:
-            list(self.live.process_buffer(silence(1.0)))
+            list(self.live.process_buffer(silence(1.0), opened=0.7))
 
         [record] = logs.records
         self.assertEqual(record.levelname, "INFO")
@@ -606,26 +656,196 @@ class PreConnectDedupeTest(AsyncTest):
         self.assertEqual(samples_of(forwarded[:-1]), samples_of(live))
 
 
+class OpenTimedHandler:
+    """A handler whose buffer completes when the test releases it, and which reports when its stream opened."""
+
+    def __init__(self, frames, opened):
+        self.done = asyncio.get_running_loop().create_future()
+        self._frames, self._opened = frames, opened
+
+    async def wait_for_data(self, track_id):
+        return await self.done
+
+    def opened_at(self, track_id):
+        return self._opened
+
+
+class OpenTimeInputTest(AsyncTest):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.clock = FakeTime()
+        clock = mock.patch.object(preconnect, "time", self.clock)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    async def test_live_audio_heard_before_the_buffer_stream_opened_is_dropped_and_the_rest_pass(self):
+        live = ramp(2.0)
+        frames = frames_of(live, LIVE_RATE)
+        stream = GatedStream()
+        buffer = silence(1.0, LIVE_RATE)
+        handler = OpenTimedHandler(buffer, opened=0.3)
+        track = SimpleNamespace(sid="TR_audio")
+        publication = SimpleNamespace(sid="TR_audio", source=0, audio_features=[PRECONNECT_FEATURE])
+        participant = SimpleNamespace(identity="phone")
+
+        with track_streams(stream):
+            audio_input = build_input(handler)
+            live_stream = audio_input._create_stream(track, participant)
+            forward = asyncio.create_task(
+                audio_input._forward_task(None, live_stream, track, publication, participant)
+            )
+            self.clock.now = 0.0
+            stream.push(frames[:6])  # 0.3 s heard before the stream opened at 0.3
+            await settle()
+            self.clock.now = 0.3
+            stream.push(frames[6:12])  # 0.3 s heard once the stream had opened
+            await settle()
+            self.clock.now = 0.6
+            handler.done.set_result(buffer)  # the buffer completes at 0.6
+            await settle()
+            stream.push(frames[12:])
+            stream.end()
+            await forward
+
+        audio_input._data_ch.close()
+        forwarded = [frame async for frame in audio_input._data_ch]
+
+        self.assertEqual(samples_of(forwarded[len(buffer):-1]), live[round(0.3 * LIVE_RATE):])
+
+
+def room_options(timeout=3.0):
+    if STAND_INS:
+        audio = SimpleNamespace(sample_rate=LIVE_RATE, noise_cancellation=None,
+                                pre_connect_audio=True, pre_connect_audio_timeout=timeout)
+        return SimpleNamespace(get_audio_input_options=lambda: audio)
+    return preconnect.room_io.RoomOptions(
+        audio_input=preconnect.room_io.AudioInputOptions(pre_connect_audio_timeout=timeout),
+        audio_output=False,
+        text_output=False,
+    )
+
+
+class GatedReader:
+    """Stands in for rtc.ByteStreamReader: chunks reach it when the test pushes them, and it ends when told."""
+
+    def __init__(self, track_id):
+        self.info = SimpleNamespace(
+            attributes={"trackId": track_id, "sampleRate": str(BUFFER_RATE), "channels": "1"},
+            mime_type="",
+        )
+        self._chunks = deque()
+        self._changed = asyncio.Event()
+        self._ended = False
+
+    def push(self, chunk):
+        self._chunks.append(chunk)
+        self._changed.set()
+
+    def end(self):
+        self._ended = True
+        self._changed.set()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        while not self._chunks:
+            if self._ended:
+                raise StopAsyncIteration
+            self._changed.clear()
+            await self._changed.wait()
+        return self._chunks.popleft()
+
+
+class ClockLoop(asyncio.SelectorEventLoop):
+    """An event loop whose clock moves only when it would otherwise sleep, so a 9 s wait takes no time."""
+
+    def __init__(self):
+        super().__init__()
+        self._now = 0.0
+        selector = self._selector
+        select = selector.select
+
+        def skip_to_next_timer(timeout=None):
+            if timeout:
+                self._now += timeout
+            return select(0)
+
+        selector.select = skip_to_next_timer
+
+    def time(self):
+        return self._now
+
+
+class OpenRecordingHandlerTest(AsyncTest):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.clock = FakeTime()
+        clock = mock.patch.object(preconnect, "time", self.clock)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    async def test_the_open_time_of_each_buffer_stream_is_recorded_per_track(self):
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+        reader = GatedReader("TR_audio")
+        self.clock.now = 0.7
+
+        reading = asyncio.create_task(handler._read_audio_task(reader, "phone"))
+        await settle()
+        reader.push(bytes(2 * 1000))
+        reader.end()
+        await reading
+
+        self.assertEqual(handler.opened_at("TR_audio"), 0.7)
+
+    def test_a_buffer_completing_nine_seconds_after_the_wait_begins_is_used(self):
+        loop = ClockLoop()
+        clock = SimpleNamespace(monotonic=loop.time)
+        with mock.patch.object(preconnect, "time", clock), asyncio.Runner(loop_factory=lambda: loop) as runner:
+            runner.run(self._nine_seconds())
+
+    async def _nine_seconds(self):
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+        reader = GatedReader("TR_audio")
+        buffer = bytes(2 * BUFFER_RATE)
+        wait = asyncio.create_task(handler.wait_for_data("TR_audio"))  # the wait begins at subscription
+        await asyncio.sleep(0.7)
+        reading = asyncio.create_task(handler._read_audio_task(reader, "phone"))  # the stream opens
+        await asyncio.sleep(8.3)
+        reader.push(buffer)  # the buffer completes at 9 s
+        reader.end()
+        await reading
+
+        frames = await wait
+
+        self.assertEqual(sum(frame.samples_per_channel for frame in frames), BUFFER_RATE)
+
+
 class PreConnectRoomIOTest(AsyncTest):
     async def test_start_installs_the_input_and_restores_livekits(self):
         upstream = preconnect.upstream
         stock = upstream._ParticipantAudioInputStream
-        if STAND_INS:
-            options = SimpleNamespace(audio_input=SimpleNamespace(sample_rate=LIVE_RATE, noise_cancellation=None))
-        else:
-            options = preconnect.room_io.RoomOptions(
-                audio_input=preconnect.room_io.AudioInputOptions(),
-                audio_output=False,
-                text_output=False,
-            )
         session = mock.MagicMock()
         room = mock.MagicMock()
-        voice_io = preconnect.PreConnectRoomIO(agent_session=session, room=room, options=options)
+        voice_io = preconnect.PreConnectRoomIO(agent_session=session, room=room, options=room_options(timeout=10.0))
 
         await voice_io.start()
 
         self.assertIsInstance(voice_io.audio_input, preconnect._PreConnectAudioInput)
         self.assertIs(upstream._ParticipantAudioInputStream, stock)
+
+    async def test_start_builds_the_open_recording_handler_with_the_options_timeout(self):
+        upstream = preconnect.upstream
+        stock = upstream.PreConnectAudioHandler
+        voice_io = preconnect.PreConnectRoomIO(agent_session=mock.MagicMock(), room=mock.MagicMock(),
+                                               options=room_options(timeout=10.0))
+
+        await voice_io.start()
+
+        handler = voice_io._pre_connect_audio_handler
+        self.assertIsInstance(handler, preconnect._OpenRecordingHandler)
+        self.assertEqual(handler._timeout, 10.0)
+        self.assertIs(upstream.PreConnectAudioHandler, stock)
 
     def test_it_is_a_room_io(self):
         self.assertTrue(issubclass(preconnect.PreConnectRoomIO, preconnect.room_io.RoomIO))
