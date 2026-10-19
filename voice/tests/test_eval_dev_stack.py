@@ -2412,7 +2412,7 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         self.assertIn('"voice-python.path"', batch_script)
         self.assertNotIn("nix build", run_script)
         for module in (
-            "livekit.plugins.dtln", "livekit.plugins.elevenlabs",
+            "livekit.plugins.elevenlabs",
             "livekit.plugins.turn_detector", "livekit.plugins.silero",
         ):
             self.assertIn(module, batch_script)
@@ -2442,7 +2442,7 @@ sleep() { printf 'sleep\n' >> "$KILL_LOG"; }
         )
         self.assertEqual(
             observed,
-            ["aiohttp", "livekit.api", "livekit.rtc", "livekit.plugins.dtln",
+            ["aiohttp", "livekit.api", "livekit.rtc",
              "livekit.plugins.elevenlabs", "livekit.plugins.silero",
              "livekit.plugins.turn_detector"],
         )

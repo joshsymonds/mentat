@@ -607,7 +607,7 @@ test -x "$VOICE_PY"
 import importlib
 
 for module in (
-    "aiohttp", "livekit.api", "livekit.rtc", "livekit.plugins.dtln",
+    "aiohttp", "livekit.api", "livekit.rtc",
     "livekit.plugins.elevenlabs", "livekit.plugins.silero",
     "livekit.plugins.turn_detector",
 ):

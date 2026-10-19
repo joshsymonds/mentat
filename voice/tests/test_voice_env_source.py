@@ -134,8 +134,12 @@ class VoiceEnvironmentSourceContractTest(unittest.TestCase):
             "])).overrideAttrs", 1
         )[0]
         self.assertIn("livekit-plugins-elevenlabs", runtime)
-        self.assertIn("from livekit.plugins import dtln, elevenlabs, silero", source)
+        self.assertIn("from livekit.plugins import elevenlabs, silero", source)
         self.assertIn('elevenlabs.TTS(api_key="synthetic-test-key")', source)
+
+    def test_dtln_noise_suppression_is_absent_from_the_voice_environment(self):
+        source = (Path(__file__).resolve().parents[2] / "nix" / "voice-env.nix").read_text()
+        self.assertNotRegex(source, re.compile("dtln", re.IGNORECASE))
 
 
 if __name__ == "__main__":
