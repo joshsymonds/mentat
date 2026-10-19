@@ -300,13 +300,16 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertTrue(phone.preconnect_first_line)
         self.assertEqual(phone.preconnect_repeat_seconds, 0.8)
         self.assertEqual(phone.preconnect_send_lag_seconds, 0.2)
+        self.assertEqual(phone.preconnect_lead_seconds, 0.15)
         self.assertTrue(phone.exact_caller_stt)
         self.assertTrue(phone.close_after_final_line_optional)
         self.assertEqual(phone.barge_in_after, ())
 
         slow = self.scenario("phone-first-line-slow-send")
+        self.assertEqual(slow.preconnect_lead_seconds, 0.7)
         self.assertEqual(slow, dataclasses.replace(
             phone, name="phone-first-line-slow-send", preconnect_send_lag_seconds=1.5,
+            preconnect_lead_seconds=0.7,
         ))
 
         barge = self.scenario("barge-in-long-reply")
@@ -333,6 +336,7 @@ class ScenarioScoringTests(unittest.TestCase):
                 self.assertFalse(scenario.preconnect_first_line)
                 self.assertEqual(scenario.preconnect_repeat_seconds, 0.0)
                 self.assertEqual(scenario.preconnect_send_lag_seconds, 0.0)
+                self.assertEqual(scenario.preconnect_lead_seconds, 0.0)
                 self.assertEqual(scenario.barge_in_after, ())
                 self.assertFalse(scenario.exact_caller_stt)
                 self.assertFalse(scenario.close_after_final_line_optional)
@@ -663,12 +667,28 @@ class BargeInDocumentationTests(unittest.TestCase):
         for name in ("phone-first-line", "phone-first-line-slow-send"):
             scenario = next(s for s in SCENARIOS if s.name == name)
             sentence = (
-                f"`{name}` repeats {scenario.preconnect_repeat_seconds:g} s and "
-                f"sends {scenario.preconnect_send_lag_seconds:g} s"
+                f"`{name}` repeats {scenario.preconnect_repeat_seconds:g} s, "
+                f"sends {scenario.preconnect_send_lag_seconds:g} s, and "
+                f"leads {scenario.preconnect_lead_seconds:g} s"
             )
             with self.subTest(scenario=name):
                 self.assertIn(sentence, paragraph)
                 self.assertIn(f"--scenario {name}", command)
+
+    def test_readme_documents_first_line_cli_form_and_lead_trace_field(self):
+        paragraph = self.capture_modes_paragraph()
+        for name in ("phone-first-line", "phone-first-line-slow-send"):
+            scenario = next(s for s in SCENARIOS if s.name == name)
+            flag = (
+                f"--preconnect-first-line {scenario.preconnect_repeat_seconds:g}:"
+                f"{scenario.preconnect_send_lag_seconds:g}:"
+                f"{scenario.preconnect_lead_seconds:g}"
+            )
+            with self.subTest(scenario=name):
+                self.assertIn(f"`{flag}`", paragraph)
+        self.assertIn("`lead_seconds`", paragraph)
+        self.assertIn("`repeat_seconds`", paragraph)
+        self.assertIn("`send_lag_seconds`", paragraph)
 
     def test_readme_documents_barge_in_timing(self):
         paragraph = self.capture_modes_paragraph()

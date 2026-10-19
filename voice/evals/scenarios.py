@@ -43,6 +43,7 @@ class Scenario:
     preconnect_first_line: bool = False
     preconnect_repeat_seconds: float = 0.0
     preconnect_send_lag_seconds: float = 0.0
+    preconnect_lead_seconds: float = 0.0
     barge_in_after: tuple[float | None, ...] = ()
     exact_caller_stt: bool = False
     close_after_final_line_optional: bool = False
@@ -213,6 +214,7 @@ SCENARIOS = (
         preconnect_first_line=True,
         preconnect_repeat_seconds=0.8,
         preconnect_send_lag_seconds=0.2,
+        preconnect_lead_seconds=0.15,
         exact_caller_stt=True,
         close_after_final_line_optional=True,
     ),
@@ -229,6 +231,7 @@ SCENARIOS = (
         preconnect_first_line=True,
         preconnect_repeat_seconds=0.8,
         preconnect_send_lag_seconds=1.5,
+        preconnect_lead_seconds=0.7,
         exact_caller_stt=True,
         close_after_final_line_optional=True,
     ),
