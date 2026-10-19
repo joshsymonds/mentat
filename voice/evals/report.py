@@ -241,6 +241,8 @@ def _score_turn(
         report["segments"] = _transcript_segments(turn["raw_segments"])
     if "judge" in turn:
         report["judge"] = turn["judge"]
+    if "preconnect" in turn:
+        report["preconnect"] = turn["preconnect"]
     return report, problems
 
 

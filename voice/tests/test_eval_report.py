@@ -315,6 +315,27 @@ class ScoringTests(unittest.TestCase):
 
         self.assertEqual(result["cases"][0]["turns"][0]["judge"], judge)
 
+    def test_scored_turn_keeps_preconnect_entry_and_omits_it_when_absent(self):
+        preconnect = {
+            "buffer_seconds": 0.8,
+            "repeat_seconds": 0.8,
+            "send_lag_seconds": 0.2,
+            "lead_seconds": 0.7,
+        }
+        with_preconnect = turn(kind="search")
+        with_preconnect["preconnect"] = preconnect
+
+        result = score_observations({
+            "cases": [{
+                "name": "place lookup",
+                "runs": [{"turns": [with_preconnect, turn(kind="search")]}],
+            }],
+        }, required_runs=1)
+
+        kept, absent = result["cases"][0]["turns"]
+        self.assertEqual(kept["preconnect"], preconnect)
+        self.assertNotIn("preconnect", absent)
+
     def test_later_judge_unavailable_keeps_prior_verdict_raw_evidence_and_phone_commands(self):
         prior_judge = {
             "context": "",
