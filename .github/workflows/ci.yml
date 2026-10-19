@@ -13,7 +13,8 @@ jobs:
           node-version: 24
           cache: npm
       # Voice and HA tests run on the Python the voice env ships (3.14), and the
-      # recipe tests shell out to `just`.
+      # recipe tests shell out to `just`. The voice tests import numpy (the
+      # pre-connect alignment), so the voice step installs the voice env's pin.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
@@ -22,6 +23,7 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: python3 -m unittest discover -s ha/tests
+      - run: python3 -m pip install numpy==2.5.2
       - run: python3 -m unittest discover -s voice/tests
 
   android:

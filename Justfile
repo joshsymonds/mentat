@@ -13,9 +13,9 @@ test:
 test-ha:
     python3 -m unittest discover -s ha/tests
 
-# Voice stream adapter (voice/): stdlib-only, no livekit install needed
+# Voice stream adapter (voice/): runs on the voice env's python, which has numpy for the pre-connect alignment; no livekit install needed
 test-voice:
-    python3 -m unittest discover -s voice/tests
+    "$(nix build .#voice-env --no-link --print-out-paths)/bin/python3" -m unittest discover -s voice/tests
 
 # Opt-in live voice evaluation; RUNS defaults to 10 observations per scenario and concurrency to 8 (within ElevenLabs' 9-request limit).
 eval-voice RUNS='10' MODEL='chatgpt/sol-fast' CONCURRENCY='':
