@@ -28,7 +28,7 @@ from livekit.agents import (
     tts,
 )
 from livekit.agents.voice import room_io
-from livekit.plugins import dtln, elevenlabs, silero
+from livekit.plugins import elevenlabs, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from preconnect import PreConnectRoomIO
@@ -1121,7 +1121,8 @@ async def entrypoint(ctx: JobContext) -> None:
         room=ctx.room,
         options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
-                noise_cancellation=dtln.noise_suppression(),
+                auto_gain_control=False,
+                pre_connect_audio_timeout=10.0,
             ),
         ),
     )
