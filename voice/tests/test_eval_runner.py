@@ -448,6 +448,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         clock = Clock()
         recorded = SimpleNamespace(
             events=[], options=[], streams=[], frames=[], sleeps=[], playout_ends=[],
+            subscribed_at=None, stream_opened_at=None,
         )
         agent = SimpleNamespace(kind=1, identity="agent-worker-1")
 
@@ -469,10 +470,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         async def stream_bytes(name, **kwargs):
             stream = {"name": name, "kwargs": kwargs, "data": bytearray(), "closed": False}
             recorded.streams.append(stream)
+            recorded.stream_opened_at = clock.now
             recorded.events.append("stream-opened")
             return Writer(stream)
 
         async def wait_for_subscription():
+            recorded.subscribed_at = clock.now
             recorded.events.append("subscribed")
 
         publication = SimpleNamespace(sid="TR_caller_mic", wait_for_subscription=wait_for_subscription)
@@ -529,7 +532,9 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         return b"".join(pcm[index : index + 2] * 2 for index in range(0, len(pcm), 2))
 
     @staticmethod
-    async def run_preconnect_capture(dependencies, recorded, *, preconnect_first_line):
+    async def run_preconnect_capture(
+        dependencies, recorded, *, preconnect_first_line, timing=(0.8, 0.2),
+    ):
         async def speech_end(source):
             recorded.playout_ends.append(len(recorded.frames))
             await source.wait_for_playout()
@@ -544,7 +549,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 ["First question@0::answer", "Second question@0::answer"],
                 dependencies=dependencies,
                 room_close_after=None,
-                **({"preconnect_first_line": True} if preconnect_first_line else {}),
+                **({"preconnect_timing": timing} if preconnect_first_line else {}),
             )
 
     async def test_preconnect_first_line_streams_live_from_its_first_sample_before_the_agent_joins(self):
@@ -573,24 +578,51 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             "destination_identities": ["agent-worker-1"],
             "attributes": {"trackId": "TR_caller_mic", "sampleRate": "48000", "channels": "1"},
         })
-        # Three 0.2 s polls bring the agent in, then the buffer waits 0.7 s after
-        # subscription: 1.3 s of mic audio, from the first sample to the send.
-        send_samples = round(1.3 * runner.RATE)
+        # Three 0.2 s polls bring the agent in 0.6 s after the first sample.
+        # The buffer records 0.8 s past subscription, 1.4 s from the first sample, and its
+        # stream opens 0.2 s after recording stops.
+        send_samples = round(1.4 * runner.RATE)
         self.assertEqual(bytes(stream["data"]), self.upsample_2x(first[: send_samples * 2]))
         self.assertEqual(len(stream["data"]), 4 * send_samples)
         self.assertTrue(stream["closed"])
         self.assertLess(recorded.events.index("agent-joined"), recorded.events.index("subscribed"))
-        self.assertLess(recorded.events.index("subscribed"), recorded.events.index("sleep 0.7"))
-        self.assertLess(recorded.events.index("sleep 0.7"), recorded.events.index("stream-opened"))
+        self.assertLess(recorded.events.index("subscribed"), recorded.events.index("stream-opened"))
+        self.assertEqual(recorded.sleeps[-2:], [0.8, 0.2])
+        self.assertAlmostEqual(recorded.subscribed_at, 10.6)
+        self.assertAlmostEqual(recorded.stream_opened_at - recorded.subscribed_at, 1.0)
         self.assertAlmostEqual(
             traces[0]["preconnect"]["buffer_seconds"],
             len(stream["data"]) / (runner.PRECONNECT_SAMPLE_RATE * 2),
         )
-        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 1.3)
-        self.assertAlmostEqual(traces[0]["preconnect"]["overlap_seconds"], 0.7)
+        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 1.4)
+        self.assertAlmostEqual(traces[0]["preconnect"]["repeat_seconds"], 0.8)
+        self.assertAlmostEqual(traces[0]["preconnect"]["send_lag_seconds"], 0.2)
+        self.assertEqual(
+            set(traces[0]["preconnect"]),
+            {"buffer_seconds", "repeat_seconds", "send_lag_seconds"},
+        )
         self.assertNotIn("preconnect", traces[1])
         second = b"".join(recorded.frames[-self.frames_in(rendered_pcm("Second question")):])
         self.assertEqual(second, rendered_pcm("Second question"))
+
+    async def test_slow_send_opens_the_buffer_stream_after_its_send_lag_and_keeps_live_audio(self):
+        first = self.ramp_pcm("First question", 2.0)
+        dependencies, recorded = self.preconnect_dependencies(first, agent_after_sleeps=3)
+
+        traces = await self.run_preconnect_capture(
+            dependencies, recorded, preconnect_first_line=True, timing=(0.8, 1.5),
+        )
+
+        self.assertEqual(recorded.sleeps[-2:], [0.8, 1.5])
+        self.assertAlmostEqual(recorded.stream_opened_at - recorded.subscribed_at, 2.3)
+        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 1.4)
+        self.assertAlmostEqual(traces[0]["preconnect"]["send_lag_seconds"], 1.5)
+        send_samples = round(1.4 * runner.RATE)
+        self.assertEqual(
+            bytes(recorded.streams[0]["data"]), self.upsample_2x(first[: send_samples * 2]),
+        )
+        first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
+        self.assertEqual(b"".join(first_frames)[: len(first)], first)
 
     async def test_preconnect_live_track_holds_silence_after_the_line_until_the_buffer_is_sent(self):
         first = self.ramp_pcm("First question", 2.0)
@@ -598,11 +630,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         traces = await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
 
-        # Fifteen 0.2 s polls and the 0.7 s send delay put the send at 3.7 s, 1.7 s past the line.
-        send_samples = round(3.7 * runner.RATE)
+        # Fifteen 0.2 s polls put the agent in at 3.0 s, and the buffer records 0.8 s more:
+        # 3.8 s of mic audio, 1.8 s past the line.
+        send_samples = round(3.8 * runner.RATE)
         mic = first + bytes(send_samples * 2 - len(first))
         self.assertEqual(bytes(recorded.streams[0]["data"]), self.upsample_2x(mic))
-        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 3.7)
+        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 3.8)
         first_frames = recorded.frames[: -self.frames_in(rendered_pcm("Second question"))]
         live = b"".join(first_frames)
         self.assertEqual(live[: len(first)], first)
@@ -615,10 +648,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         traces = await self.run_preconnect_capture(dependencies, recorded, preconnect_first_line=True)
 
-        send_samples = round(1.3 * runner.RATE)
+        send_samples = round(1.4 * runner.RATE)
         mic = first + bytes(send_samples * 2 - len(first))
         self.assertEqual(bytes(recorded.streams[0]["data"]), self.upsample_2x(mic))
-        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 1.3)
+        self.assertAlmostEqual(traces[0]["preconnect"]["buffer_seconds"], 1.4)
 
     async def test_preconnect_speech_end_is_the_end_of_line_one_playout_before_any_silence(self):
         first = self.ramp_pcm("First question", 2.0)
@@ -639,7 +672,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         opened = recorded.events.index("stream-opened")
         closed = recorded.events.index("stream-closed")
         self.assertIn("frame", recorded.events[opened:closed])
-        send_samples = round(1.3 * runner.RATE)
+        send_samples = round(1.4 * runner.RATE)
         self.assertEqual(
             bytes(recorded.streams[0]["data"]), self.upsample_2x(first[: send_samples * 2]),
         )
@@ -699,10 +732,23 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_cli_flag_reaches_capture_script_through_every_capture_entry(self):
         self.assertEqual(
             runner._parse_arguments(
-                ["--preconnect-first-line", "android-selected-room", "First@0::answer"]
+                ["--preconnect-first-line", "0.8:0.2", "android-selected-room", "First@0::answer"]
             ),
-            ("android-selected-room", ["First@0::answer"], 1, {}),
+            ("android-selected-room", ["First@0::answer"], 1, {}, (0.8, 0.2)),
         )
+        self.assertIsNone(
+            runner._parse_arguments(["android-selected-room", "First@0::answer"])[4],
+        )
+        for value in ("0.8", "x:0.2", "0.8:x", "-0.1:0.2", "0.8:-1", "nan:0.2", "0.8:inf"):
+            with (
+                self.subTest(value=value),
+                patch("sys.stderr"),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                runner._parse_arguments(
+                    ["--preconnect-first-line", value, "android-selected-room", "First@0::answer"]
+                )
+            self.assertEqual(raised.exception.code, 2)
         calls = []
 
         async def capture(room, steps, **options):
@@ -710,7 +756,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             return []
 
         for arguments, expected in (
-            (["--preconnect-first-line"], {"room_close_after": 1, "preconnect_first_line": True}),
+            (
+                ["--preconnect-first-line", "0.8:1.5"],
+                {"room_close_after": 1, "preconnect_timing": (0.8, 1.5)},
+            ),
             ([], {"room_close_after": 1}),
         ):
             with (
@@ -742,8 +791,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(runner, "capture_script", capture_script_spy),
             patch.object(runner, "_dependencies", lambda _http: object()),
         ):
-            await runner.run_remote_capture("android-selected-room", ["First@0::answer"], preconnect_first_line=True)
-        self.assertTrue(script_calls[0]["preconnect_first_line"])
+            await runner.run_remote_capture(
+                "android-selected-room", ["First@0::answer"], preconnect_timing=(0.8, 0.2),
+            )
+        self.assertEqual(script_calls[0]["preconnect_timing"], (0.8, 0.2))
 
         class PhoneProcess:
             returncode = None
@@ -773,9 +824,9 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         ):
             await runner._run_remote_capture_with_fake_phone(
                 "android-selected-room", ["First@0::answer"],
-                room_close_after=None, preconnect_first_line=True,
+                room_close_after=None, preconnect_timing=(0.8, 0.2),
             )
-        self.assertTrue(remote_calls[0]["preconnect_first_line"])
+        self.assertEqual(remote_calls[0]["preconnect_timing"], (0.8, 0.2))
 
     BARGE_ONSET = 25.0
     BARGE_REPLY_END = 45.0
@@ -1588,7 +1639,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._parse_arguments(
                 ["--barge-in", "2:9", "--barge-in", "3:1.5", "android-selected-room", *steps]
             ),
-            ("android-selected-room", steps, 3, {2: 9.0, 3: 1.5}),
+            ("android-selected-room", steps, 3, {2: 9.0, 3: 1.5}, None),
         )
         for flags in (
             ["--barge-in", "2"], ["--barge-in", "x:1"], ["--barge-in", "2:x"],
@@ -1816,6 +1867,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 ["First@0::answer", "Second@0::answer"],
                 None,
                 {},
+                None,
             ),
         )
 
@@ -6133,11 +6185,13 @@ class ScenarioObservationTests(unittest.TestCase):
                     self.assertNotIn("--retain-sms-audio", command)
 
     def test_capture_command_carries_first_line_and_barge_in_modes_only_for_their_scenarios(self):
+        FIRST_LINE_TIMINGS = {"phone-first-line": "0.8:0.2", "phone-first-line-slow-send": "0.8:1.5"}
         for scenario in SCENARIOS:
             command = runner._capture_command(scenario, "safe-room", ["Question@0::answer"])
             with self.subTest(scenario=scenario.name):
-                if scenario.name == "phone-first-line":
-                    self.assertIn("--preconnect-first-line", command)
+                if scenario.name in FIRST_LINE_TIMINGS:
+                    flag = command.index("--preconnect-first-line")
+                    self.assertEqual(command[flag + 1], FIRST_LINE_TIMINGS[scenario.name])
                 else:
                     self.assertNotIn("--preconnect-first-line", command)
                 if scenario.name == "barge-in-long-reply":

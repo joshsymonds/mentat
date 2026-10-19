@@ -282,7 +282,6 @@ def _retain_caller_audio(
 
 
 PRECONNECT_TOPIC = "lk.agent.pre-connect-audio-buffer"
-PRECONNECT_SEND_DELAY_SECONDS = 0.7
 PRECONNECT_SAMPLE_RATE = 48000
 PRECONNECT_WRITE_BYTES = 16000
 
@@ -934,15 +933,16 @@ async def capture_script(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
-    preconnect_first_line: bool = False,
+    preconnect_timing: tuple[float, float] | None = None,
     barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy.
 
-    With preconnect_first_line line 1 streams live from its first sample as soon as the
-    mic is published, the way the Pixel's does. Once the agent is subscribed and
-    PRECONNECT_SEND_DELAY_SECONDS have passed, the mic audio up to that moment goes to the
-    worker as the pre-connect buffer, so the two overlap by that delay.
+    With preconnect_timing=(repeat, send_lag) line 1 streams live from its first sample as
+    soon as the mic is published, the way the Pixel's does. The pre-connect buffer records
+    the mic audio from that first sample until REPEAT seconds after the agent subscribes to
+    the live track, then opens its stream SEND_LAG seconds later, so the two overlap by
+    REPEAT seconds of the line.
 
     With barge_in={turn: seconds} line TURN starts that many seconds after the agent
     begins speaking its reply to line TURN-1, over the reply instead of after it; the
@@ -1173,7 +1173,7 @@ async def capture_script(
         publish_options: dict[str, Any] = {
             "source": dependencies.rtc.TrackSource.SOURCE_MICROPHONE
         }
-        if preconnect_first_line:
+        if preconnect_timing is not None:
             publish_options["preconnect_buffer"] = True
         publication = await _with_deadline(
             room.local_participant.publish_track(
@@ -1190,7 +1190,7 @@ async def capture_script(
                     return participant.identity
             return None
 
-        if not preconnect_first_line:
+        if preconnect_timing is None:
             participant_deadline = dependencies.monotonic() + PARTICIPANT_DEADLINE_SECONDS
             while not room.remote_participants:
                 if dependencies.monotonic() >= participant_deadline:
@@ -1223,13 +1223,15 @@ async def capture_script(
 
         async def send_preconnect_buffer(
             speech: caller.TTSResponse, started: float, sent: asyncio.Event,
+            timing: tuple[float, float],
         ) -> float:
-            """Send the mic audio from the first live sample to now, once the agent is subscribed.
+            """Send the mic audio from the first live sample to REPEAT seconds past subscription.
 
-            Like the phone, the buffer goes out PRECONNECT_SEND_DELAY_SECONDS after the agent
-            subscribes to the live track, so it overlaps the live head by that delay. Mic audio
-            past the end of the line is silence. Returns the buffer's seconds.
+            Like the phone, the buffer stops recording REPEAT seconds after the agent subscribes
+            to the live track, and its stream opens SEND_LAG seconds after that. Mic audio past
+            the end of the line is silence. Returns the buffer's seconds.
             """
+            repeat_seconds, send_lag_seconds = timing
             deadline = dependencies.monotonic() + PARTICIPANT_DEADLINE_SECONDS
             while agent_identity() is None:
                 if dependencies.monotonic() >= deadline:
@@ -1249,15 +1251,20 @@ async def capture_script(
                     "caller microphone subscription exceeded its deadline"
                 ) from error
             await _with_deadline(
-                dependencies.sleep(PRECONNECT_SEND_DELAY_SECONDS),
+                dependencies.sleep(repeat_seconds),
                 REMOTE_OPERATION_DEADLINE_SECONDS,
-                "pre-connect send delay",
+                "pre-connect repeat",
+            )
+            samples = round((dependencies.monotonic() - started) * RATE)
+            mic = speech.pcm[: samples * 2].ljust(samples * 2, b"\x00")
+            await _with_deadline(
+                dependencies.sleep(send_lag_seconds),
+                REMOTE_OPERATION_DEADLINE_SECONDS,
+                "pre-connect send lag",
             )
             identity = agent_identity()
             if identity is None:
                 raise RuntimeError("voice worker left the room before the pre-connect buffer")
-            samples = round((dependencies.monotonic() - started) * RATE)
-            mic = speech.pcm[: samples * 2].ljust(samples * 2, b"\x00")
             writer = await _with_deadline(
                 room.local_participant.stream_bytes(
                     "preconnect",
@@ -1351,7 +1358,7 @@ async def capture_script(
 
         async def push_with_preconnect_buffer(
             speech: caller.TTSResponse, step: caller.ScriptStep, line_number: int,
-            attempt: int,
+            attempt: int, timing: tuple[float, float],
         ) -> tuple[float, tuple[float, float, float]]:
             """Stream line 1 live from its first sample while its pre-connect buffer is sent.
 
@@ -1377,7 +1384,7 @@ async def capture_script(
                 return playout
 
             live = asyncio.ensure_future(stream_live())
-            buffer = asyncio.ensure_future(send_preconnect_buffer(speech, started, sent))
+            buffer = asyncio.ensure_future(send_preconnect_buffer(speech, started, sent, timing))
             try:
                 playout, buffer_seconds = await asyncio.gather(live, buffer)
             except BaseException:
@@ -1424,7 +1431,7 @@ async def capture_script(
             index: int,
             step: caller.ScriptStep,
             retry_count: int,
-            preconnect_buffer_seconds: float | None,
+            preconnect: dict[str, float] | None,
             barge_after: float | None,
             speech_started_at: float,
             speech_end: float,
@@ -1590,11 +1597,8 @@ async def capture_script(
                 "raw_segments": raw_segments,
                 "room_deleted": None,
             }
-            if preconnect_buffer_seconds is not None:
-                trace["preconnect"] = {
-                    "buffer_seconds": preconnect_buffer_seconds,
-                    "overlap_seconds": PRECONNECT_SEND_DELAY_SECONDS,
-                }
+            if preconnect is not None:
+                trace["preconnect"] = preconnect
             if barge_after is not None:
                 trace["barge_in_after"] = barge_after
             traces.append(trace)
@@ -1668,12 +1672,17 @@ async def capture_script(
                 REMOTE_OPERATION_DEADLINE_SECONDS,
                 "continuous answer capture start",
             )
-            preconnect_buffer_seconds: float | None = None
+            preconnect: dict[str, float] | None = None
             speech_started_at = time.time()
-            if preconnect_first_line and index == 0:
-                preconnect_buffer_seconds, playout = await push_with_preconnect_buffer(
-                    speech, step, index + 1, attempt,
+            if preconnect_timing is not None and index == 0:
+                buffer_seconds, playout = await push_with_preconnect_buffer(
+                    speech, step, index + 1, attempt, preconnect_timing,
                 )
+                preconnect = {
+                    "buffer_seconds": buffer_seconds,
+                    "repeat_seconds": preconnect_timing[0],
+                    "send_lag_seconds": preconnect_timing[1],
+                }
             else:
                 await push(speech, step, index + 1, attempt)
                 playout = await measure_playout_end()
@@ -1708,7 +1717,7 @@ async def capture_script(
             except TimeoutError as error:
                 raise RuntimeError("agent audio capture exceeded its deadline") from error
             turn = finish_turn(
-                index, step, retry_count, preconnect_buffer_seconds, barge_after,
+                index, step, retry_count, preconnect, barge_after,
                 speech_started_at, speech_end, speech_end_wall, answer, pending_finish,
             )
             if next_barge_after is None:
@@ -3104,7 +3113,10 @@ def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str
     if getattr(scenario, "name", None) in SMS_AUDIO_SCENARIOS:
         command.extend(("--retain-sms-audio", scenario.name))
     if getattr(scenario, "preconnect_first_line", False):
-        command.append("--preconnect-first-line")
+        command.extend((
+            "--preconnect-first-line",
+            f"{scenario.preconnect_repeat_seconds:g}:{scenario.preconnect_send_lag_seconds:g}",
+        ))
     for turn, seconds in enumerate(getattr(scenario, "barge_in_after", ()), 1):
         if seconds is not None:
             command.extend(("--barge-in", f"{turn}:{seconds}"))
@@ -3529,7 +3541,7 @@ async def _run_remote_capture_with_fake_phone(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
-    preconnect_first_line: bool = False,
+    preconnect_timing: tuple[float, float] | None = None,
     barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
@@ -3563,7 +3575,7 @@ async def _run_remote_capture_with_fake_phone(
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
             retain_caller_audio_dir=retain_caller_audio_dir,
-            preconnect_first_line=preconnect_first_line,
+            preconnect_timing=preconnect_timing,
             barge_in=barge_in,
         )
     finally:
@@ -3584,7 +3596,7 @@ async def run_remote_capture(
     retain_sms_audio_dir: Path | None = None,
     retain_sms_audio_scenario: str | None = None,
     retain_caller_audio_dir: Path | None = None,
-    preconnect_first_line: bool = False,
+    preconnect_timing: tuple[float, float] | None = None,
     barge_in: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     import aiohttp
@@ -3598,9 +3610,24 @@ async def run_remote_capture(
             retain_sms_audio_dir=retain_sms_audio_dir,
             retain_sms_audio_scenario=retain_sms_audio_scenario,
             retain_caller_audio_dir=retain_caller_audio_dir,
-            preconnect_first_line=preconnect_first_line,
+            preconnect_timing=preconnect_timing,
             barge_in=barge_in,
         )
+
+
+def _preconnect_timing(value: str) -> tuple[float, float]:
+    import argparse
+
+    repeat, separator, send_lag = value.partition(":")
+    try:
+        if not separator:
+            raise ValueError(value)
+        timing = (float(repeat), float(send_lag))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be REPEAT:SEND_LAG") from error
+    if not all(math.isfinite(seconds) and seconds >= 0 for seconds in timing):
+        raise argparse.ArgumentTypeError("must be REPEAT:SEND_LAG")
+    return timing
 
 
 def _barge_in_pair(value: str) -> tuple[int, float]:
@@ -3615,7 +3642,9 @@ def _barge_in_pair(value: str) -> tuple[int, float]:
         raise argparse.ArgumentTypeError("must be TURN:SECONDS") from error
 
 
-def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None, dict[int, float]]:
+def _parse_arguments(
+    argv: list[str],
+) -> tuple[str, list[str], int | None, dict[int, float], tuple[float, float] | None]:
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -3624,8 +3653,11 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None, dict[
     parser.add_argument("--fake-phone", action="store_true", help="run the loopback-only fake phone during capture")
     parser.add_argument(
         "--preconnect-first-line",
-        action="store_true",
-        help="send the opening second of line 1 as a phone-style pre-connect buffer",
+        type=_preconnect_timing,
+        default=None,
+        metavar="REPEAT:SEND_LAG",
+        help="send line 1 as a phone-style pre-connect buffer: record until REPEAT s after "
+        "agent subscription, open the stream SEND_LAG s later",
     )
     parser.add_argument(
         "--barge-in",
@@ -3660,7 +3692,13 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str], int | None, dict[
         barge_in = _validated_barge_in(barge_in, len(arguments.steps))
     except ValueError as error:
         parser.error(str(error))
-    return arguments.room, arguments.steps, room_close_after, barge_in
+    return (
+        arguments.room,
+        arguments.steps,
+        room_close_after,
+        barge_in,
+        arguments.preconnect_first_line,
+    )
 
 
 def _positive_int(value: str) -> int:
@@ -4091,7 +4129,7 @@ def main(argv: list[str] | None = None) -> int:
         retain_sms_audio_dir = Path(evidence_path)
     else:
         retain_sms_audio_dir = None
-    room, steps, room_close_after, barge_in = _parse_arguments(arguments)
+    room, steps, room_close_after, barge_in, preconnect_timing = _parse_arguments(arguments)
     capture = _run_remote_capture_with_fake_phone if "--fake-phone" in arguments else run_remote_capture
     capture_options = {"room_close_after": room_close_after}
     if retain_sms_audio_scenario is not None:
@@ -4101,8 +4139,8 @@ def main(argv: list[str] | None = None) -> int:
         })
     if retain_caller_audio:
         capture_options["retain_caller_audio_dir"] = retain_caller_audio_dir
-    if "--preconnect-first-line" in arguments:
-        capture_options["preconnect_first_line"] = True
+    if preconnect_timing is not None:
+        capture_options["preconnect_timing"] = preconnect_timing
     if barge_in:
         capture_options["barge_in"] = barge_in
     try:

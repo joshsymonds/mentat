@@ -1,5 +1,6 @@
 """Offline acceptance checks for judge-backed scenario scoring."""
 
+import dataclasses
 import sys
 import unittest
 from pathlib import Path
@@ -239,6 +240,7 @@ class ScenarioScoringTests(unittest.TestCase):
                 "¿De qué color es el cielo en un día despejado?",
             ),
             "phone-first-line": ("Hey, what's the capital of Australia?",),
+            "phone-first-line-slow-send": ("Hey, what's the capital of Australia?",),
             "barge-in-long-reply": (
                 "Tell me a long story about a lighthouse keeper and her cat.",
                 "Stop. What's the capital of Japan?",
@@ -290,9 +292,16 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertEqual(phone.commands, ())
         self.assertIsNone(phone.room_close_after)
         self.assertTrue(phone.preconnect_first_line)
+        self.assertEqual(phone.preconnect_repeat_seconds, 0.8)
+        self.assertEqual(phone.preconnect_send_lag_seconds, 0.2)
         self.assertTrue(phone.exact_caller_stt)
         self.assertTrue(phone.close_after_final_line_optional)
         self.assertEqual(phone.barge_in_after, ())
+
+        slow = self.scenario("phone-first-line-slow-send")
+        self.assertEqual(slow, dataclasses.replace(
+            phone, name="phone-first-line-slow-send", preconnect_send_lag_seconds=1.5,
+        ))
 
         barge = self.scenario("barge-in-long-reply")
         self.assertEqual(barge.turns, (
@@ -310,12 +319,14 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertTrue(barge.close_after_final_line_optional)
 
     def test_existing_scenarios_keep_new_field_defaults(self):
-        new = {"phone-first-line", "barge-in-long-reply"}
+        new = {"phone-first-line", "phone-first-line-slow-send", "barge-in-long-reply"}
         for scenario in SCENARIOS:
             if scenario.name in new:
                 continue
             with self.subTest(scenario=scenario.name):
                 self.assertFalse(scenario.preconnect_first_line)
+                self.assertEqual(scenario.preconnect_repeat_seconds, 0.0)
+                self.assertEqual(scenario.preconnect_send_lag_seconds, 0.0)
                 self.assertEqual(scenario.barge_in_after, ())
                 self.assertFalse(scenario.exact_caller_stt)
                 self.assertFalse(scenario.close_after_final_line_optional)
@@ -631,11 +642,27 @@ class ScenarioScoringTests(unittest.TestCase):
 
 
 class BargeInDocumentationTests(unittest.TestCase):
+    def readme(self):
+        return (Path(__file__).resolve().parents[1] / "README.md").read_text()
+
     def capture_modes_paragraph(self):
-        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+        readme = self.readme()
         start = readme.index("`phone-first-line` runs with")
         end = readme.index("The R4/R5 command", start)
         return " ".join(readme[start:end].split())
+
+    def test_readme_documents_both_first_line_send_timings(self):
+        paragraph = self.capture_modes_paragraph()
+        command = " ".join(self.readme().split("The R4/R5 command", 1)[1].split("The eval prints", 1)[0].split())
+        for name in ("phone-first-line", "phone-first-line-slow-send"):
+            scenario = next(s for s in SCENARIOS if s.name == name)
+            sentence = (
+                f"`{name}` repeats {scenario.preconnect_repeat_seconds:g} s and "
+                f"sends {scenario.preconnect_send_lag_seconds:g} s"
+            )
+            with self.subTest(scenario=name):
+                self.assertIn(sentence, paragraph)
+                self.assertIn(f"--scenario {name}", command)
 
     def test_readme_documents_barge_in_timing(self):
         paragraph = self.capture_modes_paragraph()
