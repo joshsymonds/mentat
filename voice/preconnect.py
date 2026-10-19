@@ -9,7 +9,7 @@ live track is held until its head covers the buffer's length plus 0.2 s, so the 
 has the whole window, or the track ends, or that span has passed. When no tail aligns, the
 repeat falls back to timing: a live frame the worker received before the buffer's stream
 opened is the repeat, so the live frames heard before that moment are dropped, at most the
-buffer's length in total. Every frame after the cut passes.
+buffer's length and 1.0 s in total. Every frame after the cut passes.
 
 Frames carry no receive time, so each live frame is stamped as it comes off the track,
 from the moment the track is created. The buffer's stream opening is recorded by the
@@ -41,6 +41,7 @@ REPEAT_AGREE_SECONDS = 0.05
 REPEAT_MIN_CORRELATION = 0.3
 REPEAT_FRAME_SECONDS = 0.01
 REPEAT_VOICED_FRACTION = 0.05
+REPEAT_TIMING_CAP_SECONDS = 1.0
 
 
 def _part(frame: Any, begin: int, end: int) -> Any:
@@ -96,9 +97,10 @@ def cut_repeat(buffer: np.ndarray, live: np.ndarray, rate: int, heard_before_ope
     live by zero-mean normalized cross-correlation. When all three correlate at least 0.3 and end
     within 0.05 s of each other, the repeat ends at their median end plus the quiet span
     ("aligned"). Otherwise the repeat is the live audio heard before the buffer opened, at most
-    the buffer's length ("timing"), and so is any buffer whose voiced part is shorter than 0.6 s.
+    the buffer's length and 1.0 s ("timing"), and so is any buffer whose voiced part is shorter
+    than 0.6 s.
     """
-    timing = min(heard_before_open, len(buffer)), "timing"
+    timing = min(heard_before_open, len(buffer), round(REPEAT_TIMING_CAP_SECONDS * rate)), "timing"
     voiced_end = _voiced_end(buffer, rate)
     voiced = buffer[:voiced_end]
     window = live[:min(len(live), len(buffer) + round(REPEAT_SEARCH_EXTRA_SECONDS * rate))]

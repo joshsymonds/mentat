@@ -504,6 +504,21 @@ class LiveAudioTest(AsyncTest):
 
         self.assertEqual(samples_of(out), live[round(0.5 * LIVE_RATE):])
 
+    async def test_a_slow_send_drops_one_second_of_the_live_audio_heard_before_the_stream_opened(self):
+        buffer = speechlike(2.3, seed=1, rate=BUFFER_RATE)
+        live = speechlike(3.0, seed=2)
+        frames = frames_of(live, LIVE_RATE)
+        self.stream.push(frames[:46])  # 2.3 s heard from t=0, before the stream opened at 2.3
+        await settle()
+        self.clock.now = 2.3
+        list(self.live.process_buffer(frames_of(buffer, BUFFER_RATE), opened=2.3))
+        self.stream.push(frames[46:])
+        self.stream.end()
+
+        out = await drain(self.live)
+
+        self.assertEqual(samples_of(out).tolist(), live[round(1.0 * LIVE_RATE):].tolist())
+
     async def test_live_frames_heard_after_the_buffer_completed_all_pass(self):
         live = ramp(1.0)
         self.clock.now = 0.0
@@ -1122,11 +1137,20 @@ class CutRepeatTest(unittest.TestCase):
         )
 
     def test_timing_is_capped_at_the_buffer_length(self):
+        buffer = self.buffer[:round(0.8 * LIVE_RATE)]
+        live = speechlike(1.0, seed=2)
+
+        self.assertEqual(
+            preconnect.cut_repeat(buffer, live, LIVE_RATE, 2 * LIVE_RATE),
+            (len(buffer), "timing"),
+        )
+
+    def test_timing_is_capped_at_one_second(self):
         live = speechlike(1.0, seed=2)
 
         self.assertEqual(
             preconnect.cut_repeat(self.buffer, live, LIVE_RATE, 2 * LIVE_RATE),
-            (len(self.buffer), "timing"),
+            (LIVE_RATE, "timing"),
         )
 
     def test_tails_that_end_apart_are_timing(self):
