@@ -37,8 +37,10 @@ logger = logging.getLogger("mentat.voice")
 
 REPEAT_TAIL_SECONDS = (0.2, 0.4, 0.6)
 REPEAT_SEARCH_EXTRA_SECONDS = 0.2
-REPEAT_AGREE_SECONDS = 0.03
+REPEAT_AGREE_SECONDS = 0.05
 REPEAT_MIN_CORRELATION = 0.3
+REPEAT_FRAME_SECONDS = 0.01
+REPEAT_VOICED_FRACTION = 0.05
 
 
 def _part(frame: Any, begin: int, end: int) -> Any:
@@ -68,30 +70,50 @@ def _mono_at_rate(frames: list[Any], rate: int) -> np.ndarray:
     return np.round(samples).astype(np.int16)
 
 
+def _voiced_end(buffer: np.ndarray, rate: int) -> int:
+    """Where the buffer's last voiced 10 ms frame ends, in samples.
+
+    A frame is voiced when its RMS is at least 5% of the buffer's 95th-percentile frame RMS.
+    """
+    step = round(REPEAT_FRAME_SECONDS * rate)
+    levels = np.array([
+        np.sqrt(np.mean(np.square(buffer[at:at + step].astype(np.float64))))
+        for at in range(0, len(buffer), step)
+    ])
+    if levels.size == 0:
+        return 0
+    voiced = np.flatnonzero(levels >= REPEAT_VOICED_FRACTION * np.percentile(levels, 95))
+    return min((int(voiced[-1]) + 1) * step, len(buffer))
+
+
 def cut_repeat(buffer: np.ndarray, live: np.ndarray, rate: int, heard_before_open: int) -> tuple[int, str]:
     """How many live samples repeat the pre-connect buffer, and the path that decided it.
 
     The live audio opens by repeating the buffer's last half second or so, time-stretched and
-    reshaped on the way through the jitter buffer. Each of the buffer's last 0.2, 0.4 and 0.6 s is
-    matched within the first len(buffer) plus 0.2 s of live by zero-mean normalized
-    cross-correlation. When all three correlate at least 0.3 and end within 30 ms of each other,
-    the repeat ends at their median end ("aligned"). Otherwise the repeat is the live audio heard
-    before the buffer opened, at most the buffer's length ("timing").
+    reshaped on the way through the jitter buffer. The buffer's voiced part ends at its last
+    voiced 10 ms frame, and the quiet span after it is a pause the repeat may carry too. Each of
+    the voiced part's last 0.2, 0.4 and 0.6 s is matched within the first len(buffer) plus 0.2 s of
+    live by zero-mean normalized cross-correlation. When all three correlate at least 0.3 and end
+    within 0.05 s of each other, the repeat ends at their median end plus the quiet span
+    ("aligned"). Otherwise the repeat is the live audio heard before the buffer opened, at most
+    the buffer's length ("timing"), and so is any buffer whose voiced part is shorter than 0.6 s.
     """
     timing = min(heard_before_open, len(buffer)), "timing"
+    voiced_end = _voiced_end(buffer, rate)
+    voiced = buffer[:voiced_end]
     window = live[:min(len(live), len(buffer) + round(REPEAT_SEARCH_EXTRA_SECONDS * rate))]
     ends = []
     for seconds in REPEAT_TAIL_SECONDS:
         length = round(seconds * rate)
-        if length > len(buffer) or length > len(window):
+        if length > len(voiced) or length > len(window):
             return timing
-        end, correlation = _best_match(buffer[-length:], window)
+        end, correlation = _best_match(voiced[-length:], window)
         if correlation < REPEAT_MIN_CORRELATION:
             return timing
         ends.append(end)
     if max(ends) - min(ends) > round(REPEAT_AGREE_SECONDS * rate):
         return timing
-    return sorted(ends)[1], "aligned"
+    return sorted(ends)[1] + len(buffer) - voiced_end, "aligned"
 
 
 def _best_match(tail: np.ndarray, window: np.ndarray) -> tuple[int, float]:

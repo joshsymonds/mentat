@@ -268,6 +268,12 @@ def speechlike(seconds, seed, rate=LIVE_RATE):
     return np.round(smooth / smooth.std() * 4000).astype(np.int16)
 
 
+def quiet_noise(seconds, seed):
+    """Near-silent noise at 1% of speechlike's level as int16 samples, as a pause or a quiet tail has it."""
+    count = round(seconds * LIVE_RATE)
+    return np.round(np.random.default_rng(seed).standard_normal(count) * 40).astype(np.int16)
+
+
 def jittered_repeat(tail, *, noise_scale, seed, rate=LIVE_RATE):
     """The tail as a jittered live track replays it: 20 ms chunks, one dropped and two duplicated
     (about 2% longer), with noise at noise_scale times the tail's own level."""
@@ -1076,6 +1082,37 @@ class CutRepeatTest(unittest.TestCase):
         self.assertEqual(path, "aligned")
         self.assertLessEqual(abs(cut - len(repeat)), round(0.05 * LIVE_RATE))
 
+    def test_a_voiced_repeat_stretched_by_a_gap_before_its_end_is_aligned_and_cut_at_its_end(self):
+        repeat = self.buffer[-round(0.9 * LIVE_RATE):]
+        split = len(repeat) - round(0.25 * LIVE_RATE)
+        live = np.concatenate([repeat[:split], speechlike(0.04, seed=5), repeat[split:], speechlike(0.6, seed=4)])
+
+        cut, path = preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        self.assertLessEqual(abs(cut - (len(repeat) + round(0.04 * LIVE_RATE))), round(0.05 * LIVE_RATE))
+
+    def test_a_buffer_ending_in_a_quiet_pause_is_aligned_and_cut_after_the_pause(self):
+        speech = speechlike(0.7, seed=1)
+        buffer = np.concatenate([speech, quiet_noise(0.3, seed=7)])
+        voiced_repeat = jittered_repeat(speech[-round(0.6 * LIVE_RATE):], noise_scale=1.2, seed=3)
+        repeat = np.concatenate([voiced_repeat, quiet_noise(0.3, seed=8)])
+        live = np.concatenate([repeat, speechlike(0.6, seed=4)])
+
+        cut, path = preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        self.assertLessEqual(abs(cut - len(repeat)), round(0.05 * LIVE_RATE))
+
+    def test_a_buffer_whose_voiced_part_is_shorter_than_the_longest_tail_is_timing(self):
+        buffer = np.concatenate([speechlike(0.5, seed=1), quiet_noise(0.5, seed=7)])
+        live = np.concatenate([buffer, speechlike(0.5, seed=4)])
+
+        self.assertEqual(
+            preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
+            (round(0.3 * LIVE_RATE), "timing"),
+        )
+
     def test_no_repeat_is_timing_cut_at_the_samples_heard_before_open(self):
         live = speechlike(1.0, seed=2)
 
@@ -1095,7 +1132,7 @@ class CutRepeatTest(unittest.TestCase):
     def test_tails_that_end_apart_are_timing(self):
         tail = self.buffer[-round(0.6 * LIVE_RATE):]
         split = round(0.4 * LIVE_RATE)
-        live = np.concatenate([tail[:split], speechlike(0.04, seed=5), tail[split:], speechlike(0.5, seed=6)])
+        live = np.concatenate([tail[:split], speechlike(0.1, seed=5), tail[split:], speechlike(0.5, seed=6)])
 
         self.assertEqual(
             preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
