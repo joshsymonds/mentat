@@ -560,9 +560,9 @@ class LiveAudioTest(AsyncTest):
         with self.assertLogs("mentat.voice", level="INFO") as logs:
             list(self.live.process_buffer(silence(1.0), opened=0.7))
 
-        [record] = logs.records
-        self.assertEqual(record.levelname, "INFO")
-        self.assertEqual(record.getMessage(), "pre-connect cut: path=timing dropped=0.50 s")
+        self.assertEqual({record.levelname for record in logs.records}, {"INFO"})
+        self.assertEqual(pre_connect_messages(logs, "pre-connect cut:"), ["pre-connect cut: path=timing dropped=0.50 s"])
+        self.assertEqual(pre_connect_messages(logs, "pre-connect tails:"), ["pre-connect tails: quiet=0.00 s none"])
 
     async def test_aclose_stops_the_stamping_and_closes_the_stream(self):
         self.stream.push(frames_of(ramp(0.5), LIVE_RATE))
@@ -739,6 +739,9 @@ class OpenTimeInputTest(AsyncTest):
 
 
 NO_CUT = "pre-connect cut: path=none dropped=0.00 s"
+
+
+TAIL_ENTRY = r"(\d+\.\d{2}) s end=(\d+\.\d{2}) s r=(\d+\.\d{2})"
 
 
 def pre_connect_messages(logs, prefix):
@@ -1188,6 +1191,109 @@ class CutRepeatTest(unittest.TestCase):
             preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.4 * LIVE_RATE)),
             (round(0.4 * LIVE_RATE), "timing"),
         )
+
+    def test_an_aligned_cut_logs_its_three_tails_with_the_ends_and_correlations_it_decided(self):
+        repeat = jittered_repeat(self.tail, noise_scale=1.2, seed=3)
+        live = np.concatenate([repeat, speechlike(0.6, seed=4)])
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            cut, path = preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        [line] = pre_connect_messages(logs, "pre-connect tails:")
+        match = re.fullmatch(r"pre-connect tails: quiet=(\d+\.\d{2}) s (.+)", line)
+        self.assertIsNotNone(match, line)
+        entries = [re.fullmatch(TAIL_ENTRY, entry) for entry in match[2].split(", ")]
+        self.assertTrue(all(entries), line)
+        self.assertEqual([float(entry[1]) for entry in entries], [0.2, 0.4, 0.6])
+
+        voiced_end = preconnect._voiced_end(self.buffer, LIVE_RATE)
+        voiced = self.buffer[:voiced_end]
+        window = live[:len(self.buffer) + round(0.2 * LIVE_RATE)]
+        decided = [
+            preconnect._best_match(voiced[-round(seconds * LIVE_RATE):], window)
+            for seconds in (0.2, 0.4, 0.6)
+        ]
+        for entry, (end, correlation) in zip(entries, decided):
+            self.assertAlmostEqual(float(entry[2]), end / LIVE_RATE, delta=0.0051)
+            self.assertAlmostEqual(float(entry[3]), correlation, delta=0.0051)
+        ends = [float(entry[2]) for entry in entries]
+        self.assertAlmostEqual(sorted(ends)[1] + float(match[1]), cut / LIVE_RATE, delta=0.0101)
+
+    def test_a_no_repeat_timing_cut_logs_all_three_tails_with_their_sub_point_three_correlations(self):
+        live = speechlike(1.0, seed=2)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            cut, path = preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.5 * LIVE_RATE))
+
+        self.assertEqual((cut, path), (round(0.5 * LIVE_RATE), "timing"))
+        [line] = pre_connect_messages(logs, "pre-connect tails:")
+        match = re.fullmatch(r"pre-connect tails: quiet=(\d+\.\d{2}) s (.+)", line)
+        self.assertIsNotNone(match, line)
+        self.assertEqual(match[1], "0.00")
+        entries = [re.fullmatch(TAIL_ENTRY, entry) for entry in match[2].split(", ")]
+        self.assertTrue(all(entries), line)
+        self.assertEqual([float(entry[1]) for entry in entries], [0.2, 0.4, 0.6])
+        voiced_end = preconnect._voiced_end(self.buffer, LIVE_RATE)
+        voiced = self.buffer[:voiced_end]
+        window = live[:len(self.buffer) + round(0.2 * LIVE_RATE)]
+        decided = [
+            preconnect._best_match(voiced[-round(seconds * LIVE_RATE):], window)
+            for seconds in (0.2, 0.4, 0.6)
+        ]
+        for entry, (end, correlation) in zip(entries, decided):
+            self.assertAlmostEqual(float(entry[2]), end / LIVE_RATE, delta=0.0051)
+            self.assertAlmostEqual(float(entry[3]), correlation, delta=0.0051)
+            self.assertLess(correlation, 0.3)
+
+    def test_a_timing_cut_logs_every_tail_that_fits_including_those_below_point_three(self):
+        loud = np.round(np.random.default_rng(9).standard_normal(round(0.25 * LIVE_RATE)) * 20000)
+        loud = loud.clip(-32768, 32767).astype(np.int16)
+        clean = self.tail[-round(0.2 * LIVE_RATE):]
+        live = np.concatenate([loud, clean, speechlike(0.6, seed=4)])
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            cut, path = preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual((cut, path), (round(0.3 * LIVE_RATE), "timing"))
+        [line] = pre_connect_messages(logs, "pre-connect tails:")
+        match = re.fullmatch(r"pre-connect tails: quiet=(\d+\.\d{2}) s (.+)", line)
+        self.assertIsNotNone(match, line)
+        self.assertEqual(match[1], "0.00")
+        entries = [re.fullmatch(TAIL_ENTRY, entry) for entry in match[2].split(", ")]
+        self.assertTrue(all(entries), line)
+        self.assertEqual([float(entry[1]) for entry in entries], [0.2, 0.4, 0.6])
+        self.assertAlmostEqual(float(entries[0][2]), 0.45, delta=0.0051)
+        self.assertGreater(float(entries[0][3]), 0.95)
+        self.assertTrue(all(float(entry[3]) < 0.3 for entry in entries[1:]), line)
+
+    def test_a_silent_buffer_logs_none_rather_than_matching_its_flat_tails(self):
+        buffer = np.zeros(self.buffer.size, dtype=np.int16)
+        live = speechlike(1.0, seed=2)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            cut, path = preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual((cut, path), (round(0.3 * LIVE_RATE), "timing"))
+        [line] = pre_connect_messages(logs, "pre-connect tails:")
+        self.assertRegex(line, r"^pre-connect tails: quiet=\d+\.\d{2} s none$")
+
+    def test_a_buffer_too_short_for_any_tail_logs_none(self):
+        buffer = speechlike(0.1, seed=1)
+        live = speechlike(1.0, seed=2)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            cut, path = preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual((cut, path), (len(buffer), "timing"))
+        [line] = pre_connect_messages(logs, "pre-connect tails:")
+        self.assertRegex(line, r"^pre-connect tails: quiet=\d+\.\d{2} s none$")
+
+    def test_an_empty_buffer_logs_no_tails_line(self):
+        with self.assertNoLogs("mentat.voice", "INFO"):
+            cut, path = preconnect.cut_repeat(np.zeros(0, dtype=np.int16), self.buffer, LIVE_RATE, 0)
+
+        self.assertEqual((cut, path), (0, "timing"))
 
 
 if __name__ == "__main__":

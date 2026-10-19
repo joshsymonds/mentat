@@ -98,24 +98,53 @@ def cut_repeat(buffer: np.ndarray, live: np.ndarray, rate: int, heard_before_ope
     within 0.05 s of each other, the repeat ends at their median end plus the quiet span
     ("aligned"). Otherwise the repeat is the live audio heard before the buffer opened, at most
     the buffer's length and 1.0 s ("timing"), and so is any buffer whose voiced part is shorter
-    than 0.6 s.
+    than 0.6 s. A non-empty buffer also logs the tails it matched and its quiet span.
     """
     timing = min(heard_before_open, len(buffer), round(REPEAT_TIMING_CAP_SECONDS * rate)), "timing"
     voiced_end = _voiced_end(buffer, rate)
     voiced = buffer[:voiced_end]
     window = live[:min(len(live), len(buffer) + round(REPEAT_SEARCH_EXTRA_SECONDS * rate))]
-    ends = []
+    matches = _match_tails(voiced, window, rate)
+    quiet = len(buffer) - voiced_end
+    if len(buffer):
+        _log_tails(quiet, matches, rate)
+    ends = [end for _, end, _ in matches]
+    correlations = [correlation for _, _, correlation in matches]
+    if (
+        len(matches) < len(REPEAT_TAIL_SECONDS)
+        or min(correlations) < REPEAT_MIN_CORRELATION
+        or max(ends) - min(ends) > round(REPEAT_AGREE_SECONDS * rate)
+    ):
+        return timing
+    return sorted(ends)[1] + quiet, "aligned"
+
+
+def _match_tails(voiced: np.ndarray, window: np.ndarray, rate: int) -> list[tuple[float, int, float]]:
+    """Each tail of the voiced part that fits the window, as (seconds, end, correlation), in order.
+
+    Matching stops at the first tail too long for the voiced part or the window, or flat, since a
+    flat tail has no shape to match. Every other tail that fits is matched, whatever its correlation.
+    """
+    matches = []
     for seconds in REPEAT_TAIL_SECONDS:
         length = round(seconds * rate)
         if length > len(voiced) or length > len(window):
-            return timing
-        end, correlation = _best_match(voiced[-length:], window)
-        if correlation < REPEAT_MIN_CORRELATION:
-            return timing
-        ends.append(end)
-    if max(ends) - min(ends) > round(REPEAT_AGREE_SECONDS * rate):
-        return timing
-    return sorted(ends)[1] + len(buffer) - voiced_end, "aligned"
+            break
+        tail = voiced[-length:]
+        if np.ptp(tail) == 0:
+            break
+        end, correlation = _best_match(tail, window)
+        matches.append((seconds, end, correlation))
+    return matches
+
+
+def _log_tails(quiet: int, matches: list[tuple[float, int, float]], rate: int) -> None:
+    """Log the buffer's trailing quiet span and each matched tail's length, end and correlation."""
+    tails = ", ".join(
+        f"{seconds:.2f} s end={end / rate:.2f} s r={correlation:.2f}"
+        for seconds, end, correlation in matches
+    ) or "none"
+    logger.info("pre-connect tails: quiet=%.2f s %s", quiet / rate, tails)
 
 
 def _best_match(tail: np.ndarray, window: np.ndarray) -> tuple[int, float]:
