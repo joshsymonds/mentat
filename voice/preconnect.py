@@ -5,12 +5,13 @@ byte stream; its live track then starts a moment before the end of that buffer, 
 live audio opens by repeating the buffer's last half second or so. LiveKit feeds both to
 the speech-to-text and the first words arrive twice. This input drops the repeat by
 aligning the buffer's tails with the live head, where two agreeing tails are enough
-(see cut_repeat). Once the buffer arrives, the
-live track is held until its head covers the buffer's length plus 0.2 s, so the alignment
-has the whole window, or the track ends, or that span has passed. When no tail aligns, the
-repeat falls back to timing: a live frame the worker received before the buffer's stream
-opened is the repeat, so the live frames heard before that moment are dropped, at most the
-buffer's length and 1.0 s in total. Every frame after the cut passes.
+(see cut_repeat). A buffer whose voiced part is shorter than 0.6 s has its tails taken as
+thirds of that part. Once the buffer arrives, the live track is held until its head covers
+the buffer's length plus 0.2 s, so the alignment has the whole window, or the track ends, or
+that span has passed. When no tail aligns, the repeat falls back to timing: a live frame
+the worker received before the buffer's stream opened is the repeat, so the live frames
+heard before that moment are dropped, at most the buffer's length and 1.0 s in total. Every
+frame after the cut passes.
 
 Frames carry no receive time, so each live frame is stamped as it comes off the track,
 from the moment the track is created. The buffer's stream opening is recorded by the
@@ -42,6 +43,7 @@ from livekit.agents.voice.room_io._pre_connect_audio import PreConnectAudioHandl
 logger = logging.getLogger("mentat.voice")
 
 REPEAT_TAIL_SECONDS = (0.2, 0.4, 0.6)
+REPEAT_MIN_TAIL_SECONDS = 0.1
 REPEAT_SEARCH_EXTRA_SECONDS = 0.2
 REPEAT_AGREE_SECONDS = 0.05
 REPEAT_MIN_CORRELATION = 0.3
@@ -99,14 +101,17 @@ def cut_repeat(buffer: np.ndarray, live: np.ndarray, rate: int, heard_before_ope
     The live audio opens by repeating the buffer's last half second or so, time-stretched and
     reshaped on the way through the jitter buffer. The buffer's voiced part ends at its last
     voiced 10 ms frame, and the quiet span after it is a pause the repeat may carry too. Each of
-    the voiced part's last 0.2, 0.4 and 0.6 s is matched within the first len(buffer) plus 0.2 s of
-    live by zero-mean normalized cross-correlation, and all three must match. The repeat ends at
-    the agreed end plus the quiet span ("aligned"), where the agreed end is the median end of the
-    three tails when each correlates at least 0.3 and they end within 0.05 s of each other, else
-    the mean end of the closest pair of tails that do (see _agreed_end). Otherwise the repeat is
-    the live audio heard before the buffer opened, at most the buffer's length and 1.0 s
-    ("timing"), and so is any buffer whose voiced part is shorter than 0.6 s. A non-empty buffer
-    also logs the tails it matched and its quiet span.
+    the voiced part's tails is matched within the first len(buffer) plus 0.2 s of live by
+    zero-mean normalized cross-correlation, and all three must match. The tails are the voiced
+    part's last 0.2, 0.4 and 0.6 s when it is at least 0.6 s long; otherwise they are its last one,
+    two and three thirds of its length, so a short first line still has three tails to agree. A
+    voiced part whose shortest third is under 0.1 s has no tails to match (see _tail_seconds). The
+    repeat ends at the agreed end plus the quiet span ("aligned"), where the agreed end is the
+    median end of the three tails when each correlates at least 0.3 and they end within 0.05 s of
+    each other, else the mean end of the closest pair of tails that do (see _agreed_end).
+    Otherwise the repeat is the live audio heard before the buffer opened, at most the buffer's
+    length and 1.0 s ("timing"). A non-empty buffer also logs the tails it matched, with their
+    lengths, and its quiet span.
     """
     timing = min(heard_before_open, len(buffer), round(REPEAT_TIMING_CAP_SECONDS * rate)), "timing"
     voiced_end = _voiced_end(buffer, rate)
@@ -122,14 +127,29 @@ def cut_repeat(buffer: np.ndarray, live: np.ndarray, rate: int, heard_before_ope
     return end + quiet, "aligned"
 
 
+def _tail_seconds(voiced_seconds: float) -> tuple[float, ...]:
+    """The lengths of the tails to match in a voiced part, in seconds.
+
+    The standard lengths when the part is at least as long as the longest of them, else its
+    last one, two and three thirds. A part whose third is under REPEAT_MIN_TAIL_SECONDS has no
+    tails.
+    """
+    if voiced_seconds >= REPEAT_TAIL_SECONDS[-1]:
+        return REPEAT_TAIL_SECONDS
+    if voiced_seconds / 3 < REPEAT_MIN_TAIL_SECONDS:
+        return ()
+    return (voiced_seconds / 3, 2 * voiced_seconds / 3, voiced_seconds)
+
+
 def _match_tails(voiced: np.ndarray, window: np.ndarray, rate: int) -> list[tuple[float, int, float]]:
     """Each tail of the voiced part that fits the window, as (seconds, end, correlation), in order.
 
-    Matching stops at the first tail too long for the voiced part or the window, or flat, since a
-    flat tail has no shape to match. Every other tail that fits is matched, whatever its correlation.
+    The tails are those of _tail_seconds. Matching stops at the first tail too long for the voiced
+    part or the window, or flat, since a flat tail has no shape to match. Every other tail that fits
+    is matched, whatever its correlation.
     """
     matches = []
-    for seconds in REPEAT_TAIL_SECONDS:
+    for seconds in _tail_seconds(len(voiced) / rate):
         length = round(seconds * rate)
         if length > len(voiced) or length > len(window):
             break
