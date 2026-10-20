@@ -99,19 +99,19 @@ def cut_repeat(buffer: np.ndarray, live: np.ndarray, rate: int, heard_before_ope
     """How many live samples repeat the pre-connect buffer, and the path that decided it.
 
     The live audio opens by repeating the buffer's last half second or so, time-stretched and
-    reshaped on the way through the jitter buffer. The buffer's voiced part ends at its last
-    voiced 10 ms frame, and the quiet span after it is a pause the repeat may carry too. Each of
-    the voiced part's tails is matched within the first len(buffer) plus 0.2 s of live by
-    zero-mean normalized cross-correlation, and all three must match. The tails are the voiced
-    part's last 0.2, 0.4 and 0.6 s when it is at least 0.6 s long; otherwise they are its last one,
-    two and three thirds of its length, so a short first line still has three tails to agree. A
-    voiced part whose shortest third is under 0.1 s has no tails to match (see _tail_seconds). The
-    repeat ends at the agreed end plus the quiet span ("aligned"), where the agreed end is the
-    median end of the three tails when each correlates at least 0.3 and they end within 0.05 s of
-    each other, else the mean end of the closest pair of tails that do (see _agreed_end).
-    Otherwise the repeat is the live audio heard before the buffer opened, at most the buffer's
-    length and 1.0 s ("timing"). A non-empty buffer also logs the tails it matched, with their
-    lengths, and its quiet span.
+    reshaped on the way through the jitter buffer. The buffer's voiced part ends at its last voiced
+    10 ms frame, and the quiet span after it is a pause the repeat may carry too. Each of the voiced
+    part's tails is matched within the first len(buffer) plus 0.2 s of live by zero-mean normalized
+    cross-correlation; every tail must produce a match, and two that agree decide the cut. The tails
+    are the voiced part's last 0.2, 0.4 and 0.6 s when it is at least 0.6 s long; otherwise they are
+    its last one, two and three thirds of its length, so a short first line still has three tails to
+    agree. A voiced part whose shortest third is under 0.1 s has no tails to match (see
+    _tail_seconds). The repeat ends at the agreed end plus the quiet span ("aligned"), where the
+    agreed end is the median end of the three tails when each correlates at least 0.3 and they end
+    within 0.05 s of each other, else the mean end of the closest pair of tails that do (see
+    _agreed_end). Otherwise the repeat is the live audio heard before the buffer opened, at most the
+    buffer's length and 1.0 s ("timing"). A non-empty buffer also logs the tails it matched, with
+    their lengths, and its quiet span.
     """
     timing = min(heard_before_open, len(buffer), round(REPEAT_TIMING_CAP_SECONDS * rate)), "timing"
     voiced_end = _voiced_end(buffer, rate)
