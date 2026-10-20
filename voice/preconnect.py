@@ -20,10 +20,15 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import functools
+import io
 import logging
+import os
 import time
+import wave
 from collections import deque
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -168,17 +173,114 @@ def _best_match(tail: np.ndarray, window: np.ndarray) -> tuple[int, float]:
     return best + length, float(correlations[best])
 
 
+def _wav(frames: Iterable[Any], rate: int, channels: int) -> bytes:
+    """The frames' samples as a 16-bit PCM WAV file."""
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(b"".join(bytes(frame.data) for frame in frames))
+    return out.getvalue()
+
+
+def _turn_names(track_id: str, number: int) -> tuple[str, str, str]:
+    """The buffer's WAV, the live head's WAV and the live head's arrival lines, for one turn."""
+    return (
+        f"{track_id}-preconnect-buffer-turn-{number:03d}.wav",
+        f"{track_id}-preconnect-live-turn-{number:03d}.wav",
+        f"{track_id}-preconnect-live-turn-{number:03d}.txt",
+    )
+
+
+def _create_exclusive(paths: list[Path]) -> list[int]:
+    """Creates each path private and exclusively; on failure, removes what it created and raises."""
+    descriptors: list[int] = []
+    try:
+        for path in paths:
+            descriptors.append(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except Exception:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        for path in paths[:len(descriptors)]:
+            path.unlink()
+        raise
+    return descriptors
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(descriptor, view):]
+
+
+class _PreConnectRecorder:
+    """Writes each processed pre-connect buffer and the live head it was cut from, for local replay.
+
+    A turn is three files under one number: the buffer as it arrived, the stamped live head as a
+    WAV at the live rate, and a line per live frame with its arrival in seconds from the buffer
+    stream's opening and its sample count. A turn takes the first number whose files do not exist,
+    so nothing is overwritten, and a failed write leaves none of its files behind.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self._directory = directory
+        self._turn_number = 0
+
+    def record(
+        self, track_id: str, buffer: list[Any], head: Iterable[tuple[float, Any]], opened: float, rate: int
+    ) -> None:
+        try:
+            snapshot = list(head)
+            live = [frame for _, frame in snapshot]
+            contents = (
+                _wav(buffer, buffer[0].sample_rate, buffer[0].num_channels),
+                _wav(live, rate, live[0].num_channels if live else 1),
+                "".join(f"{stamp - opened:.6f} {frame.samples_per_channel}\n" for stamp, frame in snapshot).encode(),
+            )
+            self._write_turn(track_id, contents)
+        except Exception:
+            logger.exception("failed to write pre-connect recording")
+
+    def _write_turn(self, track_id: str, contents: tuple[bytes, bytes, bytes]) -> None:
+        self._directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        number = self._turn_number + 1
+        while True:
+            paths = [self._directory / name for name in _turn_names(track_id, number)]
+            try:
+                descriptors = _create_exclusive(paths)
+            except FileExistsError:
+                number += 1
+                continue
+            break
+        self._turn_number = number
+        try:
+            for descriptor, data in zip(descriptors, contents):
+                _write_all(descriptor, data)
+        except Exception:
+            for path in paths:
+                path.unlink(missing_ok=True)
+            raise
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+
 class _LiveAudio:
     """The live track as the audio input reads it, with the repeat dropped.
 
     Stands in for rtc.AudioStream, which the input only iterates and closes. The stream is
-    read from creation, so every frame is stamped with the time it arrived.
+    read from creation, so every frame is stamped with the time it arrived. A recorder, when
+    given, writes each buffer it cuts along with the head the cut was matched in.
     """
 
-    def __init__(self, stream: Any, *, sample_rate: int, track_id: str) -> None:
+    def __init__(
+        self, stream: Any, *, sample_rate: int, track_id: str, recorder: _PreConnectRecorder | None = None
+    ) -> None:
         self._stream = stream
         self._sample_rate = sample_rate
         self.track_id = track_id
+        self._recorder = recorder
         self._stamped: deque[tuple[float, Any]] = deque()
         self._changed = asyncio.Event()
         self._ended = False
@@ -240,6 +342,8 @@ class _LiveAudio:
             cut, path = 0, "none"
         self._skip = cut
         logger.info("pre-connect cut: path=%s dropped=%.2f s", path, cut / self._sample_rate)
+        if buffer and self._recorder is not None:
+            self._recorder.record(self.track_id, buffer, self._stamped, opened, self._sample_rate)
         return buffer
 
     def __aiter__(self) -> _LiveAudio:
@@ -296,6 +400,10 @@ _LIVE: contextvars.ContextVar[_LiveAudio] = contextvars.ContextVar("preconnect_l
 class _PreConnectAudioInput(_ParticipantAudioInputStream):
     """LiveKit's participant audio input, reading the track through _LiveAudio."""
 
+    def __init__(self, *args: Any, recorder: _PreConnectRecorder | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._recorder = recorder
+
     def _create_stream(self, track: rtc.Track, participant: rtc.Participant) -> Any:
         stream = rtc.AudioStream.from_track(
             track=track,
@@ -303,7 +411,7 @@ class _PreConnectAudioInput(_ParticipantAudioInputStream):
             num_channels=self._num_channels,
             frame_size_ms=self._frame_size_ms,
         )
-        return _LiveAudio(stream, sample_rate=self._sample_rate, track_id=track.sid)
+        return _LiveAudio(stream, sample_rate=self._sample_rate, track_id=track.sid, recorder=self._recorder)
 
     async def _forward_task(self, old_task: Any, stream: Any, *rest: Any) -> None:
         _LIVE.set(stream)
@@ -348,14 +456,21 @@ class _OpenRecordingHandler(PreConnectAudioHandler):
 
 
 class PreConnectRoomIO(room_io.RoomIO):
-    """RoomIO whose microphone input hears the pre-connect buffer once."""
+    """RoomIO whose microphone input hears the pre-connect buffer once.
+
+    With a record_dir, each processed buffer and the live head it was cut from are written there.
+    """
+
+    def __init__(self, *args: Any, record_dir: Path | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._recorder = None if record_dir is None else _PreConnectRecorder(record_dir)
 
     async def start(self) -> None:
         # RoomIO.start builds its audio input and pre-connect handler from these module globals
         # and never yields to the loop before it does, so the swaps cannot be seen by another RoomIO.
         stock_input = upstream._ParticipantAudioInputStream
         stock_handler = upstream.PreConnectAudioHandler
-        upstream._ParticipantAudioInputStream = _PreConnectAudioInput
+        upstream._ParticipantAudioInputStream = functools.partial(_PreConnectAudioInput, recorder=self._recorder)
         upstream.PreConnectAudioHandler = _OpenRecordingHandler
         try:
             await super().start()

@@ -5,12 +5,17 @@ few LiveKit pieces it touches; where livekit is installed the real ones are used
 """
 
 import asyncio
+import contextlib
 import importlib
 import importlib.util
+import os
 import re
+import stat
 import sys
+import tempfile
 import types
 import unittest
+import wave
 from array import array
 from collections import deque
 from dataclasses import dataclass
@@ -905,9 +910,9 @@ def room_options(timeout=3.0):
 class GatedReader:
     """Stands in for rtc.ByteStreamReader: chunks reach it when the test pushes them, and it ends when told."""
 
-    def __init__(self, track_id):
+    def __init__(self, track_id, rate=BUFFER_RATE):
         self.info = SimpleNamespace(
-            attributes={"trackId": track_id, "sampleRate": str(BUFFER_RATE), "channels": "1"},
+            attributes={"trackId": track_id, "sampleRate": str(rate), "channels": "1"},
             mime_type="",
         )
         self._chunks = deque()
@@ -940,9 +945,9 @@ def pcm_chunks(samples, rate, seconds=FRAME_SECONDS):
     return [samples[at:at + step].tobytes() for at in range(0, len(samples), step)]
 
 
-async def arrive(handler, chunks, track_id="TR_audio"):
+async def arrive(handler, chunks, track_id="TR_audio", rate=BUFFER_RATE):
     """Hands the handler a pre-connect buffer stream of the given chunks, which then ends."""
-    reader = GatedReader(track_id)
+    reader = GatedReader(track_id, rate)
     reading = asyncio.create_task(handler._read_audio_task(reader, "phone"))
     await settle()
     for chunk in chunks:
@@ -1084,6 +1089,166 @@ class PreConnectRoomIOTest(AsyncTest):
 
     def test_it_is_a_room_io(self):
         self.assertTrue(issubclass(preconnect.PreConnectRoomIO, preconnect.room_io.RoomIO))
+
+
+async def started_room_io(**kwargs):
+    voice_io = preconnect.PreConnectRoomIO(
+        agent_session=mock.MagicMock(), room=mock.MagicMock(), options=room_options(timeout=10.0), **kwargs
+    )
+    await voice_io.start()
+    return voice_io
+
+
+async def record_turn(voice_io, clock, track_id, buffer, live, *, base, rate=BUFFER_RATE):
+    """One track's pre-connect turn through the room IO's input, on the clock.
+
+    The first live frames are heard at base, the buffer's stream opens at base + 0.2 s, and the rest
+    of the live head is heard at base + 0.3 s. The head is the 1.2 s the buffer's window needs.
+    """
+    handler = voice_io._pre_connect_audio_handler
+    audio_input = voice_io.audio_input
+    stream = GatedStream()
+    track = SimpleNamespace(sid=track_id)
+    publication = SimpleNamespace(sid=track_id, source=0, audio_features=[PRECONNECT_FEATURE])
+    participant = SimpleNamespace(identity="phone")
+    frames = frames_of(live, LIVE_RATE)
+    with track_streams(stream):
+        live_stream = audio_input._create_stream(track, participant)
+    clock.now = base
+    stream.push(frames[:4])
+    await settle()
+    forward = asyncio.create_task(audio_input._forward_task(None, live_stream, track, publication, participant))
+    await settle()
+    clock.now = base + 0.2
+    await arrive(handler, pcm_chunks(buffer, rate), track_id=track_id, rate=rate)
+    clock.now = base + 0.3
+    stream.push(frames[4:24])
+    await settle()
+    stream.end()
+    await forward
+
+
+async def forwarded_frames(voice_io):
+    audio_input = voice_io.audio_input
+    audio_input._data_ch.close()
+    return [frame async for frame in audio_input._data_ch]
+
+
+def read_wav(path):
+    with wave.open(str(path), "rb") as wav:
+        return wav.getframerate(), wav.getnchannels(), wav.readframes(wav.getnframes())
+
+
+def read_arrivals(path):
+    return [(float(offset), int(count)) for offset, count in (line.split() for line in path.read_text().splitlines())]
+
+
+class PreConnectRecordingTest(AsyncTest):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.clock = FakeTime()
+        clock = mock.patch.object(preconnect, "time", self.clock)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    async def test_a_processed_buffer_is_written_with_its_samples_and_the_live_head_it_was_cut_from(self):
+        buffer = speechlike(1.0, seed=1, rate=BUFFER_RATE)
+        live = speechlike(1.2, seed=2)
+        with tempfile.TemporaryDirectory() as directory:
+            voice_io = await started_room_io(record_dir=Path(directory))
+
+            await record_turn(voice_io, self.clock, "TR_one", buffer, live, base=0.0)
+
+            self.assertEqual(sorted(os.listdir(directory)), sorted([
+                "TR_one-preconnect-buffer-turn-001.wav",
+                "TR_one-preconnect-live-turn-001.wav",
+                "TR_one-preconnect-live-turn-001.txt",
+            ]))
+            self.assertEqual(
+                read_wav(Path(directory, "TR_one-preconnect-buffer-turn-001.wav")),
+                (BUFFER_RATE, 1, buffer.tobytes()),
+            )
+            self.assertEqual(
+                read_wav(Path(directory, "TR_one-preconnect-live-turn-001.wav")),
+                (LIVE_RATE, 1, live.tobytes()),
+            )
+            self.assertEqual(
+                read_arrivals(Path(directory, "TR_one-preconnect-live-turn-001.txt")),
+                [(-0.2, 1200)] * 4 + [(0.1, 1200)] * 20,
+            )
+            for name in os.listdir(directory):
+                self.assertEqual(stat.S_IMODE(os.stat(Path(directory, name)).st_mode), 0o600)
+
+    async def test_each_processed_buffer_takes_the_next_number(self):
+        buffer = speechlike(1.0, seed=1, rate=BUFFER_RATE)
+        live = speechlike(1.2, seed=2)
+        with tempfile.TemporaryDirectory() as directory:
+            voice_io = await started_room_io(record_dir=Path(directory))
+
+            await record_turn(voice_io, self.clock, "TR_one", buffer, live, base=0.0)
+            await record_turn(voice_io, self.clock, "TR_two", buffer, live, base=1.0)
+
+            self.assertEqual(sorted(os.listdir(directory)), sorted([
+                "TR_one-preconnect-buffer-turn-001.wav",
+                "TR_one-preconnect-live-turn-001.wav",
+                "TR_one-preconnect-live-turn-001.txt",
+                "TR_two-preconnect-buffer-turn-002.wav",
+                "TR_two-preconnect-live-turn-002.wav",
+                "TR_two-preconnect-live-turn-002.txt",
+            ]))
+
+    async def test_an_existing_turn_is_never_overwritten(self):
+        buffer = speechlike(1.0, seed=1, rate=BUFFER_RATE)
+        live = speechlike(1.2, seed=2)
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "TR_one-preconnect-buffer-turn-001.wav").write_bytes(b"kept")
+            voice_io = await started_room_io(record_dir=Path(directory))
+
+            await record_turn(voice_io, self.clock, "TR_one", buffer, live, base=0.0)
+
+            self.assertEqual(Path(directory, "TR_one-preconnect-buffer-turn-001.wav").read_bytes(), b"kept")
+            self.assertTrue(Path(directory, "TR_one-preconnect-buffer-turn-002.wav").is_file())
+            self.assertTrue(Path(directory, "TR_one-preconnect-live-turn-002.txt").is_file())
+
+    async def test_without_a_record_dir_nothing_is_written_and_the_cut_is_the_same(self):
+        # A buffer at the live rate passes LiveKit's resampler unchanged. LiveKit's gain control then
+        # processes the live output, so the cut is compared by its log line and the whole output.
+        buffer = speechlike(1.0, seed=1)
+        live = speechlike(1.2, seed=2)
+        with tempfile.TemporaryDirectory() as directory, contextlib.chdir(directory):
+            with self.assertLogs("mentat.voice", "INFO") as unrecorded_logs:
+                unrecorded_io = await started_room_io()
+                await record_turn(unrecorded_io, self.clock, "TR_one", buffer, live, base=0.0, rate=LIVE_RATE)
+                unrecorded = await forwarded_frames(unrecorded_io)
+            self.assertEqual(os.listdir(directory), [])
+
+        with tempfile.TemporaryDirectory() as record_dir, self.assertLogs("mentat.voice", "INFO") as recorded_logs:
+            recorded_io = await started_room_io(record_dir=Path(record_dir))
+            await record_turn(recorded_io, self.clock, "TR_one", buffer, live, base=0.0, rate=LIVE_RATE)
+            recorded = await forwarded_frames(recorded_io)
+
+        cut = pre_connect_messages(unrecorded_logs, "pre-connect cut:")
+        self.assertEqual(cut, ["pre-connect cut: path=timing dropped=0.20 s"])
+        self.assertEqual(pre_connect_messages(recorded_logs, "pre-connect cut:"), cut)
+        self.assertEqual(samples_of(recorded), samples_of(unrecorded))
+
+    async def test_a_write_failure_is_logged_and_the_cut_still_applies(self):
+        buffer = speechlike(1.0, seed=1)
+        live = speechlike(1.2, seed=2)
+        unrecorded_io = await started_room_io()
+        await record_turn(unrecorded_io, self.clock, "TR_one", buffer, live, base=0.0, rate=LIVE_RATE)
+        unrecorded = await forwarded_frames(unrecorded_io)
+
+        with tempfile.TemporaryDirectory() as directory:
+            blocked = Path(directory, "recordings")
+            blocked.write_bytes(b"")  # a file where the recording directory should be
+            voice_io = await started_room_io(record_dir=blocked)
+            with self.assertLogs("mentat.voice", "ERROR") as logs:
+                await record_turn(voice_io, self.clock, "TR_one", buffer, live, base=0.0, rate=LIVE_RATE)
+            cut = await forwarded_frames(voice_io)
+
+        self.assertEqual([record.getMessage() for record in logs.records], ["failed to write pre-connect recording"])
+        self.assertEqual(samples_of(cut), samples_of(unrecorded))
 
 
 class CutRepeatTest(unittest.TestCase):
