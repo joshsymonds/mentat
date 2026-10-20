@@ -306,6 +306,55 @@ class TranscribeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(form.fields[1][1], "scribe_v2")
         self.assertEqual(form.fields[2][1], "false")
 
+    async def test_scribe_batch_request_carries_language_code_when_given(self):
+        class FormData:
+            def __init__(self):
+                self.fields = []
+
+            def add_field(self, name, value, **kwargs):
+                self.fields.append((name, value, kwargs))
+
+        forms = []
+
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def json(self):
+                return {"text": "Tokyo", "words": [{"text": "Tokyo", "start": 0.1, "end": 0.6, "type": "word"}]}
+
+        http = Mock()
+        http.post.return_value = Response()
+
+        def make_form():
+            form = FormData()
+            forms.append(form)
+            return form
+
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": "test-key"}):
+            with patch.dict(sys.modules, {"aiohttp": SimpleNamespace(FormData=make_form)}):
+                await caller._transcribe(http, b"\0\0" * 24000, 24000, 1, language_code="en")
+                await caller._transcribe(http, b"\0\0" * 24000, 24000, 1, language_code=None)
+
+        with_language, without_language = forms
+        self.assertEqual(
+            [field[0] for field in with_language.fields],
+            ["file", "model_id", "tag_audio_events", "language_code"],
+        )
+        self.assertEqual(with_language.fields[3][1], "en")
+        self.assertEqual(
+            [field[0] for field in without_language.fields],
+            ["file", "model_id", "tag_audio_events"],
+        )
+
     async def test_text_without_word_timestamps_fails_by_name_and_keeps_text(self):
         class FormData:
             def add_field(self, *_args, **_kwargs):

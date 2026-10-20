@@ -435,7 +435,14 @@ async def _tts(http: Any, text: str, *, language: str = "en") -> TTSResponse:
         return TTSResponse(pcm, response.status, len(pcm))
 
 
-async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) -> list[dict[str, Any]]:
+async def _transcribe(
+    http: Any,
+    pcm: bytes,
+    sample_rate: int,
+    channels: int,
+    *,
+    language_code: str | None = None,
+) -> list[dict[str, Any]]:
     if len(pcm) * 10 < sample_rate * channels * 2:
         return []
 
@@ -457,6 +464,8 @@ async def _transcribe(http: Any, pcm: bytes, sample_rate: int, channels: int) ->
         form.add_field("file", wav_data, filename="answer.wav", content_type="audio/wav")
         form.add_field("model_id", "scribe_v2")
         form.add_field("tag_audio_events", "false")
+        if language_code is not None:
+            form.add_field("language_code", language_code)
         async with http.post(
             "https://api.elevenlabs.io/v1/speech-to-text",
             headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
