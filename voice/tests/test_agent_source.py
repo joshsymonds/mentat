@@ -356,6 +356,46 @@ class AgentSourceContractTest(unittest.TestCase):
         )[0]
         self.assertIn("await _close_voice_room_io()", close_audio)
 
+    def test_pre_connect_recording_follows_the_eval_directory_variable(self):
+        agent_path = Path(__file__).resolve().parents[1] / "agent.py"
+        tree = ast.parse(agent_path.read_text())
+        entrypoint = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "entrypoint"
+        )
+        build = next(
+            node for node in ast.walk(entrypoint)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "PreConnectRoomIO"
+        )
+        record_dir_keywords = [keyword for keyword in build.keywords if keyword.arg == "record_dir"]
+        self.assertEqual(len(record_dir_keywords), 1)
+        lookup = next(
+            node for node in entrypoint.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "record_dir" for target in node.targets)
+        )
+        lookup_module = ast.fix_missing_locations(ast.Module(body=[lookup], type_ignores=[]))
+        record_dir_expression = ast.fix_missing_locations(
+            ast.Expression(body=record_dir_keywords[0].value)
+        )
+        for environment, expected in (
+            ({}, None),
+            ({"MENTAT_VOICE_INPUT_RECORD_DIR": ""}, None),
+            ({"MENTAT_VOICE_INPUT_RECORD_DIR": "/eval/recordings"}, Path("/eval/recordings")),
+        ):
+            with self.subTest(environment=environment):
+                namespace = {"os": os, "Path": Path}
+                with patch.dict(os.environ, environment, clear=True):
+                    exec(compile(lookup_module, str(agent_path), "exec"), namespace)
+                    value = eval(compile(record_dir_expression, str(agent_path), "eval"), namespace)
+                self.assertEqual(value, expected)
+
+    def test_production_module_never_sets_the_input_record_dir(self):
+        module = (Path(__file__).resolve().parents[2] / "nix" / "module.nix").read_text()
+        self.assertNotIn("MENTAT_VOICE_INPUT_RECORD_DIR", module)
+
     def test_close_sequence_call_matches_helper_signature(self):
         voice_dir = Path(__file__).resolve().parents[1]
         agent_tree = ast.parse((voice_dir / "agent.py").read_text())

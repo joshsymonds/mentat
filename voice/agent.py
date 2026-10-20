@@ -1116,6 +1116,7 @@ async def entrypoint(ctx: JobContext) -> None:
         },
         transcription_timeout=STT_STALL_TIMEOUT,
     )
+    record_dir = os.environ.get("MENTAT_VOICE_INPUT_RECORD_DIR")
     voice_room_io = PreConnectRoomIO(
         agent_session=session,
         room=ctx.room,
@@ -1125,6 +1126,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 pre_connect_audio_timeout=10.0,
             ),
         ),
+        record_dir=Path(record_dir) if record_dir else None,
     )
     voice_room_io_closed = False
 
