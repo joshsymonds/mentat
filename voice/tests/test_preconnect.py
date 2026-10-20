@@ -1251,10 +1251,30 @@ class PreConnectRecordingTest(AsyncTest):
         self.assertEqual(samples_of(cut), samples_of(unrecorded))
 
 
+URH8Q2EU_FIXTURE = VOICE_DIR / "tests" / "fixtures" / "urh8q2eu-preconnect.npz"
+
+
 class CutRepeatTest(unittest.TestCase):
     def setUp(self):
         self.buffer = speechlike(1.04, seed=1)
         self.tail = self.buffer[-round(0.92 * LIVE_RATE):]
+
+    def test_a_recorded_first_line_whose_voiced_part_is_0_53_seconds_is_aligned_on_thirds_of_it(self):
+        with np.load(URH8Q2EU_FIXTURE) as fixture:
+            buffer = preconnect._mono_at_rate(frames_of(fixture["buffer"], BUFFER_RATE), LIVE_RATE)
+            live = fixture["live"]
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            cut, path = preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        self.assertLessEqual(abs(cut - round(0.83 * LIVE_RATE)), round(0.03 * LIVE_RATE))
+        [line] = pre_connect_messages(logs, "pre-connect tails:")
+        match = re.fullmatch(r"pre-connect tails: quiet=(\d+\.\d{2}) s (.+)", line)
+        self.assertIsNotNone(match, line)
+        entries = [re.fullmatch(TAIL_ENTRY, entry) for entry in match[2].split(", ")]
+        self.assertTrue(all(entries), line)
+        self.assertEqual([float(entry[1]) for entry in entries], [0.18, 0.35, 0.53])
 
     def test_a_stretched_jittered_repeat_is_aligned_and_cut_at_its_end(self):
         repeat = jittered_repeat(self.tail, noise_scale=1.2, seed=3)
@@ -1287,14 +1307,25 @@ class CutRepeatTest(unittest.TestCase):
         self.assertEqual(path, "aligned")
         self.assertLessEqual(abs(cut - len(repeat)), round(0.05 * LIVE_RATE))
 
-    def test_a_buffer_whose_voiced_part_is_shorter_than_the_longest_tail_is_timing(self):
+    def test_a_buffer_whose_voiced_part_is_shorter_than_the_longest_tail_is_aligned_on_thirds_of_it(self):
         buffer = np.concatenate([speechlike(0.5, seed=1), quiet_noise(0.5, seed=7)])
         live = np.concatenate([buffer, speechlike(0.5, seed=4)])
 
-        self.assertEqual(
-            preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
-            (round(0.3 * LIVE_RATE), "timing"),
-        )
+        cut, path = preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        self.assertLessEqual(abs(cut - len(buffer)), round(0.05 * LIVE_RATE))
+
+    def test_a_voiced_part_whose_shortest_third_is_under_a_tenth_of_a_second_is_timing_with_no_tail(self):
+        buffer = np.concatenate([speechlike(0.25, seed=1), quiet_noise(0.5, seed=7)])
+        live = np.concatenate([buffer, speechlike(0.5, seed=4)])
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            cut, path = preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual((cut, path), (round(0.3 * LIVE_RATE), "timing"))
+        [line] = pre_connect_messages(logs, "pre-connect tails:")
+        self.assertRegex(line, r"^pre-connect tails: quiet=\d+\.\d{2} s none$")
 
     def test_no_repeat_is_timing_cut_at_the_samples_heard_before_open(self):
         live = speechlike(1.0, seed=2)
@@ -1414,14 +1445,14 @@ class CutRepeatTest(unittest.TestCase):
             (round(0.3 * LIVE_RATE), "timing"),
         )
 
-    def test_a_buffer_too_short_for_the_longest_tail_is_timing(self):
+    def test_a_buffer_too_short_for_the_longest_tail_is_aligned_on_thirds_of_it(self):
         buffer = speechlike(0.5, seed=1)
         live = np.concatenate([buffer, speechlike(0.5, seed=4)])
 
-        self.assertEqual(
-            preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
-            (round(0.3 * LIVE_RATE), "timing"),
-        )
+        cut, path = preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        self.assertLessEqual(abs(cut - len(buffer)), round(0.05 * LIVE_RATE))
 
     def test_a_live_head_too_short_for_the_longest_tail_is_timing(self):
         live = self.buffer[-round(0.3 * LIVE_RATE):]
