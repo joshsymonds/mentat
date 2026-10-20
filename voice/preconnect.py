@@ -4,7 +4,8 @@ The phone records the first words into a buffer while it connects and sends it a
 byte stream; its live track then starts a moment before the end of that buffer, so the
 live audio opens by repeating the buffer's last half second or so. LiveKit feeds both to
 the speech-to-text and the first words arrive twice. This input drops the repeat by
-aligning the buffer's tail with the live head (see cut_repeat). Once the buffer arrives, the
+aligning the buffer's tails with the live head, where two agreeing tails are enough
+(see cut_repeat). Once the buffer arrives, the
 live track is held until its head covers the buffer's length plus 0.2 s, so the alignment
 has the whole window, or the track ends, or that span has passed. When no tail aligns, the
 repeat falls back to timing: a live frame the worker received before the buffer's stream
@@ -99,11 +100,13 @@ def cut_repeat(buffer: np.ndarray, live: np.ndarray, rate: int, heard_before_ope
     reshaped on the way through the jitter buffer. The buffer's voiced part ends at its last
     voiced 10 ms frame, and the quiet span after it is a pause the repeat may carry too. Each of
     the voiced part's last 0.2, 0.4 and 0.6 s is matched within the first len(buffer) plus 0.2 s of
-    live by zero-mean normalized cross-correlation. When all three correlate at least 0.3 and end
-    within 0.05 s of each other, the repeat ends at their median end plus the quiet span
-    ("aligned"). Otherwise the repeat is the live audio heard before the buffer opened, at most
-    the buffer's length and 1.0 s ("timing"), and so is any buffer whose voiced part is shorter
-    than 0.6 s. A non-empty buffer also logs the tails it matched and its quiet span.
+    live by zero-mean normalized cross-correlation, and all three must match. The repeat ends at
+    the agreed end plus the quiet span ("aligned"), where the agreed end is the median end of the
+    three tails when each correlates at least 0.3 and they end within 0.05 s of each other, else
+    the mean end of the closest pair of tails that do (see _agreed_end). Otherwise the repeat is
+    the live audio heard before the buffer opened, at most the buffer's length and 1.0 s
+    ("timing"), and so is any buffer whose voiced part is shorter than 0.6 s. A non-empty buffer
+    also logs the tails it matched and its quiet span.
     """
     timing = min(heard_before_open, len(buffer), round(REPEAT_TIMING_CAP_SECONDS * rate)), "timing"
     voiced_end = _voiced_end(buffer, rate)
@@ -113,15 +116,10 @@ def cut_repeat(buffer: np.ndarray, live: np.ndarray, rate: int, heard_before_ope
     quiet = len(buffer) - voiced_end
     if len(buffer):
         _log_tails(quiet, matches, rate)
-    ends = [end for _, end, _ in matches]
-    correlations = [correlation for _, _, correlation in matches]
-    if (
-        len(matches) < len(REPEAT_TAIL_SECONDS)
-        or min(correlations) < REPEAT_MIN_CORRELATION
-        or max(ends) - min(ends) > round(REPEAT_AGREE_SECONDS * rate)
-    ):
+    end = _agreed_end(matches, rate)
+    if end is None:
         return timing
-    return sorted(ends)[1] + quiet, "aligned"
+    return end + quiet, "aligned"
 
 
 def _match_tails(voiced: np.ndarray, window: np.ndarray, rate: int) -> list[tuple[float, int, float]]:
@@ -141,6 +139,26 @@ def _match_tails(voiced: np.ndarray, window: np.ndarray, rate: int) -> list[tupl
         end, correlation = _best_match(tail, window)
         matches.append((seconds, end, correlation))
     return matches
+
+
+def _agreed_end(matches: list[tuple[float, int, float]], rate: int) -> int | None:
+    """The end the tails agree on in live samples, or None when they do not.
+
+    Every tail must be matched. The tails that correlate at least 0.3 are the candidates. When all
+    three are candidates and end within 0.05 s of each other, the agreed end is their median. Else
+    the agreed end is the mean of the closest pair of candidates, if that pair ends within 0.05 s.
+    The closest pair is always adjacent once the candidate ends are sorted.
+    """
+    if len(matches) < len(REPEAT_TAIL_SECONDS):
+        return None
+    agree = round(REPEAT_AGREE_SECONDS * rate)
+    ends = sorted(end for _, end, correlation in matches if correlation >= REPEAT_MIN_CORRELATION)
+    if len(ends) == len(REPEAT_TAIL_SECONDS) and ends[-1] - ends[0] <= agree:
+        return ends[1]
+    closest = min(zip(ends, ends[1:]), key=lambda pair: pair[1] - pair[0], default=None)
+    if closest is None or closest[1] - closest[0] > agree:
+        return None
+    return (closest[0] + closest[1]) // 2
 
 
 def _log_tails(quiet: int, matches: list[tuple[float, int, float]], rate: int) -> None:

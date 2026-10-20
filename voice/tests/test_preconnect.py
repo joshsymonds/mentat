@@ -1322,14 +1322,88 @@ class CutRepeatTest(unittest.TestCase):
         )
 
     def test_tails_that_end_apart_are_timing(self):
+        # The buffer's last 0.2, 0.4 and 0.6 s, back to back: each tail matches its own copy
+        # exactly, ending at 0.2, 0.6 and 1.2 s, so no two of the three agree within 0.05 s.
         tail = self.buffer[-round(0.6 * LIVE_RATE):]
-        split = round(0.4 * LIVE_RATE)
-        live = np.concatenate([tail[:split], speechlike(0.1, seed=5), tail[split:], speechlike(0.5, seed=6)])
+        live = np.concatenate([
+            tail[-round(0.2 * LIVE_RATE):], tail[-round(0.4 * LIVE_RATE):], tail, speechlike(0.5, seed=6),
+        ])
 
         self.assertEqual(
             preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
             (round(0.3 * LIVE_RATE), "timing"),
         )
+
+    def test_three_tails_at_or_above_point_three_that_end_apart_are_timing(self):
+        matches = [
+            (0.2, round(0.40 * LIVE_RATE), 0.90),
+            (0.4, round(0.60 * LIVE_RATE), 0.90),
+            (0.6, round(0.80 * LIVE_RATE), 0.90),
+        ]
+        live = speechlike(1.0, seed=2)
+
+        with mock.patch.object(preconnect, "_match_tails", return_value=matches):
+            self.assertEqual(
+                preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
+                (round(0.3 * LIVE_RATE), "timing"),
+            )
+
+    def test_a_pair_ending_six_hundredths_of_a_second_apart_is_timing(self):
+        matches = [
+            (0.2, round(0.90 * LIVE_RATE), 0.10),
+            (0.4, round(0.50 * LIVE_RATE), 0.90),
+            (0.6, round(0.56 * LIVE_RATE), 0.90),
+        ]
+        live = speechlike(1.0, seed=2)
+
+        with mock.patch.object(preconnect, "_match_tails", return_value=matches):
+            self.assertEqual(
+                preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
+                (round(0.3 * LIVE_RATE), "timing"),
+            )
+
+    def test_two_agreeing_tails_align_when_the_third_is_a_weak_outlier(self):
+        # lcdzk1ju's live tails: 0.20 s end=0.93 s r=0.60, 0.40 s end=1.15 s r=0.35, 0.60 s end=0.97 s r=0.46
+        matches = [
+            (0.2, round(0.93 * LIVE_RATE), 0.60),
+            (0.4, round(1.15 * LIVE_RATE), 0.35),
+            (0.6, round(0.97 * LIVE_RATE), 0.46),
+        ]
+        live = speechlike(1.0, seed=2)
+
+        with mock.patch.object(preconnect, "_match_tails", return_value=matches):
+            cut, path = preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        self.assertEqual(cut, (round(0.93 * LIVE_RATE) + round(0.97 * LIVE_RATE)) // 2)
+
+    def test_of_two_agreeing_pairs_the_one_with_the_closer_ends_aligns(self):
+        matches = [
+            (0.2, round(0.40 * LIVE_RATE), 0.90),
+            (0.4, round(0.44 * LIVE_RATE), 0.90),
+            (0.6, round(0.46 * LIVE_RATE), 0.90),
+        ]
+        live = speechlike(1.0, seed=2)
+
+        with mock.patch.object(preconnect, "_match_tails", return_value=matches):
+            cut, path = preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        self.assertEqual(cut, (round(0.44 * LIVE_RATE) + round(0.46 * LIVE_RATE)) // 2)
+
+    def test_a_single_tail_at_or_above_point_three_with_the_others_below_is_timing(self):
+        matches = [
+            (0.2, round(0.5 * LIVE_RATE), 0.90),
+            (0.4, round(0.9 * LIVE_RATE), 0.10),
+            (0.6, round(0.7 * LIVE_RATE), 0.10),
+        ]
+        live = speechlike(1.0, seed=2)
+
+        with mock.patch.object(preconnect, "_match_tails", return_value=matches):
+            self.assertEqual(
+                preconnect.cut_repeat(self.buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
+                (round(0.3 * LIVE_RATE), "timing"),
+            )
 
     def test_tails_that_correlate_below_point_three_are_timing(self):
         repeat = jittered_repeat(self.tail, noise_scale=4.0, seed=3)
