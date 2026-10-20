@@ -954,6 +954,7 @@ async def capture_script(
     retain_caller_audio_dir: Path | None = None,
     preconnect_timing: tuple[float, float, float] | None = None,
     barge_in: dict[int, float] | None = None,
+    reply_language: str | None = None,
 ) -> list[dict[str, Any]]:
     """Capture every script turn and enforce its expected room-close policy.
 
@@ -1491,11 +1492,14 @@ async def capture_script(
             transcription_deadline = (
                 dependencies.monotonic() + ANSWER_TRANSCRIPTION_DEADLINE_SECONDS
             )
+            transcribe_options = {} if reply_language is None else {"language_code": reply_language}
 
             async def transcribe_by_deadline(clip: bytes) -> list[dict[str, Any]] | None:
                 """Words for CLIP, or None when the turn's transcription deadline passes first."""
                 transcription_task = asyncio.create_task(
-                    dependencies.transcribe(dependencies.http, clip, sample_rate, channels)
+                    dependencies.transcribe(
+                        dependencies.http, clip, sample_rate, channels, **transcribe_options
+                    )
                 )
                 remaining = transcription_deadline - dependencies.monotonic()
                 if remaining > 0:
@@ -3127,6 +3131,10 @@ def _voice_token(base_url: str) -> dict[str, Any]:
     return grant
 
 
+def _english_replies(scenario: Any) -> bool:
+    return all(language == "en" for language in getattr(scenario, "reply_languages", ()))
+
+
 def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str]:
     close_after = getattr(scenario, "room_close_after", None)
     close_arg = "none" if close_after is None else str(close_after)
@@ -3145,6 +3153,8 @@ def _capture_command(scenario: Any, room: str, raw_steps: list[str]) -> list[str
     for turn, seconds in enumerate(getattr(scenario, "barge_in_after", ()), 1):
         if seconds is not None:
             command.extend(("--barge-in", f"{turn}:{seconds}"))
+    if _english_replies(scenario):
+        command.extend(("--reply-language", "en"))
     command.extend((room, *raw_steps))
     return command
 
@@ -3568,6 +3578,7 @@ async def _run_remote_capture_with_fake_phone(
     retain_caller_audio_dir: Path | None = None,
     preconnect_timing: tuple[float, float, float] | None = None,
     barge_in: dict[int, float] | None = None,
+    reply_language: str | None = None,
 ) -> list[dict[str, Any]]:
     base_url = os.environ.get("MENTAT_URL", "")
     log_path = Path(__file__).resolve().parents[1] / FAKE_PHONE_LOG
@@ -3602,6 +3613,7 @@ async def _run_remote_capture_with_fake_phone(
             retain_caller_audio_dir=retain_caller_audio_dir,
             preconnect_timing=preconnect_timing,
             barge_in=barge_in,
+            reply_language=reply_language,
         )
     finally:
         if process.poll() is None:
@@ -3623,6 +3635,7 @@ async def run_remote_capture(
     retain_caller_audio_dir: Path | None = None,
     preconnect_timing: tuple[float, float, float] | None = None,
     barge_in: dict[int, float] | None = None,
+    reply_language: str | None = None,
 ) -> list[dict[str, Any]]:
     import aiohttp
 
@@ -3637,6 +3650,7 @@ async def run_remote_capture(
             retain_caller_audio_dir=retain_caller_audio_dir,
             preconnect_timing=preconnect_timing,
             barge_in=barge_in,
+            reply_language=reply_language,
         )
 
 
@@ -3669,7 +3683,9 @@ def _barge_in_pair(value: str) -> tuple[int, float]:
 
 def _parse_arguments(
     argv: list[str],
-) -> tuple[str, list[str], int | None, dict[int, float], tuple[float, float, float] | None]:
+) -> tuple[
+    str, list[str], int | None, dict[int, float], tuple[float, float, float] | None, str | None
+]:
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -3692,6 +3708,12 @@ def _parse_arguments(
         type=_barge_in_pair,
         metavar="TURN:SECONDS",
         help="start line TURN SECONDS after the agent begins replying to the line before it",
+    )
+    parser.add_argument(
+        "--reply-language",
+        choices=("en",),
+        default=None,
+        help="transcribe the agent's reply clips in this language instead of detecting it",
     )
     parser.add_argument("room")
     parser.add_argument(
@@ -3724,6 +3746,7 @@ def _parse_arguments(
         room_close_after,
         barge_in,
         arguments.preconnect_first_line,
+        arguments.reply_language,
     )
 
 
@@ -4159,7 +4182,9 @@ def main(argv: list[str] | None = None) -> int:
         retain_sms_audio_dir = Path(evidence_path)
     else:
         retain_sms_audio_dir = None
-    room, steps, room_close_after, barge_in, preconnect_timing = _parse_arguments(arguments)
+    room, steps, room_close_after, barge_in, preconnect_timing, reply_language = _parse_arguments(
+        arguments
+    )
     capture = _run_remote_capture_with_fake_phone if "--fake-phone" in arguments else run_remote_capture
     capture_options = {"room_close_after": room_close_after}
     if retain_sms_audio_scenario is not None:
@@ -4173,6 +4198,8 @@ def main(argv: list[str] | None = None) -> int:
         capture_options["preconnect_timing"] = preconnect_timing
     if barge_in:
         capture_options["barge_in"] = barge_in
+    if reply_language is not None:
+        capture_options["reply_language"] = reply_language
     try:
         traces = asyncio.run(capture(room, steps, **capture_options))
     except NamedCapacityFailure as error:

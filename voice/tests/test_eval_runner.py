@@ -82,10 +82,10 @@ def rendered_pcm(text, seconds_per_character=0.2):
 
 
 def rendered_aware_transcriber(transcribe):
-    async def wrapped(http, pcm, sample_rate, channels):
+    async def wrapped(http, pcm, sample_rate, channels, **options):
         if pcm in RENDERED_PCM_TEXT:
             return [{"start": 0.0, "end": 1.0, "text": RENDERED_PCM_TEXT[pcm]}]
-        return await transcribe(http, pcm, sample_rate, channels)
+        return await transcribe(http, pcm, sample_rate, channels, **options)
 
     return wrapped
 
@@ -792,7 +792,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     "android-selected-room", "First@0::answer",
                 ]
             ),
-            ("android-selected-room", ["First@0::answer"], 1, {}, (0.8, 0.2, 0.15)),
+            ("android-selected-room", ["First@0::answer"], 1, {}, (0.8, 0.2, 0.15), None),
         )
         self.assertIsNone(
             runner._parse_arguments(["android-selected-room", "First@0::answer"])[4],
@@ -1701,7 +1701,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             runner._parse_arguments(
                 ["--barge-in", "2:9", "--barge-in", "3:1.5", "android-selected-room", *steps]
             ),
-            ("android-selected-room", steps, 3, {2: 9.0, 3: 1.5}, None),
+            ("android-selected-room", steps, 3, {2: 9.0, 3: 1.5}, None, None),
         )
         for flags in (
             ["--barge-in", "2"], ["--barge-in", "x:1"], ["--barge-in", "2:x"],
@@ -1786,6 +1786,119 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 room_close_after=None, barge_in={2: 9.0},
             )
         self.assertEqual(remote_calls[0]["barge_in"], {2: 9.0})
+
+    async def test_reply_clips_are_transcribed_in_the_reply_language_only_when_one_is_set(self):
+        windows = [0] * (23 * 50)
+        for onset, level in ((50, 400), (500, 500), (1000, 600)):
+            windows[onset : onset + 15] = [level] * 15
+        pcm = pcm_windows(*windows)
+
+        class LongCapture:
+            async def start(self):
+                pass
+
+            async def result(self):
+                return pcm, 24000, 1, 100.0
+
+        async def speech_end(_source):
+            return 110.0
+
+        for reply_language, expected_options in (("en", {"language_code": "en"}), (None, {})):
+            with self.subTest(reply_language=reply_language):
+                dependencies = self.dependencies_for_failure("other")
+                options_seen = []
+
+                async def transcribe(_http, _audio, _rate, _channels, **options):
+                    options_seen.append(options)
+                    return [
+                        {"start": 1.0, "end": 1.25, "text": "Got"},
+                        {"start": 1.25, "end": 1.3, "text": "it."},
+                        {"start": 9.8, "end": 9.9, "text": "Timer"},
+                        {"start": 10.0, "end": 10.1, "text": "set"},
+                        {"start": 20.0, "end": 20.1, "text": "OK."},
+                    ]
+
+                dependencies = CaptureDependencies(
+                    **{
+                        **dependencies.__dict__,
+                        "capture_factory": lambda *_args: LongCapture(),
+                        "transcribe": rendered_aware_transcriber(transcribe),
+                    }
+                )
+                with (
+                    patch.dict(os.environ, TEST_VOICE_ENV),
+                    patch.object(runner.caller, "_speech_end_after_playout", speech_end),
+                ):
+                    await capture_script(
+                        "android-selected-room",
+                        [r"Set a timer@0::timer set for 5 minutes"],
+                        dependencies=dependencies,
+                        room_close_after=None,
+                        reply_language=reply_language,
+                    )
+                self.assertEqual(options_seen, [expected_options])
+
+    async def test_reply_language_cli_flag_reaches_capture_script_through_every_capture_entry(self):
+        self.assertEqual(
+            runner._parse_arguments(
+                ["--reply-language", "en", "android-selected-room", "First@0::a", "Second@0::a"]
+            ),
+            ("android-selected-room", ["First@0::a", "Second@0::a"], 2, {}, None, "en"),
+        )
+        for flags in (["--reply-language", "fr"], ["--reply-language"]):
+            with (
+                self.subTest(flags=flags),
+                patch("sys.stderr"),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                runner._parse_arguments([*flags, "android-selected-room", "First@0::a"])
+            self.assertEqual(raised.exception.code, 2)
+
+        script_calls = []
+
+        async def capture_script_spy(room, steps, **options):
+            script_calls.append(options)
+            return []
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class PhoneProcess:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        async def no_sleep(_seconds):
+            pass
+
+        with (
+            patch.dict(sys.modules, {"aiohttp": SimpleNamespace(ClientSession=Session)}),
+            patch.object(runner, "capture_script", capture_script_spy),
+            patch.object(runner, "_dependencies", lambda _http: object()),
+            patch.object(runner.subprocess, "Popen", return_value=PhoneProcess()),
+            patch.object(runner.asyncio, "sleep", no_sleep),
+            patch("sys.stdout"),
+        ):
+            for fake_phone in (False, True):
+                arguments = [
+                    "--reply-language", "en", "android-selected-room", "First@0::a", "Second@0::a",
+                ]
+                if fake_phone:
+                    arguments.insert(0, "--fake-phone")
+                with self.subTest(fake_phone=fake_phone):
+                    self.assertEqual(await asyncio.to_thread(runner.main, arguments), 0)
+                    self.assertEqual(script_calls[-1]["reply_language"], "en")
 
     async def test_line_frames_are_pushed_exactly_as_rendered(self):
         dependencies, record, _captures, _clock = self.barge_in_harness()
@@ -1929,6 +2042,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 ["First@0::answer", "Second@0::answer"],
                 None,
                 {},
+                None,
                 None,
             ),
         )
@@ -6273,6 +6387,18 @@ class ScenarioObservationTests(unittest.TestCase):
                         ),
                         command.index("safe-room"),
                     )
+
+    def test_capture_command_asks_for_english_replies_except_in_spanish_scenarios(self):
+        SPANISH_REPLY_SCENARIOS = {"spanish-language-switch", "spanish-interpreter"}
+        for scenario in SCENARIOS:
+            command = runner._capture_command(scenario, "safe-room", ["Question@0::answer"])
+            with self.subTest(scenario=scenario.name):
+                if scenario.name in SPANISH_REPLY_SCENARIOS:
+                    self.assertNotIn("--reply-language", command)
+                else:
+                    flag = command.index("--reply-language")
+                    self.assertEqual(command[flag + 1], "en")
+                    self.assertLess(flag, command.index("safe-room"))
 
     def observe_exact_caller_stt(self, scenario_name, sidecars, *, captured=None):
         import json
