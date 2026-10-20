@@ -339,6 +339,29 @@ SPOKEN_NUMBER_WORDS = frozenset({
     "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
     "sixty", "seventy", "eighty", "ninety",
 })
+SPANISH_NUMBER_WORDS = {
+    "cero": "0", "uno": "1", "dos": "2", "tres": "3", "cuatro": "4",
+    "cinco": "5", "seis": "6", "siete": "7", "ocho": "8", "nueve": "9",
+    "diez": "10", "once": "11", "doce": "12", "trece": "13", "catorce": "14",
+    "quince": "15", "dieciseis": "16", "diecisiete": "17", "dieciocho": "18",
+    "diecinueve": "19", "veinte": "20", "veintiuno": "21", "veintidos": "22",
+    "veintitres": "23", "veinticuatro": "24", "veinticinco": "25",
+    "veintiseis": "26", "veintisiete": "27", "veintiocho": "28",
+    "veintinueve": "29", "treinta": "30", "cuarenta": "40", "cincuenta": "50",
+    "sesenta": "60",
+}
+SPANISH_TENS_COMPOUND_PATTERN = re.compile(
+    r"\b(treinta|cuarenta|cincuenta)\s+y\s+(uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve)\b"
+)
+TIME_UNIT_FORMS = {
+    form: unit
+    for unit, forms in {
+        "minute": ("minutes", "min", "mins", "minuto", "minutos"),
+        "second": ("seconds", "sec", "secs", "segundo", "segundos", "seg"),
+        "hour": ("hours", "hr", "hrs", "hora", "horas"),
+    }.items()
+    for form in forms
+}
 SCRIPTED_TRANSCRIPTION_FAILURE_PATTERN = re.compile(
     r"scripted speech transcription rejected for line ([1-9][0-9]*) "
     rf"\({TRANSCRIPTION_FAILURE_DETAIL}\)"
@@ -713,8 +736,18 @@ def _content_tokens(text: str) -> list[str]:
         flags=re.IGNORECASE,
     )
     expanded = re.sub(r"\bi'll\b", "i will", normalized, flags=re.IGNORECASE)
-    matches = list(re.finditer(r"[a-z0-9]+", expanded.lower()))
-    tokens = [match.group() for match in matches]
+    expanded = SPANISH_TENS_COMPOUND_PATTERN.sub(
+        lambda match: str(
+            int(SPANISH_NUMBER_WORDS[match.group(1)])
+            + int(SPANISH_NUMBER_WORDS[match.group(2)])
+        ),
+        expanded.lower(),
+    )
+    matches = list(re.finditer(r"[a-z0-9]+", expanded))
+    tokens = [
+        SPANISH_NUMBER_WORDS.get(word, TIME_UNIT_FORMS.get(word, word))
+        for word in (match.group() for match in matches)
+    ]
     result = []
     index = 0
     while index < len(tokens):

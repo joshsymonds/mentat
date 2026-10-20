@@ -6950,6 +6950,130 @@ def observe_single_run(test_case, log_text, *, observe, name="phantoms", **scena
     return captured["observations"]["cases"][0]["runs"][0]
 
 
+class CallerSttContentTokenTests(unittest.TestCase):
+    ENGLISH_WORDS = (
+        "zero one two three four five six seven eight nine ten eleven twelve "
+        "thirteen fourteen fifteen sixteen seventeen eighteen nineteen"
+    ).split()
+    ENGLISH_TENS = {20: "twenty", 30: "thirty", 40: "forty", 50: "fifty", 60: "sixty"}
+    SPANISH_WORDS = (
+        "cero uno dos tres cuatro cinco seis siete ocho nueve diez once doce "
+        "trece catorce quince dieciséis diecisiete dieciocho diecinueve veinte "
+        "veintiuno veintidós veintitrés veinticuatro veinticinco veintiséis "
+        "veintisiete veintiocho veintinueve"
+    ).split()
+    SPANISH_TENS = {30: "treinta", 40: "cuarenta", 50: "cincuenta", 60: "sesenta"}
+    UNIT_FORMS = {
+        "minute": ("minute", "minutes", "min", "mins", "minuto", "minutos"),
+        "second": ("second", "seconds", "sec", "secs", "segundo", "segundos", "seg"),
+        "hour": ("hour", "hours", "hr", "hrs", "hora", "horas"),
+    }
+
+    def english_phrase(self, value):
+        if value < 20:
+            return self.ENGLISH_WORDS[value]
+        tens = value // 10 * 10
+        if value == tens:
+            return self.ENGLISH_TENS[tens]
+        return f"{self.ENGLISH_TENS[tens]}-{self.ENGLISH_WORDS[value - tens]}"
+
+    def spanish_phrase(self, value):
+        if value < 30:
+            return self.SPANISH_WORDS[value]
+        tens = value // 10 * 10
+        if value == tens:
+            return self.SPANISH_TENS[tens]
+        return f"{self.SPANISH_TENS[tens]} y {self.SPANISH_WORDS[value - tens]}"
+
+    def caller_stt_failure(self, sidecar_for_turn_four):
+        lines = next(s for s in SCENARIOS if s.name == "spanish-interpreter").caller_lines
+        sidecars = list(lines)
+        sidecars[3] = sidecar_for_turn_four
+        return runner._caller_stt_failure_turn(lines, sidecars)
+
+    def test_spanish_timer_line_matches_its_digit_transcription(self):
+        self.assertEqual(
+            runner._content_tokens("Ahora programa un temporizador de cinco minutos para regar las plantas."),
+            runner._content_tokens("Ahora, programa un temporizador de 5 min para regar las plantas."),
+        )
+
+    def test_spanish_timer_turn_passes_the_whole_call_caller_stt_check(self):
+        self.assertIsNone(self.caller_stt_failure(
+            "Ahora, programa un temporizador de 5 min para regar las plantas."
+        ))
+
+    def test_spanish_timer_turn_passes_the_interpreter_sidecar_check(self):
+        scenario = next(s for s in SCENARIOS if s.name == "spanish-interpreter")
+        for sidecar, mismatched in (
+            ("Ahora, programa un temporizador de 5 min para regar las plantas.", False),
+            ("Ahora, programa un temporizador de 4 min para regar las plantas.", True),
+        ):
+            sidecars = list(scenario.caller_lines)
+            sidecars[3] = sidecar
+            failures, _ = runner._spanish_interpreter_evidence_failures(
+                scenario, "interpreter-room", [], sidecars, []
+            )
+            with self.subTest(sidecar=sidecar):
+                self.assertEqual(
+                    "spanish-interpreter: input STT sidecar turn 4 did not match its scripted line"
+                    in failures,
+                    mismatched,
+                )
+
+    def test_spanish_timer_turn_with_a_different_number_still_fails_caller_stt(self):
+        self.assertEqual(self.caller_stt_failure(
+            "Ahora, programa un temporizador de cuatro minutos para regar las plantas."
+        ), 4)
+
+    def test_english_spoken_number_matches_its_digits(self):
+        self.assertEqual(runner._content_tokens("five minutes"), runner._content_tokens("5 min"))
+
+    def test_spanish_spoken_seconds_match_their_digits(self):
+        self.assertEqual(runner._content_tokens("treinta segundos"), runner._content_tokens("30 sec"))
+
+    def test_spoken_numbers_zero_through_sixty_match_their_digits_in_both_languages(self):
+        for value in range(61):
+            digits = runner._content_tokens(f"{value} min")
+            with self.subTest(value=value):
+                self.assertEqual(
+                    runner._content_tokens(f"{self.english_phrase(value)} minutes"), digits,
+                )
+                self.assertEqual(
+                    runner._content_tokens(f"{self.spanish_phrase(value)} minutos"), digits,
+                )
+
+    def test_time_unit_forms_match_each_other_singular_plural_and_across_languages(self):
+        for unit, forms in self.UNIT_FORMS.items():
+            expected = runner._content_tokens(f"5 {forms[0]}")
+            for form in forms:
+                with self.subTest(unit=unit, form=form):
+                    self.assertEqual(runner._content_tokens(f"5 {form}"), expected)
+
+    def test_different_time_units_still_fail(self):
+        self.assertNotEqual(runner._content_tokens("5 minutes"), runner._content_tokens("5 seconds"))
+        self.assertNotEqual(runner._content_tokens("5 min"), runner._content_tokens("5 hours"))
+
+    def test_a_different_number_still_fails_against_digits(self):
+        self.assertNotEqual(
+            runner._content_tokens("cuatro minutos"), runner._content_tokens("5 min"),
+        )
+
+    def test_a_missing_or_extra_word_still_fails(self):
+        expected = "Ahora programa un temporizador de cinco minutos para regar las plantas."
+        self.assertNotEqual(
+            runner._content_tokens(expected),
+            runner._content_tokens("Ahora programa un temporizador de 5 min regar las plantas."),
+        )
+        self.assertNotEqual(
+            runner._content_tokens(expected),
+            runner._content_tokens(expected.replace("cinco", "cinco extra")),
+        )
+
+    def test_spanish_articles_un_and_una_are_not_numbers(self):
+        self.assertEqual(runner._content_tokens("un temporizador"), ["un", "temporizador"])
+        self.assertEqual(runner._content_tokens("una hora"), ["una", "hour"])
+
+
 class PhantomFinalCountTests(unittest.TestCase):
     def count(self, log_text):
         with tempfile.TemporaryDirectory() as directory:
