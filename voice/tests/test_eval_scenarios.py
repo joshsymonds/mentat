@@ -241,6 +241,7 @@ class ScenarioScoringTests(unittest.TestCase):
             ),
             "phone-first-line": ("Hey, I'm out on a walk with my nephew right now and we got curious, so tell me, what's the capital city of Australia?",),
             "phone-first-line-slow-send": ("Hey, I'm out on a walk with my nephew right now and we got curious, so tell me, what's the capital city of Australia?",),
+            "phone-first-line-long-send": ("Hey, I'm out on a walk with my nephew right now and we got curious, so tell me, what's the capital city of Australia?",),
             "barge-in-long-reply": (
                 "Tell me a long story about a lighthouse keeper and her cat.",
                 "Stop. What's the capital of Japan?",
@@ -284,7 +285,7 @@ class ScenarioScoringTests(unittest.TestCase):
             self.assertEqual(by_name[name].commands[0]["to"], "+1-202-555-0142")
 
     def test_first_line_scenarios_speak_a_long_first_line(self):
-        for name in ("phone-first-line", "phone-first-line-slow-send"):
+        for name in ("phone-first-line", "phone-first-line-slow-send", "phone-first-line-long-send"):
             with self.subTest(scenario=name):
                 first_line = self.scenario(name).caller_lines[0]
                 self.assertGreaterEqual(len(first_line.split()), 20, first_line)
@@ -312,6 +313,15 @@ class ScenarioScoringTests(unittest.TestCase):
             preconnect_lead_seconds=0.7,
         ))
 
+        long_send = self.scenario("phone-first-line-long-send")
+        self.assertEqual(long_send.preconnect_repeat_seconds, 0.8)
+        self.assertEqual(long_send.preconnect_send_lag_seconds, 0.2)
+        self.assertEqual(long_send.preconnect_lead_seconds, 6.0)
+        self.assertEqual(long_send, dataclasses.replace(
+            slow, name="phone-first-line-long-send", preconnect_send_lag_seconds=0.2,
+            preconnect_lead_seconds=6.0,
+        ))
+
         barge = self.scenario("barge-in-long-reply")
         self.assertEqual(barge.turns, (
             TurnExpectation((QuestionSpec("story_start", {}),)),
@@ -328,7 +338,10 @@ class ScenarioScoringTests(unittest.TestCase):
         self.assertTrue(barge.close_after_final_line_optional)
 
     def test_existing_scenarios_keep_new_field_defaults(self):
-        new = {"phone-first-line", "phone-first-line-slow-send", "barge-in-long-reply"}
+        new = {
+            "phone-first-line", "phone-first-line-slow-send", "phone-first-line-long-send",
+            "barge-in-long-reply",
+        }
         for scenario in SCENARIOS:
             if scenario.name in new:
                 continue
@@ -350,8 +363,8 @@ class ScenarioScoringTests(unittest.TestCase):
 
     def test_judge_corpus_covers_new_turns_with_both_polarities(self):
         fixtures = load_fixtures()
-        for name, turn in (("phone-first-line", 1), ("barge-in-long-reply", 1),
-                           ("barge-in-long-reply", 2)):
+        for name, turn in (("phone-first-line", 1), ("phone-first-line-long-send", 1),
+                           ("barge-in-long-reply", 1), ("barge-in-long-reply", 2)):
             with self.subTest(scenario=name, turn=turn):
                 polarities = {
                     fixture["expected"] for fixture in fixtures
@@ -664,7 +677,7 @@ class BargeInDocumentationTests(unittest.TestCase):
     def test_readme_documents_both_first_line_send_timings(self):
         paragraph = self.capture_modes_paragraph()
         command = " ".join(self.readme().split("The R4/R5 command", 1)[1].split("The eval prints", 1)[0].split())
-        for name in ("phone-first-line", "phone-first-line-slow-send"):
+        for name in ("phone-first-line", "phone-first-line-slow-send", "phone-first-line-long-send"):
             scenario = next(s for s in SCENARIOS if s.name == name)
             sentence = (
                 f"`{name}` repeats {scenario.preconnect_repeat_seconds:g} s, "
@@ -677,7 +690,7 @@ class BargeInDocumentationTests(unittest.TestCase):
 
     def test_readme_documents_first_line_cli_form_and_lead_trace_field(self):
         paragraph = self.capture_modes_paragraph()
-        for name in ("phone-first-line", "phone-first-line-slow-send"):
+        for name in ("phone-first-line", "phone-first-line-slow-send", "phone-first-line-long-send"):
             scenario = next(s for s in SCENARIOS if s.name == name)
             flag = (
                 f"--preconnect-first-line {scenario.preconnect_repeat_seconds:g}:"

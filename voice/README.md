@@ -308,8 +308,8 @@ python3 -m voice.evals.runner eval --live --runs 8 \
 The current scenarios are `timer-300-seconds`, `equivalent-alarm`,
 `place-search-navigation`, `sms-say-back-yes`, `sms-correction-new-yes`,
 `alice-keck-context-chain`, `spanish-language-switch`,
-`spanish-interpreter`, `phone-first-line`, `phone-first-line-slow-send`, and
-`barge-in-long-reply`. The
+`spanish-interpreter`, `phone-first-line`, `phone-first-line-slow-send`,
+`phone-first-line-long-send`, and `barge-in-long-reply`. The
 Spanish scenario switches from English to Spanish,
 back to English, then to Spanish again; its pass verdict requires the recorded
 input transcripts, mode transitions, and synthesis voices to agree with each
@@ -328,6 +328,9 @@ recording stops, so the two overlap by REPEAT seconds and the room must still
 hear the line once. `phone-first-line` repeats 0.8 s, sends 0.2 s, and leads
 0.15 s. `phone-first-line-slow-send` repeats 0.8 s, sends 1.5 s, and leads 0.7 s;
 it is otherwise the same line, run with `--preconnect-first-line 0.8:1.5:0.7`.
+`phone-first-line-long-send` repeats 0.8 s, sends 0.2 s, and leads 6 s; it is
+otherwise the same line, run with `--preconnect-first-line 0.8:0.2:6` so its
+buffer is about 7 s, as in real call 1.
 The live track carries silence after the line until the buffer is sent, and the
 trace records the buffer's actual seconds, `repeat_seconds`, `send_lag_seconds`,
 and `lead_seconds`. A first-line run fails unless its retained worker log
@@ -337,17 +340,17 @@ turn-1 product failure. In `barge-in-long-reply`,
 `--barge-in TURN:SECONDS` (one-based TURN, repeatable) starts that line SECONDS
 after the agent's reply begins; the scenario speaks its second line 8 seconds
 into a long story to check that the interruption commits during the agent's
-speech. All three scenarios set `exact_caller_stt`:
+speech. All four scenarios set `exact_caller_stt`:
 the words of every committed input STT sidecar, in order, must match the
 scripted lines' words, so a misheard or duplicated first line, a missing or
 phantom sidecar fails the call, while a line the worker commits as two turns
-still passes. The observation records the sidecars as `caller_stt`. The R4/R5 command runs the three
+still passes. The observation records the sidecars as `caller_stt`. The R4/R5 command runs the four
 scenarios eight times on Opus 5.5:
 
 ```sh
 MENTAT_VOICE_MODEL=claude-opus-5-5 python3 -m voice.evals.runner eval --live --runs 8 \
   --scenario phone-first-line --scenario phone-first-line-slow-send \
-  --scenario barge-in-long-reply
+  --scenario phone-first-line-long-send --scenario barge-in-long-reply
 ```
 
 The eval prints a JSON report to stdout and exits nonzero if any scenario,

@@ -549,6 +549,24 @@
     "source": {"kind": "scenario_corruption","based_on": "phone-first-line-slow-send-canberra","change": "named Sydney as the capital instead of Canberra"}
   },
   {
+    "id": "phone-first-line-long-send-canberra",
+    "scenario": "phone-first-line-long-send",
+    "turn": 1,
+    "reply": "Canberra is the capital of Australia.",
+    "expected": true,
+    "tags": ["scripted-first-line"],
+    "source": {"kind": "scripted","reason": "The long-send variant speaks the same first line as phone-first-line; this is the correct capital answer."}
+  },
+  {
+    "id": "phone-first-line-long-send-sydney",
+    "scenario": "phone-first-line-long-send",
+    "turn": 1,
+    "reply": "Sydney is the capital of Australia.",
+    "expected": false,
+    "tags": ["wrong-fact"],
+    "source": {"kind": "scenario_corruption","based_on": "phone-first-line-long-send-canberra","change": "named Sydney as the capital instead of Canberra"}
+  },
+  {
     "id": "barge-in-story-start",
     "scenario": "barge-in-long-reply",
     "turn": 1,

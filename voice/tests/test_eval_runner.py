@@ -6364,7 +6364,12 @@ class ScenarioObservationTests(unittest.TestCase):
         FIRST_LINE_TIMINGS = {
             "phone-first-line": "0.8:0.2:0.15",
             "phone-first-line-slow-send": "0.8:1.5:0.7",
+            "phone-first-line-long-send": "0.8:0.2:6",
         }
+        self.assertEqual(
+            {scenario.name for scenario in SCENARIOS} & set(FIRST_LINE_TIMINGS),
+            set(FIRST_LINE_TIMINGS),
+        )
         for scenario in SCENARIOS:
             command = runner._capture_command(scenario, "safe-room", ["Question@0::answer"])
             with self.subTest(scenario=scenario.name):
