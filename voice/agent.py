@@ -306,6 +306,10 @@ def write_voice_trace(room_name: str, event: str, **fields: Any) -> None:
 class ScribeCommitController:
     """Commit the live Scribe stream every few quiet seconds, never mid-line."""
 
+    # Scribe answers a commit with too little uncommitted audio by closing the
+    # socket ("commit_throttled"), so a commit that comes due earlier waits for it.
+    MIN_UNCOMMITTED_SECONDS = 0.3
+
     def __init__(
         self, interval: float = 5.0, clock: Callable[[], float] = time.monotonic
     ) -> None:
@@ -319,6 +323,7 @@ class ScribeCommitController:
         self._line_open = False
         self._quiet_due = clock() + interval
         self._last_commit_at: float | None = None
+        self._uncommitted_seconds = 0.0
         self._closed = False
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -330,11 +335,18 @@ class ScribeCommitController:
         self._stream = stream
         self.session_started()
 
+    def audio_sent(self, seconds: float) -> None:
+        was_ready = self._uncommitted_seconds >= self.MIN_UNCOMMITTED_SECONDS
+        self._uncommitted_seconds += seconds
+        if not was_ready and self._uncommitted_seconds >= self.MIN_UNCOMMITTED_SECONDS:
+            self._wake.set()
+
     def session_started(self) -> None:
         # A new Scribe session, whether a fresh stream or a same-stream reconnect,
         # counts as the worker's last commit: flushing right after it hands Scribe
         # a few hundred milliseconds of near-silence and it invents a final.
         self._last_commit_at = self._clock()
+        self._uncommitted_seconds = 0.0
         self._wake.set()
 
     def agent_state(self, old_state: str | None, new_state: str) -> None:
@@ -361,6 +373,9 @@ class ScribeCommitController:
     def _due_at(self) -> float | None:
         if self._stream is None or self._user_speaking or self._line_open:
             return None
+        # Without the floor no time is due: audio_sent wakes the worker once it arrives.
+        if self._uncommitted_seconds < self.MIN_UNCOMMITTED_SECONDS:
+            return None
         if self._last_commit_at is None:
             return self._quiet_due
         return max(self._quiet_due, self._last_commit_at + self._interval)
@@ -378,6 +393,7 @@ class ScribeCommitController:
             return
         self._last_commit_at = self._clock()
         self._quiet_due = self._last_commit_at + self._interval
+        self._uncommitted_seconds = 0.0
 
     async def _run(self) -> None:
         while not self._closed:
@@ -464,18 +480,19 @@ class FrontAgent(Agent):
     def stt_node(
         self, audio: AsyncIterable[Any], model_settings: Any
     ) -> AsyncIterable[Any]:
-        """Record only the exact input frames handed to STT, when opted in."""
-        if self._input_audio is None:
-            return super().stt_node(audio, model_settings)
+        """Count each frame handed to STT toward the commit floor; record it when opted in."""
+        recorder = self._input_audio
+        if recorder is not None:
+            recorder.begin()
 
-        self._input_audio.begin()
-
-        async def recorded_audio() -> AsyncGenerator[Any, None]:
+        async def sent_audio() -> AsyncGenerator[Any, None]:
             async for frame in audio:
-                self._input_audio.capture(frame)
+                if recorder is not None:
+                    recorder.capture(frame)
+                self._scribe_commits.audio_sent(frame.samples_per_channel / frame.sample_rate)
                 yield frame
 
-        return super().stt_node(recorded_audio(), model_settings)
+        return super().stt_node(sent_audio(), model_settings)
 
     def recover_stalled_stt(self, speech_duration: float) -> None:
         """Reconnect a transcriber that heard speech but never committed it, and ask again."""
