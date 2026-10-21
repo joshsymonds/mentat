@@ -9,7 +9,7 @@ import os
 import re
 import time
 import wave
-from collections.abc import AsyncGenerator, AsyncIterable, Callable
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -415,6 +415,55 @@ class ScribeCommitController:
             self._task = None
 
 
+class AudioPacer:
+    """Paces the audio handed to Scribe so its backlog never outruns what Scribe takes.
+
+    The backlog is audio released minus wall time elapsed, floored at zero. A frame
+    passes at once while the backlog stays at or under FREE_BACKLOG_SECONDS; past
+    that, it waits until a quarter of its duration after the previous release, so
+    release never runs faster than MAX_SPEED times real time.
+    """
+
+    FREE_BACKLOG_SECONDS = 5.0
+    MAX_SPEED = 4.0
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    ) -> None:
+        self._clock = clock
+        self._sleep = sleep
+        self._backlog = 0.0
+        self._settled_at = clock()
+        self._released_at = float("-inf")
+        self._engaged = False
+
+    def _settle(self, now: float) -> None:
+        self._backlog = max(0.0, self._backlog - (now - self._settled_at))
+        self._settled_at = now
+
+    async def paced(self, audio: AsyncIterable[Any]) -> AsyncGenerator[Any, None]:
+        async for frame in audio:
+            seconds = frame.samples_per_channel / frame.sample_rate
+            now = self._clock()
+            self._settle(now)
+            held = self._backlog + seconds > self.FREE_BACKLOG_SECONDS
+            if held and not self._engaged:
+                logger.info("STT backlog %.1f s; pacing audio to Scribe", self._backlog + seconds)
+            self._engaged = held
+            if held:
+                release = max(now, self._released_at + seconds / self.MAX_SPEED)
+                if release > now:
+                    await self._sleep(release - now)
+                    now = self._clock()
+                    self._settle(now)
+            self._backlog += seconds
+            self._released_at = now
+            yield frame
+
+
 class CommitSTT(elevenlabs.STT):
     """Scribe that hands every stream it opens to the worker's commit cadence."""
 
@@ -480,13 +529,13 @@ class FrontAgent(Agent):
     def stt_node(
         self, audio: AsyncIterable[Any], model_settings: Any
     ) -> AsyncIterable[Any]:
-        """Count each frame handed to STT toward the commit floor; record it when opted in."""
+        """Pace frames to STT, then count each toward the commit floor and record it when opted in."""
         recorder = self._input_audio
         if recorder is not None:
             recorder.begin()
 
         async def sent_audio() -> AsyncGenerator[Any, None]:
-            async for frame in audio:
+            async for frame in AudioPacer().paced(audio):
                 if recorder is not None:
                     recorder.capture(frame)
                 self._scribe_commits.audio_sent(frame.samples_per_channel / frame.sample_rate)

@@ -1950,6 +1950,7 @@ class AgentSourceContractTest(unittest.TestCase):
         )
         stt_source = ast.unparse(stt_node)
         self.assertIn("recorder.capture", stt_source)
+        self.assertLess(stt_source.index("AudioPacer().paced(audio)"), stt_source.index("capture(frame)"))
         self.assertLess(stt_source.index("capture(frame)"), stt_source.index("yield frame"))
         self.assertIn("self._scribe_commits.audio_sent(", stt_source)
         self.assertLess(stt_source.index("audio_sent("), stt_source.index("yield frame"))

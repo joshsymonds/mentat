@@ -4,7 +4,7 @@ import ast
 import asyncio
 import logging
 import unittest
-from collections.abc import AsyncGenerator, AsyncIterable, Callable
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -522,9 +522,11 @@ class SttNodeAudioTest(unittest.IsolatedAsyncioTestCase):
             type_params=[],
         )
         namespace = _exec(
-            [ast.fix_missing_locations(class_node)],
-            {"PassThroughSTT": PassThroughSTT, "Any": Any,
-             "AsyncGenerator": AsyncGenerator, "AsyncIterable": AsyncIterable},
+            [_top_level("AudioPacer"), ast.fix_missing_locations(class_node)],
+            {"PassThroughSTT": PassThroughSTT, "Any": Any, "asyncio": asyncio,
+             "time": SimpleNamespace(monotonic=lambda: 0.0), "logger": Mock(spec=logging.Logger),
+             "AsyncGenerator": AsyncGenerator, "AsyncIterable": AsyncIterable,
+             "Awaitable": Awaitable, "Callable": Callable},
         )
         self.front_agent = namespace["FrontAgent"]
         self.frames = [_frame(800), _frame(1600), _frame(400)]
