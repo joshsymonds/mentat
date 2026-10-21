@@ -4,16 +4,17 @@ import ast
 import asyncio
 import logging
 import unittest
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 AGENT_PATH = Path(__file__).resolve().parents[1] / "agent.py"
 SOURCE = AGENT_PATH.read_text()
 TREE = ast.parse(SOURCE)
 INTERVAL = 5.0
+AUDIO_TICK = 0.25
 
 
 def _top_level(name):
@@ -38,10 +39,13 @@ def _exec(nodes, namespace):
 
 class FakeTime:
     """A fake clock that also stands in for asyncio.wait_for, so the controller's
-    real background loop sleeps on fake time and fires when the clock reaches it."""
+    real background loop sleeps on fake time and fires when the clock reaches it.
+    As time passes it reports the seconds to `hear`, the way Josh's audio streams in."""
 
     def __init__(self):
         self.now = 0.0
+        self.hear = None
+        self.waits = 0
         self._timer = None
         self._deadline = None
 
@@ -49,6 +53,7 @@ class FakeTime:
         return self.now
 
     async def wait_for(self, awaitable, timeout):
+        self.waits += 1
         wake = asyncio.ensure_future(awaitable)
         if timeout is None:
             await wake
@@ -71,14 +76,23 @@ class FakeTime:
     async def advance(self, seconds):
         end = self.now + seconds
         while True:
-            if self._timer is not None and not self._timer.done() and self._deadline <= end:
-                self.now = max(self.now, self._deadline)
+            # Audio streams in tick by tick, so the worker can act on it as it arrives.
+            tick_end = min(end, self.now + AUDIO_TICK)
+            if self._timer is not None and not self._timer.done() and self._deadline <= tick_end:
+                self._move_to(max(self.now, self._deadline))
                 self._timer.set_result(None)
+            elif self.now < end:
+                self._move_to(tick_end)
+            else:
                 await self.settle()
-                continue
-            self.now = end
+                return
             await self.settle()
-            return
+
+    def _move_to(self, when):
+        # Audio reaches the stream before the timer at `when` fires, so a commit due then sees it.
+        if self.hear is not None and when > self.now:
+            self.hear(when - self.now)
+        self.now = when
 
 
 class FakeStream:
@@ -116,6 +130,7 @@ class FakeScribe:
 class ScribeCommitTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.time = FakeTime()
+        self.time.hear = self._josh_audio
         fake_asyncio = SimpleNamespace(**vars(asyncio))
         fake_asyncio.wait_for = self.time.wait_for
         self.logger = Mock(spec=logging.Logger)
@@ -132,6 +147,9 @@ class ScribeCommitTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.controller.aclose()
+
+    def _josh_audio(self, seconds):
+        self.controller.audio_sent(seconds)
 
     @property
     def flushes(self):
@@ -402,6 +420,142 @@ class SessionStartGapTest(ScribeCommitTestCase):
         self.assertEqual(self.flushes, [5.0])
         await self.time.advance(0.1)
         self.assertEqual(self.flushes, [5.0, 12.0])
+
+
+class CommitFloorTest(ScribeCommitTestCase):
+    """Scribe rejects a commit under 0.3 s of uncommitted audio, so a commit waits for that much."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        # Audio reaches the stream only where a test reports it.
+        self.time.hear = None
+
+    async def test_no_audio_means_no_commit_at_five_or_ten_seconds(self):
+        await self.time.advance(5)
+        self.assertEqual(self.flushes, [])
+        await self.time.advance(5)
+        self.assertEqual(self.flushes, [])
+
+    async def test_point_two_nine_seconds_is_under_the_floor(self):
+        for seconds in (0.1, 0.1, 0.09):
+            self.controller.audio_sent(seconds)
+        await self.time.advance(10)
+        self.assertEqual(self.flushes, [])
+
+    async def test_three_tenths_of_a_second_commits_on_the_cadence(self):
+        self.controller.audio_sent(0.3)
+        await self.time.advance(4.9)
+        self.assertEqual(self.flushes, [])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [5.0])
+
+    async def test_a_commit_due_early_waits_for_the_floor_then_fires_on_arrival(self):
+        self.controller.audio_sent(0.1)
+        await self.time.advance(7)
+        self.assertEqual(self.flushes, [])
+        self.controller.audio_sent(0.2)
+        await self.time.settle()
+        self.assertEqual(self.flushes, [7.0])
+        self.controller.audio_sent(1.0)
+        await self.time.advance(4.9)
+        self.assertEqual(self.flushes, [7.0])
+        await self.time.advance(0.1)
+        self.assertEqual(self.flushes, [7.0, 12.0])
+
+    async def test_waiting_for_the_floor_does_not_spin(self):
+        self.controller.audio_sent(0.1)
+        await self.time.advance(1)
+        waits = self.time.waits
+        await self.time.advance(60)
+        self.assertEqual(self.time.waits, waits)
+        self.assertEqual(self.flushes, [])
+
+    async def test_each_commit_restarts_the_count(self):
+        self.controller.audio_sent(5.0)
+        await self.time.advance(5)
+        self.assertEqual(self.flushes, [5.0])
+        await self.time.advance(5)
+        self.assertEqual(self.flushes, [5.0])
+        self.controller.audio_sent(0.3)
+        await self.time.settle()
+        self.assertEqual(self.flushes, [5.0, 10.0])
+
+    async def test_a_session_start_restarts_the_count(self):
+        self.controller.audio_sent(0.5)
+        await self.time.advance(3)
+        self.controller.session_started()
+        await self.time.advance(10)
+        self.assertEqual(self.flushes, [])
+        self.controller.audio_sent(0.3)
+        await self.time.settle()
+        self.assertEqual(self.flushes, [13.0])
+
+
+class PassThroughSTT:
+    """Stands in for the livekit default stt_node, which hands the frames on to STT."""
+
+    def stt_node(self, audio, model_settings):
+        return audio
+
+
+async def _frames(frames):
+    for frame in frames:
+        yield frame
+
+
+def _frame(samples):
+    return SimpleNamespace(
+        samples_per_channel=samples, sample_rate=16000, num_channels=1, data=bytes(2 * samples),
+    )
+
+
+class SttNodeAudioTest(unittest.IsolatedAsyncioTestCase):
+    """FrontAgent.stt_node reports each frame's seconds to the commit controller."""
+
+    def setUp(self):
+        class_node = ast.ClassDef(
+            name="FrontAgent",
+            bases=[ast.Name(id="PassThroughSTT", ctx=ast.Load())],
+            keywords=[],
+            body=[_front_agent_method("stt_node")],
+            decorator_list=[],
+            type_params=[],
+        )
+        namespace = _exec(
+            [_top_level("AudioPacer"), ast.fix_missing_locations(class_node)],
+            {"PassThroughSTT": PassThroughSTT, "Any": Any, "asyncio": asyncio,
+             "time": SimpleNamespace(monotonic=lambda: 0.0), "logger": Mock(spec=logging.Logger),
+             "AsyncGenerator": AsyncGenerator, "AsyncIterable": AsyncIterable,
+             "Awaitable": Awaitable, "Callable": Callable},
+        )
+        self.front_agent = namespace["FrontAgent"]
+        self.frames = [_frame(800), _frame(1600), _frame(400)]
+        self.seconds = [0.05, 0.1, 0.025]
+
+    def agent(self, recorder):
+        agent = self.front_agent.__new__(self.front_agent)
+        agent._input_audio = recorder
+        agent._scribe_commits = Mock()
+        return agent
+
+    async def handed_on(self, agent):
+        return [frame async for frame in agent.stt_node(_frames(self.frames), None)]
+
+    def reported(self, agent):
+        return [args.args[0] for args in agent._scribe_commits.audio_sent.call_args_list]
+
+    async def test_frames_are_reported_to_the_controller_without_a_recorder(self):
+        agent = self.agent(recorder=None)
+        self.assertEqual(await self.handed_on(agent), self.frames)
+        self.assertEqual(self.reported(agent), self.seconds)
+
+    async def test_frames_are_recorded_and_reported_with_a_recorder(self):
+        recorder = Mock()
+        agent = self.agent(recorder=recorder)
+        self.assertEqual(await self.handed_on(agent), self.frames)
+        recorder.begin.assert_called_once_with()
+        self.assertEqual(recorder.capture.call_args_list, [call(frame) for frame in self.frames])
+        self.assertEqual(self.reported(agent), self.seconds)
 
 
 class StreamHandoffTest(ScribeCommitTestCase):

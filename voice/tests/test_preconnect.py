@@ -894,6 +894,54 @@ class HoldTest(AsyncTest):
         self.assertIsNotNone(match, hold)
         self.assertAlmostEqual(float(match[1]), 1.2, delta=0.1)
 
+    async def test_a_long_buffer_is_held_for_at_most_the_capped_window(self):
+        buffer = speechlike(7.0, seed=1, rate=BUFFER_RATE)
+        live = frames_of(speechlike(8.0, seed=2), LIVE_RATE)
+        stream = GatedStream()
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            audio_input, forward = start_input(stream, handler)
+            await arrive(handler, pcm_chunks(buffer, BUFFER_RATE))
+            stream.push(live[:49])  # 2.45 s of live, short of the 2.5 s cap
+            await settle()
+            self.assertEqual(pre_connect_messages(logs, "pre-connect cut:"), [])
+
+            stream.push(live[49:50])  # 2.5 s of live covers the capped window
+            await settle()
+            self.assertEqual(len(pre_connect_messages(logs, "pre-connect cut:")), 1)
+
+            stream.end()
+            await forward
+
+        self.assertEqual(len(pre_connect_messages(logs, "pre-connect hold:")), 1)
+
+    def test_a_stalled_live_track_releases_a_long_buffer_after_the_capped_span(self):
+        loop = ClockLoop()
+        clock = SimpleNamespace(monotonic=loop.time)
+        with mock.patch.object(preconnect, "time", clock), asyncio.Runner(loop_factory=lambda: loop) as runner:
+            runner.run(self._stalls_on_a_long_buffer())
+
+    async def _stalls_on_a_long_buffer(self):
+        buffer = speechlike(7.0, seed=1, rate=BUFFER_RATE)
+        live = frames_of(speechlike(2.0, seed=2), LIVE_RATE)
+        stream = GatedStream()
+        handler = preconnect._OpenRecordingHandler(mock.MagicMock(), timeout=10.0)
+
+        with self.assertLogs("mentat.voice", "INFO") as logs:
+            audio_input, forward = start_input(stream, handler)
+            await arrive(handler, pcm_chunks(buffer, BUFFER_RATE))
+            stream.push(live[:10])  # 0.5 s of live, then the track stalls
+            await asyncio.sleep(3.0)
+            self.assertEqual(len(pre_connect_messages(logs, "pre-connect cut:")), 1)
+            stream.end()
+            await forward
+
+        [hold] = pre_connect_messages(logs, "pre-connect hold:")
+        match = re.fullmatch(r"pre-connect hold: (\d+\.\d{2}) s", hold)
+        self.assertIsNotNone(match, hold)
+        self.assertAlmostEqual(float(match[1]), 2.5, delta=0.1)
+
 
 def room_options(timeout=3.0):
     if STAND_INS:
@@ -1258,6 +1306,26 @@ class CutRepeatTest(unittest.TestCase):
     def setUp(self):
         self.buffer = speechlike(1.04, seed=1)
         self.tail = self.buffer[-round(0.92 * LIVE_RATE):]
+
+    def test_a_repeat_within_the_capped_window_of_a_long_buffer_is_aligned_and_cut_at_its_end(self):
+        buffer = speechlike(7.0, seed=1)
+        repeat = jittered_repeat(buffer[-round(0.92 * LIVE_RATE):], noise_scale=1.2, seed=3)
+        live = np.concatenate([repeat, speechlike(0.6, seed=4)])
+
+        cut, path = preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE))
+
+        self.assertEqual(path, "aligned")
+        self.assertLessEqual(abs(cut - len(repeat)), round(0.05 * LIVE_RATE))
+
+    def test_a_repeat_past_the_capped_window_of_a_long_buffer_is_not_searched_for(self):
+        buffer = speechlike(7.0, seed=1)
+        repeat = jittered_repeat(buffer[-round(0.92 * LIVE_RATE):], noise_scale=1.2, seed=3)
+        live = np.concatenate([speechlike(3.0, seed=2), repeat, speechlike(0.6, seed=4)])
+
+        self.assertEqual(
+            preconnect.cut_repeat(buffer, live, LIVE_RATE, round(0.3 * LIVE_RATE)),
+            (round(0.3 * LIVE_RATE), "timing"),
+        )
 
     def test_a_recorded_first_line_whose_voiced_part_is_0_53_seconds_is_aligned_on_thirds_of_it(self):
         with np.load(URH8Q2EU_FIXTURE) as fixture:

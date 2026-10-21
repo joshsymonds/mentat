@@ -1949,10 +1949,12 @@ class AgentSourceContractTest(unittest.TestCase):
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "on_user_turn_completed"
         )
         stt_source = ast.unparse(stt_node)
-        self.assertIn("self._input_audio.capture", stt_source)
+        self.assertIn("recorder.capture", stt_source)
+        self.assertLess(stt_source.index("AudioPacer().paced(audio)"), stt_source.index("capture(frame)"))
         self.assertLess(stt_source.index("capture(frame)"), stt_source.index("yield frame"))
-        self.assertIn("return super().stt_node(audio, model_settings)", stt_source)
-        self.assertIn("return super().stt_node(recorded_audio(), model_settings)", stt_source)
+        self.assertIn("self._scribe_commits.audio_sent(", stt_source)
+        self.assertLess(stt_source.index("audio_sent("), stt_source.index("yield frame"))
+        self.assertIn("return super().stt_node(sent_audio(), model_settings)", stt_source)
         self.assertIn("input_audio.commit(question)", ast.unparse(callback))
         self.assertIn("text_content", ast.unparse(callback))
         init = next(

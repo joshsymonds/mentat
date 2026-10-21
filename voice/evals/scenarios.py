@@ -236,6 +236,23 @@ SCENARIOS = (
         close_after_final_line_optional=True,
     ),
     Scenario(
+        name="phone-first-line-long-send",
+        caller_lines=("Hey, I'm out on a walk with my nephew right now and we got curious, so tell me, what's the capital city of Australia?",),
+        turns=(TurnExpectation((_question(
+            "claims",
+            required=["Canberra is the capital of Australia"],
+            rejected=["Sydney is the capital of Australia"],
+        ),)),),
+        commands=(),
+        room_close_after=None,
+        preconnect_first_line=True,
+        preconnect_repeat_seconds=0.8,
+        preconnect_send_lag_seconds=0.2,
+        preconnect_lead_seconds=6.0,
+        exact_caller_stt=True,
+        close_after_final_line_optional=True,
+    ),
+    Scenario(
         name="barge-in-long-reply",
         caller_lines=(
             "Tell me a long story about a lighthouse keeper and her cat.",
