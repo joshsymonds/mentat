@@ -1,7 +1,16 @@
 # Python environment for the public OAuth front.
 { pkgs }:
 
-(pkgs.python3.withPackages (ps: [
+let
+  # mcp pinned to 1.x so nixpkgs' fastmcp 3.x isn't broken; see ./mcp-1.nix.
+  python = pkgs.python3.override {
+    self = python;
+    packageOverrides = pyfinal: _: {
+      mcp = pyfinal.callPackage ./mcp-1.nix { };
+    };
+  };
+in
+(python.withPackages (ps: [
   ps.fastmcp
   ps.uvicorn
 ])).overrideAttrs (old: {
